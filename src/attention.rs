@@ -120,63 +120,45 @@ impl MultiHeadAttention {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let mut attn_outs: Vec<Tensor> = Vec::with_capacity(bh);
+        let head_size = self.head_dim;
 
-        let q_data = q.to_vec();
-        let k_data = k_full.to_vec();
-        let v_data = v_full.to_vec();
-
+        // q/k_full/v_full are [bh, seq, head_dim] — flat buffer of bh * seq * head_dim elements.
+        // Use slice_flat to extract each head's data WITH tape tracking.
         for i in 0..bh {
-            // Extract this head's Q, K, V as tape-tracked tensors
-            let q_head = Tensor::from_slice(
-                &q.ctx,
-                &q_data[i * seq_len * self.head_dim..(i + 1) * seq_len * self.head_dim],
-                vec![seq_len, self.head_dim],
-            );
-            let k_head = Tensor::from_slice(
-                &q.ctx,
-                &k_data[i * seq_k * self.head_dim..(i + 1) * seq_k * self.head_dim],
-                vec![seq_k, self.head_dim],
-            );
-            let v_head = Tensor::from_slice(
-                &q.ctx,
-                &v_data[i * seq_k * self.head_dim..(i + 1) * seq_k * self.head_dim],
-                vec![seq_k, self.head_dim],
-            );
+            let q_offset = i * seq_len * head_size;
+            let q_head = q.slice_flat(q_offset, seq_len * head_size, vec![seq_len, head_size]);
 
-            // scores = Q @ K^T / sqrt(d_k) — goes through tape
-            let scores = q_head.matmul_trans_b(&k_head); // [seq_q, seq_k]
+            let k_offset = i * seq_k * head_size;
+            let k_head = k_full.slice_flat(k_offset, seq_k * head_size, vec![seq_k, head_size]);
+
+            let v_offset = i * seq_k * head_size;
+            let v_head = v_full.slice_flat(v_offset, seq_k * head_size, vec![seq_k, head_size]);
+
+            // scores = Q @ K^T / sqrt(d_k) — tape-tracked
+            let scores = q_head.matmul_trans_b(&k_head);
             let scores = scores.scale(scale);
 
-            // Causal mask — reshape to 3D for the mask kernel, then back
+            // Causal mask
             let scores_3d = scores.reshape(vec![1, seq_len, seq_k]);
             let masked = scores_3d.causal_mask(offset);
             let masked_2d = masked.reshape(vec![seq_len, seq_k]);
 
-            // Softmax — goes through tape
-            let weights = masked_2d.softmax(); // [seq_q, seq_k]
+            // Softmax — tape-tracked
+            let weights = masked_2d.softmax();
 
-            // output = weights @ V — goes through tape
+            // output = weights @ V — tape-tracked
             let head_out = weights.matmul(&v_head); // [seq_q, head_dim]
-
             attn_outs.push(head_out);
         }
 
-        // Concatenate all head outputs: [bh * seq_q, head_dim] → reassemble
-        // Read all head outputs and interleave back to [batch*seq, d_model]
-        let mut combined = vec![0.0f32; batch * seq_len * d_model];
-        for (i, head_out) in attn_outs.iter().enumerate() {
-            let head_data = head_out.to_vec();
-            let b = i / self.n_heads;
-            let h = i % self.n_heads;
-            for s in 0..seq_len {
-                for d in 0..self.head_dim {
-                    let dst = b * seq_len * d_model + s * d_model + h * self.head_dim + d;
-                    let src = s * self.head_dim + d;
-                    combined[dst] = head_data[src];
-                }
-            }
-        }
-        let attn_combined = Tensor::from_slice(&x.ctx, &combined, vec![batch * seq_len, d_model]);
+        // Concatenate all head outputs using tape-tracked concat.
+        // First concat to [bh * seq_q, head_dim], then transpose back.
+        let attn_refs: Vec<&Tensor> = attn_outs.iter().collect();
+        let attn_cat = Tensor::concat_flat(&attn_refs, vec![bh * seq_len, head_size]);
+
+        // Transpose [bh, seq, head_dim] back to [batch*seq, d_model] using tape-tracked transpose
+        let attn_3d = attn_cat.reshape(vec![bh, seq_len, head_size]);
+        let attn_combined = transpose_bhs_to_bsh(&attn_3d, batch, seq_len, self.n_heads, head_size);
 
         // Output projection — goes through tape
         let out = attn_combined.matmul(&self.w_o); // [batch*seq, d_model]
@@ -233,6 +215,62 @@ fn transpose_bsh_to_bhs(
                 n_heads,
                 head_dim,
                 forward_dir: true, // bsh → bhs
+            },
+            inputs: vec![t.id],
+            output: out_id,
+            input_buffers: vec![t.buffer.clone()],
+            output_buffer: out_buf,
+            shapes: vec![t.shape.clone(), result.shape.clone()],
+            cached: None,
+        });
+    }
+
+    result
+}
+
+/// Transpose [batch*n_heads, seq, head_dim] → [batch*seq, n_heads*head_dim]
+/// Records a tape entry (reverse direction) so gradients flow through.
+fn transpose_bhs_to_bsh(
+    t: &Tensor,
+    batch: usize,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Tensor {
+    let data = t.to_vec();
+    let d_model = n_heads * head_dim;
+    let mut out = vec![0.0f32; batch * seq_len * d_model];
+
+    for b in 0..batch {
+        for h in 0..n_heads {
+            for s in 0..seq_len {
+                for d in 0..head_dim {
+                    let src_idx = (b * n_heads + h) * seq_len * head_dim + s * head_dim + d;
+                    let dst_idx = (b * seq_len + s) * d_model + h * head_dim + d;
+                    out[dst_idx] = data[src_idx];
+                }
+            }
+        }
+    }
+
+    let out_buf = t.ctx.buffer_from_slice(&out);
+    let out_id = autograd::next_id();
+    let result = Tensor {
+        id: out_id,
+        buffer: out_buf.clone(),
+        shape: vec![batch * seq_len, d_model],
+        requires_grad: false,
+        ctx: Arc::clone(&t.ctx),
+    };
+
+    if t.requires_grad || autograd::is_recording() {
+        autograd::record(TapeEntry {
+            op: Op::Transpose {
+                batch,
+                seq_len,
+                n_heads,
+                head_dim,
+                forward_dir: false, // bhs → bsh (reverse direction)
             },
             inputs: vec![t.id],
             output: out_id,

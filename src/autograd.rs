@@ -1,5 +1,6 @@
 use crate::metal::{compute, GpuBuffer, MetalContext};
 use objc2::rc::Retained;
+use objc2_metal::MTLBuffer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,6 +39,10 @@ pub enum Op {
         forward_dir: bool, // true = bsh→bhs, false = bhs→bsh
     },
     Checkpoint { layer_idx: usize },
+    /// Slice a contiguous region from a flat buffer. offset and length in elements.
+    Slice { offset: usize, length: usize, source_size: usize },
+    /// Concatenate multiple tensors along first dimension (used to reassemble heads).
+    ConcatParts { part_sizes: Vec<usize> },
 }
 
 /// A single entry on the autodiff tape.
@@ -231,6 +236,12 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::Checkpoint { layer_idx } => {
                     backward_checkpoint(ctx, entry, &out_grad, *layer_idx);
+                }
+                Op::Slice { offset, length, source_size } => {
+                    backward_slice(ctx, entry, &out_grad, *offset, *length, *source_size);
+                }
+                Op::ConcatParts { part_sizes } => {
+                    backward_concat_parts(ctx, entry, &out_grad, part_sizes);
                 }
             }
         }
@@ -471,6 +482,12 @@ fn backward_checkpoint(
             Op::Checkpoint { layer_idx: nested_idx } => {
                 backward_checkpoint(ctx, sub_entry, &sub_out_grad, *nested_idx);
             }
+            Op::Slice { offset, length, source_size } => {
+                backward_slice(ctx, sub_entry, &sub_out_grad, *offset, *length, *source_size);
+            }
+            Op::ConcatParts { part_sizes } => {
+                backward_concat_parts(ctx, sub_entry, &sub_out_grad, part_sizes);
+            }
         }
     }
 
@@ -542,4 +559,45 @@ fn backward_transpose(
 
     let grad_buf = ctx.buffer_from_slice(&grad_input);
     accumulate_grad(ctx, entry.inputs[0], &grad_buf, size);
+}
+
+/// Slice backward: scatter gradient back into the source tensor's gradient at the correct offset.
+fn backward_slice(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    offset: usize,
+    length: usize,
+    source_size: usize,
+) {
+    // Create a zero buffer the size of the source, then copy the slice gradient into it at offset
+    let grad_source = ctx.alloc_buffer(source_size * 4);
+    compute::gpu_fill(ctx, &grad_source, source_size as u32, 0.0);
+
+    // Copy out_grad (length elements) into grad_source at offset
+    let grad_data = MetalContext::read_buffer(out_grad, length);
+    unsafe {
+        let dst = (grad_source.contents().as_ptr() as *mut f32).add(offset);
+        std::ptr::copy_nonoverlapping(grad_data.as_ptr(), dst, length);
+    }
+
+    accumulate_grad(ctx, entry.inputs[0], &grad_source, source_size);
+}
+
+/// ConcatParts backward: split the gradient and distribute to each input part.
+fn backward_concat_parts(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    part_sizes: &[usize],
+) {
+    let total: usize = part_sizes.iter().sum();
+    let grad_data = MetalContext::read_buffer(out_grad, total);
+
+    let mut offset = 0;
+    for (i, &part_size) in part_sizes.iter().enumerate() {
+        let part_grad = ctx.buffer_from_slice(&grad_data[offset..offset + part_size]);
+        accumulate_grad(ctx, entry.inputs[i], &part_grad, part_size);
+        offset += part_size;
+    }
 }

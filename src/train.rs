@@ -102,19 +102,28 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Backward pass
         autograd::backward(ctx, loss_tensor.id);
 
-        // Gradient clipping
+        // Gradient clipping (also filters NaN gradients)
         clip_gradients(ctx, &model, config.max_grad_norm);
 
-        // Optimizer step
-        optimizer.step(lr);
+        // Optimizer step (skip if lr is effectively zero to avoid NaN momentum from 0*NaN)
+        if lr > 1e-10 {
+            optimizer.step(lr);
+        }
         optimizer.zero_grad();
 
         let tokens_this_step = (config.batch_size * config.seq_len) as u64;
         total_tokens += tokens_this_step;
 
+        // NaN detection — abort early to save time
+        let loss_val = loss_tensor.to_vec()[0];
+        if loss_val.is_nan() || loss_val.is_infinite() {
+            eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
+            eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
+            break;
+        }
+
         // Logging
         if step % config.log_interval == 0 {
-            let loss_val = loss_tensor.to_vec()[0];
             let step_time = step_start.elapsed().as_secs_f32();
             let tokens_per_sec = tokens_this_step as f32 / step_time;
             let elapsed = start_time.elapsed().as_secs();
@@ -147,22 +156,27 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     Ok(())
 }
 
-/// Clip gradients by global L2 norm.
+/// Clip gradients by global L2 norm. Also zeroes NaN/Inf gradients.
 fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
 
-    // Compute global gradient norm
+    // Compute global gradient norm, zeroing any NaN/Inf gradients
     let mut total_norm_sq = 0.0f32;
     for param in &params {
         if let Some(grad) = autograd::get_grad(param.id) {
             let norm = compute::gpu_l2_norm(ctx, &grad, param.numel() as u32);
-            total_norm_sq += norm * norm;
+            if norm.is_nan() || norm.is_infinite() {
+                // NaN gradient — zero it out to prevent corruption
+                compute::gpu_fill(ctx, &grad, param.numel() as u32, 0.0);
+            } else {
+                total_norm_sq += norm * norm;
+            }
         }
     }
     let total_norm = total_norm_sq.sqrt();
 
     // Scale gradients if norm exceeds max_norm
-    if total_norm > max_norm {
+    if total_norm > max_norm && total_norm.is_finite() {
         let scale = max_norm / (total_norm + 1e-6);
         for param in &params {
             if let Some(grad) = autograd::get_grad(param.id) {

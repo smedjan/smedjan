@@ -457,6 +457,86 @@ impl Tensor {
         }
     }
 
+    /// Slice a contiguous region from the flat buffer. Tape-tracked for gradient flow.
+    /// Returns a tensor with `length` elements starting at `offset` in the flat buffer.
+    pub fn slice_flat(&self, offset: usize, length: usize, new_shape: Vec<usize>) -> Tensor {
+        let source_size = self.numel();
+        assert!(offset + length <= source_size, "slice out of bounds");
+        assert_eq!(length, new_shape.iter().product::<usize>(), "shape doesn't match length");
+
+        // Copy the slice into a new buffer
+        let data = self.to_vec();
+        let out_buf = self.ctx.buffer_from_slice(&data[offset..offset + length]);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: new_shape,
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Slice { offset, length, source_size },
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
+    /// Concatenate multiple tensors along flat dimension. Tape-tracked.
+    pub fn concat_flat(tensors: &[&Tensor], new_shape: Vec<usize>) -> Tensor {
+        let ctx = &tensors[0].ctx;
+        let total: usize = tensors.iter().map(|t| t.numel()).sum();
+        assert_eq!(total, new_shape.iter().product::<usize>(), "shape doesn't match total");
+
+        let mut all_data = Vec::with_capacity(total);
+        let mut part_sizes = Vec::with_capacity(tensors.len());
+        let mut input_ids = Vec::with_capacity(tensors.len());
+        let mut input_bufs = Vec::with_capacity(tensors.len());
+
+        for t in tensors {
+            let data = t.to_vec();
+            part_sizes.push(data.len());
+            all_data.extend_from_slice(&data);
+            input_ids.push(t.id);
+            input_bufs.push(t.buffer.clone());
+        }
+
+        let out_buf = ctx.buffer_from_slice(&all_data);
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: new_shape,
+            requires_grad: false,
+            ctx: Arc::clone(ctx),
+        };
+
+        if autograd::is_recording() {
+            let shapes: Vec<Vec<usize>> = tensors.iter().map(|t| t.shape.clone()).chain(std::iter::once(out.shape.clone())).collect();
+            autograd::record(TapeEntry {
+                op: Op::ConcatParts { part_sizes },
+                inputs: input_ids,
+                output: out_id,
+                input_buffers: input_bufs,
+                output_buffer: out.buffer.clone(),
+                shapes,
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Scale: self * scalar
     pub fn scale(&self, factor: f32) -> Tensor {
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
