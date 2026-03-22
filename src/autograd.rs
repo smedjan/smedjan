@@ -63,15 +63,28 @@ pub struct TapeEntry {
 }
 
 thread_local! {
-    static TAPE: RefCell<Vec<TapeEntry>> = RefCell::new(Vec::new());
+    static TAPE: RefCell<Vec<TapeEntry>> = const { RefCell::new(Vec::new()) };
     static GRADS: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
-    static NO_GRAD: RefCell<bool> = RefCell::new(false);
+    static NO_GRAD: RefCell<bool> = const { RefCell::new(false) };
     static RECOMPUTE_REGISTRY: RefCell<HashMap<usize, RecomputeFn>> = RefCell::new(HashMap::new());
 }
 
 /// Check if we're currently recording ops.
 pub fn is_recording() -> bool {
     NO_GRAD.with(|ng| !*ng.borrow())
+}
+
+/// Return diagnostic info about the current tape: (num_ops, total_output_bytes).
+/// Reads output_buffer size from each tape entry to compute total activation memory.
+pub fn tape_stats() -> (usize, usize) {
+    TAPE.with(|tape| {
+        let tape = tape.borrow();
+        let num_ops = tape.len();
+        let total_bytes: usize = tape.iter()
+            .map(|entry| entry.output_buffer.length())
+            .sum();
+        (num_ops, total_bytes)
+    })
 }
 
 /// Record an operation on the tape.
@@ -238,7 +251,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                     backward_scale(ctx, entry, &out_grad, *factor);
                 }
                 Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-                    backward_transpose(ctx, entry, &out_grad, *batch, *seq_len, *n_heads, *head_dim, *forward_dir);
+                    backward_transpose(ctx, entry, &out_grad, &TransposeParams {
+                        batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
+                    });
                 }
                 Op::Checkpoint { layer_idx } => {
                     backward_checkpoint(ctx, entry, &out_grad, *layer_idx);
@@ -379,9 +394,11 @@ fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Reta
         out_grad,
         &grad_input,
         &grad_weight,
-        rows as u32,
-        cols as u32,
-        eps,
+        &compute::RmsNormBackwardParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            eps,
+        },
     );
 
     accumulate_grad(ctx, entry.inputs[0], &grad_input, rows * cols);
@@ -489,7 +506,9 @@ fn backward_checkpoint(
             Op::Embedding => backward_embedding(ctx, sub_entry, &sub_out_grad),
             Op::Scale { factor } => backward_scale(ctx, sub_entry, &sub_out_grad, *factor),
             Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-                backward_transpose(ctx, sub_entry, &sub_out_grad, *batch, *seq_len, *n_heads, *head_dim, *forward_dir);
+                backward_transpose(ctx, sub_entry, &sub_out_grad, &TransposeParams {
+                    batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
+                });
             }
             Op::Checkpoint { layer_idx: nested_idx } => {
                 backward_checkpoint(ctx, sub_entry, &sub_out_grad, *nested_idx);
@@ -529,6 +548,15 @@ fn backward_checkpoint(
     // overwritten or cleared when clear_tape() is called at the end of the step.
 }
 
+/// Parameters for the transpose backward pass.
+pub struct TransposeParams {
+    pub batch: usize,
+    pub seq_len: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub forward_dir: bool,
+}
+
 /// Transpose backward: the inverse permutation.
 /// Forward: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
 /// Backward: apply the reverse permutation to the gradient.
@@ -536,12 +564,9 @@ fn backward_transpose(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
     out_grad: &Retained<GpuBuffer>,
-    batch: usize,
-    seq_len: usize,
-    n_heads: usize,
-    head_dim: usize,
-    forward_dir: bool,
+    tp: &TransposeParams,
 ) {
+    let TransposeParams { batch, seq_len, n_heads, head_dim, forward_dir } = *tp;
     let size = batch * seq_len * n_heads * head_dim;
     let grad_data = MetalContext::read_buffer(out_grad, size);
     let mut grad_input = vec![0.0f32; size];

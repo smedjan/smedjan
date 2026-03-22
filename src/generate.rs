@@ -32,6 +32,8 @@ pub fn generate(
     prompt: &str,
     config: &SamplingConfig,
 ) -> String {
+    eprintln!("Generating on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
+        ctx.device_name(), config.temperature, config.top_p, config.top_k, config.max_tokens);
     autograd::no_grad(|| {
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));
@@ -150,6 +152,8 @@ pub fn generate_streaming<F>(
 ) where
     F: FnMut(&str),
 {
+    eprintln!("Streaming on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
+        ctx.device_name(), config.temperature, config.top_p, config.top_k, config.max_tokens);
     autograd::no_grad(|| {
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));

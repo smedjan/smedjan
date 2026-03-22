@@ -62,6 +62,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         "Training: batch_size={}, seq_len={}, total_steps={}, gradient_checkpointing={}",
         config.batch_size, config.seq_len, config.total_steps, config.gradient_checkpointing
     );
+    eprintln!("Tokenizer: {}", config.tokenizer_path);
 
     // Create checkpoint directory
     std::fs::create_dir_all(&config.checkpoint_dir)?;
@@ -82,6 +83,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
     // Data loader
     let mut data_loader = DataLoader::new(&config.dataset_path, config.batch_size, config.seq_len)?;
+    let batches_per_epoch = data_loader.batches_per_epoch();
+    eprintln!("Dataset: {} tokens, ~{} batches/epoch", data_loader.total_tokens(), batches_per_epoch);
 
     let mut total_tokens: u64 = 0;
     let start_time = Instant::now();
@@ -127,9 +130,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             let step_time = step_start.elapsed().as_secs_f32();
             let tokens_per_sec = tokens_this_step as f32 / step_time;
             let elapsed = start_time.elapsed().as_secs();
+            let (tape_ops, tape_bytes) = autograd::tape_stats();
+            if step == 0 {
+                eprintln!("Tape: {} ops, {:.1} MB activation memory", tape_ops, tape_bytes as f64 / (1024.0 * 1024.0));
+            }
 
             eprintln!(
-                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens",
+                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens | epoch {} ({}/{})",
                 step,
                 loss_val,
                 lr,
@@ -137,6 +144,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 step_time,
                 elapsed,
                 total_tokens / 1_000_000,
+                data_loader.epoch(),
+                step as usize % batches_per_epoch,
+                batches_per_epoch,
             );
         }
 

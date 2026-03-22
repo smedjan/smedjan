@@ -170,6 +170,27 @@ impl BpeTokenizer {
         self.inverse_vocab.len() as u32
     }
 
+    /// Check if a byte sequence is a known token in the vocabulary.
+    pub fn contains_token(&self, token_bytes: &[u8]) -> bool {
+        self.vocab.contains_key(token_bytes)
+    }
+
+    /// Print tokenizer statistics: vocab size, merge count, average token length.
+    pub fn print_stats(&self) {
+        let avg_len = if self.inverse_vocab.is_empty() {
+            0.0
+        } else {
+            self.inverse_vocab.iter().map(|t| t.len()).sum::<usize>() as f64
+                / self.inverse_vocab.len() as f64
+        };
+        eprintln!(
+            "Tokenizer: {} tokens in vocab, {} merges, avg token {:.1} bytes",
+            self.vocab.len(),
+            self.merges.len(),
+            avg_len,
+        );
+    }
+
     /// Save tokenizer to a binary file.
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;

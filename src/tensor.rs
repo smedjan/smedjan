@@ -17,6 +17,12 @@ pub struct Tensor {
     pub ctx: Arc<MetalContext>,
 }
 
+// SAFETY: Tensor's non-Send fields are Metal GPU buffers. All GPU dispatch
+// in this codebase is synchronous (waitUntilCompleted), and Metal buffers
+// on Apple Silicon are safe to reference from any thread.
+unsafe impl Send for Tensor {}
+unsafe impl Sync for Tensor {}
+
 impl Tensor {
     /// Create a tensor from raw float data.
     pub fn from_slice(ctx: &Arc<MetalContext>, data: &[f32], shape: Vec<usize>) -> Self {

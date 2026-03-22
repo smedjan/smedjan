@@ -26,7 +26,7 @@ impl ModelConfig {
     pub fn d_ff(&self) -> usize {
         let raw = (self.d_model as f32 * self.ffn_multiplier) as usize;
         // Round UP to next multiple of 256 for GPU alignment
-        ((raw + 255) / 256) * 256
+        raw.div_ceil(256) * 256
     }
 
     /// Build a config with exact control over every knob.

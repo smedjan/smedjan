@@ -133,7 +133,7 @@ pub fn quality_filter(text: &str) -> bool {
     let len = text.len();
 
     // Too short or too long
-    if len < 50 || len > 100_000 {
+    if !(50..=100_000).contains(&len) {
         return false;
     }
 

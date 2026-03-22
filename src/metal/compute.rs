@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Round up to the next power of 2, clamped to [1, 256].
 /// Required for threadgroup reductions in all row-wise kernels.
 fn next_power_of_2_clamped(n: u64) -> u64 {
-    let p = (n as u32).next_power_of_two().min(256).max(1);
+    let p = (n as u32).next_power_of_two().clamp(1, 256);
     p as u64
 }
 
@@ -68,8 +68,8 @@ pub fn gpu_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &Gpu
     let params_buf = params_buffer(ctx, &params);
 
     let tile = 32u64;
-    let groups_x = ((n as u64) + tile - 1) / tile;
-    let groups_y = ((m as u64) + tile - 1) / tile;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, 1);
     let tg = MetalContext::size(64, 1, 1);
 
@@ -86,8 +86,8 @@ pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     let params_buf = params_buffer(ctx, &params);
 
     let tile = 32u64;
-    let groups_x = ((n as u64) + tile - 1) / tile;
-    let groups_y = ((m as u64) + tile - 1) / tile;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, 1);
     let tg = MetalContext::size(64, 1, 1);
 
@@ -172,7 +172,7 @@ pub fn gpu_add(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuf
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -189,7 +189,7 @@ pub fn gpu_mul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuf
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -206,7 +206,7 @@ pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, 
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -254,6 +254,16 @@ pub fn gpu_reduce_sum(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBu
     );
 }
 
+/// AdamW optimizer hyperparameters.
+pub struct AdamWHyperparams {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub weight_decay: f32,
+    pub step: u32,
+}
+
 /// AdamW fused update.
 pub fn gpu_adamw_update(
     ctx: &Arc<MetalContext>,
@@ -262,13 +272,9 @@ pub fn gpu_adamw_update(
     m: &GpuBuffer,
     v: &GpuBuffer,
     size: u32,
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    weight_decay: f32,
-    step: u32,
+    hp: &AdamWHyperparams,
 ) {
+    let AdamWHyperparams { lr, beta1, beta2, eps, weight_decay, step } = *hp;
     #[repr(C)]
     struct Params {
         size: u32,
@@ -293,7 +299,7 @@ pub fn gpu_adamw_update(
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -376,7 +382,7 @@ pub fn gpu_scale(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, scale: f3
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -393,7 +399,7 @@ pub fn gpu_fill(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, value: f32
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -410,7 +416,7 @@ pub fn gpu_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size:
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
@@ -433,13 +439,20 @@ pub fn gpu_silu_backward(
     let params_buf = params_buffer(ctx, &params);
 
     let tpg = 256u64;
-    let groups = ((size as u64) + tpg - 1) / tpg;
+    let groups = (size as u64).div_ceil(tpg);
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
     dispatch_sync!(ctx, "silu_backward", grid, tg,
         0 => input, 1 => grad_output, 2 => grad_input, 3 => &params_buf
     );
+}
+
+/// RMS norm backward shape and epsilon parameters.
+pub struct RmsNormBackwardParams {
+    pub rows: u32,
+    pub cols: u32,
+    pub eps: f32,
 }
 
 /// RMS norm backward
@@ -450,10 +463,9 @@ pub fn gpu_rms_norm_backward(
     grad_output: &GpuBuffer,
     grad_input: &GpuBuffer,
     grad_weight: &GpuBuffer,
-    rows: u32,
-    cols: u32,
-    eps: f32,
+    params: &RmsNormBackwardParams,
 ) {
+    let RmsNormBackwardParams { rows, cols, eps } = *params;
     // Zero grad_weight first
     gpu_fill(ctx, grad_weight, cols, 0.0);
 

@@ -30,6 +30,12 @@ pub struct MetalContext {
     pub pipelines: HashMap<&'static str, Retained<GpuPipeline>>,
 }
 
+// SAFETY: MetalContext is only used from a single thread in practice.
+// Metal's command queue and device are thread-safe on Apple Silicon,
+// and all GPU dispatch in this codebase is synchronous (waitUntilCompleted).
+unsafe impl Send for MetalContext {}
+unsafe impl Sync for MetalContext {}
+
 impl MetalContext {
     pub fn new() -> Arc<Self> {
         let device = MTLCreateSystemDefaultDevice().expect("No Metal device found");
@@ -99,7 +105,7 @@ impl MetalContext {
     pub fn alloc_buffer(&self, size_bytes: usize) -> Retained<GpuBuffer> {
         self.device
             .newBufferWithLength_options(
-                size_bytes as usize,
+                size_bytes,
                 MTLResourceOptions::StorageModeShared,
             )
             .expect("Failed to allocate Metal buffer")
@@ -107,7 +113,7 @@ impl MetalContext {
 
     /// Allocate a buffer and initialize with float data.
     pub fn buffer_from_slice(&self, data: &[f32]) -> Retained<GpuBuffer> {
-        let byte_len = data.len() * std::mem::size_of::<f32>();
+        let byte_len = std::mem::size_of_val(data);
         let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();
         unsafe {
             self.device
@@ -122,7 +128,7 @@ impl MetalContext {
 
     /// Allocate a buffer and initialize with u32 data.
     pub fn buffer_from_u32_slice(&self, data: &[u32]) -> Retained<GpuBuffer> {
-        let byte_len = data.len() * std::mem::size_of::<u32>();
+        let byte_len = std::mem::size_of_val(data);
         let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();
         unsafe {
             self.device

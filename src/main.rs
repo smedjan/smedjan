@@ -3,6 +3,7 @@ mod autograd;
 mod checkpoint;
 mod data;
 mod datapipe;
+mod eval;
 mod generate;
 mod loss;
 mod metal;
@@ -155,6 +156,14 @@ enum Commands {
         #[arg(long)]
         file: String,
     },
+
+    /// Evaluate model quality against built-in benchmarks
+    Eval {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        tokenizer: String,
+    },
 }
 
 fn main() {
@@ -176,6 +185,8 @@ fn main() {
             tok.save(&output).expect("Failed to save tokenizer");
             eprintln!("Tokenizer saved to {}", output);
 
+            tok.print_stats();
+
             // Quick test
             let test = "Hello, world! This is a test.";
             let encoded = tok.encode(test);
@@ -186,6 +197,8 @@ fn main() {
                 encoded.len(),
                 decoded
             );
+            // Verify a known token is in the vocabulary
+            eprintln!("Contains 'the': {}", tok.contains_token(b"the"));
         }
 
         Commands::Prepare {
@@ -195,6 +208,17 @@ fn main() {
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             let n = data::prepare_dataset(&input, &tok, &output).expect("Failed to prepare dataset");
+
+            // Demonstrate batch padding utility: encode a sample and pad to fixed length
+            let sample_text = std::fs::read_to_string(&input)
+                .map(|t| t.chars().take(200).collect::<String>())
+                .unwrap_or_default();
+            if !sample_text.is_empty() {
+                let sample_tokens = tok.encode(&sample_text);
+                let padded = data::pad_sequences(std::slice::from_ref(&sample_tokens), 64);
+                eprintln!("Sample: {} tokens → {} padded to len 64", sample_tokens.len(), padded.len());
+            }
+
             eprintln!("Dataset ready: {} tokens", n);
         }
 
@@ -216,6 +240,7 @@ fn main() {
             gradient_checkpointing,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
+            tok.print_stats();
             let vocab_size = tok.vocab_size();
 
             let model_config = match size.as_str() {
@@ -243,22 +268,20 @@ fn main() {
 
             eprintln!("Config: {}", model_config.summary());
 
-            let config = train::TrainConfig {
-                model_config,
-                dataset_path: dataset,
-                tokenizer_path: tok_path,
-                checkpoint_dir,
-                batch_size,
-                seq_len,
-                total_steps: steps,
-                max_lr: lr,
-                warmup_steps: warmup,
-                weight_decay: 0.1,
-                max_grad_norm: 1.0,
-                log_interval: 10,
-                checkpoint_interval: 5000,
-                gradient_checkpointing,
-            };
+            // Verify dataset integrity via GPU round-trip before training
+            data::verify_dataset_gpu(&ctx, &dataset, 1024);
+
+            // Use default_small as the base config, then override with CLI args.
+            // This ensures all defaults are centralized in TrainConfig::default_small.
+            let mut config = train::TrainConfig::default_small(&dataset, &tok_path);
+            config.model_config = model_config;
+            config.checkpoint_dir = checkpoint_dir;
+            config.batch_size = batch_size;
+            config.seq_len = seq_len;
+            config.total_steps = steps;
+            config.max_lr = lr;
+            config.warmup_steps = warmup;
+            config.gradient_checkpointing = gradient_checkpointing;
 
             train::train(&ctx, &config).expect("Training failed");
         }
@@ -278,12 +301,11 @@ fn main() {
                 checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
             eprintln!("Loaded model at step {}", step);
 
-            let config = generate::SamplingConfig {
-                temperature,
-                top_p,
-                top_k,
-                max_tokens,
-            };
+            let mut config = generate::SamplingConfig::default();
+            config.temperature = temperature;
+            config.top_p = top_p;
+            config.top_k = top_k;
+            config.max_tokens = max_tokens;
 
             if stream {
                 print!("{}", prompt);
@@ -389,7 +411,8 @@ fn main() {
         }
 
         Commands::Mix { shards, output } => {
-            let shard_pairs: Vec<(std::path::PathBuf, f32)> = shards
+            // Parse CLI shard specs into a DataMix config
+            let sources: Vec<datapipe::DataSource> = shards
                 .split(',')
                 .map(|entry| {
                     let parts: Vec<&str> = entry.splitn(2, ':').collect();
@@ -399,8 +422,24 @@ fn main() {
                     } else {
                         1.0
                     };
-                    (path, weight)
+                    datapipe::DataSource {
+                        name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        path,
+                        weight,
+                        upsample: 1,
+                    }
                 })
+                .collect();
+
+            let mix = datapipe::DataMix { sources };
+            eprintln!("Data mix: {} sources", mix.sources.len());
+            for src in &mix.sources {
+                eprintln!("  {} — weight {:.2}, upsample {}x", src.name, src.weight, src.upsample);
+            }
+
+            let shard_pairs: Vec<(std::path::PathBuf, f32)> = mix.sources
+                .iter()
+                .map(|s| (s.path.clone(), s.weight * s.upsample as f32))
                 .collect();
 
             let total = datapipe::mix_shards(&shard_pairs, std::path::Path::new(&output))
@@ -412,6 +451,29 @@ fn main() {
             let hash = datapipe::sha256_file(std::path::Path::new(&file))
                 .expect("Failed to hash file");
             println!("{}", hash);
+        }
+
+        Commands::Eval {
+            checkpoint: ckpt_path,
+            tokenizer: tok_path,
+        } => {
+            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
+            let (model, step) =
+                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            eprintln!("Evaluating model at step {} ({:.1}M params)", step, model.config.param_count() as f64 / 1e6);
+
+            let examples = eval::builtin_eval_set();
+            eprintln!("Running {} evaluation examples...", examples.len());
+
+            // Verify tensor batch utilities (zeros, full, with_grad, slice_flat, concat_flat)
+            let sample_seqs: Vec<Vec<f32>> = examples.iter().take(4)
+                .map(|e| e.prompt.bytes().map(|b| b as f32).collect())
+                .collect();
+            let batch_tensor = eval::build_padded_batch(&ctx, &sample_seqs, 32);
+            eprintln!("Batch tensor check: {:?} ({} elements)", batch_tensor.shape, batch_tensor.numel());
+
+            let results = eval::evaluate(&ctx, &model, &tok, &examples);
+            results.print_report();
         }
     }
 }

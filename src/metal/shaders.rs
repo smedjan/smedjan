@@ -1,7 +1,6 @@
 /// Metal Shader Language (MSL) kernel sources for AndreAI.
 /// All GPU compute happens through these shaders.
 /// Optimized for Apple M1: 8-core GPU, 32KB threadgroup memory per core, 128 ALUs/core.
-
 /// Tiled matrix multiplication: C = A @ B
 /// A: [M, K], B: [K, N], C: [M, N]
 /// Tile size: 32x32 output, K-blocking in chunks of 32.

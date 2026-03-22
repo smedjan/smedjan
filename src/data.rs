@@ -1,7 +1,9 @@
-use crate::tokenizer::BpeTokenizer;
+use crate::metal::MetalContext;
+use crate::tokenizer::{BpeTokenizer, PAD_TOKEN};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 
 /// Pre-tokenized dataset stored as flat u32 array on disk.
 pub struct Dataset {
@@ -141,4 +143,37 @@ impl DataLoader {
         let tokens_per_batch = self.batch_size * (self.seq_len + 1);
         self.dataset.len() / tokens_per_batch
     }
+
+    /// Total tokens in the underlying dataset.
+    pub fn total_tokens(&self) -> usize {
+        self.dataset.len()
+    }
+}
+
+/// Pad a batch of variable-length token sequences to the same length using PAD_TOKEN.
+/// Each sequence is padded on the right to `max_len`.
+pub fn pad_sequences(sequences: &[Vec<u32>], max_len: usize) -> Vec<u32> {
+    let mut padded = Vec::with_capacity(sequences.len() * max_len);
+    for seq in sequences {
+        let take = seq.len().min(max_len);
+        padded.extend_from_slice(&seq[..take]);
+        padded.extend(std::iter::repeat_n(PAD_TOKEN, max_len - take));
+    }
+    padded
+}
+
+/// Verify a dataset shard by round-tripping a sample through a GPU u32 buffer.
+/// Returns the number of verified tokens. Panics on mismatch.
+pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_size: usize) -> usize {
+    let dataset = Dataset::load(dataset_path).expect("Failed to load dataset for verification");
+    let count = sample_size.min(dataset.len());
+    let tokens = dataset.get_tokens(0, count);
+
+    // Round-trip through Metal GPU buffer
+    let gpu_buf = ctx.buffer_from_u32_slice(&tokens);
+    let readback = MetalContext::read_buffer_u32(&gpu_buf, count);
+
+    assert_eq!(tokens, readback, "GPU round-trip verification failed for dataset");
+    eprintln!("Dataset verification passed: {} tokens round-tripped through GPU", count);
+    count
 }

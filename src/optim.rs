@@ -72,12 +72,14 @@ impl AdamW {
                 &ps.m,
                 &ps.v,
                 ps.size as u32,
-                lr,
-                self.beta1,
-                self.beta2,
-                self.eps,
-                self.weight_decay,
-                self.step,
+                &compute::AdamWHyperparams {
+                    lr,
+                    beta1: self.beta1,
+                    beta2: self.beta2,
+                    eps: self.eps,
+                    weight_decay: self.weight_decay,
+                    step: self.step,
+                },
             );
         }
     }
