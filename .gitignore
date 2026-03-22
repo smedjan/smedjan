@@ -1,5 +1,6 @@
 /target
 /data
+!/data/sft_*.jsonl
 *.bin
 *.sha256
 checkpoints/
