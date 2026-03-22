@@ -537,6 +537,120 @@ impl Tensor {
         out
     }
 
+    /// Batched matrix multiplication: self[b] @ other[b] for each batch element.
+    /// self: [B, M, K], other: [B, K, N] → result: [B, M, N]
+    /// Records a single Op::BatchedMatmul tape entry.
+    pub fn batched_matmul(&self, other: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 3, "batched_matmul expects 3D tensors, got {:?}", self.shape);
+        assert_eq!(other.shape.len(), 3, "batched_matmul expects 3D tensors, got {:?}", other.shape);
+        let batches = self.shape[0];
+        let m = self.shape[1];
+        let k = self.shape[2];
+        assert_eq!(other.shape[0], batches, "batch dim mismatch: {} vs {}", batches, other.shape[0]);
+        assert_eq!(other.shape[1], k, "inner dim mismatch: {} vs {}", k, other.shape[1]);
+        let n = other.shape[2];
+
+        let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
+        let a_data = self.to_vec();
+        let b_data = other.to_vec();
+
+        for b in 0..batches {
+            let a_off = b * m * k;
+            let b_off = b * k * n;
+            let c_off = b * m * n;
+
+            let a_sub = self.ctx.buffer_from_slice(&a_data[a_off..a_off + m * k]);
+            let b_sub = self.ctx.buffer_from_slice(&b_data[b_off..b_off + k * n]);
+            let c_sub = self.ctx.alloc_buffer(m * n * 4);
+            compute::gpu_matmul(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
+            let c_vals = MetalContext::read_buffer(&c_sub, m * n);
+            unsafe {
+                let dst = (out_buf.contents().as_ptr() as *mut f32).add(c_off);
+                std::ptr::copy_nonoverlapping(c_vals.as_ptr(), dst, m * n);
+            }
+        }
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![batches, m, n],
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || other.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::BatchedMatmul,
+                inputs: vec![self.id, other.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), other.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), other.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
+    /// Batched matrix multiply with B transposed: self[b] @ other[b]^T for each batch element.
+    /// self: [B, M, K], other: [B, N, K] → result: [B, M, N]
+    /// Records a single Op::BatchedMatmulTransB tape entry.
+    pub fn batched_matmul_trans_b(&self, other: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 3, "batched_matmul_trans_b expects 3D tensors, got {:?}", self.shape);
+        assert_eq!(other.shape.len(), 3, "batched_matmul_trans_b expects 3D tensors, got {:?}", other.shape);
+        let batches = self.shape[0];
+        let m = self.shape[1];
+        let k = self.shape[2];
+        assert_eq!(other.shape[0], batches, "batch dim mismatch: {} vs {}", batches, other.shape[0]);
+        assert_eq!(other.shape[2], k, "inner dim mismatch: {} vs {}", k, other.shape[2]);
+        let n = other.shape[1];
+
+        let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
+        let a_data = self.to_vec();
+        let b_data = other.to_vec();
+
+        for b in 0..batches {
+            let a_off = b * m * k;
+            let b_off = b * n * k;
+            let c_off = b * m * n;
+
+            let a_sub = self.ctx.buffer_from_slice(&a_data[a_off..a_off + m * k]);
+            let b_sub = self.ctx.buffer_from_slice(&b_data[b_off..b_off + n * k]);
+            let c_sub = self.ctx.alloc_buffer(m * n * 4);
+            compute::gpu_matmul_trans_b(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
+            let c_vals = MetalContext::read_buffer(&c_sub, m * n);
+            unsafe {
+                let dst = (out_buf.contents().as_ptr() as *mut f32).add(c_off);
+                std::ptr::copy_nonoverlapping(c_vals.as_ptr(), dst, m * n);
+            }
+        }
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![batches, m, n],
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || other.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::BatchedMatmulTransB,
+                inputs: vec![self.id, other.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), other.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), other.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Scale: self * scalar
     pub fn scale(&self, factor: f32) -> Tensor {
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);

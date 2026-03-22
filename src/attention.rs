@@ -90,75 +90,37 @@ impl MultiHeadAttention {
         let k = k.apply_rope(offset, 10000.0);
 
         // Handle KV cache (inference only — no tape needed)
-        let (k_full, v_full, seq_k) = match kv_cache {
-            Some(cache) => {
-                let (k_full, v_full) = update_kv_cache(cache, &k, &v, bh, self.head_dim);
-                let seq_k = k_full.shape[1];
-                (k_full, v_full, seq_k)
-            }
-            None => (k, v, seq_len),
+        let (k_full, v_full) = match kv_cache {
+            Some(cache) => update_kv_cache(cache, &k, &v, bh, self.head_dim),
+            None => (k, v),
         };
 
-        // --- Attention computation ---
+        // --- Attention computation (batched) ---
         // Q: [bh, seq_q, head_dim], K: [bh, seq_k, head_dim], V: [bh, seq_k, head_dim]
         //
-        // Strategy: flatten batch_heads into the first dimension of a 2D matmul.
-        // For Q @ K^T: reshape Q to [bh*seq_q, head_dim], K to [bh*seq_k, head_dim]
-        // But we need per-head matmuls, not one giant matmul.
-        //
-        // Correct approach: treat each head independently as a 2D matmul.
-        // Flatten Q → [bh * seq_q, head_dim] and K → [bh * seq_k, head_dim]
-        // won't work because matmul would mix heads.
-        //
-        // We must do per-head matmul. To keep this on the tape, we use the
-        // batched matmul support in tensor.rs (which handles batch>1 via loop).
-        // But that also uses CPU readbacks...
-        //
-        // SIMPLEST CORRECT APPROACH for training: for each batch-head, do a
-        // tape-tracked 2D matmul. This creates tape entries per head which is
-        // more tape entries but each one flows gradients correctly.
+        // Use batched matmul ops that treat the first dimension as independent batch
+        // elements. This records a single tape entry per op instead of bh entries,
+        // and avoids the slice/concat gradient scatter that caused NaN on larger models.
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let mut attn_outs: Vec<Tensor> = Vec::with_capacity(bh);
-        let head_size = self.head_dim;
 
-        // q/k_full/v_full are [bh, seq, head_dim] — flat buffer of bh * seq * head_dim elements.
-        // Use slice_flat to extract each head's data WITH tape tracking.
-        for i in 0..bh {
-            let q_offset = i * seq_len * head_size;
-            let q_head = q.slice_flat(q_offset, seq_len * head_size, vec![seq_len, head_size]);
+        // scores = Q @ K^T : [bh, seq_q, head_dim] @ [bh, head_dim, seq_k]^T → [bh, seq_q, seq_k]
+        // batched_matmul_trans_b handles B as [bh, seq_k, head_dim] and transposes per element
+        let scores = q.batched_matmul_trans_b(&k_full); // [bh, seq_q, seq_k]
+        let scores = scores.scale(scale);
 
-            let k_offset = i * seq_k * head_size;
-            let k_head = k_full.slice_flat(k_offset, seq_k * head_size, vec![seq_k, head_size]);
+        // Causal mask — already handles [bh, seq_q, seq_k]
+        let scores = scores.causal_mask(offset);
 
-            let v_offset = i * seq_k * head_size;
-            let v_head = v_full.slice_flat(v_offset, seq_k * head_size, vec![seq_k, head_size]);
+        // Softmax over last dim — handles [bh, seq_q, seq_k] correctly (rows = bh*seq_q, cols = seq_k)
+        let weights = scores.softmax(); // [bh, seq_q, seq_k]
 
-            // scores = Q @ K^T / sqrt(d_k) — tape-tracked
-            let scores = q_head.matmul_trans_b(&k_head);
-            let scores = scores.scale(scale);
-
-            // Causal mask
-            let scores_3d = scores.reshape(vec![1, seq_len, seq_k]);
-            let masked = scores_3d.causal_mask(offset);
-            let masked_2d = masked.reshape(vec![seq_len, seq_k]);
-
-            // Softmax — tape-tracked
-            let weights = masked_2d.softmax();
-
-            // output = weights @ V — tape-tracked
-            let head_out = weights.matmul(&v_head); // [seq_q, head_dim]
-            attn_outs.push(head_out);
-        }
-
-        // Concatenate all head outputs using tape-tracked concat.
-        // First concat to [bh * seq_q, head_dim], then transpose back.
-        let attn_refs: Vec<&Tensor> = attn_outs.iter().collect();
-        let attn_cat = Tensor::concat_flat(&attn_refs, vec![bh * seq_len, head_size]);
+        // output = weights @ V : [bh, seq_q, seq_k] @ [bh, seq_k, head_dim] → [bh, seq_q, head_dim]
+        let attn_cat = weights.batched_matmul(&v_full); // [bh, seq_q, head_dim]
 
         // Transpose [bh, seq, head_dim] back to [batch*seq, d_model] using tape-tracked transpose
-        let attn_3d = attn_cat.reshape(vec![bh, seq_len, head_size]);
-        let attn_combined = transpose_bhs_to_bsh(&attn_3d, batch, seq_len, self.n_heads, head_size);
+        // attn_cat is already [bh, seq_len, head_dim] from batched_matmul
+        let attn_combined = transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
 
         // Output projection — goes through tape
         let out = attn_combined.matmul(&self.w_o); // [batch*seq, d_model]
