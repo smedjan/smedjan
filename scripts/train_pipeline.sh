@@ -36,11 +36,11 @@ $BIN train \
   --dataset "$DATA/train_v3.bin" \
   --tokenizer "$DATA/tokenizer_v2.bin" \
   --size custom --dim 256 --layers 6 --heads 4 \
-  --batch-size 8 \
+  --batch-size 32 \
   --seq-len 256 \
-  --steps 50000 \
+  --steps 15000 \
   --lr 1e-3 \
-  --warmup 2000 \
+  --warmup 1000 \
   --checkpoint-dir "$CKPT_DIR" 2>&1 | tee -a "$LOG"
 
 log "Pre-training complete."
