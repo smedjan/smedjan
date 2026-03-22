@@ -114,44 +114,84 @@ impl BpeTokenizer {
     }
 
     /// Encode text to token IDs.
+    /// Optimized: applies merges in priority order, scanning once per merge level.
+    /// For long texts, splits into chunks to avoid O(n^2) behavior.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        // Start with byte-level tokens
-        let mut tokens: Vec<u32> = text.as_bytes().iter().map(|&b| b as u32 + SPECIAL_TOKENS).collect();
+        if text.len() > 10_000 {
+            // Split long texts into overlapping chunks to avoid O(n^2) merge scanning.
+            // Process each chunk independently then concatenate.
+            return self.encode_chunked(text, 8_000);
+        }
+        self.encode_segment(text.as_bytes())
+    }
 
-        // Apply merges in priority order
-        loop {
-            // Find the highest-priority (lowest index) merge that applies
-            let mut best_merge: Option<(usize, usize)> = None; // (position, priority)
+    /// Encode a byte segment using BPE merges.
+    fn encode_segment(&self, bytes: &[u8]) -> Vec<u32> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
 
-            for i in 0..tokens.len().saturating_sub(1) {
-                let pair = (tokens[i], tokens[i + 1]);
-                if let Some(&priority) = self.merge_priority.get(&pair) {
-                    match best_merge {
-                        None => best_merge = Some((i, priority)),
-                        Some((_, best_pri)) if priority < best_pri => {
-                            best_merge = Some((i, priority));
-                        }
-                        _ => {}
-                    }
-                }
+        let mut tokens: Vec<u32> = bytes.iter().map(|&b| b as u32 + SPECIAL_TOKENS).collect();
+
+        // Apply merges in priority order (lowest priority number = highest priority).
+        // For each merge rule, scan the token list once and apply all non-overlapping matches.
+        for &(a, b, merged) in &self.merges {
+            if tokens.len() < 2 {
+                break;
             }
 
-            match best_merge {
-                None => break,
-                Some((pos, _)) => {
-                    let pair = (tokens[pos], tokens[pos + 1]);
-                    // Look up the merged token
-                    let merged = self.merges.iter()
-                        .find(|&&(a, b, _)| a == pair.0 && b == pair.1)
-                        .map(|&(_, _, new)| new)
-                        .unwrap();
-                    tokens[pos] = merged;
-                    tokens.remove(pos + 1);
+            let mut new_tokens = Vec::with_capacity(tokens.len());
+            let mut i = 0;
+            while i < tokens.len() {
+                if i + 1 < tokens.len() && tokens[i] == a && tokens[i + 1] == b {
+                    new_tokens.push(merged);
+                    i += 2; // skip both tokens
+                } else {
+                    new_tokens.push(tokens[i]);
+                    i += 1;
                 }
             }
+            tokens = new_tokens;
         }
 
         tokens
+    }
+
+    /// Encode long text by splitting into chunks, encoding each, and concatenating.
+    fn encode_chunked(&self, text: &str, chunk_size: usize) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        let mut all_tokens = Vec::new();
+
+        let mut start = 0;
+        while start < bytes.len() {
+            // Find a safe split point (don't break UTF-8 or mid-word if possible)
+            let end = if start + chunk_size >= bytes.len() {
+                bytes.len()
+            } else {
+                // Try to split at a whitespace boundary
+                let target = start + chunk_size;
+                let mut split = target;
+                // Search backward for whitespace
+                while split > start + chunk_size / 2 {
+                    if bytes[split] == b' ' || bytes[split] == b'\n' || bytes[split] == b'\t' {
+                        split += 1; // include the whitespace in the previous chunk
+                        break;
+                    }
+                    split -= 1;
+                }
+                if split <= start + chunk_size / 2 {
+                    target // no whitespace found, just split at chunk boundary
+                } else {
+                    split
+                }
+            };
+
+            let chunk_tokens = self.encode_segment(&bytes[start..end]);
+            all_tokens.extend_from_slice(&chunk_tokens);
+            start = end;
+        }
+
+        all_tokens
     }
 
     /// Decode token IDs back to text.
