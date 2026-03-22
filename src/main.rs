@@ -1,3 +1,4 @@
+pub mod api;
 mod attention;
 mod autograd;
 mod checkpoint;
@@ -9,9 +10,14 @@ mod loss;
 mod metal;
 mod model;
 mod optim;
+pub mod quantize;
 mod tensor;
 mod tokenizer;
+mod sft;
 mod train;
+
+#[cfg(test)]
+mod tests;
 
 use clap::{Parser, Subcommand};
 
@@ -164,6 +170,51 @@ enum Commands {
         #[arg(long)]
         tokenizer: String,
     },
+
+    /// Supervised fine-tuning on instruction-response pairs
+    Sft {
+        /// Pre-trained model checkpoint to fine-tune from
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        tokenizer: String,
+        /// JSONL file with {"prompt": "...", "response": "..."} per line
+        #[arg(long)]
+        data: String,
+        #[arg(long, default_value = "1000")]
+        steps: u32,
+        #[arg(long, default_value = "2e-5")]
+        lr: f32,
+        #[arg(long, default_value = "8")]
+        batch_size: usize,
+        #[arg(long, default_value = "256")]
+        seq_len: usize,
+        #[arg(long, default_value = "100")]
+        warmup: u32,
+        #[arg(long, default_value = "sft_checkpoints")]
+        output_dir: String,
+    },
+
+    /// Convert NL2Bash or paired text into JSONL SFT format
+    SftPrepare {
+        /// Input file: tab-separated or alternating-line pairs
+        #[arg(long)]
+        input: String,
+        /// Output JSONL file
+        #[arg(long)]
+        output: String,
+    },
+
+    /// Quantize a model checkpoint to reduce size (Q8 = 4x smaller, Q4 = 8x smaller)
+    Quantize {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long, default_value = "model.qbin")]
+        output: String,
+        /// Quantization bits: 4 or 8
+        #[arg(long, default_value = "4")]
+        bits: u8,
+    },
 }
 
 fn main() {
@@ -297,8 +348,11 @@ fn main() {
             stream,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let (model, step) =
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            let (model, step) = if ckpt_path.ends_with(".qbin") {
+                quantize::load_quantized(&ctx, &ckpt_path).expect("Failed to load quantized checkpoint")
+            } else {
+                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint")
+            };
             eprintln!("Loaded model at step {}", step);
 
             let mut config = generate::SamplingConfig::default();
@@ -474,6 +528,43 @@ fn main() {
 
             let results = eval::evaluate(&ctx, &model, &tok, &examples);
             results.print_report();
+        }
+
+        Commands::Sft {
+            checkpoint: ckpt_path,
+            tokenizer: tok_path,
+            data,
+            steps,
+            lr,
+            batch_size,
+            seq_len,
+            warmup,
+            output_dir,
+        } => {
+            let mut config = sft::SftConfig::default_sft(&ckpt_path, &tok_path, &data);
+            config.total_steps = steps;
+            config.max_lr = lr;
+            config.batch_size = batch_size;
+            config.seq_len = seq_len;
+            config.warmup_steps = warmup;
+            config.output_dir = output_dir;
+
+            sft::sft_train(&ctx, &config).expect("SFT training failed");
+        }
+
+        Commands::SftPrepare { input, output } => {
+            let count = sft::generate_sft_dataset(&input, &output)
+                .expect("SFT data preparation failed");
+            println!("Generated {} instruction-response pairs", count);
+        }
+
+        Commands::Quantize {
+            checkpoint: ckpt_path,
+            output,
+            bits,
+        } => {
+            quantize::quantize_checkpoint(&ckpt_path, &output, bits)
+                .expect("Quantization failed");
         }
     }
 }
