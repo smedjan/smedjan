@@ -2,8 +2,8 @@
 //! Used to prepare training data from raw sources.
 
 use crate::tokenizer::BpeTokenizer;
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// SHA-256 hash of a byte slice.

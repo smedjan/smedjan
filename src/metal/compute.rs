@@ -1,6 +1,6 @@
 use super::{GpuBuffer, MetalContext};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions,
 };
 use std::ffi::c_void;

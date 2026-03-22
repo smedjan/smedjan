@@ -1,6 +1,5 @@
 use crate::tokenizer::BpeTokenizer;
 use memmap2::Mmap;
-use rand::seq::SliceRandom;
 use std::fs::File;
 use std::io::Write;
 

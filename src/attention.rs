@@ -1,7 +1,6 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::metal::{compute, GpuBuffer, MetalContext};
+use crate::metal::MetalContext;
 use crate::tensor::Tensor;
-use objc2::rc::Retained;
 use std::sync::Arc;
 
 /// Multi-head attention with rotary positional encoding and KV cache support.

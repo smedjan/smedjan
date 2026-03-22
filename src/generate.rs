@@ -1,4 +1,3 @@
-use crate::attention::KvCache;
 use crate::autograd;
 use crate::metal::MetalContext;
 use crate::model::Transformer;

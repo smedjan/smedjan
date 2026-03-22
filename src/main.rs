@@ -13,7 +13,6 @@ mod tokenizer;
 mod train;
 
 use clap::{Parser, Subcommand};
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "andreai", about = "AndreAI — Pure Rust AI Engine")]

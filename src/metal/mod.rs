@@ -5,9 +5,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandQueue, MTLCompileOptions, MTLComputePipelineState, MTLDevice,
+    MTLLibrary, MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
