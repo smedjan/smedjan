@@ -1,0 +1,6 @@
+/target
+/data
+*.bin
+*.sha256
+checkpoints/
+.DS_Store
