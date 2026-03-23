@@ -5,3 +5,4 @@
 *.sha256
 checkpoints/
 .DS_Store
+src/metal/compute_head.tmp
