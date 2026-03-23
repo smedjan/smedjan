@@ -96,16 +96,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Get batch (wraps around automatically)
         let (inputs, targets) = data_loader.next_batch();
 
-        // Forward pass
+        // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
+        ctx.begin_batch();
         let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
 
         // Compute loss
         let (loss_tensor, _grad_logits) = loss::cross_entropy_loss(ctx, &logits, &targets);
+        ctx.flush_batch();
 
-        // Backward pass
+        // Backward pass (batched)
+        ctx.begin_batch();
         autograd::backward(ctx, loss_tensor.id);
+        ctx.flush_batch();
 
         // Gradient clipping (also filters NaN gradients)
+        ctx.begin_batch();
         clip_gradients(ctx, &model, config.max_grad_norm);
 
         // Optimizer step (skip if lr is effectively zero to avoid NaN momentum from 0*NaN)
@@ -113,6 +118,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             optimizer.step(lr);
         }
         optimizer.zero_grad();
+        ctx.flush_batch();
 
         let tokens_this_step = (config.batch_size * config.seq_len) as u64;
         total_tokens += tokens_this_step;

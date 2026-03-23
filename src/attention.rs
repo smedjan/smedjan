@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::metal::MetalContext;
+use crate::metal::{compute, MetalContext};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -141,23 +141,20 @@ fn transpose_bsh_to_bhs(
     n_heads: usize,
     head_dim: usize,
 ) -> Tensor {
-    let data = t.to_vec();
     let bh = batch * n_heads;
-    let mut out = vec![0.0f32; bh * seq_len * head_dim];
+    let size = bh * seq_len * head_dim;
+    let out_buf = t.ctx.alloc_buffer(size * 4);
 
-    for b in 0..batch {
-        for s in 0..seq_len {
-            for h in 0..n_heads {
-                for d in 0..head_dim {
-                    let src_idx = (b * seq_len + s) * n_heads * head_dim + h * head_dim + d;
-                    let dst_idx = (b * n_heads + h) * seq_len * head_dim + s * head_dim + d;
-                    out[dst_idx] = data[src_idx];
-                }
-            }
-        }
-    }
-
-    let out_buf = t.ctx.buffer_from_slice(&out);
+    // GPU transpose — no CPU roundtrip
+    compute::gpu_transpose_perm_forward(
+        &t.ctx,
+        &t.buffer,
+        &out_buf,
+        batch as u32,
+        seq_len as u32,
+        n_heads as u32,
+        head_dim as u32,
+    );
     let out_id = autograd::next_id();
     let result = Tensor {
         id: out_id,
@@ -198,23 +195,20 @@ fn transpose_bhs_to_bsh(
     n_heads: usize,
     head_dim: usize,
 ) -> Tensor {
-    let data = t.to_vec();
     let d_model = n_heads * head_dim;
-    let mut out = vec![0.0f32; batch * seq_len * d_model];
+    let size = batch * seq_len * d_model;
+    let out_buf = t.ctx.alloc_buffer(size * 4);
 
-    for b in 0..batch {
-        for h in 0..n_heads {
-            for s in 0..seq_len {
-                for d in 0..head_dim {
-                    let src_idx = (b * n_heads + h) * seq_len * head_dim + s * head_dim + d;
-                    let dst_idx = (b * seq_len + s) * d_model + h * head_dim + d;
-                    out[dst_idx] = data[src_idx];
-                }
-            }
-        }
-    }
-
-    let out_buf = t.ctx.buffer_from_slice(&out);
+    // GPU transpose — bhs→bsh is the backward of bsh→bhs
+    compute::gpu_transpose_perm_backward(
+        &t.ctx,
+        &t.buffer,
+        &out_buf,
+        batch as u32,
+        seq_len as u32,
+        n_heads as u32,
+        head_dim as u32,
+    );
     let out_id = autograd::next_id();
     let result = Tensor {
         id: out_id,

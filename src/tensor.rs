@@ -470,9 +470,9 @@ impl Tensor {
         assert!(offset + length <= source_size, "slice out of bounds");
         assert_eq!(length, new_shape.iter().product::<usize>(), "shape doesn't match length");
 
-        // Copy the slice into a new buffer
-        let data = self.to_vec();
-        let out_buf = self.ctx.buffer_from_slice(&data[offset..offset + length]);
+        // Copy the slice into a new buffer using GPU buffer copy — no CPU roundtrip
+        let out_buf = self.ctx.alloc_buffer(length * 4);
+        compute::gpu_buffer_copy(&self.ctx, &self.buffer, &out_buf, offset as u32, 0, length as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -504,20 +504,21 @@ impl Tensor {
         let total: usize = tensors.iter().map(|t| t.numel()).sum();
         assert_eq!(total, new_shape.iter().product::<usize>(), "shape doesn't match total");
 
-        let mut all_data = Vec::with_capacity(total);
         let mut part_sizes = Vec::with_capacity(tensors.len());
         let mut input_ids = Vec::with_capacity(tensors.len());
         let mut input_bufs = Vec::with_capacity(tensors.len());
 
+        // Concatenate on GPU using buffer_copy — no CPU roundtrip
+        let out_buf = ctx.alloc_buffer(total * 4);
+        let mut offset = 0u32;
         for t in tensors {
-            let data = t.to_vec();
-            part_sizes.push(data.len());
-            all_data.extend_from_slice(&data);
+            let n = t.numel();
+            compute::gpu_buffer_copy(ctx, &t.buffer, &out_buf, 0, offset, n as u32);
+            part_sizes.push(n);
             input_ids.push(t.id);
             input_bufs.push(t.buffer.clone());
+            offset += n as u32;
         }
-
-        let out_buf = ctx.buffer_from_slice(&all_data);
         let out_id = autograd::next_id();
         let out = Tensor {
             id: out_id,
@@ -557,23 +558,23 @@ impl Tensor {
         let n = other.shape[2];
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
-        let a_data = self.to_vec();
-        let b_data = other.to_vec();
 
+        // Dispatch per batch element using GPU buffer slicing — no CPU roundtrip
         for b in 0..batches {
             let a_off = b * m * k;
             let b_off = b * k * n;
             let c_off = b * m * n;
 
-            let a_sub = self.ctx.buffer_from_slice(&a_data[a_off..a_off + m * k]);
-            let b_sub = self.ctx.buffer_from_slice(&b_data[b_off..b_off + k * n]);
+            let a_sub = self.ctx.alloc_buffer(m * k * 4);
+            compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_off as u32, 0, (m * k) as u32);
+
+            let b_sub = self.ctx.alloc_buffer(k * n * 4);
+            compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_off as u32, 0, (k * n) as u32);
+
             let c_sub = self.ctx.alloc_buffer(m * n * 4);
             compute::gpu_matmul(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-            let c_vals = MetalContext::read_buffer(&c_sub, m * n);
-            unsafe {
-                let dst = (out_buf.contents().as_ptr() as *mut f32).add(c_off);
-                std::ptr::copy_nonoverlapping(c_vals.as_ptr(), dst, m * n);
-            }
+
+            compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_off as u32, (m * n) as u32);
         }
 
         let out_id = autograd::next_id();
@@ -614,23 +615,23 @@ impl Tensor {
         let n = other.shape[1];
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
-        let a_data = self.to_vec();
-        let b_data = other.to_vec();
 
+        // Dispatch per batch element using GPU buffer slicing — no CPU roundtrip
         for b in 0..batches {
             let a_off = b * m * k;
             let b_off = b * n * k;
             let c_off = b * m * n;
 
-            let a_sub = self.ctx.buffer_from_slice(&a_data[a_off..a_off + m * k]);
-            let b_sub = self.ctx.buffer_from_slice(&b_data[b_off..b_off + n * k]);
+            let a_sub = self.ctx.alloc_buffer(m * k * 4);
+            compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_off as u32, 0, (m * k) as u32);
+
+            let b_sub = self.ctx.alloc_buffer(n * k * 4);
+            compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_off as u32, 0, (n * k) as u32);
+
             let c_sub = self.ctx.alloc_buffer(m * n * 4);
             compute::gpu_matmul_trans_b(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-            let c_vals = MetalContext::read_buffer(&c_sub, m * n);
-            unsafe {
-                let dst = (out_buf.contents().as_ptr() as *mut f32).add(c_off);
-                std::ptr::copy_nonoverlapping(c_vals.as_ptr(), dst, m * n);
-            }
+
+            compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_off as u32, (m * n) as u32);
         }
 
         let out_id = autograd::next_id();

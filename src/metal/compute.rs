@@ -1,8 +1,5 @@
-use super::{GpuBuffer, MetalContext};
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions,
-};
+use super::{GpuBuffer, GpuComputeEncoder, MetalContext};
+use objc2_metal::{MTLComputeCommandEncoder as MTLComputeCommandEncoderTrait, MTLDevice, MTLResourceOptions};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -28,35 +25,33 @@ fn params_buffer<T>(ctx: &Arc<MetalContext>, params: &T) -> objc2::rc::Retained<
     }
 }
 
-/// Dispatch helper: encode compute command, set buffers, dispatch threadgroups, wait.
+/// Helper to bind buffers to a compute encoder.
+fn bind_buffer(encoder: &GpuComputeEncoder, buf: &GpuBuffer, index: usize) {
+    unsafe { encoder.setBuffer_offset_atIndex(Some(buf), 0, index); }
+}
+
+/// Dispatch helper: encode compute command, set buffers, dispatch threadgroups.
+/// Uses command batching when active (encode-only, no commit/wait).
+/// Falls back to sync dispatch when no batch is active.
 macro_rules! dispatch_sync {
     ($ctx:expr, $kernel:expr, $grid:expr, $tg:expr, $($idx:expr => $buf:expr),+ $(,)?) => {{
-        let cmd = $ctx.queue.commandBuffer().expect("Failed to create command buffer");
-        let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
-        encoder.setComputePipelineState($ctx.pipeline($kernel));
-        $(
-            unsafe { encoder.setBuffer_offset_atIndex(Some($buf), 0, $idx); }
-        )+
-        encoder.dispatchThreadgroups_threadsPerThreadgroup($grid, $tg);
-        encoder.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+        let grid = $grid;
+        let tg = $tg;
+        $ctx.dispatch_kernel($kernel, grid, tg, false, |encoder| {
+            $(bind_buffer(encoder, $buf, $idx);)+
+        });
     }};
 }
 
-/// Dispatch using dispatchThreads (non-uniform grid).
+/// Dispatch using dispatchThreads (automatic threadgroup tiling by Metal).
+/// Uses command batching when active.
 macro_rules! dispatch_threads_sync {
     ($ctx:expr, $kernel:expr, $total:expr, $tg:expr, $($idx:expr => $buf:expr),+ $(,)?) => {{
-        let cmd = $ctx.queue.commandBuffer().expect("Failed to create command buffer");
-        let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
-        encoder.setComputePipelineState($ctx.pipeline($kernel));
-        $(
-            unsafe { encoder.setBuffer_offset_atIndex(Some($buf), 0, $idx); }
-        )+
-        encoder.dispatchThreads_threadsPerThreadgroup($total, $tg);
-        encoder.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+        let total = $total;
+        let tg = $tg;
+        $ctx.dispatch_kernel($kernel, total, tg, true, |encoder| {
+            $(bind_buffer(encoder, $buf, $idx);)+
+        });
     }};
 }
 
@@ -632,5 +627,33 @@ pub fn gpu_transpose_perm_backward(
 
     dispatch_sync!(ctx, "transpose_perm_backward", grid, tg,
         0 => grad_in, 1 => grad_out, 2 => &params_buf
+    );
+}
+
+/// Forward attention transpose (GPU).
+/// Input: [batch*seq, n_heads*head_dim]
+/// Output: [batch*n_heads, seq, head_dim]
+pub fn gpu_transpose_perm_forward(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    output: &GpuBuffer,
+    batch: u32,
+    seq: u32,
+    n_heads: u32,
+    head_dim: u32,
+) {
+    #[repr(C)]
+    struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32 }
+    let params = Params { batch, seq, n_heads, head_dim };
+    let params_buf = params_buffer(ctx, &params);
+
+    let total = (batch * seq * n_heads * head_dim) as u64;
+    let tpg = 256u64;
+    let groups = total.div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "transpose_perm_forward", grid, tg,
+        0 => input, 1 => output, 2 => &params_buf
     );
 }

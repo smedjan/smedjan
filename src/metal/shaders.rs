@@ -1071,3 +1071,43 @@ kernel void transpose_perm_backward(
     grad_out[out_idx] = grad_in[gid];
 }
 "#;
+
+/// Forward attention transpose: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
+pub const TRANSPOSE_PERM_FORWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct PermParams {
+    uint batch;
+    uint seq;
+    uint n_heads;
+    uint head_dim;
+};
+
+kernel void transpose_perm_forward(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant PermParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.batch * params.seq * params.n_heads * params.head_dim;
+    if (gid >= total) return;
+
+    uint head_dim = params.head_dim;
+    uint seq = params.seq;
+    uint n_heads = params.n_heads;
+
+    // Decompose gid into output indices: (batch, n_heads, seq, head_dim)
+    uint rem = gid;
+    uint b = rem / (n_heads * seq * head_dim);
+    rem %= n_heads * seq * head_dim;
+    uint h = rem / (seq * head_dim);
+    rem %= seq * head_dim;
+    uint s = rem / head_dim;
+    uint d = rem % head_dim;
+
+    // Input layout: [batch*seq, n_heads*head_dim]
+    uint in_idx = (b * seq + s) * (n_heads * head_dim) + h * head_dim + d;
+    output[gid] = input[in_idx];
+}
+"#;

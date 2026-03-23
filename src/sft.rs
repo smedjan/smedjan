@@ -404,7 +404,8 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         // Get SFT batch with loss mask
         let (inputs, targets, loss_mask) = data_loader.next_batch();
 
-        // Forward pass
+        // Forward pass (batched GPU dispatch)
+        ctx.begin_batch();
         let logits = model.forward(
             &inputs,
             config.batch_size,
@@ -416,14 +417,18 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         // Cross-entropy loss on all positions (we mask gradients below)
         let (loss_tensor, grad_logits) =
             loss::cross_entropy_loss(ctx, &logits, &targets);
+        ctx.flush_batch();
 
         // Apply loss mask: zero out gradients for prompt positions, rescale
         let response_frac = apply_loss_mask(&grad_logits, &loss_mask, vocab_size);
 
-        // Backward pass (uses the masked gradient buffer via tape)
+        // Backward pass (batched — uses the masked gradient buffer via tape)
+        ctx.begin_batch();
         autograd::backward(ctx, loss_tensor.id);
+        ctx.flush_batch();
 
-        // Gradient clipping
+        // Gradient clipping + optimizer step (batched)
+        ctx.begin_batch();
         clip_gradients_sft(ctx, &model, config.max_grad_norm);
 
         // Optimizer step
@@ -431,6 +436,7 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
             optimizer.step(lr);
         }
         optimizer.zero_grad();
+        ctx.flush_batch();
 
         let tokens_this_step = (config.batch_size * config.seq_len) as u64;
         total_tokens += tokens_this_step;

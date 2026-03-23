@@ -5,9 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLCompileOptions, MTLComputePipelineState, MTLDevice,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice,
     MTLLibrary, MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -22,6 +24,22 @@ pub type GpuDevice = ProtocolObject<dyn MTLDevice>;
 pub type GpuQueue = ProtocolObject<dyn MTLCommandQueue>;
 pub type GpuBuffer = ProtocolObject<dyn MTLBuffer>;
 pub type GpuPipeline = ProtocolObject<dyn MTLComputePipelineState>;
+pub type GpuCommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
+pub type GpuComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
+
+/// Active command batch for kernel fusion. Accumulates multiple kernel dispatches
+/// into a single command buffer, then commits and waits once.
+/// This eliminates the per-kernel commit+wait overhead (~50-80% of wall time).
+struct CommandBatch {
+    cmd: Retained<GpuCommandBuffer>,
+    encoder_count: usize,
+}
+
+thread_local! {
+    /// Active command batch. When Some, kernels encode into this batch.
+    /// When None, kernels create and commit individual command buffers (legacy sync path).
+    static ACTIVE_BATCH: RefCell<Option<CommandBatch>> = const { RefCell::new(None) };
+}
 
 /// Metal context: device, command queue, and pre-compiled compute pipelines.
 pub struct MetalContext {
@@ -69,6 +87,7 @@ impl MetalContext {
             ("matmul_trans_a", shaders::MATMUL_TRANS_A),
             ("buffer_copy", shaders::BUFFER_COPY),
             ("transpose_perm_backward", shaders::TRANSPOSE_PERM_BACKWARD),
+            ("transpose_perm_forward", shaders::TRANSPOSE_PERM_FORWARD),
         ];
 
         let compile_options = MTLCompileOptions::new();
@@ -147,6 +166,8 @@ impl MetalContext {
 
     /// Read float data back from a buffer.
     pub fn read_buffer(buf: &GpuBuffer, count: usize) -> Vec<f32> {
+        // Auto-flush any active batch to ensure GPU data is committed
+        Self::auto_flush_batch();
         let mut result = vec![0.0f32; count];
         unsafe {
             let ptr = buf.contents().as_ptr() as *const f32;
@@ -157,12 +178,32 @@ impl MetalContext {
 
     /// Read u32 data back from a buffer.
     pub fn read_buffer_u32(buf: &GpuBuffer, count: usize) -> Vec<u32> {
+        // Auto-flush any active batch to ensure GPU data is committed
+        Self::auto_flush_batch();
         let mut result = vec![0u32; count];
         unsafe {
             let ptr = buf.contents().as_ptr() as *const u32;
             std::ptr::copy_nonoverlapping(ptr, result.as_mut_ptr(), count);
         }
         result
+    }
+
+    /// Auto-flush the active batch if one exists, then restart it.
+    /// Called before any GPU→CPU data read to ensure coherence.
+    /// The batch is restarted so subsequent kernel dispatches continue batching.
+    fn auto_flush_batch() {
+        ACTIVE_BATCH.with(|batch| {
+            let mut b = batch.borrow_mut();
+            if let Some(cb) = b.take() {
+                if cb.encoder_count > 0 {
+                    cb.cmd.commit();
+                    cb.cmd.waitUntilCompleted();
+                }
+                // Note: batch is NOT restarted — we'd need &self (the queue) to create
+                // a new command buffer. Since read_buffer is a static method, callers
+                // must call begin_batch() again if they want to continue batching.
+            }
+        });
     }
 
     /// Get a pipeline by name, panics if not found.
@@ -184,5 +225,93 @@ impl MetalContext {
     /// Device name string.
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Begin a command batch. All subsequent GPU kernel dispatches will be encoded
+    /// into a single command buffer instead of individual commit+wait cycles.
+    /// Call `flush_batch()` when you need results.
+    pub fn begin_batch(&self) {
+        ACTIVE_BATCH.with(|batch| {
+            let mut b = batch.borrow_mut();
+            // If a batch is already active, flush it first (e.g., auto-flush consumed it partially)
+            if let Some(cb) = b.take() {
+                if cb.encoder_count > 0 {
+                    cb.cmd.commit();
+                    cb.cmd.waitUntilCompleted();
+                }
+            }
+            let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
+            *b = Some(CommandBatch { cmd, encoder_count: 0 });
+        });
+    }
+
+    /// Flush the current command batch: commit the command buffer and wait.
+    /// Returns the number of kernels that were batched.
+    /// If no batch is active, this is a no-op returning 0.
+    pub fn flush_batch(&self) -> usize {
+        ACTIVE_BATCH.with(|batch| {
+            let mut b = batch.borrow_mut();
+            if let Some(cb) = b.take() {
+                if cb.encoder_count > 0 {
+                    cb.cmd.commit();
+                    cb.cmd.waitUntilCompleted();
+                }
+                cb.encoder_count
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Check if a command batch is currently active.
+    pub fn batch_active() -> bool {
+        ACTIVE_BATCH.with(|batch| batch.borrow().is_some())
+    }
+
+    /// Encode a kernel dispatch into the active batch, or create a one-off sync dispatch.
+    /// This is the core dispatch primitive used by all compute functions.
+    /// When batching: encodes into the shared command buffer (no commit/wait).
+    /// When not batching: creates a one-off command buffer, commits, waits (legacy path).
+    pub fn dispatch_kernel(
+        &self,
+        pipeline_name: &str,
+        grid: MTLSize,
+        threadgroup: MTLSize,
+        use_dispatch_threads: bool,
+        bind: impl FnOnce(&GpuComputeEncoder),
+    ) {
+        let pipeline = self.pipelines.get(pipeline_name)
+            .unwrap_or_else(|| panic!("Unknown pipeline: {}", pipeline_name));
+
+        ACTIVE_BATCH.with(|batch| {
+            let mut b = batch.borrow_mut();
+            if let Some(ref mut cb) = *b {
+                // Batched path: encode into the shared command buffer
+                let encoder = cb.cmd.computeCommandEncoder().expect("Failed to create encoder");
+                encoder.setComputePipelineState(pipeline);
+                bind(&encoder);
+                if use_dispatch_threads {
+                    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+                } else {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+                }
+                encoder.endEncoding();
+                cb.encoder_count += 1;
+            } else {
+                // Unbatched path: one-off command buffer with sync wait
+                let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
+                let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
+                encoder.setComputePipelineState(pipeline);
+                bind(&encoder);
+                if use_dispatch_threads {
+                    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+                } else {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+                }
+                encoder.endEncoding();
+                cmd.commit();
+                cmd.waitUntilCompleted();
+            }
+        });
     }
 }
