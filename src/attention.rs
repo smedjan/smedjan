@@ -273,6 +273,7 @@ fn update_kv_cache(
 }
 
 /// Concatenate along sequence dimension: [bh, len_a, dim] + [bh, len_b, dim] → [bh, len_a+len_b, dim]
+/// GPU-resident — no CPU roundtrip via to_vec().
 fn concat_seq(
     a: &Tensor,
     b: &Tensor,
@@ -281,21 +282,20 @@ fn concat_seq(
     len_b: usize,
     dim: usize,
 ) -> Tensor {
-    let a_data = a.to_vec();
-    let b_data = b.to_vec();
     let total_len = len_a + len_b;
-    let mut out = vec![0.0f32; bh * total_len * dim];
+    let out_buf = a.ctx.alloc_buffer(bh * total_len * dim * 4);
 
     for i in 0..bh {
-        let a_start = i * len_a * dim;
-        let out_start = i * total_len * dim;
-        out[out_start..out_start + len_a * dim]
-            .copy_from_slice(&a_data[a_start..a_start + len_a * dim]);
-        let b_start = i * len_b * dim;
-        let out_offset = out_start + len_a * dim;
-        out[out_offset..out_offset + len_b * dim]
-            .copy_from_slice(&b_data[b_start..b_start + len_b * dim]);
+        // Copy a's chunk for this batch-head
+        let a_off = (i * len_a * dim) as u32;
+        let out_off = (i * total_len * dim) as u32;
+        compute::gpu_buffer_copy(&a.ctx, &a.buffer, &out_buf, a_off, out_off, (len_a * dim) as u32);
+
+        // Copy b's chunk for this batch-head
+        let b_off = (i * len_b * dim) as u32;
+        let out_off_b = out_off + (len_a * dim) as u32;
+        compute::gpu_buffer_copy(&a.ctx, &b.buffer, &out_buf, b_off, out_off_b, (len_b * dim) as u32);
     }
 
-    Tensor::from_slice(&a.ctx, &out, vec![bh, total_len, dim])
+    Tensor::from_buffer(Arc::clone(&a.ctx), out_buf, vec![bh, total_len, dim])
 }

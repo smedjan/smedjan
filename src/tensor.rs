@@ -33,6 +33,12 @@ impl Tensor {
         Self { id, buffer, shape, requires_grad: false, ctx: Arc::clone(ctx) }
     }
 
+    /// Create a tensor from an existing GPU buffer (no copy).
+    pub fn from_buffer(ctx: Arc<MetalContext>, buffer: Retained<GpuBuffer>, shape: Vec<usize>) -> Self {
+        let id = autograd::next_id();
+        Self { id, buffer, shape, requires_grad: false, ctx }
+    }
+
     /// Create a tensor of zeros.
     pub fn zeros(ctx: &Arc<MetalContext>, shape: Vec<usize>) -> Self {
         let size: usize = shape.iter().product();
