@@ -49,6 +49,9 @@ pub enum Op {
     /// Batched matrix multiply with B transposed: A[b] @ B[b]^T for each batch element.
     /// A: [B, M, K], B: [B, N, K] → C: [B, M, N]
     BatchedMatmulTransB,
+    /// Fused SiLU-gate: output = silu(gate) * up
+    /// gate and up are the two inputs. Backward: d_gate = d_out * up * silu'(gate), d_up = d_out * silu(gate)
+    SiluGate,
 }
 
 /// A single entry on the autodiff tape.
@@ -233,6 +236,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Op::Silu => {
                     backward_silu(ctx, entry, &out_grad);
                 }
+                Op::SiluGate => {
+                    backward_silu_gate(ctx, entry, &out_grad);
+                }
                 Op::Reshape => {
                     backward_reshape(ctx, entry, &out_grad);
                 }
@@ -392,6 +398,23 @@ fn backward_silu(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained
     accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
 }
 
+fn backward_silu_gate(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+    let size: usize = entry.shapes[0].iter().product();
+    let grad_gate = ctx.alloc_buffer(size * 4);
+    let grad_up = ctx.alloc_buffer(size * 4);
+    compute::gpu_silu_gate_backward(
+        ctx,
+        &entry.input_buffers[0], // gate
+        &entry.input_buffers[1], // up
+        out_grad,
+        &grad_gate,
+        &grad_up,
+        size as u32,
+    );
+    accumulate_grad(ctx, entry.inputs[0], &grad_gate, size);
+    accumulate_grad(ctx, entry.inputs[1], &grad_up, size);
+}
+
 fn backward_reshape(_ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
     // Reshape backward: just pass the gradient through (same data, different shape)
     let size: usize = entry.shapes[0].iter().product();
@@ -476,6 +499,7 @@ fn backward_checkpoint(
             Op::Softmax => backward_softmax(ctx, sub_entry, &sub_out_grad),
             Op::RmsNorm { eps } => backward_rms_norm(ctx, sub_entry, &sub_out_grad, *eps),
             Op::Silu => backward_silu(ctx, sub_entry, &sub_out_grad),
+            Op::SiluGate => backward_silu_gate(ctx, sub_entry, &sub_out_grad),
             Op::Reshape => backward_reshape(ctx, sub_entry, &sub_out_grad),
             Op::CrossEntropy => {
                 if let Some(grad_logits) = &sub_entry.cached {

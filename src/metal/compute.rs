@@ -210,6 +210,23 @@ pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, 
     );
 }
 
+/// Fused SiLU-gate: output = silu(gate) * up (one kernel, one buffer)
+pub fn gpu_silu_gate(ctx: &Arc<MetalContext>, gate: &GpuBuffer, up: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "silu_gate", grid, tg,
+        0 => gate, 1 => up, 2 => output, 3 => &params_buf
+    );
+}
+
 /// Fused cross-entropy loss.
 pub fn gpu_cross_entropy(
     ctx: &Arc<MetalContext>,
@@ -440,6 +457,31 @@ pub fn gpu_silu_backward(
 
     dispatch_sync!(ctx, "silu_backward", grid, tg,
         0 => input, 1 => grad_output, 2 => grad_input, 3 => &params_buf
+    );
+}
+
+/// Fused SiLU-gate backward: computes grad_gate and grad_up in one kernel.
+pub fn gpu_silu_gate_backward(
+    ctx: &Arc<MetalContext>,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    grad_output: &GpuBuffer,
+    grad_gate: &GpuBuffer,
+    grad_up: &GpuBuffer,
+    size: u32,
+) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "silu_gate_backward", grid, tg,
+        0 => gate, 1 => up, 2 => grad_output, 3 => grad_gate, 4 => grad_up, 5 => &params_buf
     );
 }
 

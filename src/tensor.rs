@@ -386,6 +386,38 @@ impl Tensor {
         out
     }
 
+    /// Fused SiLU-gate: output = silu(self) * other
+    /// Replaces separate silu() + mul() with a single kernel dispatch.
+    pub fn silu_gate(&self, other: &Tensor) -> Tensor {
+        assert_eq!(self.shape, other.shape, "silu_gate shape mismatch");
+        let size = self.numel();
+        let out_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_silu_gate(&self.ctx, &self.buffer, &other.buffer, &out_buf, size as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || other.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::SiluGate,
+                inputs: vec![self.id, other.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), other.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), other.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Reshape tensor (view, no data copy if contiguous).
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let new_numel: usize = new_shape.iter().product();

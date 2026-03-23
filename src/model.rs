@@ -201,9 +201,8 @@ impl TransformerBlock {
         let gate = x_flat.matmul(&self.ffn_w1); // [bs, d_ff]
         let up = x_flat.matmul(&self.ffn_w3);   // [bs, d_ff]
 
-        // SwiGLU activation
-        let gate_activated = gate.silu();
-        let hidden = gate_activated.mul(&up);
+        // SwiGLU activation (fused: silu(gate) * up in one kernel)
+        let hidden = gate.silu_gate(&up);
 
         // Down projection
         let out = hidden.matmul(&self.ffn_w2); // [bs, d]

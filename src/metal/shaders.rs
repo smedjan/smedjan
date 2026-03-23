@@ -441,6 +441,31 @@ kernel void silu(
 }
 "#;
 
+/// Fused SiLU-gate: output[i] = silu(gate[i]) * up[i]
+/// Saves one kernel dispatch and one temporary buffer vs separate silu + mul.
+pub const SILU_GATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct SiluGateParams {
+    uint size;
+};
+
+kernel void silu_gate(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant SiluGateParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < params.size) {
+        float x = gate[gid];
+        float silu_x = x / (1.0f + exp(-x));
+        output[gid] = silu_x * up[gid];
+    }
+}
+"#;
+
 /// Fused cross-entropy loss: log-softmax + NLL
 /// logits: [batch, vocab], targets: [batch] (as uint)
 /// Output: scalar loss (single float), plus grad_output: [batch, vocab] = softmax - one_hot
@@ -789,6 +814,39 @@ kernel void silu_backward(
     float sig = 1.0f / (1.0f + exp(-x));
     float grad_out = grad_output[gid];
     grad_input[gid] = grad_out * sig * (1.0f + x * (1.0f - sig));
+}
+"#;
+
+/// Fused SiLU-gate backward:
+/// d_gate = d_out * up * silu'(gate)  where silu'(x) = sigmoid(x)*(1+x*(1-sigmoid(x)))
+/// d_up = d_out * silu(gate)
+pub const SILU_GATE_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct SiluGateBwdParams {
+    uint size;
+};
+
+kernel void silu_gate_backward(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device const float* grad_output [[buffer(2)]],
+    device float* grad_gate [[buffer(3)]],
+    device float* grad_up [[buffer(4)]],
+    constant SiluGateBwdParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+
+    float x = gate[gid];
+    float sig = 1.0f / (1.0f + exp(-x));
+    float silu_x = x * sig;
+    float silu_prime = sig * (1.0f + x * (1.0f - sig));
+    float d_out = grad_output[gid];
+
+    grad_gate[gid] = d_out * up[gid] * silu_prime;
+    grad_up[gid] = d_out * silu_x;
 }
 "#;
 
