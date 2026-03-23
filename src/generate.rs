@@ -91,7 +91,7 @@ fn sample_token(logits: &[f32], config: &SamplingConfig) -> u32 {
 
     // Top-k filtering: keep only top-k logits
     if config.top_k > 0 && config.top_k < scaled.len() {
-        scaled.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scaled.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scaled.truncate(config.top_k);
     }
 
@@ -108,7 +108,7 @@ fn sample_token(logits: &[f32], config: &SamplingConfig) -> u32 {
 
     // Top-p (nucleus) filtering
     if config.top_p < 1.0 {
-        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut cumulative = 0.0;
         let mut cutoff = probs.len();
         for (i, &(_, prob)) in probs.iter().enumerate() {

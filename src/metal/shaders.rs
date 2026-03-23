@@ -952,3 +952,122 @@ kernel void embedding_backward(
     );
 }
 "#;
+
+/// 2D matrix transpose: out[j, i] = in[i, j]
+/// in: [rows, cols], out: [cols, rows]
+pub const TRANSPOSE_2D: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TransposeParams {
+    uint rows;
+    uint cols;
+};
+
+kernel void transpose_2d(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant TransposeParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.rows * params.cols) return;
+    uint r = gid / params.cols;
+    uint c = gid % params.cols;
+    output[c * params.rows + r] = input[r * params.cols + c];
+}
+"#;
+
+/// C = A^T @ B where A:[M,K] stored row-major, B:[M,N], C:[K,N]
+/// A^T is [K,M], so C[i,j] = sum_m A[m,i] * B[m,j]
+pub const MATMUL_TRANS_A: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulTransAParams {
+    uint M;  // shared (inner after transpose)
+    uint K;  // rows of output (cols of A)
+    uint N;  // cols of output (cols of B)
+};
+
+kernel void matmul_trans_a(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulTransAParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;  // K dimension
+    uint col = gid.x;  // N dimension
+    if (row >= params.K || col >= params.N) return;
+
+    float sum = 0.0;
+    for (uint m = 0; m < params.M; m++) {
+        sum += A[m * params.K + row] * B[m * params.N + col];
+    }
+    C[row * params.N + col] = sum;
+}
+"#;
+
+/// Buffer-to-buffer copy with offset: dst[dst_offset..dst_offset+count] = src[src_offset..src_offset+count]
+pub const BUFFER_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CopyParams {
+    uint src_offset;  // in floats
+    uint dst_offset;  // in floats
+    uint count;       // number of floats to copy
+};
+
+kernel void buffer_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant CopyParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.count) return;
+    dst[params.dst_offset + gid] = src[params.src_offset + gid];
+}
+"#;
+
+/// Attention transpose permutation for backward pass.
+/// Forward mapped: flat[batch*seq, n_heads*head_dim] → out[batch*n_heads, seq, head_dim]
+/// Backward: grad_in[batch*n_heads, seq, head_dim] → grad_out[batch*seq, n_heads*head_dim]
+pub const TRANSPOSE_PERM_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct PermParams {
+    uint batch;
+    uint seq;
+    uint n_heads;
+    uint head_dim;
+};
+
+kernel void transpose_perm_backward(
+    device const float* grad_in [[buffer(0)]],
+    device float* grad_out [[buffer(1)]],
+    constant PermParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.batch * params.seq * params.n_heads * params.head_dim;
+    if (gid >= total) return;
+
+    // Decompose gid into (batch, n_heads, seq, head_dim) indices — input layout
+    uint head_dim = params.head_dim;
+    uint seq = params.seq;
+    uint n_heads = params.n_heads;
+
+    uint rem = gid;
+    uint b = rem / (n_heads * seq * head_dim);
+    rem %= n_heads * seq * head_dim;
+    uint h = rem / (seq * head_dim);
+    rem %= seq * head_dim;
+    uint s = rem / head_dim;
+    uint d = rem % head_dim;
+
+    // Output layout: [batch*seq, n_heads*head_dim]
+    uint out_idx = (b * seq + s) * (n_heads * head_dim) + h * head_dim + d;
+    grad_out[out_idx] = grad_in[gid];
+}
+"#;

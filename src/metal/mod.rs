@@ -65,6 +65,10 @@ impl MetalContext {
             ("rms_norm_backward", shaders::RMS_NORM_BACKWARD),
             ("softmax_backward", shaders::SOFTMAX_BACKWARD),
             ("embedding_backward", shaders::EMBEDDING_BACKWARD),
+            ("transpose_2d", shaders::TRANSPOSE_2D),
+            ("matmul_trans_a", shaders::MATMUL_TRANS_A),
+            ("buffer_copy", shaders::BUFFER_COPY),
+            ("transpose_perm_backward", shaders::TRANSPOSE_PERM_BACKWARD),
         ];
 
         let compile_options = MTLCompileOptions::new();

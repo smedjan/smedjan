@@ -294,24 +294,9 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retain
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = A^T @ dC : [K, M] @ [M, N] = [K, N]
-    // A^T @ dC is equivalent to dC^T @ A transposed... let's use the identity:
-    // dB = A^T @ dC. We need matmul with A transposed.
-    // matmul_trans_b computes A @ B^T, but we need A^T @ B.
-    // A^T @ dC = (dC^T @ A)^T. For 2D: we can do matmul_trans_b(dC, A) which gives dC @ A^T = [N,M]@...
-    // Actually let's just do it differently: dB[i,j] = sum_m A[m,i] * dC[m,j]
-    // This is the same as: dB = matmul(A^T, dC) where A^T is [K, M]
-    // We can use matmul_trans_b(dC^T, ...) — no, let's keep it simple with a transposed-A matmul.
-    // For now, we'll read and transpose A on CPU, then matmul.
-    let a_data = MetalContext::read_buffer(&entry.input_buffers[0], m * k);
-    let mut a_t = vec![0.0f32; k * m];
-    for r in 0..m {
-        for c in 0..k {
-            a_t[c * m + r] = a_data[r * k + c];
-        }
-    }
-    let a_t_buf = ctx.buffer_from_slice(&a_t);
+    // Use gpu_matmul_trans_a which computes A^T @ B directly on GPU.
     let db_buf = ctx.alloc_buffer(k * n * 4);
-    compute::gpu_matmul(ctx, &a_t_buf, out_grad, &db_buf, k as u32, n as u32, m as u32);
+    compute::gpu_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, k * n);
 }
 
@@ -334,17 +319,12 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
-    // Read dC, transpose, then matmul
-    let dc_data = MetalContext::read_buffer(out_grad, m * n);
-    let mut dc_t = vec![0.0f32; n * m];
-    for r in 0..m {
-        for c in 0..n {
-            dc_t[c * m + r] = dc_data[r * n + c];
-        }
-    }
-    let dc_t_buf = ctx.buffer_from_slice(&dc_t);
+    // Use gpu_matmul_trans_a: computes dC^T @ A = (A^T @ dC)^... no.
+    // dC is [M,N]. We need dC^T [N,M] @ A [M,K] = [N,K].
+    // This is gpu_matmul_trans_a(dC, A, ...) with dC treated as the matrix to transpose.
+    // gpu_matmul_trans_a(X, Y) = X^T @ Y. So gpu_matmul_trans_a(dC, A) = dC^T @ A. 
     let db_buf = ctx.alloc_buffer(n * k * 4);
-    compute::gpu_matmul(ctx, &dc_t_buf, &entry.input_buffers[0], &db_buf, n as u32, k as u32, m as u32);
+    compute::gpu_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_buf, m as u32, n as u32, k as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, n * k);
 }
 
@@ -568,25 +548,27 @@ fn backward_transpose(
 ) {
     let TransposeParams { batch, seq_len, n_heads, head_dim, forward_dir } = *tp;
     let size = batch * seq_len * n_heads * head_dim;
-    let grad_data = MetalContext::read_buffer(out_grad, size);
-    let mut grad_input = vec![0.0f32; size];
 
-    if forward_dir {
+    let grad_buf = if forward_dir {
         // Forward was bsh→bhs. Backward is bhs→bsh.
         // out_grad is [batch*n_heads, seq, head_dim], need [batch*seq, n_heads*head_dim]
-        for b in 0..batch {
-            for s in 0..seq_len {
-                for h in 0..n_heads {
-                    for d in 0..head_dim {
-                        let src_idx = (b * n_heads + h) * seq_len * head_dim + s * head_dim + d;
-                        let dst_idx = (b * seq_len + s) * n_heads * head_dim + h * head_dim + d;
-                        grad_input[dst_idx] = grad_data[src_idx];
-                    }
-                }
-            }
-        }
+        let output = ctx.alloc_buffer(size * 4);
+        compute::gpu_transpose_perm_backward(
+            ctx,
+            out_grad,
+            &output,
+            batch as u32,
+            seq_len as u32,
+            n_heads as u32,
+            head_dim as u32,
+        );
+        output
     } else {
         // Forward was bhs→bsh. Backward is bsh→bhs.
+        // out_grad is [batch*seq, n_heads*head_dim], need [batch*n_heads, seq, head_dim]
+        // This is the less common direction; keep CPU path for now.
+        let grad_data = MetalContext::read_buffer(out_grad, size);
+        let mut grad_input = vec![0.0f32; size];
         for b in 0..batch {
             for s in 0..seq_len {
                 for h in 0..n_heads {
@@ -598,9 +580,9 @@ fn backward_transpose(
                 }
             }
         }
-    }
+        ctx.buffer_from_slice(&grad_input)
+    };
 
-    let grad_buf = ctx.buffer_from_slice(&grad_input);
     accumulate_grad(ctx, entry.inputs[0], &grad_buf, size);
 }
 
@@ -617,12 +599,8 @@ fn backward_slice(
     let grad_source = ctx.alloc_buffer(source_size * 4);
     compute::gpu_fill(ctx, &grad_source, source_size as u32, 0.0);
 
-    // Copy out_grad (length elements) into grad_source at offset
-    let grad_data = MetalContext::read_buffer(out_grad, length);
-    unsafe {
-        let dst = (grad_source.contents().as_ptr() as *mut f32).add(offset);
-        std::ptr::copy_nonoverlapping(grad_data.as_ptr(), dst, length);
-    }
+    // Copy out_grad (length elements) into grad_source at offset — fully on GPU
+    compute::gpu_buffer_copy(ctx, out_grad, &grad_source, 0, offset as u32, length as u32);
 
     accumulate_grad(ctx, entry.inputs[0], &grad_source, source_size);
 }
@@ -635,13 +613,14 @@ fn backward_concat_parts(
     part_sizes: &[usize],
 ) {
     let total: usize = part_sizes.iter().sum();
-    let grad_data = MetalContext::read_buffer(out_grad, total);
-
-    let mut offset = 0;
+    // Slice gradient parts directly on GPU using buffer_copy — no CPU roundtrip
+    let _ = total; // validated by tape recording
+    let mut offset = 0u32;
     for (i, &part_size) in part_sizes.iter().enumerate() {
-        let part_grad = ctx.buffer_from_slice(&grad_data[offset..offset + part_size]);
+        let part_grad = ctx.alloc_buffer(part_size * 4);
+        compute::gpu_buffer_copy(ctx, out_grad, &part_grad, offset, 0, part_size as u32);
         accumulate_grad(ctx, entry.inputs[i], &part_grad, part_size);
-        offset += part_size;
+        offset += part_size as u32;
     }
 }
 
@@ -656,46 +635,33 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     let k = a_shape[2];
     let n = b_shape[2];
 
-    let a_data = MetalContext::read_buffer(&entry.input_buffers[0], batches * m * k);
-    let b_data = MetalContext::read_buffer(&entry.input_buffers[1], batches * k * n);
-    let dc_data = MetalContext::read_buffer(out_grad, batches * m * n);
-
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    let db_total = ctx.alloc_buffer(batches * k * n * 4);
+    let db_total = ctx.alloc_buffer(batches * n * k * 4);
 
     for b in 0..batches {
         let dc_off = b * m * n;
         let a_off = b * m * k;
         let b_off = b * k * n;
 
-        let dc_sub = ctx.buffer_from_slice(&dc_data[dc_off..dc_off + m * n]);
-        let b_sub = ctx.buffer_from_slice(&b_data[b_off..b_off + k * n]);
+        // Slice input buffers on GPU — no read_buffer
+        let dc_sub = ctx.alloc_buffer(m * n * 4);
+        compute::gpu_buffer_copy(ctx, out_grad, &dc_sub, dc_off as u32, 0, (m * n) as u32);
+
+        let b_sub = ctx.alloc_buffer(k * n * 4);
+        compute::gpu_buffer_copy(ctx, &entry.input_buffers[1], &b_sub, b_off as u32, 0, (k * n) as u32);
+
+        let a_sub = ctx.alloc_buffer(m * k * 4);
+        compute::gpu_buffer_copy(ctx, &entry.input_buffers[0], &a_sub, a_off as u32, 0, (m * k) as u32);
 
         // dA[b] = dC[b] @ B[b]^T : [M, N] @ [N, K] = [M, K]
         let da_sub = ctx.alloc_buffer(m * k * 4);
         compute::gpu_matmul_trans_b(ctx, &dc_sub, &b_sub, &da_sub, m as u32, k as u32, n as u32);
-        let da_vals = MetalContext::read_buffer(&da_sub, m * k);
-        unsafe {
-            let dst = (da_total.contents().as_ptr() as *mut f32).add(a_off);
-            std::ptr::copy_nonoverlapping(da_vals.as_ptr(), dst, m * k);
-        }
+        compute::gpu_buffer_copy(ctx, &da_sub, &da_total, 0, a_off as u32, (m * k) as u32);
 
         // dB[b] = A[b]^T @ dC[b] : [K, M] @ [M, N] = [K, N]
-        let a_sub_data = &a_data[a_off..a_off + m * k];
-        let mut a_t = vec![0.0f32; k * m];
-        for r in 0..m {
-            for c in 0..k {
-                a_t[c * m + r] = a_sub_data[r * k + c];
-            }
-        }
-        let a_t_buf = ctx.buffer_from_slice(&a_t);
         let db_sub = ctx.alloc_buffer(k * n * 4);
-        compute::gpu_matmul(ctx, &a_t_buf, &dc_sub, &db_sub, k as u32, n as u32, m as u32);
-        let db_vals = MetalContext::read_buffer(&db_sub, k * n);
-        unsafe {
-            let dst = (db_total.contents().as_ptr() as *mut f32).add(b_off);
-            std::ptr::copy_nonoverlapping(db_vals.as_ptr(), dst, k * n);
-        }
+        compute::gpu_matmul_trans_a(ctx, &a_sub, &dc_sub, &db_sub, m as u32, k as u32, n as u32);
+        compute::gpu_buffer_copy(ctx, &db_sub, &db_total, 0, b_off as u32, (k * n) as u32);
     }
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
@@ -703,9 +669,7 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
 }
 
 /// BatchedMatmulTransB backward: C[b] = A[b] @ B[b]^T
-/// where A: [B, M, K], B: [B, N, K], C: [B, M, N]
-/// dA[b] = dC[b] @ B[b] : [M, N] @ [N, K] = [M, K]
-/// dB[b] = dC[b]^T @ A[b] : [N, M] @ [M, K] = [N, K]
+/// dA[b] = dC[b] @ B[b], dB[b] = dC[b]^T @ A[b]
 fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
     let a_shape = &entry.shapes[0]; // [B, M, K]
     let b_shape = &entry.shapes[1]; // [B, N, K]
@@ -715,10 +679,6 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     let k = a_shape[2];
     let n = b_shape[1];
 
-    let a_data = MetalContext::read_buffer(&entry.input_buffers[0], batches * m * k);
-    let b_data = MetalContext::read_buffer(&entry.input_buffers[1], batches * n * k);
-    let dc_data = MetalContext::read_buffer(out_grad, batches * m * n);
-
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
     let db_total = ctx.alloc_buffer(batches * n * k * 4);
 
@@ -727,35 +687,24 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
         let a_off = b * m * k;
         let b_off = b * n * k;
 
-        let dc_sub = ctx.buffer_from_slice(&dc_data[dc_off..dc_off + m * n]);
-        let b_sub = ctx.buffer_from_slice(&b_data[b_off..b_off + n * k]);
-        let a_sub = ctx.buffer_from_slice(&a_data[a_off..a_off + m * k]);
+        let dc_sub = ctx.alloc_buffer(m * n * 4);
+        compute::gpu_buffer_copy(ctx, out_grad, &dc_sub, dc_off as u32, 0, (m * n) as u32);
+
+        let a_sub = ctx.alloc_buffer(m * k * 4);
+        compute::gpu_buffer_copy(ctx, &entry.input_buffers[0], &a_sub, a_off as u32, 0, (m * k) as u32);
+
+        let b_sub = ctx.alloc_buffer(n * k * 4);
+        compute::gpu_buffer_copy(ctx, &entry.input_buffers[1], &b_sub, b_off as u32, 0, (n * k) as u32);
 
         // dA[b] = dC[b] @ B[b] : [M, N] @ [N, K] = [M, K]
         let da_sub = ctx.alloc_buffer(m * k * 4);
         compute::gpu_matmul(ctx, &dc_sub, &b_sub, &da_sub, m as u32, k as u32, n as u32);
-        let da_vals = MetalContext::read_buffer(&da_sub, m * k);
-        unsafe {
-            let dst = (da_total.contents().as_ptr() as *mut f32).add(a_off);
-            std::ptr::copy_nonoverlapping(da_vals.as_ptr(), dst, m * k);
-        }
+        compute::gpu_buffer_copy(ctx, &da_sub, &da_total, 0, a_off as u32, (m * k) as u32);
 
         // dB[b] = dC[b]^T @ A[b] : [N, M] @ [M, K] = [N, K]
-        let dc_sub_data = &dc_data[dc_off..dc_off + m * n];
-        let mut dc_t = vec![0.0f32; n * m];
-        for r in 0..m {
-            for c in 0..n {
-                dc_t[c * m + r] = dc_sub_data[r * n + c];
-            }
-        }
-        let dc_t_buf = ctx.buffer_from_slice(&dc_t);
         let db_sub = ctx.alloc_buffer(n * k * 4);
-        compute::gpu_matmul(ctx, &dc_t_buf, &a_sub, &db_sub, n as u32, k as u32, m as u32);
-        let db_vals = MetalContext::read_buffer(&db_sub, n * k);
-        unsafe {
-            let dst = (db_total.contents().as_ptr() as *mut f32).add(b_off);
-            std::ptr::copy_nonoverlapping(db_vals.as_ptr(), dst, n * k);
-        }
+        compute::gpu_matmul_trans_a(ctx, &dc_sub, &a_sub, &db_sub, m as u32, n as u32, k as u32);
+        compute::gpu_buffer_copy(ctx, &db_sub, &db_total, 0, b_off as u32, (n * k) as u32);
     }
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);

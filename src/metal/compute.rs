@@ -530,3 +530,107 @@ pub fn gpu_embedding_backward(
         0 => tokens, 1 => grad_output, 2 => grad_embeddings, 3 => &params_buf
     );
 }
+
+/// GPU 2D matrix transpose: out[j,i] = in[i,j]. in:[rows,cols], out:[cols,rows]
+pub fn gpu_transpose_2d(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    output: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) {
+    #[repr(C)]
+    struct Params { rows: u32, cols: u32 }
+    let params = Params { rows, cols };
+    let params_buf = params_buffer(ctx, &params);
+
+    let size = (rows * cols) as u64;
+    let tpg = 256u64;
+    let groups = size.div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "transpose_2d", grid, tg,
+        0 => input, 1 => output, 2 => &params_buf
+    );
+}
+
+/// C = A^T @ B where A:[M,K] row-major, B:[M,N], C:[K,N]
+pub fn gpu_matmul_trans_a(
+    ctx: &Arc<MetalContext>,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    k: u32,
+    n: u32,
+) {
+    #[repr(C)]
+    struct Params { m: u32, k: u32, n: u32 }
+    let params = Params { m, k, n };
+    let params_buf = params_buffer(ctx, &params);
+
+    let threads_per_group = 16u64;
+    let total = MetalContext::size(n as u64, k as u64, 1);
+    let tg = MetalContext::size(
+        threads_per_group.min(n as u64).max(1),
+        threads_per_group.min(k as u64).max(1),
+        1,
+    );
+
+    dispatch_threads_sync!(ctx, "matmul_trans_a", total, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
+/// Buffer-to-buffer copy with offsets (all in floats, not bytes).
+pub fn gpu_buffer_copy(
+    ctx: &Arc<MetalContext>,
+    src: &GpuBuffer,
+    dst: &GpuBuffer,
+    src_offset: u32,
+    dst_offset: u32,
+    count: u32,
+) {
+    #[repr(C)]
+    struct Params { src_offset: u32, dst_offset: u32, count: u32 }
+    let params = Params { src_offset, dst_offset, count };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tpg = 256u64;
+    let groups = (count as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "buffer_copy", grid, tg,
+        0 => src, 1 => dst, 2 => &params_buf
+    );
+}
+
+/// Attention transpose permutation backward (GPU).
+/// Input: grad [batch*n_heads, seq, head_dim]
+/// Output: grad [batch*seq, n_heads*head_dim]
+pub fn gpu_transpose_perm_backward(
+    ctx: &Arc<MetalContext>,
+    grad_in: &GpuBuffer,
+    grad_out: &GpuBuffer,
+    batch: u32,
+    seq: u32,
+    n_heads: u32,
+    head_dim: u32,
+) {
+    #[repr(C)]
+    struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32 }
+    let params = Params { batch, seq, n_heads, head_dim };
+    let params_buf = params_buffer(ctx, &params);
+
+    let total = (batch * seq * n_heads * head_dim) as u64;
+    let tpg = 256u64;
+    let groups = total.div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "transpose_perm_backward", grid, tg,
+        0 => grad_in, 1 => grad_out, 2 => &params_buf
+    );
+}
