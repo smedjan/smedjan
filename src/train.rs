@@ -141,8 +141,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 eprintln!("Tape: {} ops, {:.1} MB activation memory", tape_ops, tape_bytes as f64 / (1024.0 * 1024.0));
             }
 
+            let (pool_hits, pool_misses) = MetalContext::pool_stats();
+
             eprintln!(
-                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens | epoch {} ({}/{})",
+                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens | epoch {} ({}/{}) | pool {}/{}",
                 step,
                 loss_val,
                 lr,
@@ -153,6 +155,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 data_loader.epoch(),
                 step as usize % batches_per_epoch,
                 batches_per_epoch,
+                pool_hits,
+                pool_hits + pool_misses,
             );
         }
 

@@ -131,6 +131,33 @@ pub fn gpu_rms_norm(
     );
 }
 
+/// Fused residual add + RMS norm: output = rms_norm(input + residual, weight, eps)
+/// Also stores (input + residual) in sum_out for backward pass.
+pub fn gpu_rms_norm_residual(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    residual: &GpuBuffer,
+    weight: &GpuBuffer,
+    output: &GpuBuffer,
+    sum_out: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+    eps: f32,
+) {
+    #[repr(C)]
+    struct Params { rows: u32, cols: u32, eps: f32 }
+    let params = Params { rows, cols, eps };
+    let params_buf = params_buffer(ctx, &params);
+
+    let threads_per_group = next_power_of_2_clamped(cols as u64);
+    let grid = MetalContext::size(rows as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
+
+    dispatch_sync!(ctx, "rms_norm_residual", grid, tg,
+        0 => input, 1 => residual, 2 => weight, 3 => output, 4 => sum_out, 5 => &params_buf
+    );
+}
+
 /// Apply RoPE in-place.
 pub fn gpu_rope(
     ctx: &Arc<MetalContext>,

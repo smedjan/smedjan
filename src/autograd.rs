@@ -52,6 +52,9 @@ pub enum Op {
     /// Fused SiLU-gate: output = silu(gate) * up
     /// gate and up are the two inputs. Backward: d_gate = d_out * up * silu'(gate), d_up = d_out * silu(gate)
     SiluGate,
+    /// Fused residual add + RMS norm: output = rms_norm(a + b, weight, eps)
+    /// inputs: [a, b, weight], cached: (a+b) buffer for backward
+    RmsNormResidual { eps: f32 },
 }
 
 /// A single entry on the autodiff tape.
@@ -99,7 +102,16 @@ pub fn record(entry: TapeEntry) {
 
 /// Clear the tape and all stored gradients.
 pub fn clear_tape() {
-    TAPE.with(|tape| tape.borrow_mut().clear());
+    TAPE.with(|tape| {
+        let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
+        for entry in entries {
+            // Recycle intermediate buffers back to the pool
+            MetalContext::recycle_buffer(entry.output_buffer);
+            if let Some(cached) = entry.cached {
+                MetalContext::recycle_buffer(cached);
+            }
+        }
+    });
     GRADS.with(|grads| grads.borrow_mut().clear());
 }
 
@@ -232,6 +244,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::RmsNorm { eps } => {
                     backward_rms_norm(ctx, entry, &out_grad, *eps);
+                }
+                Op::RmsNormResidual { eps } => {
+                    backward_rms_norm_residual(ctx, entry, &out_grad, *eps);
                 }
                 Op::Silu => {
                     backward_silu(ctx, entry, &out_grad);
@@ -391,6 +406,40 @@ fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Reta
     accumulate_grad(ctx, entry.inputs[1], &grad_weight, cols);
 }
 
+/// Backward for fused residual+RMSNorm: rms_norm(a + b, weight, eps)
+/// The cached buffer stores (a+b), which is the effective "input" to rms_norm.
+/// Gradients flow equally to both a and b.
+fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, eps: f32) {
+    let input_shape = &entry.shapes[0]; // shape of a (and b)
+    let cols = *input_shape.last().unwrap();
+    let rows: usize = input_shape.iter().product::<usize>() / cols;
+
+    let grad_sum = ctx.alloc_buffer(rows * cols * 4);
+    let grad_weight = ctx.alloc_buffer(cols * 4);
+
+    // The cached buffer is (a+b), which was the effective input to rms_norm
+    let sum_buf = entry.cached.as_ref().expect("RmsNormResidual requires cached (a+b) buffer");
+
+    compute::gpu_rms_norm_backward(
+        ctx,
+        sum_buf,                    // input to rms_norm was (a+b)
+        &entry.input_buffers[2],    // weight
+        out_grad,
+        &grad_sum,
+        &grad_weight,
+        &compute::RmsNormBackwardParams {
+            rows: rows as u32,
+            cols: cols as u32,
+            eps,
+        },
+    );
+
+    // grad flows equally to both a and b
+    accumulate_grad(ctx, entry.inputs[0], &grad_sum, rows * cols);
+    accumulate_grad(ctx, entry.inputs[1], &grad_sum, rows * cols);
+    accumulate_grad(ctx, entry.inputs[2], &grad_weight, cols);
+}
+
 fn backward_silu(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
@@ -498,6 +547,7 @@ fn backward_checkpoint(
             Op::Mul => backward_mul(ctx, sub_entry, &sub_out_grad),
             Op::Softmax => backward_softmax(ctx, sub_entry, &sub_out_grad),
             Op::RmsNorm { eps } => backward_rms_norm(ctx, sub_entry, &sub_out_grad, *eps),
+            Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, sub_entry, &sub_out_grad, *eps),
             Op::Silu => backward_silu(ctx, sub_entry, &sub_out_grad),
             Op::SiluGate => backward_silu_gate(ctx, sub_entry, &sub_out_grad),
             Op::Reshape => backward_reshape(ctx, sub_entry, &sub_out_grad),

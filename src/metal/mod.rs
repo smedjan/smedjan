@@ -15,6 +15,14 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+// Buffer pool: caches Metal buffers by size to avoid repeated allocations.
+// Training steps allocate the same buffer sizes every iteration, so reuse is high.
+thread_local! {
+    static BUFFER_POOL: RefCell<HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>> =
+        RefCell::new(HashMap::new());
+    static POOL_STATS: RefCell<(usize, usize)> = RefCell::new((0, 0)); // (hits, misses)
+}
+
 // Link CoreGraphics — required for MTLCreateSystemDefaultDevice
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {}
@@ -66,6 +74,7 @@ impl MetalContext {
             ("matmul_tiled_trans_b", shaders::MATMUL_TILED_TRANS_B),
             ("softmax", shaders::SOFTMAX),
             ("rms_norm", shaders::RMS_NORM),
+            ("rms_norm_residual", shaders::RMS_NORM_RESIDUAL),
             ("rope", shaders::ROPE),
             ("add", shaders::ADD),
             ("mul", shaders::MUL),
@@ -127,13 +136,53 @@ impl MetalContext {
     }
 
     /// Allocate a shared-mode Metal buffer (CPU + GPU accessible, zero-copy on M1).
+    /// Checks the buffer pool first for a cached buffer of the same size.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Retained<GpuBuffer> {
+        // Try pool first
+        let pooled = BUFFER_POOL.with(|pool| {
+            let mut p = pool.borrow_mut();
+            if let Some(list) = p.get_mut(&size_bytes) {
+                if let Some(buf) = list.pop() {
+                    POOL_STATS.with(|s| s.borrow_mut().0 += 1);
+                    return Some(buf);
+                }
+            }
+            None
+        });
+        if let Some(buf) = pooled {
+            return buf;
+        }
+        POOL_STATS.with(|s| s.borrow_mut().1 += 1);
         self.device
             .newBufferWithLength_options(
                 size_bytes,
                 MTLResourceOptions::StorageModeShared,
             )
             .expect("Failed to allocate Metal buffer")
+    }
+
+    /// Return a buffer to the pool for reuse. Call when a buffer is no longer needed.
+    pub fn recycle_buffer(buf: Retained<GpuBuffer>) {
+        let size = buf.length();
+        BUFFER_POOL.with(|pool| {
+            let mut p = pool.borrow_mut();
+            let list = p.entry(size).or_insert_with(Vec::new);
+            // Cap pool size per bucket to avoid unbounded memory growth
+            if list.len() < 32 {
+                list.push(buf);
+            }
+        });
+    }
+
+    /// Get buffer pool statistics: (hits, misses)
+    pub fn pool_stats() -> (usize, usize) {
+        POOL_STATS.with(|s| *s.borrow())
+    }
+
+    /// Clear the buffer pool (e.g., between training runs to free memory)
+    pub fn clear_pool() {
+        BUFFER_POOL.with(|pool| pool.borrow_mut().clear());
+        POOL_STATS.with(|s| *s.borrow_mut() = (0, 0));
     }
 
     /// Allocate a buffer and initialize with float data.

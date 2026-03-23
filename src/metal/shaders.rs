@@ -441,6 +441,65 @@ kernel void silu(
 }
 "#;
 
+/// Fused residual add + RMS normalization: output = rms_norm(input + residual)
+/// Saves one kernel dispatch + one temporary buffer vs separate add + rms_norm.
+pub const RMS_NORM_RESIDUAL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NormResParams {
+    uint rows;
+    uint cols;
+    float eps;
+};
+
+kernel void rms_norm_residual(
+    device const float* input [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device float* sum_out [[buffer(4)]],
+    constant NormResParams& params [[buffer(5)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    uint row = group_id;
+    if (row >= params.rows) return;
+
+    uint cols = params.cols;
+    device const float* row_in = input + row * cols;
+    device const float* row_res = residual + row * cols;
+    device float* row_out = output + row * cols;
+    device float* row_sum = sum_out + row * cols;
+
+    // Phase 1: compute input + residual and sum of squares
+    threadgroup float shared_ss[256];
+    float local_ss = 0.0f;
+    for (uint c = thread_index; c < cols; c += threads_per_group) {
+        float v = row_in[c] + row_res[c];
+        row_sum[c] = v;  // store the sum for backward pass
+        local_ss += v * v;
+    }
+    shared_ss[thread_index] = local_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride /= 2) {
+        if (thread_index < stride) {
+            shared_ss[thread_index] += shared_ss[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = rsqrt(shared_ss[0] / float(cols) + params.eps);
+
+    // Phase 2: normalize and scale
+    for (uint c = thread_index; c < cols; c += threads_per_group) {
+        row_out[c] = row_sum[c] * rms * weight[c];
+    }
+}
+"#;
+
 /// Fused SiLU-gate: output[i] = silu(gate[i]) * up[i]
 /// Saves one kernel dispatch and one temporary buffer vs separate silu + mul.
 pub const SILU_GATE: &str = r#"

@@ -356,6 +356,45 @@ impl Tensor {
         out
     }
 
+    /// Fused residual add + RMS norm: output = rms_norm(self + residual, weight, eps)
+    /// Saves 1 kernel dispatch + 1 temp buffer vs separate add() + rms_norm().
+    pub fn rms_norm_residual(&self, residual: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+        assert_eq!(self.shape, residual.shape, "rms_norm_residual shape mismatch");
+        let cols = *self.shape.last().unwrap();
+        let rows: usize = self.numel() / cols;
+        assert_eq!(weight.shape, vec![cols], "norm weight shape mismatch");
+
+        let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
+        let sum_buf = self.ctx.alloc_buffer(self.numel() * 4); // stores (self + residual)
+        compute::gpu_rms_norm_residual(
+            &self.ctx, &self.buffer, &residual.buffer, &weight.buffer,
+            &out_buf, &sum_buf, rows as u32, cols as u32, eps,
+        );
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || residual.requires_grad || weight.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::RmsNormResidual { eps },
+                inputs: vec![self.id, residual.id, weight.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), residual.buffer.clone(), weight.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), residual.shape.clone(), weight.shape.clone(), out.shape.clone()],
+                cached: Some(sum_buf),
+            });
+        }
+
+        out
+    }
+
     /// SiLU activation: x * sigmoid(x)
     pub fn silu(&self) -> Tensor {
         let size = self.numel();
