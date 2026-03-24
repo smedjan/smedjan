@@ -192,19 +192,29 @@ pub fn get_grad(tensor_id: usize) -> Option<Retained<GpuBuffer>> {
 }
 
 /// Store a gradient buffer for a tensor ID, accumulating if one already exists.
-/// IMPORTANT: On first insert we always copy into a fresh buffer. A refcount-only
-/// clone (Retained::clone) would share the underlying Metal buffer, so if the
-/// same grad buffer is passed for different tensor IDs (e.g. backward_add passes
-/// the upstream gradient to both inputs), later in-place additions would corrupt
-/// both tensors' gradients through the shared buffer.
+/// On first insert, uses the buffer directly (refcount clone — zero cost).
+/// Callers that pass the SAME buffer to multiple accumulate_grad calls
+/// (backward_add, backward_add_rms_norm) MUST use accumulate_grad_shared instead.
 fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
         if let Some(existing) = grads.get(&tensor_id) {
-            // In-place accumulate: existing += grad (no temporary buffer allocation)
             compute::gpu_add_inplace(ctx, existing, grad, size as u32);
         } else {
-            // MUST copy — same buffer may be shared with other grad consumers
+            grads.insert(tensor_id, grad.clone());
+        }
+    });
+}
+
+/// Like accumulate_grad but copies the buffer on first insert.
+/// Use this ONLY when the same grad buffer is passed to multiple tensor IDs
+/// (e.g. backward_add passes out_grad to both inputs).
+fn accumulate_grad_shared(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
+    GRADS.with(|grads| {
+        let mut grads = grads.borrow_mut();
+        if let Some(existing) = grads.get(&tensor_id) {
+            compute::gpu_add_inplace(ctx, existing, grad, size as u32);
+        } else {
             let owned = ctx.alloc_buffer(size * 4);
             compute::gpu_copy(ctx, grad, &owned, size as u32);
             grads.insert(tensor_id, owned);
@@ -361,9 +371,10 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
 
 fn backward_add(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
     // d(A + B) = dA = grad, dB = grad
+    // SHARED: same out_grad passed to both inputs — must copy on first insert
     let size: usize = entry.shapes[0].iter().product();
-    accumulate_grad(ctx, entry.inputs[0], out_grad, size);
-    accumulate_grad(ctx, entry.inputs[1], out_grad, size);
+    accumulate_grad_shared(ctx, entry.inputs[0], out_grad, size);
+    accumulate_grad_shared(ctx, entry.inputs[1], out_grad, size);
 }
 
 fn backward_mul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
@@ -445,8 +456,9 @@ fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
     );
 
     // grad flows equally to both a and b
-    accumulate_grad(ctx, entry.inputs[0], &grad_sum, rows * cols);
-    accumulate_grad(ctx, entry.inputs[1], &grad_sum, rows * cols);
+    // SHARED: same grad_sum buffer — must copy on first insert
+    accumulate_grad_shared(ctx, entry.inputs[0], &grad_sum, rows * cols);
+    accumulate_grad_shared(ctx, entry.inputs[1], &grad_sum, rows * cols);
     accumulate_grad(ctx, entry.inputs[2], &grad_weight, cols);
 }
 
