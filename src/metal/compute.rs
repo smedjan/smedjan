@@ -133,6 +133,7 @@ pub fn gpu_rms_norm(
 
 /// Fused residual add + RMS norm: output = rms_norm(input + residual, weight, eps)
 /// Also stores (input + residual) in sum_out for backward pass.
+#[allow(clippy::too_many_arguments)]
 pub fn gpu_rms_norm_residual(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -724,5 +725,29 @@ pub fn gpu_transpose_perm_forward(
 
     dispatch_sync!(ctx, "transpose_perm_forward", grid, tg,
         0 => input, 1 => output, 2 => &params_buf
+    );
+}
+
+/// Apply gradient mask: zero out rows where mask[pos] == 0.
+/// grad: [positions, vocab_size], mask: [positions] as u32 (0 or 1).
+pub fn gpu_gradient_mask(
+    ctx: &Arc<MetalContext>,
+    grad: &GpuBuffer,
+    mask: &GpuBuffer,
+    positions: u32,
+    vocab_size: u32,
+) {
+    #[repr(C)]
+    struct Params { total: u32, vocab_size: u32 }
+    let total = positions * vocab_size;
+    let params = Params { total, vocab_size };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tpg = 256u64;
+    let grid = MetalContext::size((total as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_sync!(ctx, "gradient_mask", grid, tg,
+        0 => grad, 1 => mask, 2 => &params_buf
     );
 }

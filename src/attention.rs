@@ -15,21 +15,35 @@ pub struct MultiHeadAttention {
 }
 
 /// KV cache for autoregressive inference.
+/// Pre-allocates to max_seq_len capacity to avoid O(n^2) reallocation
+/// during autoregressive generation. Only new KV pairs are copied each step.
 pub struct KvCache {
-    pub k: Option<Tensor>, // [batch * n_heads, cached_len, head_dim]
-    pub v: Option<Tensor>, // [batch * n_heads, cached_len, head_dim]
+    pub k: Option<Tensor>, // [batch * n_heads, capacity, head_dim] (only [0..len] is valid)
+    pub v: Option<Tensor>, // [batch * n_heads, capacity, head_dim]
+    pub len: usize,        // current number of cached positions
+    pub capacity: usize,   // pre-allocated max positions
 }
 
 impl KvCache {
     pub fn new() -> Self {
-        Self { k: None, v: None }
+        Self { k: None, v: None, len: 0, capacity: 0 }
+    }
+
+    /// Create a pre-allocated KV cache with capacity for max_seq_len positions.
+    pub fn with_capacity(ctx: &Arc<MetalContext>, batch_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
+        let total_floats = batch_heads * max_seq_len * head_dim;
+        let k_buf = ctx.alloc_buffer(total_floats * 4);
+        let v_buf = ctx.alloc_buffer(total_floats * 4);
+        Self {
+            k: Some(Tensor::from_buffer(Arc::clone(ctx), k_buf, vec![batch_heads, max_seq_len, head_dim])),
+            v: Some(Tensor::from_buffer(Arc::clone(ctx), v_buf, vec![batch_heads, max_seq_len, head_dim])),
+            len: 0,
+            capacity: max_seq_len,
+        }
     }
 
     pub fn cached_len(&self) -> usize {
-        match &self.k {
-            Some(k) => k.shape[1],
-            None => 0,
-        }
+        self.len
     }
 }
 
@@ -250,24 +264,64 @@ fn update_kv_cache(
 ) -> (Tensor, Tensor) {
     let new_len = k_new.shape[1];
 
-    match (&cache.k, &cache.v) {
-        (Some(k_old), Some(v_old)) => {
-            let old_len = k_old.shape[1];
-            let total_len = old_len + new_len;
+    if cache.capacity > 0 {
+        // Pre-allocated path: copy new KV data into the buffer at the right offset.
+        // No reallocation, no copying old data — O(new_len) per step instead of O(total_len).
+        let k_cache = cache.k.as_ref().expect("pre-allocated cache must have k");
+        let v_cache = cache.v.as_ref().expect("pre-allocated cache must have v");
+        let old_len = cache.len;
+        let total_len = old_len + new_len;
+        assert!(total_len <= cache.capacity, "KV cache overflow: {} + {} > {}", old_len, new_len, cache.capacity);
 
-            let k_full = concat_seq(k_old, k_new, bh, old_len, new_len, head_dim);
-            let v_full = concat_seq(v_old, v_new, bh, old_len, new_len, head_dim);
-
-            cache.k = Some(k_full.clone());
-            cache.v = Some(v_full.clone());
-
-            let _ = total_len;
-            (k_full, v_full)
+        // Copy new K, V into cache at offset = old_len (per batch-head row)
+        for i in 0..bh {
+            // K: copy new_len * head_dim floats at row offset
+            let src_off = (i * new_len * head_dim) as u32;
+            let dst_off = (i * cache.capacity * head_dim + old_len * head_dim) as u32;
+            let count = (new_len * head_dim) as u32;
+            compute::gpu_buffer_copy(&k_cache.ctx, &k_new.buffer, &k_cache.buffer, src_off, dst_off, count);
+            compute::gpu_buffer_copy(&v_cache.ctx, &v_new.buffer, &v_cache.buffer, src_off, dst_off, count);
         }
-        _ => {
-            cache.k = Some(k_new.clone());
-            cache.v = Some(v_new.clone());
-            (k_new.clone(), v_new.clone())
+
+        cache.len = total_len;
+
+        // Return views that cover [0..total_len] of the cache.
+        // We create tensors that reference sub-regions via buffer_copy to a contiguous buffer
+        // because attention needs contiguous [bh, total_len, head_dim] layout, not strided.
+        let k_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
+        let v_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
+        for i in 0..bh {
+            let src_off = (i * cache.capacity * head_dim) as u32;
+            let dst_off = (i * total_len * head_dim) as u32;
+            let count = (total_len * head_dim) as u32;
+            compute::gpu_buffer_copy(&k_cache.ctx, &k_cache.buffer, &k_view_buf, src_off, dst_off, count);
+            compute::gpu_buffer_copy(&v_cache.ctx, &v_cache.buffer, &v_view_buf, src_off, dst_off, count);
+        }
+
+        let k_full = Tensor::from_buffer(Arc::clone(&k_cache.ctx), k_view_buf, vec![bh, total_len, head_dim]);
+        let v_full = Tensor::from_buffer(Arc::clone(&v_cache.ctx), v_view_buf, vec![bh, total_len, head_dim]);
+        (k_full, v_full)
+    } else {
+        // Legacy path: concat and reallocate (used when cache was created with new())
+        match (&cache.k, &cache.v) {
+            (Some(k_old), Some(v_old)) => {
+                let old_len = k_old.shape[1];
+
+                let k_full = concat_seq(k_old, k_new, bh, old_len, new_len, head_dim);
+                let v_full = concat_seq(v_old, v_new, bh, old_len, new_len, head_dim);
+
+                cache.k = Some(k_full.clone());
+                cache.v = Some(v_full.clone());
+                cache.len = old_len + new_len;
+
+                (k_full, v_full)
+            }
+            _ => {
+                cache.k = Some(k_new.clone());
+                cache.v = Some(v_new.clone());
+                cache.len = new_len;
+                (k_new.clone(), v_new.clone())
+            }
         }
     }
 }

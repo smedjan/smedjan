@@ -310,7 +310,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf.clone(),
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -382,7 +382,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad || residual.requires_grad || weight.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -412,7 +412,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -444,7 +444,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -746,7 +746,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 

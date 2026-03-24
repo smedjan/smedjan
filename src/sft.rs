@@ -6,7 +6,6 @@ use crate::metal::MetalContext;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN};
-use objc2_metal::MTLBuffer;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
 use std::time::Instant;
@@ -288,6 +287,7 @@ impl SftConfig {
 /// This prevents gradient flow from prompt tokens — only assistant response
 /// tokens contribute to the loss.
 fn apply_loss_mask(
+    ctx: &Arc<MetalContext>,
     grad_logits: &crate::metal::GpuBuffer,
     mask: &[bool],
     vocab_size: usize,
@@ -296,54 +296,22 @@ fn apply_loss_mask(
     let masked_count = mask.iter().filter(|&&m| !m).count();
     let unmasked_count = total_positions - masked_count;
 
-    // Zero out gradient rows for masked (prompt) positions
-    // We read the full gradient, zero masked rows on CPU, write back.
-    // This is simpler and correct — the gradient buffer is batch*seq*vocab f32s.
-    let total_elements = total_positions * vocab_size;
-    let mut grad_data = vec![0.0f32; total_elements];
+    // Build u32 mask on CPU (cheap: one u32 per position, not per vocab element)
+    let mask_u32: Vec<u32> = mask.iter().map(|&m| if m { 1u32 } else { 0u32 }).collect();
+    let mask_buf = ctx.buffer_from_u32_slice(&mask_u32);
 
-    // Read from GPU
-    unsafe {
-        let ptr = grad_logits.contents().as_ptr() as *const f32;
-        std::ptr::copy_nonoverlapping(ptr, grad_data.as_mut_ptr(), total_elements);
+    // Zero out masked gradient rows entirely on GPU. No CPU roundtrip of the
+    // large [positions * vocab] gradient buffer.
+    compute::gpu_gradient_mask(ctx, grad_logits, &mask_buf, total_positions as u32, vocab_size as u32);
+
+    // Rescale unmasked rows: original CE divides by total_positions, we want
+    // to divide by unmasked_count. Scale by total_positions / unmasked_count.
+    if unmasked_count > 0 && unmasked_count != total_positions {
+        let rescale = total_positions as f32 / unmasked_count as f32;
+        compute::gpu_scale(ctx, grad_logits, (total_positions * vocab_size) as u32, rescale);
     }
 
-    // Zero out masked rows and rescale unmasked rows
-    // Original CE divides by total_positions (batch*seq). We want to divide
-    // by unmasked_count instead, so scale each unmasked row by total_positions / unmasked_count.
-    let rescale = if unmasked_count > 0 {
-        total_positions as f32 / unmasked_count as f32
-    } else {
-        0.0
-    };
-
-    for (i, &keep) in mask.iter().enumerate() {
-        let row_start = i * vocab_size;
-        let row_end = row_start + vocab_size;
-        if !keep {
-            // Zero the gradient for this position (prompt token)
-            for v in &mut grad_data[row_start..row_end] {
-                *v = 0.0;
-            }
-        } else {
-            // Rescale to correct for masked positions in the mean
-            for v in &mut grad_data[row_start..row_end] {
-                *v *= rescale;
-            }
-        }
-    }
-
-    // Write back to GPU
-    unsafe {
-        let ptr = grad_logits.contents().as_ptr() as *mut f32;
-        std::ptr::copy_nonoverlapping(grad_data.as_ptr(), ptr, total_elements);
-    }
-
-    // Compute the masked loss value for logging: read per-position losses
-    // from the original CE output, average only the unmasked ones.
-    // The cross_entropy_loss already computed the scalar mean; we need to
-    // recompute from the grad (the diagonal of softmax(logit) - one_hot).
-    // Instead, we just report the fraction of unmasked positions for logging.
+    // Report fraction of unmasked positions for logging
     unmasked_count as f32 / total_positions as f32
 }
 
@@ -420,7 +388,7 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         ctx.flush_batch();
 
         // Apply loss mask: zero out gradients for prompt positions, rescale
-        let response_frac = apply_loss_mask(&grad_logits, &loss_mask, vocab_size);
+        let response_frac = apply_loss_mask(ctx, &grad_logits, &loss_mask, vocab_size);
 
         // Backward pass (batched — uses the masked gradient buffer via tape)
         ctx.begin_batch();

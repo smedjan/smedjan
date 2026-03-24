@@ -427,7 +427,19 @@ impl Transformer {
     }
 
     /// Initialize KV caches for inference (one per layer).
+    /// Uses legacy dynamic allocation (grows on each step).
     pub fn init_kv_caches(&self) -> Vec<KvCache> {
         (0..self.config.n_layers).map(|_| KvCache::new()).collect()
+    }
+
+    /// Initialize pre-allocated KV caches for inference (one per layer).
+    /// Pre-allocates to max_seq_len to avoid O(n^2) reallocation during generation.
+    pub fn init_kv_caches_preallocated(&self, batch: usize) -> Vec<KvCache> {
+        let batch_heads = batch * self.config.n_heads;
+        let head_dim = self.config.d_model / self.config.n_heads;
+        let max_seq = self.config.max_seq_len;
+        (0..self.config.n_layers)
+            .map(|_| KvCache::with_capacity(&self.ctx, batch_heads, max_seq, head_dim))
+            .collect()
     }
 }

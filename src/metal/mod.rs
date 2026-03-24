@@ -15,12 +15,15 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+/// Type alias for the buffer pool: maps buffer size → reusable Metal buffer list.
+type BufferPool = HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>;
+
 // Buffer pool: caches Metal buffers by size to avoid repeated allocations.
 // Training steps allocate the same buffer sizes every iteration, so reuse is high.
 thread_local! {
-    static BUFFER_POOL: RefCell<HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>> =
+    static BUFFER_POOL: RefCell<BufferPool> =
         RefCell::new(HashMap::new());
-    static POOL_STATS: RefCell<(usize, usize)> = RefCell::new((0, 0)); // (hits, misses)
+    static POOL_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (hits, misses)
 }
 
 // Link CoreGraphics — required for MTLCreateSystemDefaultDevice
@@ -99,6 +102,7 @@ impl MetalContext {
             ("buffer_copy", shaders::BUFFER_COPY),
             ("transpose_perm_backward", shaders::TRANSPOSE_PERM_BACKWARD),
             ("transpose_perm_forward", shaders::TRANSPOSE_PERM_FORWARD),
+            ("gradient_mask", shaders::GRADIENT_MASK),
         ];
 
         let compile_options = MTLCompileOptions::new();
@@ -183,6 +187,20 @@ impl MetalContext {
     pub fn clear_pool() {
         BUFFER_POOL.with(|pool| pool.borrow_mut().clear());
         POOL_STATS.with(|s| *s.borrow_mut() = (0, 0));
+    }
+
+    /// Return total bytes cached in the buffer pool and the number of buffers.
+    pub fn pool_memory_bytes() -> (usize, usize) {
+        BUFFER_POOL.with(|pool| {
+            let p = pool.borrow();
+            let mut total_bytes = 0usize;
+            let mut total_bufs = 0usize;
+            for (size, bufs) in p.iter() {
+                total_bytes += size * bufs.len();
+                total_bufs += bufs.len();
+            }
+            (total_bytes, total_bufs)
+        })
     }
 
     /// Allocate a buffer and initialize with float data.

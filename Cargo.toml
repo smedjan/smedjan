@@ -17,5 +17,5 @@ byteorder = "1"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = true
 codegen-units = 1

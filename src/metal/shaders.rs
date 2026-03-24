@@ -1228,3 +1228,29 @@ kernel void transpose_perm_forward(
     output[gid] = input[in_idx];
 }
 "#;
+
+/// Gradient masking: zero out entire rows in a [positions, vocab] gradient matrix.
+/// mask[pos] == 0 → zero out grad[pos * vocab .. (pos+1) * vocab].
+/// Used in SFT to mask loss on prompt tokens (only response tokens get gradients).
+pub const GRADIENT_MASK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GradMaskParams {
+    uint total;      // positions * vocab_size
+    uint vocab_size;
+};
+
+kernel void gradient_mask(
+    device float* grad [[buffer(0)]],
+    device const uint* mask [[buffer(1)]],
+    constant GradMaskParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total) return;
+    uint pos = gid / params.vocab_size;
+    if (mask[pos] == 0u) {
+        grad[gid] = 0.0f;
+    }
+}
+"#;

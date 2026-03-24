@@ -111,7 +111,15 @@ impl CosineWarmupScheduler {
 
     pub fn get_lr(&self, step: u32) -> f32 {
         if step < self.warmup_steps {
+            // Linear warmup: scale from 0 to max_lr
+            // Guard against warmup_steps == 0 (return max_lr immediately)
+            if self.warmup_steps == 0 {
+                return self.max_lr;
+            }
             self.max_lr * (step as f32 / self.warmup_steps as f32)
+        } else if self.total_steps <= self.warmup_steps {
+            // No decay phase: total_steps == warmup_steps means all warmup
+            self.max_lr
         } else {
             let progress = (step - self.warmup_steps) as f32
                 / (self.total_steps - self.warmup_steps) as f32;

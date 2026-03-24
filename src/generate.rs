@@ -38,7 +38,7 @@ pub fn generate(
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));
 
-        let mut kv_caches = model.init_kv_caches();
+        let mut kv_caches = model.init_kv_caches_preallocated(1);
 
         // Prefill: process entire prompt at once
         let batch = 1;
@@ -158,7 +158,7 @@ pub fn generate_streaming<F>(
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));
 
-        let mut kv_caches = model.init_kv_caches();
+        let mut kv_caches = model.init_kv_caches_preallocated(1);
 
         // Prefill
         let seq_len = tokens.len();
