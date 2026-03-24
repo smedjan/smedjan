@@ -732,8 +732,8 @@ fn backward_concat_parts(
     part_sizes: &[usize],
 ) {
     let total: usize = part_sizes.iter().sum();
-    // Slice gradient parts directly on GPU using buffer_copy — no CPU roundtrip
-    let _ = total; // validated by tape recording
+    let expected: usize = entry.shapes.last().map(|s| s.iter().product()).unwrap_or(0);
+    assert_eq!(total, expected, "backward_concat_parts: part_sizes sum {} != output size {}", total, expected);
     let mut offset = 0u32;
     for (i, &part_size) in part_sizes.iter().enumerate() {
         let part_grad = ctx.alloc_buffer(part_size * 4);

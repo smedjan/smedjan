@@ -42,7 +42,7 @@ pub fn cross_entropy_loss(
         id: loss_id,
         buffer: scalar_buf,
         shape: vec![1],
-        requires_grad: false,
+        requires_grad: true,
         ctx: Arc::clone(ctx),
     };
 
