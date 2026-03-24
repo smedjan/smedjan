@@ -640,21 +640,18 @@ fn backward_transpose(
     } else {
         // Forward was bhs→bsh. Backward is bsh→bhs.
         // out_grad is [batch*seq, n_heads*head_dim], need [batch*n_heads, seq, head_dim]
-        // This is the less common direction; keep CPU path for now.
-        let grad_data = MetalContext::read_buffer(out_grad, size);
-        let mut grad_input = vec![0.0f32; size];
-        for b in 0..batch {
-            for s in 0..seq_len {
-                for h in 0..n_heads {
-                    for d in 0..head_dim {
-                        let src_idx = (b * seq_len + s) * n_heads * head_dim + h * head_dim + d;
-                        let dst_idx = (b * n_heads + h) * seq_len * head_dim + s * head_dim + d;
-                        grad_input[dst_idx] = grad_data[src_idx];
-                    }
-                }
-            }
-        }
-        ctx.buffer_from_slice(&grad_input)
+        // Use the forward transpose kernel (bsh→bhs is exactly the forward permutation)
+        let output = ctx.alloc_buffer(size * 4);
+        compute::gpu_transpose_perm_forward(
+            ctx,
+            out_grad,
+            &output,
+            batch as u32,
+            seq_len as u32,
+            n_heads as u32,
+            head_dim as u32,
+        );
+        output
     };
 
     accumulate_grad(ctx, entry.inputs[0], &grad_buf, size);

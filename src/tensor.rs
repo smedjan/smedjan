@@ -1,7 +1,6 @@
 use crate::autograd::{self, Op, TapeEntry};
 use crate::metal::{compute, GpuBuffer, MetalContext};
 use objc2::rc::Retained;
-use objc2_metal::MTLBuffer;
 use std::sync::Arc;
 
 /// Unique identifier for tensors on the autodiff tape.
@@ -143,27 +142,24 @@ impl Tensor {
             compute::gpu_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
         } else {
             // Sequential batch dispatch — each batch element is a separate matmul
+            // All operations stay on GPU — no CPU readback
             let a_stride = if batch_a == 1 { 0 } else { m * k };
             let b_stride = if batch_b == 1 { 0 } else { k * n };
             for b in 0..batch {
                 let a_offset = b * a_stride;
                 let b_offset = b * b_stride;
                 let c_offset = b * m * n;
-                // Create sub-buffer views using pointer arithmetic on the shared buffer
-                // For simplicity, we use offset-based dispatch via a temporary copy approach
-                // TODO: optimize with buffer offsets once the basic path works
-                let a_data = MetalContext::read_buffer(&self.buffer, batch_a * m * k);
-                let b_data = MetalContext::read_buffer(&other.buffer, batch_b * k * n);
-                let a_sub = self.ctx.buffer_from_slice(&a_data[a_offset..a_offset + m * k]);
-                let b_sub = self.ctx.buffer_from_slice(&b_data[b_offset..b_offset + k * n]);
+
+                let a_sub = self.ctx.alloc_buffer(m * k * 4);
+                compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_offset as u32, 0, (m * k) as u32);
+
+                let b_sub = self.ctx.alloc_buffer(k * n * 4);
+                compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_offset as u32, 0, (k * n) as u32);
+
                 let c_sub = self.ctx.alloc_buffer(m * n * 4);
                 compute::gpu_matmul(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-                // Copy result into output buffer
-                let c_data = MetalContext::read_buffer(&c_sub, m * n);
-                unsafe {
-                    let dst = (out_buf.contents().as_ptr() as *mut f32).add(c_offset);
-                    std::ptr::copy_nonoverlapping(c_data.as_ptr(), dst, m * n);
-                }
+
+                compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_offset as u32, (m * n) as u32);
             }
         }
 
@@ -179,7 +175,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: out_shape,
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -216,7 +212,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: vec![m, n],
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -247,7 +243,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -278,7 +274,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -343,7 +339,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad || weight.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -556,7 +552,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: new_shape,
-            requires_grad: false,
+            requires_grad: self.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -596,12 +592,13 @@ impl Tensor {
             input_bufs.push(t.buffer.clone());
             offset += n as u32;
         }
+        let any_grad = tensors.iter().any(|t| t.requires_grad);
         let out_id = autograd::next_id();
         let out = Tensor {
             id: out_id,
             buffer: out_buf,
             shape: new_shape,
-            requires_grad: false,
+            requires_grad: any_grad,
             ctx: Arc::clone(ctx),
         };
 
@@ -659,7 +656,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: vec![batches, m, n],
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 
@@ -716,7 +713,7 @@ impl Tensor {
             id: out_id,
             buffer: out_buf,
             shape: vec![batches, m, n],
-            requires_grad: false,
+            requires_grad: self.requires_grad || other.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
 

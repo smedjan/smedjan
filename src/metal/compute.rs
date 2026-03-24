@@ -396,22 +396,27 @@ pub fn gpu_causal_mask(
     );
 }
 
-/// Compute L2 norm. Returns the norm value.
+/// Compute L2 norm. Returns the norm value (includes GPU→CPU readback).
 pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
+    let output = ctx.alloc_buffer(std::mem::size_of::<f32>());
+    gpu_l2_norm_into(ctx, data, size, &output);
+    MetalContext::read_buffer(&output, 1)[0]
+}
+
+/// Compute L2 norm into a pre-allocated output buffer (no CPU readback).
+/// Use this in batched contexts to avoid breaking the command batch.
+pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, output: &GpuBuffer) {
     #[repr(C)]
     struct Params { size: u32 }
     let params = Params { size };
     let params_buf = params_buffer(ctx, &params);
-    let output = ctx.alloc_buffer(std::mem::size_of::<f32>());
 
     let grid = MetalContext::size(1, 1, 1);
     let tg = MetalContext::size(next_power_of_2_clamped(size as u64), 1, 1);
 
     dispatch_sync!(ctx, "l2_norm", grid, tg,
-        0 => data, 1 => &output, 2 => &params_buf
+        0 => data, 1 => output, 2 => &params_buf
     );
-
-    MetalContext::read_buffer(&output, 1)[0]
 }
 
 /// Scale buffer in-place

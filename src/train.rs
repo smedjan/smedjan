@@ -180,14 +180,30 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
 
-    // Compute global gradient norm, zeroing any NaN/Inf gradients
-    let mut total_norm_sq = 0.0f32;
+    // Phase 1: Compute all per-parameter L2 norms on GPU (batched).
+    // Allocate output buffers for each norm, dispatch all norm kernels in one batch.
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+
+    ctx.begin_batch();
     for param in &params {
         if let Some(grad) = autograd::get_grad(param.id) {
-            let norm = compute::gpu_l2_norm(ctx, &grad, param.numel() as u32);
+            let norm_out = ctx.alloc_buffer(std::mem::size_of::<f32>());
+            compute::gpu_l2_norm_into(ctx, &grad, param.numel() as u32, &norm_out);
+            norm_bufs.push(Some((norm_out, param.numel())));
+        } else {
+            norm_bufs.push(None);
+        }
+    }
+    ctx.flush_batch();
+
+    // Phase 2: Read all norms back from GPU (single CPU pass after all GPU work is done).
+    let mut total_norm_sq = 0.0f32;
+    let mut nan_indices = Vec::new();
+    for (i, entry) in norm_bufs.iter().enumerate() {
+        if let Some((norm_buf, _size)) = entry {
+            let norm = MetalContext::read_buffer(norm_buf, 1)[0];
             if norm.is_nan() || norm.is_infinite() {
-                // NaN gradient — zero it out to prevent corruption
-                compute::gpu_fill(ctx, &grad, param.numel() as u32, 0.0);
+                nan_indices.push(i);
             } else {
                 total_norm_sq += norm * norm;
             }
@@ -195,13 +211,29 @@ fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     }
     let total_norm = total_norm_sq.sqrt();
 
-    // Scale gradients if norm exceeds max_norm
-    if total_norm > max_norm && total_norm.is_finite() {
-        let scale = max_norm / (total_norm + 1e-6);
-        for param in &params {
-            if let Some(grad) = autograd::get_grad(param.id) {
-                compute::gpu_scale(ctx, &grad, param.numel() as u32, scale);
+    // Phase 3: Zero NaN grads and scale if needed (batched).
+    let needs_scale = total_norm > max_norm && total_norm.is_finite();
+    let scale = if needs_scale { max_norm / (total_norm + 1e-6) } else { 1.0 };
+
+    if !nan_indices.is_empty() || needs_scale {
+        ctx.begin_batch();
+
+        // Zero NaN gradients
+        for &i in &nan_indices {
+            if let Some(grad) = autograd::get_grad(params[i].id) {
+                compute::gpu_fill(ctx, &grad, params[i].numel() as u32, 0.0);
             }
         }
+
+        // Scale all gradients if norm exceeds max_norm
+        if needs_scale {
+            for param in &params {
+                if let Some(grad) = autograd::get_grad(param.id) {
+                    compute::gpu_scale(ctx, &grad, param.numel() as u32, scale);
+                }
+            }
+        }
+
+        ctx.flush_batch();
     }
 }
