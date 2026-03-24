@@ -96,6 +96,63 @@ pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     );
 }
 
+/// Batched C[b] = A[b] @ B[b] for all b in [0, batch). Single GPU dispatch.
+/// A: [batch, M, K], B: [batch, K, N], C: [batch, M, N]
+pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "batched_matmul_tiled", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
+/// Batched C[b] = A[b] @ B[b]^T for all b. Single GPU dispatch.
+/// A: [batch, M, K], B: [batch, N, K], C: [batch, M, N]
+pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "batched_matmul_tiled_trans_b", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
+/// Batched C[b] = A[b]^T @ B[b] for all b. Single GPU dispatch.
+/// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
+pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, k: u32, n: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (k as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "batched_matmul_tiled_trans_a", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
 /// Row-wise softmax. input/output: [rows, cols]
 pub fn gpu_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
     #[repr(C)]

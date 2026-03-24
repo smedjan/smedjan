@@ -652,23 +652,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // Dispatch per batch element using GPU buffer slicing — no CPU roundtrip
-        for b in 0..batches {
-            let a_off = b * m * k;
-            let b_off = b * k * n;
-            let c_off = b * m * n;
-
-            let a_sub = self.ctx.alloc_buffer(m * k * 4);
-            compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_off as u32, 0, (m * k) as u32);
-
-            let b_sub = self.ctx.alloc_buffer(k * n * 4);
-            compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_off as u32, 0, (k * n) as u32);
-
-            let c_sub = self.ctx.alloc_buffer(m * n * 4);
-            compute::gpu_matmul(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-
-            compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_off as u32, (m * n) as u32);
-        }
+        // Single GPU dispatch for ALL batch elements — no serial loop
+        compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -709,23 +694,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // Dispatch per batch element using GPU buffer slicing — no CPU roundtrip
-        for b in 0..batches {
-            let a_off = b * m * k;
-            let b_off = b * n * k;
-            let c_off = b * m * n;
-
-            let a_sub = self.ctx.alloc_buffer(m * k * 4);
-            compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_off as u32, 0, (m * k) as u32);
-
-            let b_sub = self.ctx.alloc_buffer(n * k * 4);
-            compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_off as u32, 0, (n * k) as u32);
-
-            let c_sub = self.ctx.alloc_buffer(m * n * 4);
-            compute::gpu_matmul_trans_b(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-
-            compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_off as u32, (m * n) as u32);
-        }
+        // Single GPU dispatch for ALL batch elements — no serial loop
+        compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {

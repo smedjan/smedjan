@@ -116,6 +116,9 @@ impl MetalContext {
             ("temperature_scale", shaders::TEMPERATURE_SCALE),
             ("strided_batch_copy", shaders::STRIDED_BATCH_COPY),
             ("compact_strided_copy", shaders::COMPACT_STRIDED_COPY),
+            ("batched_matmul_tiled", shaders::BATCHED_MATMUL_TILED),
+            ("batched_matmul_tiled_trans_b", shaders::BATCHED_MATMUL_TILED_TRANS_B),
+            ("batched_matmul_tiled_trans_a", shaders::BATCHED_MATMUL_TILED_TRANS_A),
         ];
 
         let compile_options = MTLCompileOptions::new();

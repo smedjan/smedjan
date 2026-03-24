@@ -742,34 +742,14 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     let k = a_shape[2];
     let n = b_shape[2];
 
+    // Single-dispatch batched backward — no serial loop
+    // dA = dC @ B^T : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    let db_total = ctx.alloc_buffer(batches * n * k * 4);
+    compute::gpu_batched_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
 
-    for b in 0..batches {
-        let dc_off = b * m * n;
-        let a_off = b * m * k;
-        let b_off = b * k * n;
-
-        // Slice input buffers on GPU — no read_buffer
-        let dc_sub = ctx.alloc_buffer(m * n * 4);
-        compute::gpu_buffer_copy(ctx, out_grad, &dc_sub, dc_off as u32, 0, (m * n) as u32);
-
-        let b_sub = ctx.alloc_buffer(k * n * 4);
-        compute::gpu_buffer_copy(ctx, &entry.input_buffers[1], &b_sub, b_off as u32, 0, (k * n) as u32);
-
-        let a_sub = ctx.alloc_buffer(m * k * 4);
-        compute::gpu_buffer_copy(ctx, &entry.input_buffers[0], &a_sub, a_off as u32, 0, (m * k) as u32);
-
-        // dA[b] = dC[b] @ B[b]^T : [M, N] @ [N, K] = [M, K]
-        let da_sub = ctx.alloc_buffer(m * k * 4);
-        compute::gpu_matmul_trans_b(ctx, &dc_sub, &b_sub, &da_sub, m as u32, k as u32, n as u32);
-        compute::gpu_buffer_copy(ctx, &da_sub, &da_total, 0, a_off as u32, (m * k) as u32);
-
-        // dB[b] = A[b]^T @ dC[b] : [K, M] @ [M, N] = [K, N]
-        let db_sub = ctx.alloc_buffer(k * n * 4);
-        compute::gpu_matmul_trans_a(ctx, &a_sub, &dc_sub, &db_sub, m as u32, k as u32, n as u32);
-        compute::gpu_buffer_copy(ctx, &db_sub, &db_total, 0, b_off as u32, (k * n) as u32);
-    }
+    // dB = A^T @ dC : [B,K,M] @ [B,M,N] = [B,K,N]
+    let db_total = ctx.alloc_buffer(batches * k * n * 4);
+    compute::gpu_batched_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_total, batches as u32, m as u32, k as u32, n as u32);
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], &db_total, batches * k * n);
@@ -786,33 +766,14 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     let k = a_shape[2];
     let n = b_shape[1];
 
+    // Single-dispatch batched backward — no serial loop
+    // dA = dC @ B : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
+    compute::gpu_batched_matmul(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
+
+    // dB = dC^T @ A : [B,N,M] @ [B,M,K] = [B,N,K]
     let db_total = ctx.alloc_buffer(batches * n * k * 4);
-
-    for b in 0..batches {
-        let dc_off = b * m * n;
-        let a_off = b * m * k;
-        let b_off = b * n * k;
-
-        let dc_sub = ctx.alloc_buffer(m * n * 4);
-        compute::gpu_buffer_copy(ctx, out_grad, &dc_sub, dc_off as u32, 0, (m * n) as u32);
-
-        let a_sub = ctx.alloc_buffer(m * k * 4);
-        compute::gpu_buffer_copy(ctx, &entry.input_buffers[0], &a_sub, a_off as u32, 0, (m * k) as u32);
-
-        let b_sub = ctx.alloc_buffer(n * k * 4);
-        compute::gpu_buffer_copy(ctx, &entry.input_buffers[1], &b_sub, b_off as u32, 0, (n * k) as u32);
-
-        // dA[b] = dC[b] @ B[b] : [M, N] @ [N, K] = [M, K]
-        let da_sub = ctx.alloc_buffer(m * k * 4);
-        compute::gpu_matmul(ctx, &dc_sub, &b_sub, &da_sub, m as u32, k as u32, n as u32);
-        compute::gpu_buffer_copy(ctx, &da_sub, &da_total, 0, a_off as u32, (m * k) as u32);
-
-        // dB[b] = dC[b]^T @ A[b] : [N, M] @ [M, K] = [N, K]
-        let db_sub = ctx.alloc_buffer(n * k * 4);
-        compute::gpu_matmul_trans_a(ctx, &dc_sub, &a_sub, &db_sub, m as u32, n as u32, k as u32);
-        compute::gpu_buffer_copy(ctx, &db_sub, &db_total, 0, b_off as u32, (n * k) as u32);
-    }
+    compute::gpu_batched_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_total, batches as u32, m as u32, n as u32, k as u32);
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], &db_total, batches * n * k);
