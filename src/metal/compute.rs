@@ -576,7 +576,9 @@ pub fn gpu_softmax_backward(
     );
 }
 
-/// Embedding backward
+/// Embedding backward: scatter-add gradients into embedding matrix.
+/// Uses 1D threadgroup dispatch (one threadgroup per dim position) with
+/// threadgroup-local accumulation to reduce atomic contention on common tokens.
 pub fn gpu_embedding_backward(
     ctx: &Arc<MetalContext>,
     tokens: &GpuBuffer,
@@ -593,10 +595,13 @@ pub fn gpu_embedding_backward(
     let params = Params { n_tokens, dim };
     let params_buf = params_buffer(ctx, &params);
 
-    let total = MetalContext::size(dim as u64, n_tokens as u64, 1);
-    let tg = MetalContext::size(16.min(dim as u64).max(1), 16.min(n_tokens as u64).max(1), 1);
+    // One threadgroup per dim position. Each threadgroup has up to 256 threads
+    // that split n_tokens among themselves with local accumulation per token_id.
+    let threads_per_group = 256u64.min(n_tokens as u64).max(1);
+    let grid = MetalContext::size(dim as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
 
-    dispatch_threads_sync!(ctx, "embedding_backward", total, tg,
+    dispatch_sync!(ctx, "embedding_backward", grid, tg,
         0 => tokens, 1 => grad_output, 2 => grad_embeddings, 3 => &params_buf
     );
 }

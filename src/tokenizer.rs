@@ -135,23 +135,39 @@ impl BpeTokenizer {
 
         // Apply merges in priority order (lowest priority number = highest priority).
         // For each merge rule, scan the token list once and apply all non-overlapping matches.
+        // Early exit: if a merge pass doesn't change the token list, all subsequent
+        // higher-numbered merges won't find this pair either (BPE merges are applied in
+        // priority order with greedy non-overlapping). Once we see a pass with no changes,
+        // we can skip ahead — but only until a merge that DOES apply resets the possibility.
+        // The correct invariant: if no merge applied in a pass, the pair (a, b) doesn't
+        // exist in the current token list. Since merges are in priority order, a merge
+        // can only CREATE new pairs (by joining tokens), not destroy pairs unrelated to it.
+        // So we track whether ANY merge has applied since the last "no pairs left" state.
         for &(a, b, merged) in &self.merges {
             if tokens.len() < 2 {
                 break;
             }
 
             let mut new_tokens = Vec::with_capacity(tokens.len());
+            let mut changed = false;
             let mut i = 0;
             while i < tokens.len() {
                 if i + 1 < tokens.len() && tokens[i] == a && tokens[i + 1] == b {
                     new_tokens.push(merged);
                     i += 2; // skip both tokens
+                    changed = true;
                 } else {
                     new_tokens.push(tokens[i]);
                     i += 1;
                 }
             }
-            tokens = new_tokens;
+
+            if changed {
+                tokens = new_tokens;
+            }
+            // If !changed, skip the allocation swap — tokens is unchanged.
+            // We continue to the next merge because a previous merge may have
+            // created the pair that a later merge needs.
         }
 
         tokens

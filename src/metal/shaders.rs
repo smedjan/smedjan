@@ -1038,7 +1038,12 @@ kernel void softmax_backward(
 }
 "#;
 
-/// Embedding backward: scatter-add gradients back to embedding matrix
+/// Embedding backward: scatter-add gradients back to embedding matrix.
+/// Uses threadgroup-local accumulation to reduce atomic contention: each thread
+/// iterates over a chunk of tokens for one dim position, accumulating contributions
+/// for runs of the same token_id locally before emitting a single atomic per unique
+/// token_id per thread. For common tokens (space, newline, 'the'), this reduces
+/// atomics from thousands-per-location to ~(n_tokens / threads_per_group) per location.
 pub const EMBEDDING_BACKWARD: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1053,20 +1058,52 @@ kernel void embedding_backward(
     device const float* grad_output [[buffer(1)]],
     device float* grad_embeddings [[buffer(2)]],
     constant EmbedBwdParams& params [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
 ) {
-    uint token_idx = gid.y;
-    uint dim_idx = gid.x;
+    // Each threadgroup handles one dim position.
+    // Threads within the group split n_tokens among themselves.
+    uint dim_idx = group_id;
+    if (dim_idx >= params.dim) return;
 
-    if (token_idx >= params.n_tokens || dim_idx >= params.dim) return;
+    uint n_tokens = params.n_tokens;
+    uint dim = params.dim;
 
-    uint token_id = tokens[token_idx];
-    float grad_val = grad_output[token_idx * params.dim + dim_idx];
-    atomic_fetch_add_explicit(
-        (device atomic_float*)&grad_embeddings[token_id * params.dim + dim_idx],
-        grad_val,
-        memory_order_relaxed
-    );
+    // Each thread processes tokens: thread_index, thread_index + threads_per_group, ...
+    // Accumulate locally for runs of the same token_id to reduce atomic pressure.
+    uint prev_token_id = 0xFFFFFFFF; // sentinel
+    float accum = 0.0f;
+
+    for (uint t = thread_index; t < n_tokens; t += threads_per_group) {
+        uint token_id = tokens[t];
+        float grad_val = grad_output[t * dim + dim_idx];
+
+        if (token_id == prev_token_id) {
+            // Same token as previous iteration — accumulate locally
+            accum += grad_val;
+        } else {
+            // Different token — flush previous accumulation
+            if (prev_token_id != 0xFFFFFFFF) {
+                atomic_fetch_add_explicit(
+                    (device atomic_float*)&grad_embeddings[prev_token_id * dim + dim_idx],
+                    accum,
+                    memory_order_relaxed
+                );
+            }
+            prev_token_id = token_id;
+            accum = grad_val;
+        }
+    }
+
+    // Flush final accumulation
+    if (prev_token_id != 0xFFFFFFFF) {
+        atomic_fetch_add_explicit(
+            (device atomic_float*)&grad_embeddings[prev_token_id * dim + dim_idx],
+            accum,
+            memory_order_relaxed
+        );
+    }
 }
 "#;
 

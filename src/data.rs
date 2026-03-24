@@ -32,9 +32,23 @@ impl Dataset {
         ])
     }
 
-    /// Get a slice of tokens.
+    /// Get a slice of tokens as a zero-copy reference into the mmap.
+    /// The mmap bytes are reinterpreted as &[u32] (little-endian, aligned by construction).
+    pub fn get_tokens_slice(&self, start: usize, len: usize) -> &[u32] {
+        assert!(start + len <= self.len, "token slice out of bounds");
+        let byte_offset = start * 4;
+        let byte_len = len * 4;
+        let bytes = &self.mmap[byte_offset..byte_offset + byte_len];
+        // Safety: mmap is page-aligned (always aligned to at least 4096 bytes),
+        // so the start of the mmap is u32-aligned. start*4 preserves alignment.
+        // The data was written as little-endian u32s and we're on a little-endian platform.
+        let ptr = bytes.as_ptr() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
+    /// Get a slice of tokens (copies into a new Vec). Use get_tokens_slice for zero-copy access.
     pub fn get_tokens(&self, start: usize, len: usize) -> Vec<u32> {
-        (start..start + len).map(|i| self.get_token(i)).collect()
+        self.get_tokens_slice(start, len).to_vec()
     }
 
     /// Total number of tokens.
@@ -117,7 +131,7 @@ impl DataLoader {
             }
         }
 
-        let tokens = self.dataset.get_tokens(self.position, needed);
+        let tokens = self.dataset.get_tokens_slice(self.position, needed);
 
         let mut inputs = Vec::with_capacity(self.batch_size * self.seq_len);
         let mut targets = Vec::with_capacity(self.batch_size * self.seq_len);
