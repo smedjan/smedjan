@@ -7,7 +7,10 @@ use std::sync::Arc;
 /// Round up to the next power of 2, clamped to [1, 256].
 /// Required for threadgroup reductions in all row-wise kernels.
 fn next_power_of_2_clamped(n: u64) -> u64 {
-    let p = (n as u32).next_power_of_two().clamp(1, 256);
+    // Clamp to 256 BEFORE computing next_power_of_two to avoid u32 overflow
+    // when n > 2^31 (e.g., large vocab sizes). Values > 256 always clamp to 256.
+    let clamped = n.min(256).max(1) as u32;
+    let p = clamped.next_power_of_two().min(256);
     p as u64
 }
 

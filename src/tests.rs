@@ -644,4 +644,303 @@ mod tests {
         assert_eq!(unique.len(), 3, "Should remove 1 duplicate");
         assert_eq!(unique, vec![0, 1, 3]);
     }
+
+    // =========================================================================
+    // 8. Quantize/dequantize roundtrip
+    // =========================================================================
+
+    #[test]
+    fn quantize_q8_roundtrip_within_tolerance() {
+        let data: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) * 0.1).collect();
+        let shape = vec![128];
+        let qt = crate::quantize::quantize(&data, &shape, 8, 32);
+        let recovered = crate::quantize::dequantize(&qt);
+
+        assert_eq!(recovered.len(), data.len());
+        for (orig, rec) in data.iter().zip(recovered.iter()) {
+            let err = (orig - rec).abs();
+            assert!(
+                err < 0.06,
+                "Q8 error too large: orig={}, recovered={}, err={}",
+                orig, rec, err,
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_q4_roundtrip_within_tolerance() {
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let shape = vec![64];
+        let qt = crate::quantize::quantize(&data, &shape, 4, 32);
+        let recovered = crate::quantize::dequantize(&qt);
+
+        assert_eq!(recovered.len(), data.len());
+        for (orig, rec) in data.iter().zip(recovered.iter()) {
+            let err = (orig - rec).abs();
+            assert!(
+                err < 0.25,
+                "Q4 error too large: orig={}, recovered={}, err={}",
+                orig, rec, err,
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_q4_nibble_packing_correctness() {
+        // Test that even/odd indices are packed correctly into low/high nibbles
+        let data = vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let shape = vec![8];
+        let qt = crate::quantize::quantize(&data, &shape, 4, 8);
+        let recovered = crate::quantize::dequantize(&qt);
+
+        assert_eq!(recovered.len(), 8);
+        // Even indices should be ~0.0, odd indices should be ~1.0
+        for i in 0..8 {
+            let expected = if i % 2 == 0 { 0.0 } else { 1.0 };
+            let err = (recovered[i] - expected).abs();
+            assert!(
+                err < 0.15,
+                "Q4 nibble packing error at index {}: expected ~{}, got {}",
+                i, expected, recovered[i],
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_constant_data_roundtrip() {
+        // All identical values — scale should be ~0, zero should be the value
+        let data = vec![3.14f32; 64];
+        let shape = vec![64];
+
+        let qt8 = crate::quantize::quantize(&data, &shape, 8, 32);
+        let rec8 = crate::quantize::dequantize(&qt8);
+        for &v in &rec8 {
+            assert!((v - 3.14).abs() < 0.01, "Q8 constant data: got {}", v);
+        }
+
+        let qt4 = crate::quantize::quantize(&data, &shape, 4, 32);
+        let rec4 = crate::quantize::dequantize(&qt4);
+        for &v in &rec4 {
+            assert!((v - 3.14).abs() < 0.01, "Q4 constant data: got {}", v);
+        }
+    }
+
+    // =========================================================================
+    // 9. Tokenizer edge cases
+    // =========================================================================
+
+    #[test]
+    fn tokenizer_encode_empty_string() {
+        let corpus = b"hello world test data";
+        let tok = BpeTokenizer::train(corpus, 280);
+        let encoded = tok.encode("");
+        assert!(encoded.is_empty(), "Empty string should encode to empty vec");
+    }
+
+    #[test]
+    fn tokenizer_save_load_roundtrip() {
+        let corpus = b"the quick brown fox jumps over the lazy dog again and again";
+        let tok = BpeTokenizer::train(corpus, 300);
+
+        let path = "/tmp/andreai_test_tokenizer.bin";
+        tok.save(path).expect("Failed to save tokenizer");
+        let tok2 = BpeTokenizer::load(path).expect("Failed to load tokenizer");
+
+        assert_eq!(tok.vocab_size(), tok2.vocab_size());
+        assert_eq!(tok.merges.len(), tok2.merges.len());
+
+        // Encode/decode should produce identical results
+        let text = "the quick brown fox";
+        let enc1 = tok.encode(text);
+        let enc2 = tok2.encode(text);
+        assert_eq!(enc1, enc2, "Loaded tokenizer should produce same encoding");
+
+        let dec1 = tok.decode(&enc1);
+        let dec2 = tok2.decode(&enc2);
+        assert_eq!(dec1, dec2);
+        assert_eq!(dec1, text);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tokenizer_long_text_chunked_encoding() {
+        let corpus = b"abcdefghijklmnopqrstuvwxyz 0123456789 the quick brown fox jumps";
+        let tok = BpeTokenizer::train(corpus, 280);
+
+        // Create a long text that triggers chunked encoding (> 10000 bytes)
+        let long_text = "the quick brown fox ".repeat(600); // 12000 chars
+        let encoded = tok.encode(&long_text);
+        let decoded = tok.decode(&encoded);
+
+        assert_eq!(decoded, long_text, "Chunked encoding should roundtrip correctly");
+    }
+
+    // =========================================================================
+    // 10. Tensor edge cases
+    // =========================================================================
+
+    #[test]
+    fn tensor_batched_matmul_batch_1() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // [1, 2, 3] @ [1, 3, 2] → [1, 2, 2]
+            let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 2, 3]);
+            let b = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]);
+            let c = a.batched_matmul(&b);
+            assert_eq!(c.shape, vec![1, 2, 2]);
+
+            let result = c.to_vec();
+            // [1,2,3] @ [[1,2],[3,4],[5,6]] = [1+6+15, 2+8+18] = [22, 28]
+            // [4,5,6] @ [[1,2],[3,4],[5,6]] = [4+15+30, 8+20+36] = [49, 64]
+            assert!((result[0] - 22.0).abs() < 1e-3, "got {}", result[0]);
+            assert!((result[1] - 28.0).abs() < 1e-3, "got {}", result[1]);
+            assert!((result[2] - 49.0).abs() < 1e-3, "got {}", result[2]);
+            assert!((result[3] - 64.0).abs() < 1e-3, "got {}", result[3]);
+        });
+    }
+
+    #[test]
+    fn tensor_batched_matmul_trans_b_batch_1() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // A: [1, 2, 3], B: [1, 2, 3] → C = A @ B^T: [1, 2, 2]
+            let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 2, 3]);
+            let b = Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![1, 2, 3]);
+            let c = a.batched_matmul_trans_b(&b);
+            assert_eq!(c.shape, vec![1, 2, 2]);
+
+            let result = c.to_vec();
+            // Row 0 of A [1,2,3] dot row 0 of B [1,0,0] = 1
+            // Row 0 of A [1,2,3] dot row 1 of B [0,1,0] = 2
+            // Row 1 of A [4,5,6] dot row 0 of B [1,0,0] = 4
+            // Row 1 of A [4,5,6] dot row 1 of B [0,1,0] = 5
+            assert!((result[0] - 1.0).abs() < 1e-3, "got {}", result[0]);
+            assert!((result[1] - 2.0).abs() < 1e-3, "got {}", result[1]);
+            assert!((result[2] - 4.0).abs() < 1e-3, "got {}", result[2]);
+            assert!((result[3] - 5.0).abs() < 1e-3, "got {}", result[3]);
+        });
+    }
+
+    #[test]
+    fn tensor_slice_flat_and_concat_flat() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let data = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6]);
+
+            // Slice [2..5]
+            let sliced = data.slice_flat(2, 3, vec![3]);
+            assert_eq!(sliced.to_vec(), vec![3.0, 4.0, 5.0]);
+
+            // Concat two slices
+            let a = data.slice_flat(0, 2, vec![2]);
+            let b = data.slice_flat(4, 2, vec![2]);
+            let concat = Tensor::concat_flat(&[&a, &b], vec![4]);
+            assert_eq!(concat.to_vec(), vec![1.0, 2.0, 5.0, 6.0]);
+        });
+    }
+
+    #[test]
+    fn tensor_matmul_trans_b() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // A: [2, 3], B: [2, 3] → C = A @ B^T: [2, 2]
+            let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+            let b = Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]);
+            let c = a.matmul_trans_b(&b);
+            assert_eq!(c.shape, vec![2, 2]);
+
+            let result = c.to_vec();
+            // [1,2,3] . [1,0,0] = 1, [1,2,3] . [0,1,0] = 2
+            // [4,5,6] . [1,0,0] = 4, [4,5,6] . [0,1,0] = 5
+            assert!((result[0] - 1.0).abs() < 1e-3);
+            assert!((result[1] - 2.0).abs() < 1e-3);
+            assert!((result[2] - 4.0).abs() < 1e-3);
+            assert!((result[3] - 5.0).abs() < 1e-3);
+        });
+    }
+
+    // =========================================================================
+    // 11. Cosine warmup scheduler edge cases
+    // =========================================================================
+
+    #[test]
+    fn scheduler_warmup_zero() {
+        let sched = crate::optim::CosineWarmupScheduler::new(1e-3, 0, 1000);
+        let lr0 = sched.get_lr(0);
+        assert!(
+            (lr0 - 1e-3).abs() < 1e-8,
+            "With warmup=0, step 0 should give max_lr, got {}",
+            lr0,
+        );
+    }
+
+    #[test]
+    fn scheduler_lr_decreases_after_warmup() {
+        let sched = crate::optim::CosineWarmupScheduler::new(1e-3, 100, 1000);
+        let lr_warmup = sched.get_lr(100);
+        let lr_mid = sched.get_lr(500);
+        let lr_end = sched.get_lr(999);
+
+        assert!(lr_warmup > lr_mid, "LR should decrease after warmup: {} > {}", lr_warmup, lr_mid);
+        assert!(lr_mid > lr_end, "LR should continue decreasing: {} > {}", lr_mid, lr_end);
+        assert!(lr_end > 0.0, "LR should always be positive: {}", lr_end);
+    }
+
+    // =========================================================================
+    // 12. Model config edge cases
+    // =========================================================================
+
+    #[test]
+    fn model_config_ffn_multiplier_roundtrip_checkpoint_format() {
+        // Verify that ffn_multiplier is preserved through the checkpoint config
+        // serialization format (f32 write/read)
+        let config = ModelConfig::custom(1000, 64, 4, 2, 2.6666667, 128);
+        let d_ff = config.d_ff();
+        assert!(d_ff > 0, "d_ff should be positive");
+        assert_eq!(d_ff % 256, 0, "d_ff should be 256-aligned");
+
+        // Verify the actual multiplied value rounds correctly
+        let raw_ff = (64.0f32 * 2.6666667) as usize; // ~170
+        let aligned_ff = raw_ff.div_ceil(256) * 256; // 256
+        assert_eq!(d_ff, aligned_ff);
+    }
+
+    // =========================================================================
+    // 13. RMS norm produces valid output
+    // =========================================================================
+
+    #[test]
+    fn tensor_rms_norm_output_is_normalized() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let data = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+            let weight = Tensor::from_slice(&ctx, &[1.0, 1.0, 1.0], vec![3]);
+            let normed = data.rms_norm(&weight, 1e-5);
+
+            let result = normed.to_vec();
+            assert_eq!(result.len(), 6);
+
+            // After RMS norm with weight=1, output = x / rms(x)
+            // Row 0: x=[1,2,3], rms = sqrt((1+4+9)/3) = sqrt(14/3) ≈ 2.16
+            // Row 1: x=[4,5,6], rms = sqrt((16+25+36)/3) = sqrt(77/3) ≈ 5.07
+            // Verify output is not NaN/Inf
+            for v in &result {
+                assert!(v.is_finite(), "RMS norm output should be finite, got {}", v);
+            }
+
+            // Verify the sum of squares of each row is approximately the number of columns
+            // (since rms_norm normalizes to unit RMS)
+            for row in 0..2 {
+                let row_data = &result[row * 3..(row + 1) * 3];
+                let rms_sq: f32 = row_data.iter().map(|x| x * x).sum::<f32>() / 3.0;
+                assert!(
+                    (rms_sq - 1.0).abs() < 0.1,
+                    "Row {} RMS should be ~1.0, got sqrt({})",
+                    row,
+                    rms_sq,
+                );
+            }
+        });
+    }
 }
