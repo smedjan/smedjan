@@ -126,51 +126,89 @@ impl BpeTokenizer {
     }
 
     /// Encode a byte segment using BPE merges.
+    ///
+    /// Uses a linked-list + priority queue algorithm for O(n log n) encoding
+    /// instead of the naive O(n × merges) approach. Each adjacent pair is
+    /// inserted into a min-heap keyed by merge priority. We pop the
+    /// highest-priority (lowest index) pair, merge it, and update neighbors.
     fn encode_segment(&self, bytes: &[u8]) -> Vec<u32> {
         if bytes.is_empty() {
             return Vec::new();
         }
 
-        let mut tokens: Vec<u32> = bytes.iter().map(|&b| b as u32 + SPECIAL_TOKENS).collect();
+        let n = bytes.len();
+        if n == 1 {
+            return vec![bytes[0] as u32 + SPECIAL_TOKENS];
+        }
 
-        // Apply merges in priority order (lowest priority number = highest priority).
-        // For each merge rule, scan the token list once and apply all non-overlapping matches.
-        // Early exit: if a merge pass doesn't change the token list, all subsequent
-        // higher-numbered merges won't find this pair either (BPE merges are applied in
-        // priority order with greedy non-overlapping). Once we see a pass with no changes,
-        // we can skip ahead — but only until a merge that DOES apply resets the possibility.
-        // The correct invariant: if no merge applied in a pass, the pair (a, b) doesn't
-        // exist in the current token list. Since merges are in priority order, a merge
-        // can only CREATE new pairs (by joining tokens), not destroy pairs unrelated to it.
-        // So we track whether ANY merge has applied since the last "no pairs left" state.
-        for &(a, b, merged) in &self.merges {
-            if tokens.len() < 2 {
-                break;
+        // Doubly-linked list: each node holds a token and links to prev/next.
+        // Deleted nodes have next == usize::MAX.
+        let mut token: Vec<u32> = bytes.iter().map(|&b| b as u32 + SPECIAL_TOKENS).collect();
+        let mut next: Vec<usize> = (1..=n).collect(); // next[n-1] = n (sentinel)
+        let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect(); // prev[0] = usize::MAX
+
+        // Min-heap: (priority, left_index). Lower priority = merge first.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
+
+        // Seed the heap with all adjacent pairs that have a known merge.
+        for i in 0..n - 1 {
+            if let Some(&priority) = self.merge_priority.get(&(token[i], token[i + 1])) {
+                heap.push(Reverse((priority, i)));
+            }
+        }
+
+        while let Some(Reverse((priority, left))) = heap.pop() {
+            // Validate: left must still be alive and its next must form the expected pair.
+            let right = next[left];
+            if right >= n {
+                continue; // left is the last node or was deleted
+            }
+            // Check the pair still matches the priority we stored.
+            let pair = (token[left], token[right]);
+            match self.merge_priority.get(&pair) {
+                Some(&p) if p == priority => {} // valid
+                _ => continue,                  // pair changed since we enqueued
             }
 
-            let mut new_tokens = Vec::with_capacity(tokens.len());
-            let mut changed = false;
-            let mut i = 0;
-            while i < tokens.len() {
-                if i + 1 < tokens.len() && tokens[i] == a && tokens[i + 1] == b {
-                    new_tokens.push(merged);
-                    i += 2; // skip both tokens
-                    changed = true;
-                } else {
-                    new_tokens.push(tokens[i]);
-                    i += 1;
+            // Look up the merged token from the merge rules.
+            let merged = self.merges[priority].2;
+
+            // Merge: replace left\'s token, delete right.
+            token[left] = merged;
+            let right_next = next[right];
+            next[left] = right_next;
+            if right_next < n {
+                prev[right_next] = left;
+            }
+            // Mark right as deleted.
+            next[right] = usize::MAX;
+
+            // Check new pair (prev_of_left, left).
+            if prev[left] < n {
+                let pl = prev[left];
+                if let Some(&p) = self.merge_priority.get(&(token[pl], token[left])) {
+                    heap.push(Reverse((p, pl)));
                 }
             }
 
-            if changed {
-                tokens = new_tokens;
+            // Check new pair (left, next_of_left).
+            if next[left] < n {
+                if let Some(&p) = self.merge_priority.get(&(token[left], token[next[left]])) {
+                    heap.push(Reverse((p, left)));
+                }
             }
-            // If !changed, skip the allocation swap — tokens is unchanged.
-            // We continue to the next merge because a previous merge may have
-            // created the pair that a later merge needs.
         }
 
-        tokens
+        // Collect surviving tokens by walking the linked list.
+        let mut result = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            result.push(token[i]);
+            i = next[i];
+        }
+        result
     }
 
     /// Encode long text by splitting into chunks, encoding each, and concatenating.

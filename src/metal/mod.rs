@@ -20,6 +20,11 @@ type BufferPool = HashMap<usize, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>;
 
 // Buffer pool: caches Metal buffers by size to avoid repeated allocations.
 // Training steps allocate the same buffer sizes every iteration, so reuse is high.
+//
+// THREAD-LOCAL: This pool is per-thread. All GPU work (training, inference,
+// autograd) must run on a single thread. If multi-threaded dispatch is ever
+// needed, replace with a global Arc<Mutex<BufferPool>> or per-thread pools
+// with cross-thread buffer transfer.
 thread_local! {
     static BUFFER_POOL: RefCell<BufferPool> =
         RefCell::new(HashMap::new());
@@ -79,7 +84,9 @@ impl MetalContext {
             ("rms_norm", shaders::RMS_NORM),
             ("rms_norm_residual", shaders::RMS_NORM_RESIDUAL),
             ("rope", shaders::ROPE),
+            ("rope_backward", shaders::ROPE_BACKWARD),
             ("add", shaders::ADD),
+            ("add_inplace", shaders::ADD_INPLACE),
             ("mul", shaders::MUL),
             ("silu", shaders::SILU),
             ("silu_gate", shaders::SILU_GATE),
@@ -89,6 +96,7 @@ impl MetalContext {
             ("embedding_lookup", shaders::EMBEDDING_LOOKUP),
             ("causal_mask", shaders::CAUSAL_MASK),
             ("l2_norm", shaders::L2_NORM),
+            ("l2_norm_check", shaders::L2_NORM_CHECK),
             ("scale", shaders::SCALE),
             ("fill", shaders::FILL),
             ("copy_buffer", shaders::COPY),
@@ -97,12 +105,17 @@ impl MetalContext {
             ("rms_norm_backward", shaders::RMS_NORM_BACKWARD),
             ("softmax_backward", shaders::SOFTMAX_BACKWARD),
             ("embedding_backward", shaders::EMBEDDING_BACKWARD),
+            ("zero_rows", shaders::ZERO_ROWS),
             ("transpose_2d", shaders::TRANSPOSE_2D),
-            ("matmul_trans_a", shaders::MATMUL_TRANS_A),
+            ("matmul_trans_a_tiled", shaders::MATMUL_TRANS_A),
             ("buffer_copy", shaders::BUFFER_COPY),
             ("transpose_perm_backward", shaders::TRANSPOSE_PERM_BACKWARD),
             ("transpose_perm_forward", shaders::TRANSPOSE_PERM_FORWARD),
             ("gradient_mask", shaders::GRADIENT_MASK),
+            ("argmax", shaders::ARGMAX),
+            ("temperature_scale", shaders::TEMPERATURE_SCALE),
+            ("strided_batch_copy", shaders::STRIDED_BATCH_COPY),
+            ("compact_strided_copy", shaders::COMPACT_STRIDED_COPY),
         ];
 
         let compile_options = MTLCompileOptions::new();

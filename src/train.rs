@@ -180,15 +180,16 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
 
-    // Phase 1: Compute all per-parameter L2 norms on GPU (batched).
-    // Allocate output buffers for each norm, dispatch all norm kernels in one batch.
+    // Phase 1: Compute all per-parameter L2 norms + NaN checks on GPU (batched).
+    // Uses l2_norm_check which returns [sum_sq, nan_flag] per param — avoids
+    // the sqrt in the shader so we can accumulate sum_sq directly.
     let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
 
     ctx.begin_batch();
     for param in &params {
         if let Some(grad) = autograd::get_grad(param.id) {
-            let norm_out = ctx.alloc_buffer(std::mem::size_of::<f32>());
-            compute::gpu_l2_norm_into(ctx, &grad, param.numel() as u32, &norm_out);
+            let norm_out = ctx.alloc_buffer(std::mem::size_of::<f32>() * 2);
+            compute::gpu_l2_norm_check_into(ctx, &grad, param.numel() as u32, &norm_out);
             norm_bufs.push(Some((norm_out, param.numel())));
         } else {
             norm_bufs.push(None);
@@ -201,17 +202,26 @@ fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let mut nan_indices = Vec::new();
     for (i, entry) in norm_bufs.iter().enumerate() {
         if let Some((norm_buf, _size)) = entry {
-            let norm = MetalContext::read_buffer(norm_buf, 1)[0];
-            if norm.is_nan() || norm.is_infinite() {
+            let vals = MetalContext::read_buffer(norm_buf, 2);
+            let sum_sq = vals[0];
+            let has_nan = vals[1] > 0.5;
+            if has_nan || sum_sq.is_nan() || sum_sq.is_infinite() {
                 nan_indices.push(i);
             } else {
-                total_norm_sq += norm * norm;
+                total_norm_sq += sum_sq;
             }
         }
     }
     let total_norm = total_norm_sq.sqrt();
 
     // Phase 3: Zero NaN grads and scale if needed (batched).
+    if !nan_indices.is_empty() {
+        eprintln!(
+            "[WARN] NaN/Inf detected in {} gradient(s) (param indices: {:?}) — zeroing affected gradients",
+            nan_indices.len(),
+            &nan_indices[..nan_indices.len().min(10)],
+        );
+    }
     let needs_scale = total_norm > max_norm && total_norm.is_finite();
     let scale = if needs_scale { max_norm / (total_norm + 1e-6) } else { 1.0 };
 

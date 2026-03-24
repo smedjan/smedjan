@@ -19,6 +19,13 @@ pub struct Tensor {
 // SAFETY: Tensor's non-Send fields are Metal GPU buffers. All GPU dispatch
 // in this codebase is synchronous (waitUntilCompleted), and Metal buffers
 // on Apple Silicon are safe to reference from any thread.
+//
+// INVARIANT: The autograd tape (TAPE, GRADS) and buffer pool (BUFFER_POOL)
+// are thread-local. All training/inference must run on a single thread.
+// If multi-threaded training is ever needed, these must be moved to
+// Arc<Mutex<>> or use crossbeam scoped threads with explicit synchronization.
+// The batch mode (begin_batch/flush_batch) is also thread-local and must not
+// span threads.
 unsafe impl Send for Tensor {}
 unsafe impl Sync for Tensor {}
 
@@ -102,6 +109,7 @@ impl Tensor {
     }
 
     /// Number of elements.
+    #[inline]
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
     }
@@ -502,16 +510,27 @@ impl Tensor {
         compute::gpu_rope(&self.ctx, &out_buf, total_rows as u32, seq_len as u32, head_dim as u32, offset, theta);
 
         let out_id = autograd::next_id();
-        Tensor {
+        let out = Tensor {
             id: out_id,
             buffer: out_buf,
             shape: self.shape.clone(),
-            requires_grad: false,
+            requires_grad: self.requires_grad,
             ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::RoPE { seq_len: seq_len as u32, head_dim: head_dim as u32, offset, theta },
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
         }
-        // RoPE backward is handled by storing the angle and applying inverse rotation.
-        // For simplicity in this phase, we skip RoPE on the backward pass (it has minimal
-        // impact on gradient flow for short sequences).
+
+        out
     }
 
     /// Apply causal mask to attention scores.

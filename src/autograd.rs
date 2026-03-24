@@ -38,6 +38,7 @@ pub enum Op {
         head_dim: usize,
         forward_dir: bool, // true = bsh→bhs, false = bhs→bsh
     },
+    RoPE { seq_len: u32, head_dim: u32, offset: u32, theta: f32 },
     Checkpoint { layer_idx: usize },
     /// Slice a contiguous region from a flat buffer. offset and length in elements.
     Slice { offset: usize, length: usize, source_size: usize },
@@ -195,10 +196,8 @@ fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<Gp
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
         if let Some(existing) = grads.get(&tensor_id) {
-            // Accumulate: existing += grad
-            let out = ctx.alloc_buffer(size * 4);
-            compute::gpu_add(ctx, existing, grad, &out, size as u32);
-            grads.insert(tensor_id, out);
+            // In-place accumulate: existing += grad (no temporary buffer allocation)
+            compute::gpu_add_inplace(ctx, existing, grad, size as u32);
         } else {
             grads.insert(tensor_id, grad.clone());
         }
@@ -290,6 +289,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::BatchedMatmulTransB => {
                     backward_batched_matmul_trans_b(ctx, entry, &out_grad);
+                }
+                Op::RoPE { seq_len, head_dim, offset, theta } => {
+                    backward_rope(ctx, entry, &out_grad, *seq_len, *head_dim, *offset, *theta);
                 }
             }
         }
@@ -485,7 +487,6 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Ret
         &grad_embeddings,
         n_tokens as u32,
         dim as u32,
-        vocab as u32,
     );
     accumulate_grad(ctx, entry.inputs[1], &grad_embeddings, vocab * dim);
 }
@@ -495,6 +496,25 @@ fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retaine
     let grad_input = ctx.alloc_buffer(size * 4);
     compute::gpu_copy(ctx, out_grad, &grad_input, size as u32);
     compute::gpu_scale(ctx, &grad_input, size as u32, factor);
+    accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
+}
+
+/// RoPE backward: apply inverse rotation to propagate gradients through RoPE.
+/// The forward pass rotates by angle θ, so backward rotates by -θ.
+fn backward_rope(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    seq_len: u32,
+    head_dim: u32,
+    offset: u32,
+    theta: f32,
+) {
+    let size: usize = entry.shapes[0].iter().product();
+    let total_rows = entry.shapes[0][0] as u32;
+    let grad_input = ctx.alloc_buffer(size * 4);
+    compute::gpu_copy(ctx, out_grad, &grad_input, size as u32);
+    compute::gpu_rope_backward(ctx, &grad_input, total_rows, seq_len, head_dim, offset, theta);
     accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
 }
 
@@ -578,6 +598,9 @@ fn backward_checkpoint(
             }
             Op::BatchedMatmulTransB => {
                 backward_batched_matmul_trans_b(ctx, sub_entry, &sub_out_grad);
+            }
+            Op::RoPE { seq_len, head_dim, offset, theta } => {
+                backward_rope(ctx, sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
             }
         }
     }

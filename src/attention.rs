@@ -273,15 +273,15 @@ fn update_kv_cache(
         let total_len = old_len + new_len;
         assert!(total_len <= cache.capacity, "KV cache overflow: {} + {} > {}", old_len, new_len, cache.capacity);
 
-        // Copy new K, V into cache at offset = old_len (per batch-head row)
-        for i in 0..bh {
-            // K: copy new_len * head_dim floats at row offset
-            let src_off = (i * new_len * head_dim) as u32;
-            let dst_off = (i * cache.capacity * head_dim + old_len * head_dim) as u32;
-            let count = (new_len * head_dim) as u32;
-            compute::gpu_buffer_copy(&k_cache.ctx, &k_new.buffer, &k_cache.buffer, src_off, dst_off, count);
-            compute::gpu_buffer_copy(&v_cache.ctx, &v_new.buffer, &v_cache.buffer, src_off, dst_off, count);
-        }
+        // Copy new K, V into cache at offset = old_len (single batched dispatch per tensor)
+        compute::gpu_strided_batch_copy(
+            &k_cache.ctx, &k_new.buffer, &k_cache.buffer,
+            bh as u32, new_len as u32, cache.capacity as u32, old_len as u32, head_dim as u32,
+        );
+        compute::gpu_strided_batch_copy(
+            &v_cache.ctx, &v_new.buffer, &v_cache.buffer,
+            bh as u32, new_len as u32, cache.capacity as u32, old_len as u32, head_dim as u32,
+        );
 
         cache.len = total_len;
 
@@ -290,13 +290,14 @@ fn update_kv_cache(
         // because attention needs contiguous [bh, total_len, head_dim] layout, not strided.
         let k_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
         let v_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
-        for i in 0..bh {
-            let src_off = (i * cache.capacity * head_dim) as u32;
-            let dst_off = (i * total_len * head_dim) as u32;
-            let count = (total_len * head_dim) as u32;
-            compute::gpu_buffer_copy(&k_cache.ctx, &k_cache.buffer, &k_view_buf, src_off, dst_off, count);
-            compute::gpu_buffer_copy(&v_cache.ctx, &v_cache.buffer, &v_view_buf, src_off, dst_off, count);
-        }
+        compute::gpu_compact_strided_copy(
+            &k_cache.ctx, &k_cache.buffer, &k_view_buf,
+            bh as u32, total_len as u32, cache.capacity as u32, head_dim as u32,
+        );
+        compute::gpu_compact_strided_copy(
+            &v_cache.ctx, &v_cache.buffer, &v_view_buf,
+            bh as u32, total_len as u32, cache.capacity as u32, head_dim as u32,
+        );
 
         let k_full = Tensor::from_buffer(Arc::clone(&k_cache.ctx), k_view_buf, vec![bh, total_len, head_dim]);
         let v_full = Tensor::from_buffer(Arc::clone(&v_cache.ctx), v_view_buf, vec![bh, total_len, head_dim]);
@@ -339,17 +340,16 @@ fn concat_seq(
     let total_len = len_a + len_b;
     let out_buf = a.ctx.alloc_buffer(bh * total_len * dim * 4);
 
-    for i in 0..bh {
-        // Copy a's chunk for this batch-head
-        let a_off = (i * len_a * dim) as u32;
-        let out_off = (i * total_len * dim) as u32;
-        compute::gpu_buffer_copy(&a.ctx, &a.buffer, &out_buf, a_off, out_off, (len_a * dim) as u32);
-
-        // Copy b's chunk for this batch-head
-        let b_off = (i * len_b * dim) as u32;
-        let out_off_b = out_off + (len_a * dim) as u32;
-        compute::gpu_buffer_copy(&a.ctx, &b.buffer, &out_buf, b_off, out_off_b, (len_b * dim) as u32);
-    }
+    // Copy a's data: src [bh, len_a, dim] → dst [bh, total_len, dim] at offset 0
+    compute::gpu_strided_batch_copy(
+        &a.ctx, &a.buffer, &out_buf,
+        bh as u32, len_a as u32, total_len as u32, 0, dim as u32,
+    );
+    // Copy b's data: src [bh, len_b, dim] → dst [bh, total_len, dim] at offset len_a
+    compute::gpu_strided_batch_copy(
+        &a.ctx, &b.buffer, &out_buf,
+        bh as u32, len_b as u32, total_len as u32, len_a as u32, dim as u32,
+    );
 
     Tensor::from_buffer(Arc::clone(&a.ctx), out_buf, vec![bh, total_len, dim])
 }

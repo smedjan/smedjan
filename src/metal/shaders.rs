@@ -375,6 +375,49 @@ kernel void rope(
 }
 "#;
 
+/// RoPE backward pass: inverse rotation (negate sin to undo forward rotation).
+/// Given grad_output with RoPE applied, produces grad_input by rotating by -θ.
+pub const ROPE_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RopeParams {
+    uint seq_len;
+    uint head_dim;
+    uint total_rows; // batch * n_heads
+    uint offset;     // for KV cache: start position
+    float theta;     // base frequency (default 10000.0)
+};
+
+kernel void rope_backward(
+    device float* data [[buffer(0)]],
+    constant RopeParams& params [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;       // batch * n_heads index
+    uint pos = gid.x;       // sequence position
+    uint pair = gid.z;      // which dimension pair (0..head_dim/2)
+
+    if (row >= params.total_rows || pos >= params.seq_len || pair >= params.head_dim / 2) return;
+
+    float freq = 1.0 / pow(params.theta, float(2 * pair) / float(params.head_dim));
+    float angle = float(pos + params.offset) * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
+    uint i0 = base + 2 * pair;
+    uint i1 = i0 + 1;
+
+    float x0 = data[i0];
+    float x1 = data[i1];
+
+    // Inverse rotation: rotate by -θ (negate sin)
+    data[i0] = x0 * cos_val + x1 * sin_val;
+    data[i1] = -x0 * sin_val + x1 * cos_val;
+}
+"#;
+
 /// Elementwise addition: C = A + B (broadcast-compatible)
 pub const ADD: &str = r#"
 #include <metal_stdlib>
@@ -393,6 +436,27 @@ kernel void add(
 ) {
     if (gid < params.size) {
         c[gid] = a[gid] + b[gid];
+    }
+}
+"#;
+
+/// In-place elementwise add: a += b
+pub const ADD_INPLACE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct AddInplaceParams {
+    uint size;
+};
+
+kernel void add_inplace(
+    device float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    constant AddInplaceParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < params.size) {
+        a[gid] += b[gid];
     }
 }
 "#;
@@ -787,6 +851,57 @@ kernel void l2_norm(
 }
 "#;
 
+/// Gradient clipping: compute L2 norm (sum of squares) and check for NaN/Inf
+/// Output buffer: [0] = sum_of_squares, [1] = has_nan_or_inf (1.0 or 0.0)
+/// Unlike L2_NORM which returns sqrt(sum_sq), this returns raw sum_sq for
+/// accumulation across multiple parameter buffers before a single sqrt.
+pub const L2_NORM_CHECK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NormCheckParams {
+    uint size;
+};
+
+kernel void l2_norm_check(
+    device const float* data [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant NormCheckParams& params [[buffer(2)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    threadgroup float shared_nan[256];
+
+    float local_sum = 0.0f;
+    float local_nan = 0.0f;
+    for (uint i = thread_index; i < params.size; i += threads_per_group) {
+        float val = data[i];
+        if (isnan(val) || isinf(val)) {
+            local_nan = 1.0f;
+        } else {
+            local_sum += val * val;
+        }
+    }
+    shared_sum[thread_index] = local_sum;
+    shared_nan[thread_index] = local_nan;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            shared_sum[thread_index] += shared_sum[thread_index + stride];
+            shared_nan[thread_index] = max(shared_nan[thread_index], shared_nan[thread_index + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0) {
+        output[0] = shared_sum[0];
+        output[1] = shared_nan[0];
+    }
+}
+"#;
+
 /// Scale buffer in-place: data[i] *= scale
 pub const SCALE: &str = r#"
 #include <metal_stdlib>
@@ -1107,6 +1222,32 @@ kernel void embedding_backward(
 }
 "#;
 
+/// Zero only the rows of a matrix that correspond to given token IDs.
+/// Avoids zeroing the entire vocab_size × dim matrix when only a small
+/// fraction of rows are touched during embedding backward.
+pub const ZERO_ROWS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ZeroRowsParams {
+    uint n_tokens;
+    uint dim;
+};
+
+kernel void zero_rows(
+    device const uint* tokens [[buffer(0)]],
+    device float* matrix [[buffer(1)]],
+    constant ZeroRowsParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid / params.dim;
+    uint dim_idx = gid % params.dim;
+    if (token_idx >= params.n_tokens) return;
+    uint row = tokens[token_idx];
+    matrix[row * params.dim + dim_idx] = 0.0f;
+}
+"#;
+
 /// 2D matrix transpose: out[j, i] = in[i, j]
 /// in: [rows, cols], out: [cols, rows]
 pub const TRANSPOSE_2D: &str = r#"
@@ -1133,6 +1274,7 @@ kernel void transpose_2d(
 
 /// C = A^T @ B where A:[M,K] stored row-major, B:[M,N], C:[K,N]
 /// A^T is [K,M], so C[i,j] = sum_m A[m,i] * B[m,j]
+/// Tiled version: 32x32 output tiles, 64 threads per group, each thread computes 4x4.
 pub const MATMUL_TRANS_A: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1143,22 +1285,98 @@ struct MatmulTransAParams {
     uint N;  // cols of output (cols of B)
 };
 
-kernel void matmul_trans_a(
+#define TILE_TA 32
+#define THREAD_TILE_TA 4
+#define THREADS_PER_GROUP_TA 64
+
+kernel void matmul_trans_a_tiled(
     device const float* A [[buffer(0)]],
     device const float* B [[buffer(1)]],
     device float* C [[buffer(2)]],
     constant MatmulTransAParams& params [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
 ) {
-    uint row = gid.y;  // K dimension
-    uint col = gid.x;  // N dimension
-    if (row >= params.K || col >= params.N) return;
+    // Each thread has a position in the 8x8 grid within the threadgroup
+    uint local_row = thread_index / 8;  // 0..7
+    uint local_col = thread_index % 8;  // 0..7
 
-    float sum = 0.0;
-    for (uint m = 0; m < params.M; m++) {
-        sum += A[m * params.K + row] * B[m * params.N + col];
+    // Global starting position for this threadgroup's tile
+    // C is [K, N], so tile_row indexes K, tile_col indexes N
+    uint tile_row = group_id.y * TILE_TA;
+    uint tile_col = group_id.x * TILE_TA;
+
+    // Shared memory for transposed-A tile and B tile
+    threadgroup float As[TILE_TA][TILE_TA];  // As[k][m] within tile
+    threadgroup float Bs[TILE_TA][TILE_TA];  // Bs[m][n] within tile
+
+    // Accumulator for this thread's 4x4 sub-tile
+    float acc[THREAD_TILE_TA][THREAD_TILE_TA] = {{0.0f}};
+
+    uint M = params.M;
+    uint K = params.K;
+    uint N = params.N;
+
+    // Loop over M dimension in TILE-sized chunks
+    for (uint m_block = 0; m_block < M; m_block += TILE_TA) {
+        // Cooperatively load A^T tile into shared memory
+        // We want As[k][m] = A[m_block+m][tile_row+k] = A[(m_block+m)*K + (tile_row+k)]
+        // 64 threads load 32x32 = 1024 elements, so 16 elements per thread
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE_TA;  // k index within tile (0..31)
+            uint c = flat % TILE_TA;  // m index within tile (0..31)
+            uint global_k = tile_row + r;
+            uint global_m = m_block + c;
+            As[r][c] = (global_k < K && global_m < M) ? A[global_m * K + global_k] : 0.0f;
+        }
+
+        // Cooperatively load B tile into shared memory
+        // Bs[m][n] = B[m_block+m][tile_col+n] = B[(m_block+m)*N + (tile_col+n)]
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE_TA;  // m index within tile
+            uint c = flat % TILE_TA;  // n index within tile
+            uint global_m = m_block + r;
+            uint global_n = tile_col + c;
+            Bs[r][c] = (global_m < M && global_n < N) ? B[global_m * N + global_n] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each thread computes its 4x4 sub-tile
+        // acc[i][j] += sum_m As[local_row*4+i][m] * Bs[m][local_col*4+j]
+        for (uint m = 0; m < TILE_TA; m++) {
+            float a_vals[THREAD_TILE_TA];
+            float b_vals[THREAD_TILE_TA];
+
+            for (uint i = 0; i < THREAD_TILE_TA; i++) {
+                a_vals[i] = As[local_row * THREAD_TILE_TA + i][m];
+            }
+            for (uint j = 0; j < THREAD_TILE_TA; j++) {
+                b_vals[j] = Bs[m][local_col * THREAD_TILE_TA + j];
+            }
+
+            for (uint i = 0; i < THREAD_TILE_TA; i++) {
+                for (uint j = 0; j < THREAD_TILE_TA; j++) {
+                    acc[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    C[row * params.N + col] = sum;
+
+    // Write results to C[K, N]
+    for (uint i = 0; i < THREAD_TILE_TA; i++) {
+        for (uint j = 0; j < THREAD_TILE_TA; j++) {
+            uint global_r = tile_row + local_row * THREAD_TILE_TA + i;
+            uint global_c = tile_col + local_col * THREAD_TILE_TA + j;
+            if (global_r < K && global_c < N) {
+                C[global_r * N + global_c] = acc[i][j];
+            }
+        }
+    }
 }
 "#;
 
@@ -1289,5 +1507,151 @@ kernel void gradient_mask(
     if (mask[pos] == 0u) {
         grad[gid] = 0.0f;
     }
+}
+"#;
+
+/// Batched strided copy: source [bh, src_seq_len, dim] (contiguous) →
+/// destination [bh, dst_stride, dim] at offset dst_offset per batch-head.
+/// Single dispatch replaces O(bh) individual gpu_buffer_copy calls.
+/// Thread grid: bh * src_seq_len * dim total threads.
+pub const STRIDED_BATCH_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct StridedBatchCopyParams {
+    uint bh;
+    uint src_seq_len;
+    uint dst_stride;
+    uint dst_offset;
+    uint dim;
+};
+
+kernel void strided_batch_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant StridedBatchCopyParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.bh * params.src_seq_len * params.dim;
+    if (gid >= total) return;
+
+    uint elements_per_head = params.src_seq_len * params.dim;
+    uint head = gid / elements_per_head;
+    uint within = gid % elements_per_head;
+    uint seq_pos = within / params.dim;
+    uint d = within % params.dim;
+
+    uint src_idx = head * elements_per_head + seq_pos * params.dim + d;
+    uint dst_idx = head * params.dst_stride * params.dim + (params.dst_offset + seq_pos) * params.dim + d;
+
+    dst[dst_idx] = src[src_idx];
+}
+"#;
+
+/// Compact strided copy: source [bh, stride, dim] (only first seq_len valid) →
+/// destination [bh, seq_len, dim] (contiguous). Reverse of strided_batch_copy.
+/// Thread grid: bh * seq_len * dim total threads.
+pub const COMPACT_STRIDED_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CompactStridedCopyParams {
+    uint bh;
+    uint seq_len;
+    uint src_stride;
+    uint dim;
+};
+
+kernel void compact_strided_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant CompactStridedCopyParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.bh * params.seq_len * params.dim;
+    if (gid >= total) return;
+
+    uint elements_per_head = params.seq_len * params.dim;
+    uint head = gid / elements_per_head;
+    uint within = gid % elements_per_head;
+    uint seq_pos = within / params.dim;
+    uint d = within % params.dim;
+
+    uint src_idx = head * params.src_stride * params.dim + seq_pos * params.dim + d;
+    uint dst_idx = head * elements_per_head + seq_pos * params.dim + d;
+
+    dst[dst_idx] = src[src_idx];
+}
+"#;
+
+/// Argmax reduction: find the index of the maximum value in a float buffer.
+/// Uses a single threadgroup with parallel reduction (256 threads).
+/// Reads back just 4 bytes (one u32) instead of the entire buffer.
+pub const ARGMAX: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ArgmaxParams {
+    uint size;
+};
+
+kernel void argmax(
+    device const float* data [[buffer(0)]],
+    device uint* result [[buffer(1)]],
+    constant ArgmaxParams& params [[buffer(2)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_vals[256];
+    threadgroup uint shared_idxs[256];
+
+    float local_max = -INFINITY;
+    uint local_idx = 0;
+    for (uint i = thread_index; i < params.size; i += threads_per_group) {
+        if (data[i] > local_max) {
+            local_max = data[i];
+            local_idx = i;
+        }
+    }
+    shared_vals[thread_index] = local_max;
+    shared_idxs[thread_index] = local_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            if (shared_vals[thread_index + stride] > shared_vals[thread_index]) {
+                shared_vals[thread_index] = shared_vals[thread_index + stride];
+                shared_idxs[thread_index] = shared_idxs[thread_index + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0) {
+        result[0] = shared_idxs[0];
+    }
+}
+"#;
+
+/// Temperature scaling: divide logits by temperature in-place.
+/// data[i] = data[i] / temperature for i in [offset, offset + count).
+/// Operates on a sub-range so we can scale only the last token's logits.
+pub const TEMPERATURE_SCALE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TempScaleParams {
+    uint offset;
+    uint count;
+    float inv_temperature;
+};
+
+kernel void temperature_scale(
+    device float* data [[buffer(0)]],
+    constant TempScaleParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.count) return;
+    data[params.offset + gid] = data[params.offset + gid] * params.inv_temperature;
 }
 "#;
