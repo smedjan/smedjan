@@ -1655,3 +1655,308 @@ kernel void temperature_scale(
     data[params.offset + gid] = data[params.offset + gid] * params.inv_temperature;
 }
 "#;
+
+/// Batched tiled matrix multiplication: C[b] = A[b] @ B[b]
+/// A: [B, M, K], B: [B, K, N], C: [B, M, N]
+/// Uses group_id.z as the batch index. Single dispatch for all batch elements.
+/// Same tiled algorithm as matmul_tiled (32x32 tiles, 64 threads, 4x4 per thread).
+pub const BATCHED_MATMUL_TILED: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BatchedMatmulParams {
+    uint M;
+    uint N;
+    uint K;
+    uint batch;
+};
+
+#define BM_TILE 32
+#define BM_THREAD_TILE 4
+#define BM_THREADS_PER_GROUP 64
+
+kernel void batched_matmul_tiled(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant BatchedMatmulParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint batch_idx = group_id.z;
+    if (batch_idx >= params.batch) return;
+
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+
+    uint tile_row = group_id.y * BM_TILE;
+    uint tile_col = group_id.x * BM_TILE;
+
+    uint M = params.M;
+    uint N = params.N;
+    uint K = params.K;
+
+    device const float* A_b = A + batch_idx * M * K;
+    device const float* B_b = B + batch_idx * K * N;
+    device float* C_b = C + batch_idx * M * N;
+
+    threadgroup float As[BM_TILE][BM_TILE];
+    threadgroup float Bs[BM_TILE][BM_TILE];
+
+    float acc[BM_THREAD_TILE][BM_THREAD_TILE] = {{0.0f}};
+
+    for (uint k_block = 0; k_block < K; k_block += BM_TILE) {
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;
+            uint c = flat % BM_TILE;
+            uint global_r = tile_row + r;
+            uint global_c = k_block + c;
+            As[r][c] = (global_r < M && global_c < K) ? A_b[global_r * K + global_c] : 0.0f;
+        }
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;
+            uint c = flat % BM_TILE;
+            uint global_r = k_block + r;
+            uint global_c = tile_col + c;
+            Bs[r][c] = (global_r < K && global_c < N) ? B_b[global_r * N + global_c] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < BM_TILE; k++) {
+            float a_vals[BM_THREAD_TILE];
+            float b_vals[BM_THREAD_TILE];
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                a_vals[i] = As[local_row * BM_THREAD_TILE + i][k];
+            }
+            for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                b_vals[j] = Bs[k][local_col * BM_THREAD_TILE + j];
+            }
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                    acc[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < BM_THREAD_TILE; i++) {
+        for (uint j = 0; j < BM_THREAD_TILE; j++) {
+            uint global_r = tile_row + local_row * BM_THREAD_TILE + i;
+            uint global_c = tile_col + local_col * BM_THREAD_TILE + j;
+            if (global_r < M && global_c < N) {
+                C_b[global_r * N + global_c] = acc[i][j];
+            }
+        }
+    }
+}
+"#;
+
+/// Batched tiled matmul with B transposed: C[b] = A[b] @ B[b]^T
+/// A: [B, M, K], B: [B, N, K], C: [B, M, N]
+/// Uses group_id.z as the batch index. Single dispatch for all batch elements.
+pub const BATCHED_MATMUL_TILED_TRANS_B: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BatchedMatmulParams {
+    uint M;
+    uint N;
+    uint K;
+    uint batch;
+};
+
+#define BM_TILE 32
+#define BM_THREAD_TILE 4
+#define BM_THREADS_PER_GROUP 64
+
+kernel void batched_matmul_tiled_trans_b(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant BatchedMatmulParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint batch_idx = group_id.z;
+    if (batch_idx >= params.batch) return;
+
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+
+    uint tile_row = group_id.y * BM_TILE;
+    uint tile_col = group_id.x * BM_TILE;
+
+    uint M = params.M;
+    uint N = params.N;
+    uint K = params.K;
+
+    device const float* A_b = A + batch_idx * M * K;
+    device const float* B_b = B + batch_idx * N * K;
+    device float* C_b = C + batch_idx * M * N;
+
+    threadgroup float As[BM_TILE][BM_TILE];
+    threadgroup float Bs[BM_TILE][BM_TILE];
+
+    float acc[BM_THREAD_TILE][BM_THREAD_TILE] = {{0.0f}};
+
+    for (uint k_block = 0; k_block < K; k_block += BM_TILE) {
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;
+            uint c = flat % BM_TILE;
+            uint global_r = tile_row + r;
+            uint global_c = k_block + c;
+            As[r][c] = (global_r < M && global_c < K) ? A_b[global_r * K + global_c] : 0.0f;
+        }
+        // B is [N, K], we want B^T so B^T[k, n] = B[n, k]
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;  // k index
+            uint c = flat % BM_TILE;  // n index
+            uint global_k = k_block + r;
+            uint global_n = tile_col + c;
+            Bs[r][c] = (global_k < K && global_n < N) ? B_b[global_n * K + global_k] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < BM_TILE; k++) {
+            float a_vals[BM_THREAD_TILE];
+            float b_vals[BM_THREAD_TILE];
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                a_vals[i] = As[local_row * BM_THREAD_TILE + i][k];
+            }
+            for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                b_vals[j] = Bs[k][local_col * BM_THREAD_TILE + j];
+            }
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                    acc[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < BM_THREAD_TILE; i++) {
+        for (uint j = 0; j < BM_THREAD_TILE; j++) {
+            uint global_r = tile_row + local_row * BM_THREAD_TILE + i;
+            uint global_c = tile_col + local_col * BM_THREAD_TILE + j;
+            if (global_r < M && global_c < N) {
+                C_b[global_r * N + global_c] = acc[i][j];
+            }
+        }
+    }
+}
+"#;
+
+/// Batched tiled matmul with A transposed: C[b] = A[b]^T @ B[b]
+/// A: [B, M, K] (row-major), B: [B, M, N], C: [B, K, N]
+/// A^T is [K, M], so C[b][i,j] = sum_m A[b][m,i] * B[b][m,j]
+/// Uses group_id.z as the batch index. Single dispatch for all batch elements.
+/// Used in backward pass for computing dB = A^T @ dC.
+pub const BATCHED_MATMUL_TILED_TRANS_A: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BatchedMatmulTransAParams {
+    uint M;
+    uint K;
+    uint N;
+    uint batch;
+};
+
+#define BM_TILE 32
+#define BM_THREAD_TILE 4
+#define BM_THREADS_PER_GROUP 64
+
+kernel void batched_matmul_tiled_trans_a(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant BatchedMatmulTransAParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint batch_idx = group_id.z;
+    if (batch_idx >= params.batch) return;
+
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+
+    // C is [K, N], so tile_row indexes K, tile_col indexes N
+    uint tile_row = group_id.y * BM_TILE;
+    uint tile_col = group_id.x * BM_TILE;
+
+    uint M = params.M;
+    uint K = params.K;
+    uint N = params.N;
+
+    device const float* A_b = A + batch_idx * M * K;
+    device const float* B_b = B + batch_idx * M * N;
+    device float* C_b = C + batch_idx * K * N;
+
+    threadgroup float As[BM_TILE][BM_TILE];  // As[k][m] within tile
+    threadgroup float Bs[BM_TILE][BM_TILE];  // Bs[m][n] within tile
+
+    float acc[BM_THREAD_TILE][BM_THREAD_TILE] = {{0.0f}};
+
+    // Loop over M dimension in TILE-sized chunks
+    for (uint m_block = 0; m_block < M; m_block += BM_TILE) {
+        // Load A^T tile: As[k][m] = A[m_block+m][tile_row+k] = A[(m_block+m)*K + (tile_row+k)]
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;  // k index
+            uint c = flat % BM_TILE;  // m index
+            uint global_k = tile_row + r;
+            uint global_m = m_block + c;
+            As[r][c] = (global_k < K && global_m < M) ? A_b[global_m * K + global_k] : 0.0f;
+        }
+        // Load B tile: Bs[m][n] = B[(m_block+m)*N + (tile_col+n)]
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / BM_TILE;
+            uint c = flat % BM_TILE;
+            uint global_m = m_block + r;
+            uint global_n = tile_col + c;
+            Bs[r][c] = (global_m < M && global_n < N) ? B_b[global_m * N + global_n] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint m = 0; m < BM_TILE; m++) {
+            float a_vals[BM_THREAD_TILE];
+            float b_vals[BM_THREAD_TILE];
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                a_vals[i] = As[local_row * BM_THREAD_TILE + i][m];
+            }
+            for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                b_vals[j] = Bs[m][local_col * BM_THREAD_TILE + j];
+            }
+            for (uint i = 0; i < BM_THREAD_TILE; i++) {
+                for (uint j = 0; j < BM_THREAD_TILE; j++) {
+                    acc[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < BM_THREAD_TILE; i++) {
+        for (uint j = 0; j < BM_THREAD_TILE; j++) {
+            uint global_r = tile_row + local_row * BM_THREAD_TILE + i;
+            uint global_c = tile_col + local_col * BM_THREAD_TILE + j;
+            if (global_r < K && global_c < N) {
+                C_b[global_r * N + global_c] = acc[i][j];
+            }
+        }
+    }
+}
+"#;

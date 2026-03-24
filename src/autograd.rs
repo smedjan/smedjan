@@ -192,6 +192,11 @@ pub fn get_grad(tensor_id: usize) -> Option<Retained<GpuBuffer>> {
 }
 
 /// Store a gradient buffer for a tensor ID, accumulating if one already exists.
+/// IMPORTANT: On first insert we always copy into a fresh buffer. A refcount-only
+/// clone (Retained::clone) would share the underlying Metal buffer, so if the
+/// same grad buffer is passed for different tensor IDs (e.g. backward_add passes
+/// the upstream gradient to both inputs), later in-place additions would corrupt
+/// both tensors' gradients through the shared buffer.
 fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
@@ -199,7 +204,10 @@ fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<Gp
             // In-place accumulate: existing += grad (no temporary buffer allocation)
             compute::gpu_add_inplace(ctx, existing, grad, size as u32);
         } else {
-            grads.insert(tensor_id, grad.clone());
+            // MUST copy — same buffer may be shared with other grad consumers
+            let owned = ctx.alloc_buffer(size * 4);
+            compute::gpu_copy(ctx, grad, &owned, size as u32);
+            grads.insert(tensor_id, owned);
         }
     });
 }
@@ -546,14 +554,21 @@ fn backward_checkpoint(
         let output_size: usize = last_sub_entry.shapes.last()
             .map(|s| s.iter().product())
             .unwrap_or_else(|| {
-                // Fallback: use the checkpoint entry's output shape
                 entry.shapes.last().map(|s| s.iter().product()).unwrap_or(0)
             });
         accumulate_grad(ctx, sub_output_id, out_grad, output_size);
     }
 
-    // Walk the sub-tape in reverse, computing gradients for each op
-    for sub_entry in sub_tape.iter().rev() {
+    // Save first entry's input info before consuming the tape
+    let first_input_id = sub_tape.first().map(|e| e.inputs[0]);
+    let input_size: usize = entry.shapes[0].iter().product();
+
+    // Walk the sub-tape in reverse, CONSUMING entries to free GPU buffers incrementally.
+    // This is critical: without this, all intermediate buffers stay pinned until the
+    // entire sub-tape is processed, causing memory pressure on 16GB devices.
+    let mut sub_tape_rev: Vec<TapeEntry> = sub_tape;
+    sub_tape_rev.reverse();
+    for sub_entry in sub_tape_rev.drain(..) {
         let sub_out_grad = GRADS.with(|grads| grads.borrow().get(&sub_entry.output).cloned());
         let sub_out_grad = match sub_out_grad {
             Some(g) => g,
@@ -561,56 +576,54 @@ fn backward_checkpoint(
         };
 
         match &sub_entry.op {
-            Op::Matmul => backward_matmul(ctx, sub_entry, &sub_out_grad),
-            Op::MatmulTransB => backward_matmul_trans_b(ctx, sub_entry, &sub_out_grad),
-            Op::Add => backward_add(ctx, sub_entry, &sub_out_grad),
-            Op::Mul => backward_mul(ctx, sub_entry, &sub_out_grad),
-            Op::Softmax => backward_softmax(ctx, sub_entry, &sub_out_grad),
-            Op::RmsNorm { eps } => backward_rms_norm(ctx, sub_entry, &sub_out_grad, *eps),
-            Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, sub_entry, &sub_out_grad, *eps),
-            Op::Silu => backward_silu(ctx, sub_entry, &sub_out_grad),
-            Op::SiluGate => backward_silu_gate(ctx, sub_entry, &sub_out_grad),
-            Op::Reshape => backward_reshape(ctx, sub_entry, &sub_out_grad),
+            Op::Matmul => backward_matmul(ctx, &sub_entry, &sub_out_grad),
+            Op::MatmulTransB => backward_matmul_trans_b(ctx, &sub_entry, &sub_out_grad),
+            Op::Add => backward_add(ctx, &sub_entry, &sub_out_grad),
+            Op::Mul => backward_mul(ctx, &sub_entry, &sub_out_grad),
+            Op::Softmax => backward_softmax(ctx, &sub_entry, &sub_out_grad),
+            Op::RmsNorm { eps } => backward_rms_norm(ctx, &sub_entry, &sub_out_grad, *eps),
+            Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, &sub_entry, &sub_out_grad, *eps),
+            Op::Silu => backward_silu(ctx, &sub_entry, &sub_out_grad),
+            Op::SiluGate => backward_silu_gate(ctx, &sub_entry, &sub_out_grad),
+            Op::Reshape => backward_reshape(ctx, &sub_entry, &sub_out_grad),
             Op::CrossEntropy => {
                 if let Some(grad_logits) = &sub_entry.cached {
                     let size: usize = sub_entry.shapes[0].iter().product();
                     accumulate_grad(ctx, sub_entry.inputs[0], grad_logits, size);
                 }
             }
-            Op::Embedding => backward_embedding(ctx, sub_entry, &sub_out_grad),
-            Op::Scale { factor } => backward_scale(ctx, sub_entry, &sub_out_grad, *factor),
+            Op::Embedding => backward_embedding(ctx, &sub_entry, &sub_out_grad),
+            Op::Scale { factor } => backward_scale(ctx, &sub_entry, &sub_out_grad, *factor),
             Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-                backward_transpose(ctx, sub_entry, &sub_out_grad, &TransposeParams {
+                backward_transpose(ctx, &sub_entry, &sub_out_grad, &TransposeParams {
                     batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
                 });
             }
             Op::Checkpoint { layer_idx: nested_idx } => {
-                backward_checkpoint(ctx, sub_entry, &sub_out_grad, *nested_idx);
+                backward_checkpoint(ctx, &sub_entry, &sub_out_grad, *nested_idx);
             }
             Op::Slice { offset, length, source_size } => {
-                backward_slice(ctx, sub_entry, &sub_out_grad, *offset, *length, *source_size);
+                backward_slice(ctx, &sub_entry, &sub_out_grad, *offset, *length, *source_size);
             }
             Op::ConcatParts { part_sizes } => {
-                backward_concat_parts(ctx, sub_entry, &sub_out_grad, part_sizes);
+                backward_concat_parts(ctx, &sub_entry, &sub_out_grad, part_sizes);
             }
             Op::BatchedMatmul => {
-                backward_batched_matmul(ctx, sub_entry, &sub_out_grad);
+                backward_batched_matmul(ctx, &sub_entry, &sub_out_grad);
             }
             Op::BatchedMatmulTransB => {
-                backward_batched_matmul_trans_b(ctx, sub_entry, &sub_out_grad);
+                backward_batched_matmul_trans_b(ctx, &sub_entry, &sub_out_grad);
             }
             Op::RoPE { seq_len, head_dim, offset, theta } => {
-                backward_rope(ctx, sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
+                backward_rope(ctx, &sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
             }
         }
     }
 
-    // The first sub-tape entry's first input should be the checkpoint's input tensor.
-    // Extract its gradient and accumulate it for the original input tensor ID.
-    if let Some(first_sub_entry) = sub_tape.first() {
-        let sub_input_id = first_sub_entry.inputs[0];
+    // Extract gradient for the checkpoint's input tensor.
+    // We saved first_input_id before consuming the sub-tape.
+    if let Some(sub_input_id) = first_input_id {
         if let Some(input_grad) = GRADS.with(|grads| grads.borrow().get(&sub_input_id).cloned()) {
-            let input_size: usize = entry.shapes[0].iter().product();
             accumulate_grad(ctx, entry.inputs[0], &input_grad, input_size);
         }
     }
