@@ -116,6 +116,39 @@ pub fn clear_tape() {
     GRADS.with(|grads| grads.borrow_mut().clear());
 }
 
+/// Clear the tape entries (freeing activations) but preserve accumulated gradients.
+/// Used in gradient accumulation: after each micro-step's backward pass we free the tape
+/// to reclaim activation memory, but keep gradients so the next micro-step accumulates on top.
+pub fn clear_tape_keep_grads() {
+    TAPE.with(|tape| {
+        let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
+        for entry in entries {
+            MetalContext::recycle_buffer(entry.output_buffer);
+            if let Some(cached) = entry.cached {
+                MetalContext::recycle_buffer(cached);
+            }
+        }
+    });
+}
+
+/// Zero all stored gradient buffers. Call after optimizer.step() when using gradient
+/// accumulation to prepare for the next accumulation cycle.
+pub fn zero_grads() {
+    GRADS.with(|grads| grads.borrow_mut().clear());
+}
+
+/// Scale all stored gradient buffers by a constant factor.
+/// Used in gradient accumulation to average gradients: scale by 1/grad_accum_steps.
+pub fn scale_grads(ctx: &Arc<MetalContext>, factor: f32) {
+    GRADS.with(|grads| {
+        let grads = grads.borrow();
+        for (_id, grad_buf) in grads.iter() {
+            let size = grad_buf.length() / 4; // f32 = 4 bytes
+            compute::gpu_scale(ctx, grad_buf, size as u32, factor);
+        }
+    });
+}
+
 /// Clear all registered recompute functions. Call alongside `clear_tape()`.
 pub fn clear_recompute_registry() {
     RECOMPUTE_REGISTRY.with(|reg| reg.borrow_mut().clear());

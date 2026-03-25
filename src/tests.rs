@@ -1121,4 +1121,267 @@ mod tests {
         let expected = vec![1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0];
         assert_eq!(result, expected, "transpose_2d square mismatch");
     }
+
+    // =========================================================================
+    // Gradient accumulation
+    // =========================================================================
+
+    /// Verify that gradient accumulation over N micro-steps produces the same
+    /// gradients as a single forward/backward with the combined data.
+    ///
+    /// Uses element-wise mul (scalar-safe): loss = w * x.
+    /// d(loss)/dw = x. With 2 identical micro-steps + scale by 0.5:
+    /// accumulated = (x + x) * 0.5 = x = single-shot.
+    #[test]
+    fn gradient_accumulation_matches_single_batch() {
+        let ctx = test_ctx();
+
+        let w_data = vec![3.0f32];
+        let x_data = vec![7.0f32];
+
+        // === Single-shot: one forward/backward ===
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        let w_single = Tensor::from_slice(&ctx, &w_data, vec![1, 1]).with_grad();
+        let x_single = Tensor::from_slice(&ctx, &x_data, vec![1, 1]).with_grad();
+        let c_single = w_single.mul(&x_single); // scalar
+
+        autograd::backward(&ctx, c_single.id);
+        let grad_w_single = autograd::get_grad(w_single.id).expect("grad must exist");
+        let grad_w_single_data = MetalContext::read_buffer(&grad_w_single, 1);
+        autograd::clear_tape();
+
+        // === Accumulated: two micro-steps with the same data, then scale by 0.5 ===
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        let w_accum = Tensor::from_slice(&ctx, &w_data, vec![1, 1]).with_grad();
+        let w_accum_id = w_accum.id;
+
+        // Micro-step 1
+        let x1 = Tensor::from_slice(&ctx, &x_data, vec![1, 1]).with_grad();
+        let c1 = w_accum.mul(&x1);
+        autograd::backward(&ctx, c1.id);
+        autograd::clear_tape_keep_grads();
+        autograd::clear_recompute_registry();
+
+        // Micro-step 2: same input, new tape, grads accumulate.
+        // Re-create w tensor with same ID so gradients accumulate on it.
+        let w_accum_2 = Tensor {
+            id: w_accum_id,
+            buffer: ctx.buffer_from_slice(&w_data),
+            shape: vec![1, 1],
+            requires_grad: true,
+            ctx: Arc::clone(&ctx),
+        };
+        let x2 = Tensor::from_slice(&ctx, &x_data, vec![1, 1]).with_grad();
+        let c2 = w_accum_2.mul(&x2);
+        autograd::backward(&ctx, c2.id);
+        autograd::clear_tape_keep_grads();
+        autograd::clear_recompute_registry();
+
+        // Scale accumulated gradients by 1/2 (averaging over 2 micro-steps)
+        autograd::scale_grads(&ctx, 0.5);
+
+        let grad_w_accum = autograd::get_grad(w_accum_id).expect("accumulated grad must exist");
+        let grad_w_accum_data = MetalContext::read_buffer(&grad_w_accum, 1);
+
+        autograd::clear_tape();
+
+        // Single-shot: d(w*x)/dw = x = 7.0
+        // Accumulated: (7.0 + 7.0) * 0.5 = 7.0
+        let diff = (grad_w_single_data[0] - grad_w_accum_data[0]).abs();
+        assert!(
+            diff < 1e-4,
+            "Gradient mismatch: single={}, accum={}, diff={}",
+            grad_w_single_data[0],
+            grad_w_accum_data[0],
+            diff,
+        );
+
+        // Verify the actual gradient value is correct (x = 7.0)
+        assert!(
+            (grad_w_single_data[0] - 7.0).abs() < 1e-4,
+            "Expected grad(w) = 7.0, got {}",
+            grad_w_single_data[0],
+        );
+    }
+
+    /// Verify that clear_tape_keep_grads preserves gradients while clearing tape entries.
+    #[test]
+    fn clear_tape_keep_grads_preserves_gradients() {
+        let ctx = test_ctx();
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0], vec![2, 2]).with_grad();
+        let b = Tensor::from_slice(&ctx, &[5.0, 6.0, 7.0, 8.0], vec![2, 2]).with_grad();
+        let c = a.matmul(&b);
+
+        autograd::backward(&ctx, c.id);
+
+        // Gradients should exist
+        assert!(autograd::get_grad(a.id).is_some(), "grad(a) should exist before clear");
+
+        // Clear tape but keep grads
+        autograd::clear_tape_keep_grads();
+
+        // Tape should be empty
+        let (tape_ops, _) = autograd::tape_stats();
+        assert_eq!(tape_ops, 0, "Tape should be empty after clear_tape_keep_grads");
+
+        // Gradients should still exist
+        assert!(autograd::get_grad(a.id).is_some(), "grad(a) should survive clear_tape_keep_grads");
+        assert!(autograd::get_grad(b.id).is_some(), "grad(b) should survive clear_tape_keep_grads");
+
+        // Cleanup
+        autograd::clear_tape();
+    }
+
+    /// Verify that zero_grads clears all gradient buffers.
+    #[test]
+    fn zero_grads_clears_all_gradients() {
+        let ctx = test_ctx();
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0], vec![2, 2]).with_grad();
+        let b = Tensor::from_slice(&ctx, &[5.0, 6.0, 7.0, 8.0], vec![2, 2]).with_grad();
+        let c = a.matmul(&b);
+
+        autograd::backward(&ctx, c.id);
+
+        // Gradients should exist
+        assert!(autograd::get_grad(a.id).is_some());
+        assert!(autograd::get_grad(b.id).is_some());
+
+        // Zero grads
+        autograd::zero_grads();
+
+        // Gradients should be gone
+        assert!(autograd::get_grad(a.id).is_none(), "grad(a) should be cleared by zero_grads");
+        assert!(autograd::get_grad(b.id).is_none(), "grad(b) should be cleared by zero_grads");
+
+        // Cleanup
+        autograd::clear_tape();
+    }
+
+    // =========================================================================
+    // GQA: Grouped Query Attention
+    // =========================================================================
+
+    #[test]
+    fn gqa_config_defaults_to_mha() {
+        // All preset configs should have n_kv_heads == n_heads (standard MHA)
+        let configs = [
+            ModelConfig::tiny(1000),
+            ModelConfig::small(1000),
+            ModelConfig::medium(1000),
+            ModelConfig::large(1000),
+        ];
+        for cfg in &configs {
+            assert_eq!(cfg.n_kv_heads, cfg.n_heads,
+                "Preset config should default to MHA (n_kv_heads == n_heads)");
+        }
+    }
+
+    #[test]
+    fn gqa_custom_config() {
+        // n_heads=8, n_kv_heads=2 → group_size=4
+        let cfg = ModelConfig::custom_gqa(1000, 64, 8, 2, 2, 2.0, 128);
+        assert_eq!(cfg.n_heads, 8);
+        assert_eq!(cfg.n_kv_heads, 2);
+        assert_eq!(cfg.kv_dim(), 16); // head_dim=8, kv_dim=8*2=16
+        assert!(cfg.param_count() > 0);
+    }
+
+    #[test]
+    fn gqa_param_count_less_than_mha() {
+        let mha = ModelConfig::custom(1000, 64, 4, 2, 2.0, 128);
+        let gqa = ModelConfig::custom_gqa(1000, 64, 4, 2, 2, 2.0, 128);
+        // GQA with n_kv_heads=2 has fewer params due to smaller K/V projections
+        assert!(gqa.param_count() < mha.param_count(),
+            "GQA ({}) should have fewer params than MHA ({})",
+            gqa.param_count(), mha.param_count());
+    }
+
+    #[test]
+    fn gqa_forward_pass_mha_equivalent() {
+        // With n_kv_heads == n_heads, GQA is standard MHA — forward pass should produce
+        // valid output with correct shapes.
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let cfg = ModelConfig::custom(1000, 64, 4, 2, 2.0, 128);
+            let model = crate::model::Transformer::new(&ctx, cfg);
+
+            let batch = 1;
+            let seq_len = 8;
+            let tokens: Vec<u32> = (0..batch * seq_len).map(|i| (i % 100) as u32).collect();
+
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            // logits shape: [batch * seq_len, vocab_size]
+            assert_eq!(logits.shape, vec![batch * seq_len, 1000]);
+
+            let data = logits.to_vec();
+            for v in &data {
+                assert!(v.is_finite(), "Logit should be finite, got {}", v);
+            }
+        });
+    }
+
+    #[test]
+    fn gqa_forward_pass_with_groups() {
+        // GQA with n_heads=4, n_kv_heads=2 (group_size=2)
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let cfg = ModelConfig::custom_gqa(1000, 64, 4, 2, 2, 2.0, 128);
+            let model = crate::model::Transformer::new(&ctx, cfg);
+
+            let batch = 1;
+            let seq_len = 8;
+            let tokens: Vec<u32> = (0..batch * seq_len).map(|i| (i % 100) as u32).collect();
+
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            assert_eq!(logits.shape, vec![batch * seq_len, 1000]);
+
+            let data = logits.to_vec();
+            for v in &data {
+                assert!(v.is_finite(), "GQA logit should be finite, got {}", v);
+            }
+        });
+    }
+
+    #[test]
+    fn gqa_kv_cache_inference() {
+        // Test that GQA works with KV cache (autoregressive generation)
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let cfg = ModelConfig::custom_gqa(1000, 64, 4, 2, 2, 2.0, 128);
+            let model = crate::model::Transformer::new(&ctx, cfg);
+            let mut kv_caches = model.init_kv_caches_preallocated(1);
+
+            // Prefill with 4 tokens
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+            let logits = model.forward(&tokens, 1, 4, Some(&mut kv_caches), false);
+            assert_eq!(logits.shape, vec![4, 1000]);
+
+            // Autoregressive step: 1 new token
+            let next_token: Vec<u32> = vec![5];
+            let logits2 = model.forward(&next_token, 1, 1, Some(&mut kv_caches), false);
+            assert_eq!(logits2.shape, vec![1, 1000]);
+
+            let data = logits2.to_vec();
+            for v in &data {
+                assert!(v.is_finite(), "GQA KV cache logit should be finite, got {}", v);
+            }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "n_heads (4) must be divisible by n_kv_heads (3)")]
+    fn gqa_invalid_group_size_panics() {
+        // n_heads=4, n_kv_heads=3 is invalid (4 % 3 != 0)
+        ModelConfig::custom_gqa(1000, 64, 4, 3, 2, 2.0, 128);
+    }
 }

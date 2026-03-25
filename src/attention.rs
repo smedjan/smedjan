@@ -3,13 +3,19 @@ use crate::metal::{compute, MetalContext};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
-/// Multi-head attention with rotary positional encoding and KV cache support.
+/// Multi-head attention with rotary positional encoding, KV cache, and
+/// Grouped Query Attention (GQA) support.
+///
+/// When `n_kv_heads < n_heads`, K and V projections are smaller (kv_dim instead
+/// of d_model). Each KV head serves `group_size = n_heads / n_kv_heads` query heads.
+/// When `n_kv_heads == n_heads`, this is standard Multi-Head Attention.
 pub struct MultiHeadAttention {
     pub w_q: Tensor, // [d_model, d_model]
-    pub w_k: Tensor, // [d_model, d_model]
-    pub w_v: Tensor, // [d_model, d_model]
+    pub w_k: Tensor, // [d_model, kv_dim] where kv_dim = head_dim * n_kv_heads
+    pub w_v: Tensor, // [d_model, kv_dim]
     pub w_o: Tensor, // [d_model, d_model]
     pub n_heads: usize,
+    pub n_kv_heads: usize,
     pub head_dim: usize,
     pub d_model: usize,
 }
@@ -94,27 +100,35 @@ impl KvCache {
 }
 
 impl MultiHeadAttention {
-    pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize) -> Self {
+    pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model must be divisible by n_heads");
+        assert!(n_kv_heads <= n_heads, "n_kv_heads must be <= n_heads");
+        assert_eq!(n_heads % n_kv_heads, 0, "n_heads must be divisible by n_kv_heads");
         let head_dim = d_model / n_heads;
+        let kv_dim = head_dim * n_kv_heads;
 
         // Xavier initialization
-        let std_dev = (2.0 / (d_model + d_model) as f32).sqrt();
+        let std_q = (2.0 / (d_model + d_model) as f32).sqrt();
+        let std_kv = (2.0 / (d_model + kv_dim) as f32).sqrt();
 
         Self {
-            w_q: Tensor::randn(ctx, vec![d_model, d_model], std_dev),
-            w_k: Tensor::randn(ctx, vec![d_model, d_model], std_dev),
-            w_v: Tensor::randn(ctx, vec![d_model, d_model], std_dev),
-            w_o: Tensor::randn(ctx, vec![d_model, d_model], std_dev),
+            w_q: Tensor::randn(ctx, vec![d_model, d_model], std_q),
+            w_k: Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+            w_v: Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+            w_o: Tensor::randn(ctx, vec![d_model, d_model], std_q),
             n_heads,
+            n_kv_heads,
             head_dim,
             d_model,
         }
     }
 
-    /// Forward pass.
+    /// Forward pass with Grouped Query Attention support.
     /// x: [batch, seq_len, d_model]
     /// Returns: [batch, seq_len, d_model]
+    ///
+    /// When n_kv_heads < n_heads, K and V are projected to kv_dim = head_dim * n_kv_heads,
+    /// then expanded via repeat_kv to match n_heads before attention computation.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -130,15 +144,15 @@ impl MultiHeadAttention {
 
         // Project Q, K, V — these go through the tape via matmul
         let q = x_flat.matmul(&self.w_q); // [batch*seq, d_model]
-        let k = x_flat.matmul(&self.w_k);
-        let v = x_flat.matmul(&self.w_v);
+        let k = x_flat.matmul(&self.w_k); // [batch*seq, kv_dim]
+        let v = x_flat.matmul(&self.w_v); // [batch*seq, kv_dim]
 
-        // Transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
-        // This is a physical memory rearrangement that must go through the tape.
-        let bh = batch * self.n_heads;
+        // Transpose Q: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
+        let bh_kv = batch * self.n_kv_heads;
         let q = transpose_bsh_to_bhs(&q, batch, seq_len, self.n_heads, self.head_dim);
-        let k = transpose_bsh_to_bhs(&k, batch, seq_len, self.n_heads, self.head_dim);
-        let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_heads, self.head_dim);
+        // Transpose K, V: [batch*seq, n_kv_heads*head_dim] → [batch*n_kv_heads, seq, head_dim]
+        let k = transpose_bsh_to_bhs(&k, batch, seq_len, self.n_kv_heads, self.head_dim);
+        let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
 
         // Apply RoPE to Q and K
         let offset = match &kv_cache {
@@ -149,39 +163,46 @@ impl MultiHeadAttention {
         let k = k.apply_rope(offset, 10000.0);
 
         // Handle KV cache (inference only — no tape needed)
+        // Cache stores n_kv_heads, not n_heads
         let (k_full, v_full) = match kv_cache {
-            Some(cache) => update_kv_cache(cache, &k, &v, bh, self.head_dim),
+            Some(cache) => update_kv_cache(cache, &k, &v, bh_kv, self.head_dim),
             None => (k, v),
+        };
+
+        // Expand KV heads to match Q heads for attention computation.
+        // k_full: [batch*n_kv_heads, seq_k, head_dim] → [batch*n_heads, seq_k, head_dim]
+        let group_size = self.n_heads / self.n_kv_heads;
+        let seq_k = k_full.shape[1];
+        let (k_expanded, v_expanded) = if group_size == 1 {
+            // Standard MHA — no expansion needed
+            (k_full, v_full)
+        } else {
+            (
+                repeat_kv(&k_full, bh_kv, seq_k, self.head_dim, group_size),
+                repeat_kv(&v_full, bh_kv, seq_k, self.head_dim, group_size),
+            )
         };
 
         // --- Attention computation (batched) ---
         // Q: [bh, seq_q, head_dim], K: [bh, seq_k, head_dim], V: [bh, seq_k, head_dim]
-        //
-        // Use batched matmul ops that treat the first dimension as independent batch
-        // elements. This records a single tape entry per op instead of bh entries,
-        // and avoids the slice/concat gradient scatter that caused NaN on larger models.
-
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // scores = Q @ K^T : [bh, seq_q, head_dim] @ [bh, head_dim, seq_k]^T → [bh, seq_q, seq_k]
-        // batched_matmul_trans_b handles B as [bh, seq_k, head_dim] and transposes per element
-        let scores = q.batched_matmul_trans_b(&k_full); // [bh, seq_q, seq_k]
+        let scores = q.batched_matmul_trans_b(&k_expanded); // [bh, seq_q, seq_k]
         let scores = scores.scale(scale);
 
-        // Causal mask — already handles [bh, seq_q, seq_k]
+        // Causal mask
         let scores = scores.causal_mask(offset);
 
-        // Softmax over last dim — handles [bh, seq_q, seq_k] correctly (rows = bh*seq_q, cols = seq_k)
+        // Softmax over last dim
         let weights = scores.softmax(); // [bh, seq_q, seq_k]
 
-        // output = weights @ V : [bh, seq_q, seq_k] @ [bh, seq_k, head_dim] → [bh, seq_q, head_dim]
-        let attn_cat = weights.batched_matmul(&v_full); // [bh, seq_q, head_dim]
+        // output = weights @ V
+        let attn_cat = weights.batched_matmul(&v_expanded); // [bh, seq_q, head_dim]
 
-        // Transpose [bh, seq, head_dim] back to [batch*seq, d_model] using tape-tracked transpose
-        // attn_cat is already [bh, seq_len, head_dim] from batched_matmul
+        // Transpose [bh, seq, head_dim] back to [batch*seq, d_model]
         let attn_combined = transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
 
-        // Output projection — goes through tape
+        // Output projection
         let out = attn_combined.matmul(&self.w_o); // [batch*seq, d_model]
         out.reshape(vec![batch, seq_len, d_model])
     }
@@ -398,4 +419,42 @@ fn concat_seq(
     );
 
     Tensor::from_buffer(Arc::clone(&a.ctx), out_buf, vec![bh, total_len, dim])
+}
+
+/// Expand KV heads for Grouped Query Attention.
+/// Input: [n_kv_heads_total, seq, head_dim] where n_kv_heads_total = batch * n_kv_heads
+/// Output: [n_heads_total, seq, head_dim] where n_heads_total = batch * n_heads
+///
+/// Each KV head is repeated `group_size` times contiguously:
+///   output[h] = input[h / group_size]
+///
+/// This is a GPU buffer copy operation — each KV head's [seq, head_dim] block
+/// is copied `group_size` times into the output.
+fn repeat_kv(
+    kv: &Tensor,
+    n_kv_total: usize,
+    seq_len: usize,
+    head_dim: usize,
+    group_size: usize,
+) -> Tensor {
+    let n_heads_total = n_kv_total * group_size;
+    let head_block = seq_len * head_dim;
+    let out_buf = kv.ctx.alloc_buffer(n_heads_total * head_block * 4);
+
+    for h in 0..n_kv_total {
+        let src_offset = h * head_block;
+        for g in 0..group_size {
+            let dst_offset = (h * group_size + g) * head_block;
+            compute::gpu_buffer_copy(
+                &kv.ctx,
+                &kv.buffer,
+                &out_buf,
+                src_offset as u32,
+                dst_offset as u32,
+                head_block as u32,
+            );
+        }
+    }
+
+    Tensor::from_buffer(Arc::clone(&kv.ctx), out_buf, vec![n_heads_total, seq_len, head_dim])
 }

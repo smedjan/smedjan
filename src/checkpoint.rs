@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // v2: added n_kv_heads for GQA support
 
 /// Save model weights and config to a binary checkpoint file.
 pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::Result<()> {
@@ -64,14 +64,14 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert_eq!(version, VERSION, "Unsupported checkpoint version: {}", version);
+    assert!(version == 1 || version == 2, "Unsupported checkpoint version: {} (expected 1 or 2)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
     let step = u32::from_le_bytes(buf4);
 
     // Config
-    let config = read_config(&mut file)?;
+    let config = read_config(&mut file, version)?;
     eprintln!(
         "Loading checkpoint: step {}, {}M params",
         step,
@@ -140,10 +140,12 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&(config.max_seq_len as u32).to_le_bytes())?;
     file.write_all(&config.rope_theta.to_le_bytes())?;
     file.write_all(&config.norm_eps.to_le_bytes())?;
+    // v2: GQA support
+    file.write_all(&(config.n_kv_heads as u32).to_le_bytes())?;
     Ok(())
 }
 
-fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
+fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelConfig> {
     let mut buf4 = [0u8; 4];
 
     file.read_exact(&mut buf4)?;
@@ -170,10 +172,19 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
     file.read_exact(&mut buf4)?;
     let norm_eps = f32::from_le_bytes(buf4);
 
+    // v2: read n_kv_heads; v1: default to n_heads (standard MHA)
+    let n_kv_heads = if version >= 2 {
+        file.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) as usize
+    } else {
+        n_heads
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
         n_heads,
+        n_kv_heads,
         n_layers,
         ffn_multiplier,
         max_seq_len,

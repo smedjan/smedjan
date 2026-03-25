@@ -374,6 +374,8 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&(config.max_seq_len as u32).to_le_bytes())?;
     file.write_all(&config.rope_theta.to_le_bytes())?;
     file.write_all(&config.norm_eps.to_le_bytes())?;
+    // v2: GQA support
+    file.write_all(&(config.n_kv_heads as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -396,11 +398,17 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
     let rope_theta = f32::from_le_bytes(buf4);
     file.read_exact(&mut buf4)?;
     let norm_eps = f32::from_le_bytes(buf4);
+    // v2: GQA support — read n_kv_heads if available, else default to n_heads
+    let n_kv_heads = match file.read_exact(&mut buf4) {
+        Ok(()) => u32::from_le_bytes(buf4) as usize,
+        Err(_) => n_heads, // v1 checkpoint: no n_kv_heads field
+    };
 
     Ok(ModelConfig {
         vocab_size,
         d_model,
         n_heads,
+        n_kv_heads,
         n_layers,
         ffn_multiplier,
         max_seq_len,

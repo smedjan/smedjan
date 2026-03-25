@@ -13,6 +13,7 @@ pub struct ModelConfig {
     pub vocab_size: u32,
     pub d_model: usize,
     pub n_heads: usize,
+    pub n_kv_heads: usize,    // GQA: number of key/value heads (n_kv_heads <= n_heads)
     pub n_layers: usize,
     pub ffn_multiplier: f32,  // FFN hidden dim = d_model * ffn_multiplier, rounded to multiple of 256
     pub max_seq_len: usize,
@@ -29,6 +30,13 @@ impl ModelConfig {
         raw.div_ceil(256) * 256
     }
 
+    /// Compute the KV projection dimension: head_dim * n_kv_heads.
+    /// For standard MHA (n_kv_heads == n_heads), this equals d_model.
+    pub fn kv_dim(&self) -> usize {
+        let head_dim = self.d_model / self.n_heads;
+        head_dim * self.n_kv_heads
+    }
+
     /// Build a config with exact control over every knob.
     pub fn custom(
         vocab_size: u32,
@@ -38,11 +46,29 @@ impl ModelConfig {
         ffn_multiplier: f32,
         max_seq_len: usize,
     ) -> Self {
+        Self::custom_gqa(vocab_size, d_model, n_heads, n_heads, n_layers, ffn_multiplier, max_seq_len)
+    }
+
+    /// Build a config with Grouped Query Attention.
+    /// n_kv_heads must divide n_heads evenly.
+    pub fn custom_gqa(
+        vocab_size: u32,
+        d_model: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        n_layers: usize,
+        ffn_multiplier: f32,
+        max_seq_len: usize,
+    ) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model must be divisible by n_heads");
+        assert!(n_kv_heads <= n_heads, "n_kv_heads ({}) must be <= n_heads ({})", n_kv_heads, n_heads);
+        assert!(n_kv_heads > 0, "n_kv_heads must be > 0");
+        assert_eq!(n_heads % n_kv_heads, 0, "n_heads ({}) must be divisible by n_kv_heads ({})", n_heads, n_kv_heads);
         Self {
             vocab_size,
             d_model,
             n_heads,
+            n_kv_heads,
             n_layers,
             ffn_multiplier,
             max_seq_len,
@@ -103,10 +129,12 @@ impl ModelConfig {
         let embedding = v * d;
 
         // Per layer:
-        //   attention: 4 * d * d (Q, K, V, O)
+        //   attention Q: d * d, K: d * kv_dim, V: d * kv_dim, O: d * d
         //   ffn: d * ff + ff * d + d * ff = 3 * d * ff (SwiGLU has 3 weight matrices)
         //   norms: 2 * d (ln1, ln2)
-        let per_layer = 4 * d * d + 3 * d * ff + 2 * d;
+        let kv_dim = self.kv_dim();
+        let attn_params = d * d + d * kv_dim + d * kv_dim + d * d; // Q + K + V + O
+        let per_layer = attn_params + 3 * d * ff + 2 * d;
 
         // Final norm
         let final_norm = d;
@@ -127,10 +155,16 @@ impl ModelConfig {
 
     /// Print a summary of this config.
     pub fn summary(&self) -> String {
+        let gqa_info = if self.n_kv_heads == self.n_heads {
+            String::new()
+        } else {
+            format!(", n_kv_heads={}, group_size={}", self.n_kv_heads, self.n_heads / self.n_kv_heads)
+        };
         format!(
-            "d_model={}, n_heads={}, n_layers={}, d_ff={}, seq={}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
+            "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
             self.d_model,
             self.n_heads,
+            gqa_info,
             self.n_layers,
             self.d_ff(),
             self.max_seq_len,
@@ -165,7 +199,7 @@ impl TransformerBlock {
         let _ = layer_idx;
 
         Self {
-            attn: MultiHeadAttention::new(ctx, d, config.n_heads),
+            attn: MultiHeadAttention::new(ctx, d, config.n_heads, config.n_kv_heads),
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
@@ -435,7 +469,7 @@ impl Transformer {
     /// Initialize pre-allocated KV caches for inference (one per layer).
     /// Pre-allocates to max_seq_len to avoid O(n^2) reallocation during generation.
     pub fn init_kv_caches_preallocated(&self, batch: usize) -> Vec<KvCache> {
-        let batch_heads = batch * self.config.n_heads;
+        let batch_heads = batch * self.config.n_kv_heads;
         let head_dim = self.config.d_model / self.config.n_heads;
         let max_seq = self.config.max_seq_len;
         (0..self.config.n_layers)

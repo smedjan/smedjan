@@ -32,6 +32,8 @@ pub struct TrainConfig {
     pub distill_temperature: f32,
     /// Distillation mixing weight: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5.
     pub distill_alpha: f32,
+    /// Gradient accumulation steps. Effective batch = batch_size * grad_accum_steps. Default: 1.
+    pub grad_accum_steps: u32,
 }
 
 impl TrainConfig {
@@ -54,6 +56,7 @@ impl TrainConfig {
             teacher_checkpoint: None,
             distill_temperature: 4.0,
             distill_alpha: 0.5,
+            grad_accum_steps: 1,
         }
     }
 }
@@ -68,9 +71,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         config.model_config.d_model,
         config.model_config.n_heads
     );
+    let effective_batch = config.batch_size * config.grad_accum_steps as usize;
     eprintln!(
-        "Training: batch_size={}, seq_len={}, total_steps={}, gradient_checkpointing={}",
-        config.batch_size, config.seq_len, config.total_steps, config.gradient_checkpointing
+        "Training: batch_size={}, seq_len={}, total_steps={}, gradient_checkpointing={}, grad_accum_steps={}, effective_batch={}",
+        config.batch_size, config.seq_len, config.total_steps, config.gradient_checkpointing,
+        config.grad_accum_steps, effective_batch,
     );
     eprintln!("Tokenizer: {}", config.tokenizer_path);
 
@@ -110,42 +115,62 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut total_tokens: u64 = 0;
     let start_time = Instant::now();
 
+    let grad_accum_steps = config.grad_accum_steps.max(1);
+    let loss_scale = 1.0 / grad_accum_steps as f32;
+
     for step in 0..config.total_steps {
         let step_start = Instant::now();
         let lr = scheduler.get_lr(step);
 
-        // Get batch (wraps around automatically)
-        let (inputs, targets) = data_loader.next_batch();
+        // Track the last micro-step's loss for logging
+        let mut last_loss_tensor: Option<crate::tensor::Tensor> = None;
 
-        // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
-        ctx.begin_batch();
-        let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
+        // === Gradient accumulation loop ===
+        for _micro_step in 0..grad_accum_steps {
+            // Get a micro-batch (DataLoader uses config.batch_size as micro-batch size)
+            let (inputs, targets) = data_loader.next_batch();
 
-        // Compute loss — distillation or plain cross-entropy
-        let (loss_tensor, _grad_logits) = if let Some(ref teacher) = teacher_model {
-            // Teacher forward pass (no gradient recording)
-            let teacher_logits = autograd::no_grad(|| {
-                teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
-            });
-            loss::distillation_loss(
-                ctx,
-                &logits,
-                &teacher_logits,
-                config.distill_temperature,
-                config.distill_alpha,
-                &targets,
-            )
-        } else {
-            loss::cross_entropy_loss(ctx, &logits, &targets)
-        };
-        ctx.flush_batch();
+            // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
+            ctx.begin_batch();
+            let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
 
-        // Backward pass (batched)
-        ctx.begin_batch();
-        autograd::backward(ctx, loss_tensor.id);
-        ctx.flush_batch();
+            // Compute loss — distillation or plain cross-entropy
+            let (loss_tensor, _grad_logits) = if let Some(ref teacher) = teacher_model {
+                // Teacher forward pass (no gradient recording)
+                let teacher_logits = autograd::no_grad(|| {
+                    teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
+                });
+                loss::distillation_loss(
+                    ctx,
+                    &logits,
+                    &teacher_logits,
+                    config.distill_temperature,
+                    config.distill_alpha,
+                    &targets,
+                )
+            } else {
+                loss::cross_entropy_loss(ctx, &logits, &targets)
+            };
 
-        // Gradient clipping (also filters NaN gradients)
+            // Scale loss by 1/grad_accum_steps so gradients naturally average
+            if grad_accum_steps > 1 {
+                compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
+            }
+            ctx.flush_batch();
+
+            // Backward pass — gradients accumulate via accumulate_grad (adds to existing)
+            ctx.begin_batch();
+            autograd::backward(ctx, loss_tensor.id);
+            ctx.flush_batch();
+
+            // Free the tape (activations) but keep accumulated gradients
+            autograd::clear_tape_keep_grads();
+            autograd::clear_recompute_registry();
+
+            last_loss_tensor = Some(loss_tensor);
+        }
+
+        // === After all micro-steps: clip, step, zero ===
         ctx.begin_batch();
         clip_gradients(ctx, &model, config.max_grad_norm);
 
@@ -153,15 +178,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         if lr > 1e-10 {
             optimizer.step(lr);
         }
-        optimizer.zero_grad();
         ctx.flush_batch();
 
-        let tokens_this_step = (config.batch_size * config.seq_len) as u64;
+        // Zero gradients for next accumulation cycle
+        autograd::zero_grads();
+
+        let tokens_this_step = (config.batch_size * config.seq_len * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;
 
         // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)
         if step % config.log_interval == 0 {
-            let loss_val = loss_tensor.to_vec()[0];
+            // Read back the last micro-step's loss (scaled). Undo the scale for display.
+            let raw_loss = last_loss_tensor.as_ref().map(|t| t.to_vec()[0]).unwrap_or(0.0);
+            let loss_val = if grad_accum_steps > 1 { raw_loss / loss_scale } else { raw_loss };
             if loss_val.is_nan() || loss_val.is_infinite() {
                 eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
                 eprintln!("Try: lower --lr, increase --warmup, or check data quality.");

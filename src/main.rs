@@ -4,6 +4,7 @@ mod autograd;
 mod checkpoint;
 mod data;
 mod datapipe;
+mod dpo;
 mod eval;
 mod generate;
 mod loss;
@@ -71,6 +72,9 @@ enum Commands {
         /// Custom: FFN hidden size multiplier (d_ff = dim * ffn_mult)
         #[arg(long)]
         ffn_mult: Option<f32>,
+        /// Custom: number of key/value heads for Grouped Query Attention (defaults to --heads)
+        #[arg(long)]
+        kv_heads: Option<usize>,
         /// Custom: maximum sequence length
         #[arg(long)]
         max_seq: Option<usize>,
@@ -98,6 +102,9 @@ enum Commands {
         /// Distillation alpha: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5
         #[arg(long, default_value = "0.5")]
         distill_alpha: f32,
+        /// Gradient accumulation steps. Effective batch = batch_size * grad_accum. Default: 1
+        #[arg(long, default_value = "1")]
+        grad_accum: u32,
     },
 
     /// Show available model sizes and their param counts
@@ -233,6 +240,46 @@ enum Commands {
         #[arg(long, default_value = "4")]
         bits: u8,
     },
+
+    /// Direct Preference Optimization — align a model using preference pairs
+    Dpo {
+        /// Pre-trained/SFT model checkpoint (policy — will be updated)
+        #[arg(long)]
+        checkpoint: String,
+        /// Reference model checkpoint (frozen anchor — typically same as initial policy)
+        #[arg(long)]
+        ref_checkpoint: String,
+        #[arg(long)]
+        tokenizer: String,
+        /// Binary preference dataset (.bin) — use `dpo-prepare` to create from JSONL
+        #[arg(long)]
+        dataset: String,
+        /// DPO temperature beta (lower = more conservative). Default: 0.1
+        #[arg(long, default_value = "0.1")]
+        beta: f32,
+        #[arg(long, default_value = "1e-6")]
+        lr: f32,
+        #[arg(long, default_value = "512")]
+        max_seq_len: usize,
+        #[arg(long, default_value = "1000")]
+        steps: u32,
+        #[arg(long, default_value = "100")]
+        warmup: u32,
+        #[arg(long, default_value = "dpo_checkpoints")]
+        output_dir: String,
+    },
+
+    /// Convert JSONL preference pairs to binary DPO dataset format
+    DpoPrepare {
+        /// Input JSONL file: {"prompt": "...", "chosen": "...", "rejected": "..."}
+        #[arg(long)]
+        input: String,
+        /// Output binary file
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        tokenizer: String,
+    },
 }
 
 fn main() {
@@ -299,6 +346,7 @@ fn main() {
             layers,
             heads,
             ffn_mult,
+            kv_heads,
             max_seq,
             batch_size,
             seq_len,
@@ -310,6 +358,7 @@ fn main() {
             teacher_checkpoint,
             distill_temperature,
             distill_alpha,
+            grad_accum,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -329,8 +378,9 @@ fn main() {
                     let l = layers.expect("--layers required for custom size");
                     let h = heads.expect("--heads required for custom size");
                     let fm = ffn_mult.unwrap_or(2.67);
+                    let kvh = kv_heads.unwrap_or(h);
                     let ms = max_seq.unwrap_or(512);
-                    model::ModelConfig::custom(vocab_size, d, h, l, fm, ms)
+                    model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
                 }
                 _ => panic!(
                     "Unknown model size: '{}'. Use: tiny, small, medium, large, xl, max, huge, 8b, custom",
@@ -357,6 +407,7 @@ fn main() {
             config.teacher_checkpoint = teacher_checkpoint;
             config.distill_temperature = distill_temperature;
             config.distill_alpha = distill_alpha;
+            config.grad_accum_steps = grad_accum;
 
             train::train(&ctx, &config).expect("Training failed");
         }
@@ -452,6 +503,7 @@ fn main() {
             println!("  Vocab size: {}", c.vocab_size);
             println!("  d_model: {}", c.d_model);
             println!("  n_heads: {}", c.n_heads);
+            println!("  n_kv_heads: {} (group_size={})", c.n_kv_heads, c.n_heads / c.n_kv_heads);
             println!("  n_layers: {}", c.n_layers);
             println!("  d_ff: {}", c.d_ff());
             println!("  ffn_multiplier: {}", c.ffn_multiplier);
@@ -489,7 +541,7 @@ fn main() {
                 );
             }
             println!();
-            println!("Or use --size custom with --dim --layers --heads --ffn-mult --max-seq for any arbitrary config.");
+            println!("Or use --size custom with --dim --layers --heads --kv-heads --ffn-mult --max-seq for any arbitrary config.");
         }
 
         Commands::Process {
@@ -630,6 +682,42 @@ fn main() {
         } => {
             quantize::quantize_checkpoint(&ckpt_path, &output, bits)
                 .expect("Quantization failed");
+        }
+
+        Commands::Dpo {
+            checkpoint: ckpt_path,
+            ref_checkpoint,
+            tokenizer: tok_path,
+            dataset,
+            beta,
+            lr,
+            max_seq_len,
+            steps,
+            warmup,
+            output_dir,
+        } => {
+            let mut config = dpo::DpoConfig::default_dpo(
+                &ckpt_path, &ref_checkpoint, &tok_path, &dataset,
+            );
+            config.beta = beta;
+            config.learning_rate = lr;
+            config.max_seq_len = max_seq_len;
+            config.total_steps = steps;
+            config.warmup_steps = warmup;
+            config.output_dir = output_dir;
+
+            dpo::dpo_train(&ctx, &config).expect("DPO training failed");
+        }
+
+        Commands::DpoPrepare {
+            input,
+            output,
+            tokenizer: tok_path,
+        } => {
+            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
+            let count = dpo::prepare_dpo_dataset(&input, &output, &tok)
+                .expect("DPO data preparation failed");
+            println!("Generated {} preference pairs", count);
         }
     }
 }

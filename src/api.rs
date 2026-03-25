@@ -11,6 +11,7 @@ pub struct ModelInfo {
     pub d_model: usize,
     pub n_layers: usize,
     pub n_heads: usize,
+    pub n_kv_heads: usize,
     pub vocab_size: u32,
     pub step: u32,
 }
@@ -101,6 +102,7 @@ impl AndreAI {
             d_model: c.d_model,
             n_layers: c.n_layers,
             n_heads: c.n_heads,
+            n_kv_heads: c.n_kv_heads,
             vocab_size: c.vocab_size,
             step: self.step,
         }
