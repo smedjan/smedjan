@@ -71,7 +71,7 @@ pub fn gpu_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &Gpu
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, 1);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "matmul_tiled", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
@@ -89,7 +89,7 @@ pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, 1);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "matmul_tiled_trans_b", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
@@ -108,7 +108,7 @@ pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, batch as u64);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "batched_matmul_tiled", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
@@ -127,7 +127,7 @@ pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (m as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, batch as u64);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "batched_matmul_tiled_trans_b", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
@@ -146,7 +146,7 @@ pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (k as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, batch as u64);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "batched_matmul_tiled_trans_a", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
@@ -809,7 +809,7 @@ pub fn gpu_matmul_trans_a(
     let groups_x = (n as u64).div_ceil(tile);
     let groups_y = (k as u64).div_ceil(tile);
     let grid = MetalContext::size(groups_x, groups_y, 1);
-    let tg = MetalContext::size(128, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
 
     dispatch_sync!(ctx, "matmul_trans_a_tiled", grid, tg,
         0 => a, 1 => b, 2 => c, 3 => &params_buf
