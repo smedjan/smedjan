@@ -105,7 +105,9 @@ pub fn distillation_loss(
     compute::gpu_reduce_sum(ctx, &kl_losses_buf, &kl_scalar_buf, batch as u32);
     compute::gpu_scale(ctx, &kl_scalar_buf, 1, 1.0 / batch as f32);
 
-    // Scale KL gradient by alpha * T^2 (the T^2 / batch_size factor is already in the shader)
+    // Scale KL gradient by alpha * T^2.
+    // The shader outputs raw d_KL/d_z = (1/T)(q - p) / batch. Multiplying by alpha * T^2
+    // produces alpha * T * (q - p) / batch = d(alpha * T^2 * KL) / d_z / batch.
     let t_sq = temperature * temperature;
     compute::gpu_scale(ctx, &kl_grad_buf, (batch * vocab) as u32, alpha * t_sq);
 

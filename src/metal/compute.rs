@@ -1023,7 +1023,7 @@ pub fn gpu_temperature_scale(
 /// KL divergence: KL(softmax(teacher/T) || softmax(student/T))
 /// teacher_logits, student_logits: [batch, vocab] flat f32 buffers
 /// losses: [batch] per-sample KL divergence
-/// grad_student: [batch * vocab] gradient w.r.t. student logits (T^2 * (q - p) / batch)
+/// grad_student: [batch * vocab] raw gradient w.r.t. student logits: (1/T) * (q - p) / batch
 pub fn gpu_kl_divergence(
     ctx: &Arc<MetalContext>,
     teacher_logits: &GpuBuffer,

@@ -48,7 +48,13 @@ impl Dataset {
 
     /// Get a slice of tokens (copies into a new Vec). Use get_tokens_slice for zero-copy access.
     pub fn get_tokens(&self, start: usize, len: usize) -> Vec<u32> {
-        self.get_tokens_slice(start, len).to_vec()
+        // For small ranges, use single-token lookup to avoid alignment assumptions.
+        // For larger ranges, use the zero-copy slice path.
+        if len <= 4 {
+            (start..start + len).map(|i| self.get_token(i)).collect()
+        } else {
+            self.get_tokens_slice(start, len).to_vec()
+        }
     }
 
     /// Total number of tokens.
@@ -177,8 +183,11 @@ pub fn pad_sequences(sequences: &[Vec<u32>], max_len: usize) -> Vec<u32> {
 }
 
 /// Verify a dataset shard by round-tripping a sample through a GPU u32 buffer.
+/// Also verifies the GPU transpose kernel by transposing a small matrix and checking the result.
 /// Returns the number of verified tokens. Panics on mismatch.
 pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_size: usize) -> usize {
+    use crate::metal::compute;
+
     let dataset = Dataset::load(dataset_path).expect("Failed to load dataset for verification");
     let count = sample_size.min(dataset.len());
     let tokens = dataset.get_tokens(0, count);
@@ -188,6 +197,34 @@ pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_si
     let readback = MetalContext::read_buffer_u32(&gpu_buf, count);
 
     assert_eq!(tokens, readback, "GPU round-trip verification failed for dataset");
-    eprintln!("Dataset verification passed: {} tokens round-tripped through GPU", count);
+
+    // Verify GPU transpose kernel (sanity check that compute shaders are working correctly).
+    // Transpose a 2x(count/2) float matrix and verify the result, ensuring the shader
+    // pipeline is healthy before we start training on this dataset.
+    if count >= 4 {
+        let rows = 2u32;
+        let cols = (count / 2) as u32;
+        let n = (rows * cols) as usize;
+        let float_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let input_buf = ctx.buffer_from_slice(&float_data);
+        let output_buf = ctx.alloc_buffer(n * 4);
+        compute::gpu_transpose_2d(ctx, &input_buf, &output_buf, rows, cols);
+        let transposed = MetalContext::read_buffer(&output_buf, n);
+
+        // Verify: out[j * rows + i] == in[i * cols + j]
+        for i in 0..rows as usize {
+            for j in 0..cols as usize {
+                let expected = float_data[i * cols as usize + j];
+                let actual = transposed[j * rows as usize + i];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "GPU transpose verification failed at ({}, {}): expected {}, got {}",
+                    i, j, expected, actual
+                );
+            }
+        }
+    }
+
+    eprintln!("Dataset verification passed: {} tokens round-tripped through GPU (transpose OK)", count);
     count
 }

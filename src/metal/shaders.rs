@@ -1874,7 +1874,8 @@ struct KLParams {
 // KL divergence: KL(p || q) where p = softmax(teacher/T), q = softmax(student/T)
 // Per row: compute log-sum-exp for both teacher and student logits (scaled by 1/T),
 // then KL = sum(p * (log_p - log_q)).
-// Also outputs gradient w.r.t. student logits: T^2 * (q - p) / batch_size.
+// Also outputs raw gradient w.r.t. student logits: (1/T) * (q - p) / batch_size.
+// The caller applies alpha * T^2 to produce d(alpha * T^2 * KL)/d_z = alpha * T * (q - p) / batch.
 kernel void kl_divergence(
     device const float* teacher_logits [[buffer(0)]],
     device const float* student_logits [[buffer(1)]],
@@ -1952,10 +1953,10 @@ kernel void kl_divergence(
     // KL = sum(p * (log_p - log_q))
     // log_p_c = t_row[c]*inv_T - t_max - log(t_total)
     // log_q_c = s_row[c]*inv_T - s_max - log(s_total)
-    // grad_student_c = T^2 * (q_c - p_c) / batch_size
+    // Raw gradient: d_KL/d_z_c = (1/T) * (q_c - p_c)
+    // The caller (loss.rs) applies alpha * T^2 scaling to get d(alpha * T^2 * KL)/d_z.
     threadgroup float shared_kl[256];
     float local_kl = 0.0f;
-    float T2 = params.temperature * params.temperature;
     float inv_batch = 1.0f / float(params.batch_size);
     for (uint c = thread_index; c < V; c += threads_per_group) {
         float t_scaled = t_row[c] * inv_T;
@@ -1965,7 +1966,7 @@ kernel void kl_divergence(
         float log_p = t_scaled - t_max - log_t_total;
         float log_q = s_scaled - s_max - log_s_total;
         local_kl += p_c * (log_p - log_q);
-        g_row[c] = T2 * (q_c - p_c) * inv_batch;
+        g_row[c] = inv_T * (q_c - p_c) * inv_batch;
     }
     shared_kl[thread_index] = local_kl;
     threadgroup_barrier(mem_flags::mem_threadgroup);

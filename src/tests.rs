@@ -1079,4 +1079,46 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn gpu_transpose_2d_correctness() {
+        let ctx = test_ctx();
+        // Matrix [2, 3]:
+        // [[1, 2, 3],
+        //  [4, 5, 6]]
+        // Transposed [3, 2]:
+        // [[1, 4],
+        //  [2, 5],
+        //  [3, 6]]
+        let input_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rows = 2u32;
+        let cols = 3u32;
+        let input_buf = ctx.buffer_from_slice(&input_data);
+        let output_buf = ctx.alloc_buffer((rows * cols) as usize * 4);
+
+        crate::metal::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, rows, cols);
+
+        let result = MetalContext::read_buffer(&output_buf, (rows * cols) as usize);
+        let expected = vec![1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(result, expected, "transpose_2d mismatch");
+    }
+
+    #[test]
+    fn gpu_transpose_2d_square() {
+        let ctx = test_ctx();
+        // Square matrix [3, 3]:
+        // [[1, 2, 3],
+        //  [4, 5, 6],
+        //  [7, 8, 9]]
+        let input_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let n = 3u32;
+        let input_buf = ctx.buffer_from_slice(&input_data);
+        let output_buf = ctx.alloc_buffer((n * n) as usize * 4);
+
+        crate::metal::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, n, n);
+
+        let result = MetalContext::read_buffer(&output_buf, (n * n) as usize);
+        let expected = vec![1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0];
+        assert_eq!(result, expected, "transpose_2d square mismatch");
+    }
 }
