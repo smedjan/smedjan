@@ -360,8 +360,8 @@ kernel void rope(
     float freq = 1.0f / pow(params.theta, float(2 * pair) / float(params.head_dim));
     float angle = float(pos + params.offset) * freq;
 
-    float cos_val = cos(angle);
-    float sin_val = sin(angle);
+    float cos_val;
+    float sin_val = sincos(angle, cos_val); // single instruction for both
 
     uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
     uint i0 = base + pair * 2;
@@ -402,8 +402,8 @@ kernel void rope_backward(
 
     float freq = 1.0 / pow(params.theta, float(2 * pair) / float(params.head_dim));
     float angle = float(pos + params.offset) * freq;
-    float cos_val = cos(angle);
-    float sin_val = sin(angle);
+    float cos_val;
+    float sin_val = sincos(angle, cos_val);
 
     uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
     uint i0 = base + 2 * pair;
