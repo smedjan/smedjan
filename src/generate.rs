@@ -44,7 +44,9 @@ pub fn generate(
         // Prefill: process entire prompt at once
         let batch = 1;
         let seq_len = tokens.len();
+        ctx.begin_batch();
         let logits = model.forward(&tokens, batch, seq_len, Some(&mut kv_caches), false);
+        ctx.flush_batch();
 
         // Get last token's logits for next prediction
         let vocab_size = model.config.vocab_size as usize;
@@ -73,7 +75,9 @@ pub fn generate(
             }
 
             // Forward pass on single token (KV cache handles the context)
+            ctx.begin_batch();
             let logits = model.forward(&[next_token], 1, 1, Some(&mut kv_caches), false);
+            ctx.flush_batch();
 
             next_token = if greedy {
                 // PERF-5: GPU-side argmax — reads back 4 bytes instead of 128KB (vocab_size * 4)
@@ -81,8 +85,8 @@ pub fn generate(
             } else {
                 // Temperature scaling on GPU, then read back for CPU sampling
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
-                let logits_data = logits.to_vec();
-                let token_logits = &logits_data[..vocab_size];
+                // Zero-copy: shared memory on Apple Silicon means direct pointer access
+                let token_logits = &logits.as_slice()[..vocab_size];
                 sample_token_prescaled(token_logits, config)
             };
             generated.push(next_token);
@@ -243,10 +247,13 @@ pub fn generate_streaming<F>(
 
         // Prefill
         let seq_len = tokens.len();
+        ctx.begin_batch();
         let logits = model.forward(&tokens, 1, seq_len, Some(&mut kv_caches), false);
+        ctx.flush_batch();
         let vocab_size = model.config.vocab_size as usize;
         let greedy = config.temperature < 0.01;
-        let all_logits = logits.to_vec();
+        // Zero-copy: shared memory on Apple Silicon means direct pointer access
+        let all_logits = logits.as_slice();
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
 
         let mut next_token = sample_token(last_logits, config);
@@ -259,7 +266,9 @@ pub fn generate_streaming<F>(
             let text = tokenizer.decode(&[next_token]);
             on_token(&text);
 
+            ctx.begin_batch();
             let logits = model.forward(&[next_token], 1, 1, Some(&mut kv_caches), false);
+            ctx.flush_batch();
 
             next_token = if greedy {
                 // PERF-5: GPU-side argmax — reads back 4 bytes instead of 128KB

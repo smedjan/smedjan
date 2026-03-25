@@ -119,6 +119,19 @@ impl Tensor {
         MetalContext::read_buffer(&self.buffer, self.numel())
     }
 
+    /// Zero-copy read access to GPU buffer contents as a slice.
+    /// On Apple Silicon with shared memory, this is a direct pointer — no copy.
+    /// The slice is valid only while no GPU writes are pending on this buffer.
+    pub fn as_slice(&self) -> &[f32] {
+        MetalContext::buffer_as_slice(&self.buffer, self.numel())
+    }
+
+    /// Read data into a pre-allocated buffer — avoids allocation in hot loops.
+    pub fn read_into(&self, dst: &mut [f32]) {
+        assert!(dst.len() >= self.numel(), "destination buffer too small");
+        MetalContext::read_buffer_into(&self.buffer, &mut dst[..self.numel()]);
+    }
+
     // ===== Operations =====
 
     /// Matrix multiplication: self @ other

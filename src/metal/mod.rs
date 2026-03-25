@@ -261,6 +261,29 @@ impl MetalContext {
         result
     }
 
+    /// Read float data into a pre-allocated slice — zero allocation in the hot path.
+    /// Returns the number of elements actually copied (min of count and slice length).
+    pub fn read_buffer_into(buf: &GpuBuffer, dst: &mut [f32]) -> usize {
+        Self::auto_flush_batch();
+        let count = dst.len();
+        unsafe {
+            let ptr = buf.contents().as_ptr() as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), count);
+        }
+        count
+    }
+
+    /// Get a direct read-only pointer to buffer contents — true zero-copy.
+    /// SAFETY: The returned slice is valid only while no GPU writes to this buffer.
+    /// Caller must ensure the batch is flushed before calling.
+    pub fn buffer_as_slice(buf: &GpuBuffer, count: usize) -> &[f32] {
+        Self::auto_flush_batch();
+        unsafe {
+            let ptr = buf.contents().as_ptr() as *const f32;
+            std::slice::from_raw_parts(ptr, count)
+        }
+    }
+
     /// Read u32 data back from a buffer.
     pub fn read_buffer_u32(buf: &GpuBuffer, count: usize) -> Vec<u32> {
         // Auto-flush any active batch to ensure GPU data is committed

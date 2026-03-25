@@ -1,8 +1,70 @@
 use super::{GpuBuffer, GpuComputeEncoder, MetalContext};
+use objc2::rc::Retained;
 use objc2_metal::{MTLComputeCommandEncoder as MTLComputeCommandEncoderTrait, MTLDevice, MTLResourceOptions};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Thread-local params buffer pool
+// ---------------------------------------------------------------------------
+// Kernel dispatch params are tiny repr(C) structs (8-32 bytes). Allocating a
+// new Metal buffer for each dispatch is extremely wasteful. Instead we
+// pre-allocate a ring of 64 shared-memory buffers (64 bytes each) and cycle
+// through them. With a pool of 64, even the longest command batch (128
+// encoded commands) will not alias live params because the GPU consumes them
+// before the ring wraps.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static PARAMS_POOL: RefCell<ParamsPool> = RefCell::new(ParamsPool::new());
+}
+
+struct ParamsPool {
+    buffers: Vec<Retained<GpuBuffer>>,
+    index: usize,
+    ctx_initialized: bool,
+}
+
+impl ParamsPool {
+    fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            index: 0,
+            ctx_initialized: false,
+        }
+    }
+
+    fn get(&mut self, ctx: &Arc<MetalContext>, data: *const u8, size: usize) -> Retained<GpuBuffer> {
+        const POOL_SIZE: usize = 64;
+        const BUF_SIZE: usize = 64; // 64 bytes covers all param structs
+
+        if !self.ctx_initialized {
+            let device = ctx.device();
+            let options = MTLResourceOptions::StorageModeShared;
+            self.buffers = (0..POOL_SIZE)
+                .map(|_| {
+                    device
+                        .newBufferWithLength_options(BUF_SIZE, options)
+                        .expect("Failed to allocate params pool buffer")
+                })
+                .collect();
+            self.ctx_initialized = true;
+        }
+
+        let buf = &self.buffers[self.index % POOL_SIZE];
+        self.index = self.index.wrapping_add(1);
+
+        // Copy params data into the pooled buffer
+        unsafe {
+            let ptr = buf.contents().as_ptr();
+            std::ptr::copy_nonoverlapping(data, ptr as *mut u8, size);
+        }
+
+        buf.clone()
+    }
+}
 
 /// Round up to the next power of 2, clamped to [1, 256].
 /// Required for threadgroup reductions in all row-wise kernels.
