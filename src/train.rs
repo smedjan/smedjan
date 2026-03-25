@@ -135,7 +135,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
 
             // Compute loss — distillation or plain cross-entropy
-            let (loss_tensor, _grad_logits) = if let Some(ref teacher) = teacher_model {
+            let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
                 // Teacher forward pass (no gradient recording)
                 let teacher_logits = autograd::no_grad(|| {
                     teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
@@ -152,8 +152,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 loss::cross_entropy_loss(ctx, &logits, &targets)
             };
 
-            // Scale loss by 1/grad_accum_steps so gradients naturally average
+            // Scale both loss AND gradient by 1/grad_accum_steps.
+            // CrossEntropy backward uses the pre-computed gradient (cached buffer),
+            // NOT the loss value, so scaling only the loss leaves gradients 8x too large.
             if grad_accum_steps > 1 {
+                let grad_size = (config.batch_size * config.seq_len * config.model_config.vocab_size as usize) as u32;
+                compute::gpu_scale(ctx, &grad_logits, grad_size, loss_scale);
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
             }
             ctx.flush_batch();

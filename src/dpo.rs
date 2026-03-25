@@ -497,10 +497,10 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
 
         // Inject the DPO gradient as the loss gradient for backward
         let grad_buf = ctx.buffer_from_slice(&chosen_grad_logits);
-        inject_loss_gradient(ctx, &policy_chosen_logits_2, grad_buf);
+        let chosen_loss_id = inject_loss_gradient(ctx, &policy_chosen_logits_2, grad_buf);
 
         ctx.begin_batch();
-        autograd::backward(ctx, policy_chosen_logits_2.id);
+        autograd::backward(ctx, chosen_loss_id);
         ctx.flush_batch();
 
         // Store chosen gradients, then do rejected pass
@@ -525,10 +525,10 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         ctx.flush_batch();
 
         let grad_buf_rej = ctx.buffer_from_slice(&rejected_grad_logits);
-        inject_loss_gradient(ctx, &policy_rejected_logits_2, grad_buf_rej);
+        let rejected_loss_id = inject_loss_gradient(ctx, &policy_rejected_logits_2, grad_buf_rej);
 
         ctx.begin_batch();
-        autograd::backward(ctx, policy_rejected_logits_2.id);
+        autograd::backward(ctx, rejected_loss_id);
         ctx.flush_batch();
 
         // --- Average gradients from chosen + rejected backward passes ---
@@ -638,11 +638,14 @@ fn compute_dpo_logit_gradients(
 
 /// Inject a pre-computed gradient buffer as the loss gradient for backward propagation.
 /// This records a synthetic CrossEntropy tape entry whose cached gradient is our DPO gradient.
+/// Inject a pre-computed gradient as a synthetic loss node on the tape.
+/// Returns the loss tensor ID — backward MUST be called with this ID,
+/// not the logits ID, otherwise the gradient is never visited.
 fn inject_loss_gradient(
     ctx: &Arc<MetalContext>,
     logits: &crate::tensor::Tensor,
     grad_buf: objc2::rc::Retained<crate::metal::GpuBuffer>,
-) {
+) -> usize {
     use crate::autograd::{Op, TapeEntry};
 
     // Create a scalar "loss" tensor for backward to target
@@ -660,6 +663,8 @@ fn inject_loss_gradient(
         shapes: vec![logits.shape.clone(), vec![1]],
         cached: Some(grad_buf),
     });
+
+    loss_id
 }
 
 /// Clip gradients by global L2 norm for DPO training.
@@ -1113,10 +1118,10 @@ mod tests {
         ctx.flush_batch();
 
         let grad_buf = ctx.buffer_from_slice(&chosen_grad_logits);
-        inject_loss_gradient(&ctx, &logits_2, grad_buf);
+        let chosen_loss_id = inject_loss_gradient(&ctx, &logits_2, grad_buf);
 
         ctx.begin_batch();
-        autograd::backward(&ctx, logits_2.id);
+        autograd::backward(&ctx, chosen_loss_id);
         ctx.flush_batch();
 
         autograd::clear_tape_keep_grads();
@@ -1131,10 +1136,10 @@ mod tests {
         ctx.flush_batch();
 
         let grad_buf_rej = ctx.buffer_from_slice(&rejected_grad_logits);
-        inject_loss_gradient(&ctx, &logits_3, grad_buf_rej);
+        let rejected_loss_id = inject_loss_gradient(&ctx, &logits_3, grad_buf_rej);
 
         ctx.begin_batch();
-        autograd::backward(&ctx, logits_3.id);
+        autograd::backward(&ctx, rejected_loss_id);
         ctx.flush_batch();
 
         // Verify gradients exist
