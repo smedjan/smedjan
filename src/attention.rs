@@ -45,6 +45,52 @@ impl KvCache {
     pub fn cached_len(&self) -> usize {
         self.len
     }
+
+    /// Truncate the KV cache to `new_len` positions.
+    /// Used by speculative decoding to roll back rejected draft tokens.
+    /// For pre-allocated caches, this simply adjusts the length counter —
+    /// the stale data beyond `new_len` is never read because attention
+    /// only looks at `[0..len]`. For legacy caches, we must also shrink
+    /// the actual tensors.
+    pub fn truncate(&mut self, new_len: usize) {
+        assert!(new_len <= self.len, "truncate: new_len {} > current len {}", new_len, self.len);
+        if self.capacity > 0 {
+            // Pre-allocated path: just move the length counter back.
+            // The buffer space from new_len..old_len is "dead" and will be
+            // overwritten by the next update_kv_cache call.
+            self.len = new_len;
+        } else {
+            // Legacy path: rebuild tensors from the first new_len positions.
+            if new_len == 0 {
+                self.k = None;
+                self.v = None;
+                self.len = 0;
+            } else {
+                // Extract geometry from existing tensors before mutating self
+                let (bh, old_len, head_dim, ctx_clone) = {
+                    let k = self.k.as_ref().expect("legacy cache must have k");
+                    (k.shape[0], k.shape[1], k.shape[2], Arc::clone(&k.ctx))
+                };
+
+                let k_buf = ctx_clone.alloc_buffer(bh * new_len * head_dim * 4);
+                let v_buf = ctx_clone.alloc_buffer(bh * new_len * head_dim * 4);
+
+                // Copy [0..new_len] from old tensors (which have stride = old_len)
+                compute::gpu_compact_strided_copy(
+                    &ctx_clone, &self.k.as_ref().unwrap().buffer, &k_buf,
+                    bh as u32, new_len as u32, old_len as u32, head_dim as u32,
+                );
+                compute::gpu_compact_strided_copy(
+                    &ctx_clone, &self.v.as_ref().unwrap().buffer, &v_buf,
+                    bh as u32, new_len as u32, old_len as u32, head_dim as u32,
+                );
+
+                self.k = Some(Tensor::from_buffer(Arc::clone(&ctx_clone), k_buf, vec![bh, new_len, head_dim]));
+                self.v = Some(Tensor::from_buffer(ctx_clone, v_buf, vec![bh, new_len, head_dim]));
+                self.len = new_len;
+            }
+        }
+    }
 }
 
 impl MultiHeadAttention {

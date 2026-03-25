@@ -25,6 +25,13 @@ pub struct TrainConfig {
     pub log_interval: u32,
     pub checkpoint_interval: u32,
     pub gradient_checkpointing: bool,
+    /// Knowledge distillation: path to teacher model checkpoint.
+    /// When set, training uses distillation loss instead of plain cross-entropy.
+    pub teacher_checkpoint: Option<String>,
+    /// Distillation temperature (softens teacher/student distributions). Default: 4.0.
+    pub distill_temperature: f32,
+    /// Distillation mixing weight: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5.
+    pub distill_alpha: f32,
 }
 
 impl TrainConfig {
@@ -44,6 +51,9 @@ impl TrainConfig {
             log_interval: 10,
             checkpoint_interval: 5000,
             gradient_checkpointing: false,
+            teacher_checkpoint: None,
+            distill_temperature: 4.0,
+            distill_alpha: 0.5,
         }
     }
 }
@@ -66,6 +76,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
     // Create checkpoint directory
     std::fs::create_dir_all(&config.checkpoint_dir)?;
+
+    // Load teacher model for distillation (frozen, no grad)
+    let teacher_model = match &config.teacher_checkpoint {
+        Some(teacher_path) => {
+            eprintln!("Distillation mode: loading teacher from {}", teacher_path);
+            eprintln!("  temperature={}, alpha={}", config.distill_temperature, config.distill_alpha);
+            let (teacher, _step) = checkpoint::load_checkpoint(ctx, teacher_path)?;
+            Some(teacher)
+        }
+        None => None,
+    };
 
     // Initialize model
     let model = Transformer::new(ctx, config.model_config.clone());
@@ -100,8 +121,23 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         ctx.begin_batch();
         let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
 
-        // Compute loss
-        let (loss_tensor, _grad_logits) = loss::cross_entropy_loss(ctx, &logits, &targets);
+        // Compute loss — distillation or plain cross-entropy
+        let (loss_tensor, _grad_logits) = if let Some(ref teacher) = teacher_model {
+            // Teacher forward pass (no gradient recording)
+            let teacher_logits = autograd::no_grad(|| {
+                teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
+            });
+            loss::distillation_loss(
+                ctx,
+                &logits,
+                &teacher_logits,
+                config.distill_temperature,
+                config.distill_alpha,
+                &targets,
+            )
+        } else {
+            loss::cross_entropy_loss(ctx, &logits, &targets)
+        };
         ctx.flush_batch();
 
         // Backward pass (batched)

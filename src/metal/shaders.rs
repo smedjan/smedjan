@@ -1861,6 +1861,128 @@ kernel void batched_matmul_tiled_trans_b(
 /// A^T is [K, M], so C[b][i,j] = sum_m A[b][m,i] * B[b][m,j]
 /// Uses group_id.z as the batch index. Single dispatch for all batch elements.
 /// Used in backward pass for computing dB = A^T @ dC.
+pub const KL_DIVERGENCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct KLParams {
+    uint batch_size;
+    uint vocab_size;
+    float temperature;
+};
+
+// KL divergence: KL(p || q) where p = softmax(teacher/T), q = softmax(student/T)
+// Per row: compute log-sum-exp for both teacher and student logits (scaled by 1/T),
+// then KL = sum(p * (log_p - log_q)).
+// Also outputs gradient w.r.t. student logits: T^2 * (q - p) / batch_size.
+kernel void kl_divergence(
+    device const float* teacher_logits [[buffer(0)]],
+    device const float* student_logits [[buffer(1)]],
+    device float* losses [[buffer(2)]],
+    device float* grad_student [[buffer(3)]],
+    constant KLParams& params [[buffer(4)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    uint row = group_id;
+    if (row >= params.batch_size) return;
+
+    uint V = params.vocab_size;
+    float inv_T = 1.0f / params.temperature;
+    device const float* t_row = teacher_logits + row * V;
+    device const float* s_row = student_logits + row * V;
+    device float* g_row = grad_student + row * V;
+
+    // Phase 1: Find max of teacher/T and student/T for numerical stability
+    threadgroup float shared_t_max[256];
+    threadgroup float shared_s_max[256];
+    float local_t_max = -INFINITY;
+    float local_s_max = -INFINITY;
+    for (uint c = thread_index; c < V; c += threads_per_group) {
+        local_t_max = max(local_t_max, t_row[c] * inv_T);
+        local_s_max = max(local_s_max, s_row[c] * inv_T);
+    }
+    shared_t_max[thread_index] = local_t_max;
+    shared_s_max[thread_index] = local_s_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            shared_t_max[thread_index] = max(shared_t_max[thread_index], shared_t_max[thread_index + stride]);
+            shared_s_max[thread_index] = max(shared_s_max[thread_index], shared_s_max[thread_index + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float t_max = shared_t_max[0];
+    float s_max = shared_s_max[0];
+
+    // Phase 2: Compute exp sums for both distributions
+    threadgroup float shared_t_sum[256];
+    threadgroup float shared_s_sum[256];
+    float local_t_sum = 0.0f;
+    float local_s_sum = 0.0f;
+    for (uint c = thread_index; c < V; c += threads_per_group) {
+        float t_exp = exp(t_row[c] * inv_T - t_max);
+        float s_exp = exp(s_row[c] * inv_T - s_max);
+        // Store exps temporarily in grad buffer (will overwrite with actual grad below)
+        g_row[c] = s_exp;
+        local_t_sum += t_exp;
+        local_s_sum += s_exp;
+    }
+    shared_t_sum[thread_index] = local_t_sum;
+    shared_s_sum[thread_index] = local_s_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            shared_t_sum[thread_index] += shared_t_sum[thread_index + stride];
+            shared_s_sum[thread_index] += shared_s_sum[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float t_total = shared_t_sum[0];
+    float s_total = shared_s_sum[0];
+    float inv_t_total = 1.0f / t_total;
+    float inv_s_total = 1.0f / s_total;
+    float log_t_total = log(t_total);
+    float log_s_total = log(s_total);
+
+    // Phase 3: Compute KL divergence and gradient
+    // KL = sum(p * (log_p - log_q))
+    // log_p_c = t_row[c]*inv_T - t_max - log(t_total)
+    // log_q_c = s_row[c]*inv_T - s_max - log(s_total)
+    // grad_student_c = T^2 * (q_c - p_c) / batch_size
+    threadgroup float shared_kl[256];
+    float local_kl = 0.0f;
+    float T2 = params.temperature * params.temperature;
+    float inv_batch = 1.0f / float(params.batch_size);
+    for (uint c = thread_index; c < V; c += threads_per_group) {
+        float t_scaled = t_row[c] * inv_T;
+        float s_scaled = s_row[c] * inv_T;
+        float p_c = exp(t_scaled - t_max) * inv_t_total;
+        float q_c = g_row[c] * inv_s_total; // g_row[c] still holds s_exp from phase 2
+        float log_p = t_scaled - t_max - log_t_total;
+        float log_q = s_scaled - s_max - log_s_total;
+        local_kl += p_c * (log_p - log_q);
+        g_row[c] = T2 * (q_c - p_c) * inv_batch;
+    }
+    shared_kl[thread_index] = local_kl;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            shared_kl[thread_index] += shared_kl[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0) {
+        losses[row] = shared_kl[0];
+    }
+}
+"#;
+
 pub const BATCHED_MATMUL_TILED_TRANS_A: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

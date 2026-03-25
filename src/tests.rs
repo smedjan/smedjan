@@ -943,4 +943,140 @@ mod tests {
             }
         });
     }
+
+    // =========================================================================
+    // Knowledge Distillation
+    // =========================================================================
+
+    #[test]
+    fn kl_divergence_identical_distributions_is_zero() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // Two identical logit distributions — KL divergence should be ~0
+            let batch = 4;
+            let vocab = 32;
+            let logits: Vec<f32> = (0..batch * vocab)
+                .map(|i| ((i as f32) * 0.1).sin())
+                .collect();
+
+            let teacher = Tensor::from_slice(&ctx, &logits, vec![batch, vocab]);
+            let student = Tensor::from_slice(&ctx, &logits, vec![batch, vocab]);
+            let targets: Vec<u32> = (0..batch).map(|i| (i % vocab) as u32).collect();
+
+            let (loss, _grad) = crate::loss::distillation_loss(
+                &ctx,
+                &student,
+                &teacher,
+                4.0,  // temperature
+                1.0,  // alpha=1.0 means pure KL (no CE component)
+                &targets,
+            );
+
+            let loss_val = loss.to_vec()[0];
+            assert!(
+                loss_val.abs() < 0.01,
+                "KL divergence of identical distributions should be ~0, got {}",
+                loss_val
+            );
+        });
+    }
+
+    #[test]
+    fn kl_divergence_different_distributions_is_positive() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let batch = 4;
+            let vocab = 32;
+            let teacher_logits: Vec<f32> = (0..batch * vocab)
+                .map(|i| ((i as f32) * 0.1).sin() * 2.0)
+                .collect();
+            let student_logits: Vec<f32> = (0..batch * vocab)
+                .map(|i| ((i as f32) * 0.3).cos() * 1.5)
+                .collect();
+
+            let teacher = Tensor::from_slice(&ctx, &teacher_logits, vec![batch, vocab]);
+            let student = Tensor::from_slice(&ctx, &student_logits, vec![batch, vocab]);
+            let targets: Vec<u32> = (0..batch).map(|i| (i % vocab) as u32).collect();
+
+            let (loss, _grad) = crate::loss::distillation_loss(
+                &ctx,
+                &student,
+                &teacher,
+                4.0,
+                1.0,  // pure KL
+                &targets,
+            );
+
+            let loss_val = loss.to_vec()[0];
+            assert!(
+                loss_val > 0.0,
+                "KL divergence of different distributions should be positive, got {}",
+                loss_val
+            );
+        });
+    }
+
+    #[test]
+    fn distillation_loss_combines_kl_and_ce() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let batch = 4;
+            let vocab = 32;
+            let teacher_logits: Vec<f32> = (0..batch * vocab)
+                .map(|i| ((i as f32) * 0.1).sin())
+                .collect();
+            let student_logits: Vec<f32> = (0..batch * vocab)
+                .map(|i| ((i as f32) * 0.2).cos())
+                .collect();
+
+            let teacher = Tensor::from_slice(&ctx, &teacher_logits, vec![batch, vocab]);
+            let student = Tensor::from_slice(&ctx, &student_logits, vec![batch, vocab]);
+            let targets: Vec<u32> = (0..batch).map(|i| (i % vocab) as u32).collect();
+
+            // Pure KL (alpha=1)
+            let (kl_loss, _) = crate::loss::distillation_loss(
+                &ctx,
+                &Tensor::from_slice(&ctx, &student_logits, vec![batch, vocab]),
+                &Tensor::from_slice(&ctx, &teacher_logits, vec![batch, vocab]),
+                4.0,
+                1.0,
+                &targets,
+            );
+
+            // Pure CE (alpha=0)
+            let (ce_loss, _) = crate::loss::distillation_loss(
+                &ctx,
+                &Tensor::from_slice(&ctx, &student_logits, vec![batch, vocab]),
+                &Tensor::from_slice(&ctx, &teacher_logits, vec![batch, vocab]),
+                4.0,
+                0.0,
+                &targets,
+            );
+
+            // Mixed (alpha=0.5)
+            let (mixed_loss, _) = crate::loss::distillation_loss(
+                &ctx,
+                &student,
+                &teacher,
+                4.0,
+                0.5,
+                &targets,
+            );
+
+            let kl_val = kl_loss.to_vec()[0];
+            let ce_val = ce_loss.to_vec()[0];
+            let mixed_val = mixed_loss.to_vec()[0];
+
+            // Mixed should be between pure KL and pure CE (approximately)
+            // Actually: mixed = 0.5 * T^2 * KL + 0.5 * CE, while kl_val = 1.0 * T^2 * KL, ce_val = 1.0 * CE
+            // So mixed = 0.5 * kl_val + 0.5 * ce_val
+            let expected = 0.5 * kl_val + 0.5 * ce_val;
+            let diff = (mixed_val - expected).abs();
+            assert!(
+                diff < 0.1,
+                "Mixed loss {} should be ~0.5*KL({}) + 0.5*CE({}) = {}, diff={}",
+                mixed_val, kl_val, ce_val, expected, diff
+            );
+        });
+    }
 }

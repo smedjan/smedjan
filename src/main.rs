@@ -89,6 +89,15 @@ enum Commands {
         /// Enable gradient checkpointing (trades 2x compute for ~60% less activation memory)
         #[arg(long, default_value = "false")]
         gradient_checkpointing: bool,
+        /// Knowledge distillation: path to teacher model checkpoint
+        #[arg(long)]
+        teacher_checkpoint: Option<String>,
+        /// Distillation temperature (softens distributions, higher = softer). Default: 4.0
+        #[arg(long, default_value = "4.0")]
+        distill_temperature: f32,
+        /// Distillation alpha: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5
+        #[arg(long, default_value = "0.5")]
+        distill_alpha: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -115,6 +124,15 @@ enum Commands {
         top_k: usize,
         #[arg(long, default_value = "false")]
         stream: bool,
+        /// Enable speculative decoding with a smaller draft model
+        #[arg(long, default_value = "false")]
+        speculative: bool,
+        /// Path to the draft model checkpoint (required when --speculative is set)
+        #[arg(long)]
+        draft_checkpoint: Option<String>,
+        /// Number of speculative tokens per verification step
+        #[arg(long, default_value = "8")]
+        draft_tokens: usize,
     },
 
     /// Show model info from a checkpoint
@@ -289,6 +307,9 @@ fn main() {
             warmup,
             checkpoint_dir,
             gradient_checkpointing,
+            teacher_checkpoint,
+            distill_temperature,
+            distill_alpha,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -333,6 +354,9 @@ fn main() {
             config.max_lr = lr;
             config.warmup_steps = warmup;
             config.gradient_checkpointing = gradient_checkpointing;
+            config.teacher_checkpoint = teacher_checkpoint;
+            config.distill_temperature = distill_temperature;
+            config.distill_alpha = distill_alpha;
 
             train::train(&ctx, &config).expect("Training failed");
         }
@@ -346,6 +370,9 @@ fn main() {
             top_p,
             top_k,
             stream,
+            speculative,
+            draft_checkpoint,
+            draft_tokens,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             let (model, step) = if ckpt_path.ends_with(".qbin") {
@@ -353,7 +380,7 @@ fn main() {
             } else {
                 checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint")
             };
-            eprintln!("Loaded model at step {}", step);
+            eprintln!("Loaded main model at step {}", step);
 
             let mut config = generate::SamplingConfig::default();
             config.temperature = temperature;
@@ -361,17 +388,55 @@ fn main() {
             config.top_k = top_k;
             config.max_tokens = max_tokens;
 
-            if stream {
-                print!("{}", prompt);
-                generate::generate_streaming(&ctx, &model, &tok, &prompt, &config, |token_str| {
-                    print!("{}", token_str);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                });
-                println!();
+            if speculative {
+                let draft_ckpt = draft_checkpoint.expect(
+                    "--draft-checkpoint is required when --speculative is set"
+                );
+                let (draft_model, draft_step) = if draft_ckpt.ends_with(".qbin") {
+                    quantize::load_quantized(&ctx, &draft_ckpt)
+                        .expect("Failed to load quantized draft checkpoint")
+                } else {
+                    checkpoint::load_checkpoint(&ctx, &draft_ckpt)
+                        .expect("Failed to load draft checkpoint")
+                };
+                eprintln!("Loaded draft model at step {}", draft_step);
+
+                assert_eq!(
+                    model.config.vocab_size, draft_model.config.vocab_size,
+                    "Main and draft models must have the same vocab_size (main={}, draft={})",
+                    model.config.vocab_size, draft_model.config.vocab_size
+                );
+
+                if stream {
+                    print!("{}", prompt);
+                    generate::generate_speculative_streaming(
+                        &ctx, &model, &draft_model, &tok, &prompt, &config, draft_tokens,
+                        |token_str| {
+                            print!("{}", token_str);
+                            use std::io::Write;
+                            std::io::stdout().flush().ok();
+                        },
+                    );
+                    println!();
+                } else {
+                    let output = generate::generate_speculative(
+                        &ctx, &model, &draft_model, &tok, &prompt, &config, draft_tokens,
+                    );
+                    println!("{}{}", prompt, output);
+                }
             } else {
-                let output = generate::generate(&ctx, &model, &tok, &prompt, &config);
-                println!("{}{}", prompt, output);
+                if stream {
+                    print!("{}", prompt);
+                    generate::generate_streaming(&ctx, &model, &tok, &prompt, &config, |token_str| {
+                        print!("{}", token_str);
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    });
+                    println!();
+                } else {
+                    let output = generate::generate(&ctx, &model, &tok, &prompt, &config);
+                    println!("{}{}", prompt, output);
+                }
             }
         }
 

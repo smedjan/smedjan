@@ -119,6 +119,7 @@ impl MetalContext {
             ("batched_matmul_tiled", shaders::BATCHED_MATMUL_TILED),
             ("batched_matmul_tiled_trans_b", shaders::BATCHED_MATMUL_TILED_TRANS_B),
             ("batched_matmul_tiled_trans_a", shaders::BATCHED_MATMUL_TILED_TRANS_A),
+            ("kl_divergence", shaders::KL_DIVERGENCE),
         ];
 
         let compile_options = MTLCompileOptions::new();

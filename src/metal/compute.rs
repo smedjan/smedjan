@@ -1019,3 +1019,31 @@ pub fn gpu_temperature_scale(
         0 => data, 1 => &params_buf
     );
 }
+
+/// KL divergence: KL(softmax(teacher/T) || softmax(student/T))
+/// teacher_logits, student_logits: [batch, vocab] flat f32 buffers
+/// losses: [batch] per-sample KL divergence
+/// grad_student: [batch * vocab] gradient w.r.t. student logits (T^2 * (q - p) / batch)
+pub fn gpu_kl_divergence(
+    ctx: &Arc<MetalContext>,
+    teacher_logits: &GpuBuffer,
+    student_logits: &GpuBuffer,
+    losses: &GpuBuffer,
+    grad_student: &GpuBuffer,
+    batch_size: u32,
+    vocab_size: u32,
+    temperature: f32,
+) {
+    #[repr(C)]
+    struct Params { batch_size: u32, vocab_size: u32, temperature: f32 }
+    let params = Params { batch_size, vocab_size, temperature };
+    let params_buf = params_buffer(ctx, &params);
+
+    let threads_per_group = next_power_of_2_clamped(vocab_size as u64);
+    let grid = MetalContext::size(batch_size as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
+
+    dispatch_sync!(ctx, "kl_divergence", grid, tg,
+        0 => teacher_logits, 1 => student_logits, 2 => losses, 3 => grad_student, 4 => &params_buf
+    );
+}
