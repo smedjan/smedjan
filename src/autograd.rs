@@ -106,7 +106,9 @@ pub fn clear_tape() {
     TAPE.with(|tape| {
         let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
         for entry in entries {
-            // Recycle intermediate buffers back to the pool
+            // Recycle output and cached buffers — these are unique to the tape entry.
+            // Input buffers are shared refs to source tensors and MUST NOT be recycled
+            // (model parameters still hold references to them).
             MetalContext::recycle_buffer(entry.output_buffer);
             if let Some(cached) = entry.cached {
                 MetalContext::recycle_buffer(cached);
