@@ -173,10 +173,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
 
         // === After all micro-steps: clip, step, zero ===
-        ctx.begin_batch();
+        // Gradient clipping every step (required for stability).
+        // clip_gradients does its own GPU batching internally.
         clip_gradients(ctx, &model, config.max_grad_norm);
 
-        // Optimizer step (skip if lr is effectively zero to avoid NaN momentum from 0*NaN)
+        // Optimizer step
+        ctx.begin_batch();
         if lr > 1e-10 {
             optimizer.step(lr);
         }
@@ -260,8 +262,6 @@ fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
 
     // Phase 1: Compute all per-parameter L2 norms + NaN checks on GPU (batched).
-    // Uses l2_norm_check which returns [sum_sq, nan_flag] per param — avoids
-    // the sqrt in the shader so we can accumulate sum_sq directly.
     let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
 
     ctx.begin_batch();
@@ -276,7 +276,7 @@ fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     }
     ctx.flush_batch();
 
-    // Phase 2: Read all norms back from GPU (single CPU pass after all GPU work is done).
+    // Phase 2: Read all norms back (shared memory = direct pointer, no DMA).
     let mut total_norm_sq = 0.0f32;
     let mut nan_indices = Vec::new();
     for (i, entry) in norm_bufs.iter().enumerate() {
