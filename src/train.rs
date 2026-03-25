@@ -159,16 +159,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let tokens_this_step = (config.batch_size * config.seq_len) as u64;
         total_tokens += tokens_this_step;
 
-        // NaN detection — abort early to save time
-        let loss_val = loss_tensor.to_vec()[0];
-        if loss_val.is_nan() || loss_val.is_infinite() {
-            eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
-            eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
-            break;
-        }
-
-        // Logging
+        // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)
         if step % config.log_interval == 0 {
+            let loss_val = loss_tensor.to_vec()[0];
+            if loss_val.is_nan() || loss_val.is_infinite() {
+                eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
+                eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
+                break;
+            }
             let step_time = step_start.elapsed().as_secs_f32();
             let tokens_per_sec = tokens_this_step as f32 / step_time;
             let elapsed = start_time.elapsed().as_secs();
