@@ -160,10 +160,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 compute::gpu_scale(ctx, &grad_logits, grad_size, loss_scale);
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
             }
-            ctx.flush_batch();
 
-            // Backward pass — gradients accumulate via accumulate_grad (adds to existing)
-            ctx.begin_batch();
+            // Backward pass in the SAME command batch as forward — one fewer GPU sync
             autograd::backward(ctx, loss_tensor.id);
             ctx.flush_batch();
 
