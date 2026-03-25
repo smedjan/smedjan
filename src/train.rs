@@ -179,14 +179,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             let (pool_hits, pool_misses) = MetalContext::pool_stats();
 
-            // Periodic gradient health check: report weight L2 norm of first param
-            // Uses gpu_l2_norm_check for a single GPU->CPU readback (8 bytes).
-            let param0 = &model.parameters()[0];
-            let (weight_norm_sq, has_nan) = compute::gpu_l2_norm_check(ctx, &param0.buffer, param0.numel() as u32);
-            let weight_norm = weight_norm_sq.sqrt();
-            if has_nan {
-                eprintln!("[WARN] NaN detected in model weights at step {}", step);
-            }
+            // Periodic weight health check: every 100 steps to avoid GPU→CPU sync overhead.
+            // gpu_l2_norm_check forces a batch flush + readback (8 bytes).
+            let weight_norm = if step % 100 == 0 {
+                let param0 = &model.parameters()[0];
+                let (weight_norm_sq, has_nan) = compute::gpu_l2_norm_check(ctx, &param0.buffer, param0.numel() as u32);
+                if has_nan {
+                    eprintln!("[WARN] NaN detected in model weights at step {}", step);
+                }
+                weight_norm_sq.sqrt()
+            } else {
+                0.0
+            };
 
             eprintln!(
                 "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens | epoch {} ({}/{}) | pool {}/{} | w_norm {:.4}",
