@@ -56,6 +56,9 @@ pub enum Op {
     /// Fused residual add + RMS norm: output = rms_norm(a + b, weight, eps)
     /// inputs: [a, b, weight], cached: (a+b) buffer for backward
     RmsNormResidual { eps: f32 },
+    /// GQA KV head expansion: repeat each KV head group_size times.
+    /// Backward: sum group_size gradient blocks back into each KV head.
+    RepeatKv { n_kv_heads: usize, group_size: usize, head_block: usize },
 }
 
 /// A single entry on the autodiff tape.
@@ -299,6 +302,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::RmsNormResidual { eps } => {
                     backward_rms_norm_residual(ctx, entry, &out_grad, *eps);
+                }
+                Op::RepeatKv { n_kv_heads, group_size, head_block } => {
+                    backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *head_block);
                 }
                 Op::Silu => {
                     backward_silu(ctx, entry, &out_grad);
@@ -642,6 +648,9 @@ fn backward_checkpoint(
             Op::Softmax => backward_softmax(ctx, &sub_entry, &sub_out_grad),
             Op::RmsNorm { eps } => backward_rms_norm(ctx, &sub_entry, &sub_out_grad, *eps),
             Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, &sub_entry, &sub_out_grad, *eps),
+            Op::RepeatKv { n_kv_heads, group_size, head_block } => {
+                backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *head_block);
+            }
             Op::Silu => backward_silu(ctx, &sub_entry, &sub_out_grad),
             Op::SiluGate => backward_silu_gate(ctx, &sub_entry, &sub_out_grad),
             Op::Reshape => backward_reshape(ctx, &sub_entry, &sub_out_grad),
@@ -836,4 +845,40 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], &db_total, batches * n * k);
+}
+
+/// RepeatKv backward: sum group_size gradient blocks back into each KV head.
+/// out_grad: [n_kv_heads * group_size, seq, head_dim], input grad: [n_kv_heads, seq, head_dim]
+fn backward_repeat_kv(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    n_kv_heads: usize,
+    group_size: usize,
+    head_block: usize,
+) {
+    // For each KV head, sum the gradients from its group_size copies
+    let kv_grad = ctx.alloc_buffer(n_kv_heads * head_block * 4);
+
+    for h in 0..n_kv_heads {
+        // First copy: initialize the KV head's gradient with the first group member
+        let src_offset = (h * group_size) * head_block;
+        let dst_offset = h * head_block;
+        compute::gpu_buffer_copy(ctx, out_grad, &kv_grad, src_offset as u32, dst_offset as u32, head_block as u32);
+
+        // Remaining copies: add (in-place) the other group members
+        for g in 1..group_size {
+            let src_offset = (h * group_size + g) * head_block;
+            // Need a temp buffer to add from
+            let tmp = ctx.alloc_buffer(head_block * 4);
+            compute::gpu_buffer_copy(ctx, out_grad, &tmp, src_offset as u32, 0, head_block as u32);
+            // Add tmp into kv_grad at the right offset — use a sub-buffer view
+            let dst_sub = ctx.alloc_buffer(head_block * 4);
+            compute::gpu_buffer_copy(ctx, &kv_grad, &dst_sub, dst_offset as u32, 0, head_block as u32);
+            compute::gpu_add_inplace(ctx, &dst_sub, &tmp, head_block as u32);
+            compute::gpu_buffer_copy(ctx, &dst_sub, &kv_grad, 0, dst_offset as u32, head_block as u32);
+        }
+    }
+
+    accumulate_grad(ctx, entry.inputs[0], &kv_grad, n_kv_heads * head_block);
 }

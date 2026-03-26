@@ -6,6 +6,7 @@ use crate::metal::compute;
 use crate::metal::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::{AdamW, CosineWarmupScheduler};
+use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +41,8 @@ pub struct TrainConfig {
     pub val_dataset: Option<String>,
     /// Dropout rate for regularization. Default: 0.0 (no dropout).
     pub dropout: f32,
+    /// LR restart period (steps). 0 = standard cosine decay, >0 = warm restarts.
+    pub lr_restart_period: u32,
 }
 
 impl TrainConfig {
@@ -66,6 +69,7 @@ impl TrainConfig {
             resume_from: None,
             val_dataset: None,
             dropout: 0.0,
+            lr_restart_period: 0,
         }
     }
 }
@@ -90,6 +94,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
     // Create checkpoint directory
     std::fs::create_dir_all(&config.checkpoint_dir)?;
+
+    // Training log file (CSV: step, loss, lr, tok/s, elapsed, tokens)
+    let log_path = format!("{}/train.csv", config.checkpoint_dir);
+    let log_exists = std::path::Path::new(&log_path).exists();
+    let mut log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    if !log_exists {
+        writeln!(log_file, "step,loss,lr,tok_per_sec,elapsed_sec,total_tokens")?;
+    }
 
     // Load teacher model for distillation (frozen, no grad)
     let teacher_model = match &config.teacher_checkpoint {
@@ -125,12 +137,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         (model, optimizer, 0, 0u64)
     };
 
-    // Learning rate scheduler
-    let scheduler = CosineWarmupScheduler::new(
-        config.max_lr,
-        config.warmup_steps,
-        config.total_steps,
-    );
+    // Learning rate scheduler (with optional warm restarts)
+    let scheduler = if config.lr_restart_period > 0 {
+        CosineWarmupScheduler::with_restarts(config.max_lr, config.warmup_steps, config.total_steps, config.lr_restart_period)
+    } else {
+        CosineWarmupScheduler::new(config.max_lr, config.warmup_steps, config.total_steps)
+    };
 
     // Data loader
     let mut data_loader = DataLoader::new(&config.dataset_path, config.batch_size, config.seq_len)?;
@@ -141,6 +153,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let start_time = Instant::now();
 
     let grad_accum_steps = config.grad_accum_steps.max(1);
+
+    // Early stopping state
+    let mut best_val_loss = f32::INFINITY;
+    let mut val_no_improve = 0u32;
+    let early_stop_patience = 3; // stop after 3 checkpoint intervals without val improvement
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     for step in start_step..config.total_steps {
@@ -264,6 +281,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 pool_hits + pool_misses,
                 weight_norm,
             );
+
+            // Write to CSV log file
+            let _ = writeln!(log_file, "{},{:.6},{:.6e},{:.1},{},{}", step, loss_val, lr, tokens_per_sec, elapsed, total_tokens);
         }
 
         // Checkpointing — save both model-only and full training state for resume
@@ -274,11 +294,23 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
         }
 
-        // Validation loss (if validation dataset provided)
+        // Validation loss + early stopping (if validation dataset provided)
         if let Some(ref val_path) = config.val_dataset {
             if step > 0 && step % config.checkpoint_interval == 0 {
                 let val_loss = compute_validation_loss(ctx, &model, val_path, config.batch_size, config.seq_len)?;
-                eprintln!("  val_loss: {:.4}", val_loss);
+                let _ = writeln!(log_file, "# val_loss={:.6} at step {}", val_loss, step);
+                if val_loss < best_val_loss {
+                    best_val_loss = val_loss;
+                    val_no_improve = 0;
+                    eprintln!("  val_loss: {:.4} (new best)", val_loss);
+                } else {
+                    val_no_improve += 1;
+                    eprintln!("  val_loss: {:.4} (no improve {}/{})", val_loss, val_no_improve, early_stop_patience);
+                    if early_stop_patience > 0 && val_no_improve >= early_stop_patience {
+                        eprintln!("Early stopping: val_loss didn't improve for {} checks", early_stop_patience);
+                        break;
+                    }
+                }
             }
         }
     }

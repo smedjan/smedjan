@@ -18,6 +18,7 @@ pub struct MultiHeadAttention {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub d_model: usize,
+    pub rope_theta: f32,
 }
 
 /// KV cache for autoregressive inference.
@@ -100,7 +101,7 @@ impl KvCache {
 }
 
 impl MultiHeadAttention {
-    pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize) -> Self {
+    pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model must be divisible by n_heads");
         assert!(n_kv_heads <= n_heads, "n_kv_heads must be <= n_heads");
         assert_eq!(n_heads % n_kv_heads, 0, "n_heads must be divisible by n_kv_heads");
@@ -120,6 +121,7 @@ impl MultiHeadAttention {
             n_kv_heads,
             head_dim,
             d_model,
+            rope_theta,
         }
     }
 
@@ -159,8 +161,8 @@ impl MultiHeadAttention {
             Some(cache) => cache.cached_len() as u32,
             None => 0,
         };
-        let q = q.apply_rope(offset, 10000.0);
-        let k = k.apply_rope(offset, 10000.0);
+        let q = q.apply_rope(offset, self.rope_theta);
+        let k = k.apply_rope(offset, self.rope_theta);
 
         // Handle KV cache (inference only — no tape needed)
         // Cache stores n_kv_heads, not n_heads
@@ -456,5 +458,27 @@ fn repeat_kv(
         }
     }
 
-    Tensor::from_buffer(Arc::clone(&kv.ctx), out_buf, vec![n_heads_total, seq_len, head_dim])
+    let out_id = autograd::next_id();
+    let out = Tensor {
+        id: out_id,
+        buffer: out_buf.clone(),
+        shape: vec![n_heads_total, seq_len, head_dim],
+        requires_grad: kv.requires_grad,
+        ctx: Arc::clone(&kv.ctx),
+    };
+
+    // Record on tape: backward sums group_size gradient blocks into each KV head
+    if kv.requires_grad || autograd::is_recording() {
+        autograd::record(autograd::TapeEntry {
+            op: autograd::Op::RepeatKv { n_kv_heads: n_kv_total, group_size, head_block },
+            inputs: vec![kv.id],
+            output: out_id,
+            input_buffers: vec![kv.buffer.clone()],
+            output_buffer: out_buf,
+            shapes: vec![kv.shape.clone(), out.shape.clone()],
+            cached: None,
+        });
+    }
+
+    out
 }

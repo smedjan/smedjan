@@ -173,6 +173,15 @@ impl ModelConfig {
             self.inference_memory_bytes() as f64 / (1024.0 * 1024.0),
         )
     }
+
+    /// Apply NTK-aware RoPE scaling to extend context length beyond max_seq_len.
+    /// factor = desired_context / max_seq_len. theta_scaled = theta * factor.
+    pub fn with_rope_scaling(&self, factor: f32) -> Self {
+        let mut config = self.clone();
+        config.rope_theta *= factor;
+        config.max_seq_len = (config.max_seq_len as f32 * factor) as usize;
+        config
+    }
 }
 
 /// A single transformer block (pre-norm architecture).
@@ -199,7 +208,7 @@ impl TransformerBlock {
         let _ = layer_idx;
 
         Self {
-            attn: MultiHeadAttention::new(ctx, d, config.n_heads, config.n_kv_heads),
+            attn: MultiHeadAttention::new(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta),
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),

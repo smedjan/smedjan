@@ -108,12 +108,15 @@ impl AdamW {
     }
 }
 
-/// Cosine warmup learning rate scheduler.
+/// Cosine warmup learning rate scheduler with optional warm restarts.
+/// When restart_period > 0, the cosine cycle repeats every restart_period steps
+/// (after warmup), resetting LR to max_lr. This is SGDR (Loshchilov & Hutter, 2017).
 pub struct CosineWarmupScheduler {
     pub max_lr: f32,
     pub min_lr: f32,
     pub warmup_steps: u32,
     pub total_steps: u32,
+    pub restart_period: u32, // 0 = no restarts (standard cosine decay)
 }
 
 impl CosineWarmupScheduler {
@@ -123,24 +126,39 @@ impl CosineWarmupScheduler {
             min_lr: max_lr * 0.1,
             warmup_steps,
             total_steps,
+            restart_period: 0,
+        }
+    }
+
+    pub fn with_restarts(max_lr: f32, warmup_steps: u32, total_steps: u32, restart_period: u32) -> Self {
+        Self {
+            max_lr,
+            min_lr: max_lr * 0.1,
+            warmup_steps,
+            total_steps,
+            restart_period,
         }
     }
 
     pub fn get_lr(&self, step: u32) -> f32 {
         if step < self.warmup_steps {
-            // Linear warmup: scale from 0 to max_lr
-            // Guard against warmup_steps == 0 (return max_lr immediately)
             if self.warmup_steps == 0 {
                 return self.max_lr;
             }
             self.max_lr * (step as f32 / self.warmup_steps as f32)
         } else if self.total_steps <= self.warmup_steps {
-            // No decay phase: total_steps == warmup_steps means all warmup
             self.max_lr
         } else {
-            let progress = (step - self.warmup_steps) as f32
-                / (self.total_steps - self.warmup_steps) as f32;
-            let progress = progress.min(1.0);
+            let decay_step = step - self.warmup_steps;
+            let decay_total = self.total_steps - self.warmup_steps;
+
+            let progress = if self.restart_period > 0 {
+                // Warm restarts: progress resets every restart_period steps
+                (decay_step % self.restart_period) as f32 / self.restart_period as f32
+            } else {
+                (decay_step as f32 / decay_total as f32).min(1.0)
+            };
+
             self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
         }
     }

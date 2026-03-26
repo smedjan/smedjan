@@ -114,6 +114,9 @@ enum Commands {
         /// Dropout rate (0.0 = no dropout). Default: 0.0
         #[arg(long, default_value = "0.0")]
         dropout: f32,
+        /// LR warm restart period (steps). 0 = standard cosine. Default: 0
+        #[arg(long, default_value = "0")]
+        lr_restart: u32,
     },
 
     /// Show available model sizes and their param counts
@@ -371,6 +374,7 @@ fn main() {
             resume,
             val_dataset,
             dropout,
+            lr_restart,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -423,6 +427,7 @@ fn main() {
             config.resume_from = resume;
             config.val_dataset = val_dataset;
             config.dropout = dropout;
+            config.lr_restart_period = lr_restart;
 
             train::train(&ctx, &config).expect("Training failed");
         }
