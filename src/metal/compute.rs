@@ -4,9 +4,9 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-/// Round up to the next power of 2, clamped to [1, 512].
+/// Round up to the next power of 2, clamped to [1, 256].
 /// Required for threadgroup reductions in all row-wise kernels.
-/// 512 threads × 2 shared arrays × 4 bytes = 4KB — fits in 32KB threadgroup memory.
+/// 256 threads × 2 shared arrays × 4 bytes = 2KB — fits in 32KB threadgroup memory.
 #[inline]
 fn next_power_of_2_clamped(n: u64) -> u64 {
     let clamped = n.min(256).max(1) as u32;
