@@ -125,12 +125,29 @@ pub fn clear_tape() {
 /// Used in gradient accumulation: after each micro-step's backward pass we free the tape
 /// to reclaim activation memory, but keep gradients so the next micro-step accumulates on top.
 pub fn clear_tape_keep_grads() {
+    use objc2_metal::MTLBuffer;
+
+    // Collect gradient buffer contents() pointers so we don't recycle shared buffers.
+    // A buffer in GRADS that's also in the tape (output_buffer/cached) must NOT be recycled,
+    // or the next micro-step's forward pass would overwrite the gradient via pool reuse.
+    let grad_ptrs: std::collections::HashSet<usize> = GRADS.with(|grads| {
+        grads.borrow().values().map(|buf| {
+            unsafe { buf.contents().as_ptr() as usize }
+        }).collect()
+    });
+
     TAPE.with(|tape| {
         let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
         for entry in entries {
-            MetalContext::recycle_buffer(entry.output_buffer);
+            let out_ptr = unsafe { entry.output_buffer.contents().as_ptr() as usize };
+            if !grad_ptrs.contains(&out_ptr) {
+                MetalContext::recycle_buffer(entry.output_buffer);
+            }
             if let Some(cached) = entry.cached {
-                MetalContext::recycle_buffer(cached);
+                let cached_ptr = unsafe { cached.contents().as_ptr() as usize };
+                if !grad_ptrs.contains(&cached_ptr) {
+                    MetalContext::recycle_buffer(cached);
+                }
             }
         }
     });
