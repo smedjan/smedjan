@@ -134,7 +134,8 @@ impl Tensor {
 
     // ===== Operations =====
 
-    /// Cast tensor contents to FP16 buffer. Returns a GpuBuffer with half-precision data.
+    /// Cast tensor contents to FP16 buffer with safe clamping.
+    /// Clamps values to [-65504, 65504] (half max) before cast to prevent overflow→NaN.
     /// Size in bytes = numel * 2. Does NOT create a Tensor — just a raw buffer.
     pub fn cast_to_f16(&self) -> Retained<crate::metal::GpuBuffer> {
         let size = self.numel();
@@ -167,8 +168,7 @@ impl Tensor {
         let out_size = total_m * n;
         let out_buf = self.ctx.alloc_buffer(out_size * 4);
 
-        // For non-batched: use FP16 matmul (cast inputs to half, compute, output float)
-        // Cast cost is amortized by halved memory bandwidth in the matmul kernel.
+        // FP16 matmul with clamped cast — prevents NaN from half overflow
         if batch == 1 {
             let a_f16 = self.cast_to_f16();
             let b_f16 = other.cast_to_f16();

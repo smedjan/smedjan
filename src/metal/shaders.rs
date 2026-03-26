@@ -55,7 +55,7 @@ kernel void matmul_tiled(
             uint c = flat % TILE;
             uint global_r = tile_row + r;
             uint global_c = k_block + c;
-            As[r][c] = (half)((global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f);
+            As[r][c] = (half)(clamp((global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f, -65504.0f, 65504.0f));
         }
 
         // Load B tile: cast float→half on load
@@ -65,7 +65,7 @@ kernel void matmul_tiled(
             uint c = flat % TILE;
             uint global_r = k_block + r;
             uint global_c = tile_col + c;
-            Bs[r][c] = (half)((global_r < K && global_c < N) ? B[global_r * N + global_c] : 0.0f);
+            Bs[r][c] = (half)(clamp((global_r < K && global_c < N) ? B[global_r * N + global_c] : 0.0f, -65504.0f, 65504.0f));
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -152,7 +152,7 @@ kernel void matmul_tiled_trans_b(
             uint c = flat % TILE;
             uint global_r = tile_row + r;
             uint global_c = k_block + c;
-            As[r][c] = (half)((global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f);
+            As[r][c] = (half)(clamp((global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f, -65504.0f, 65504.0f));
         }
 
         for (uint i = 0; i < 16; i++) {
@@ -161,7 +161,7 @@ kernel void matmul_tiled_trans_b(
             uint c = flat % TILE;
             uint global_k = k_block + r;
             uint global_n = tile_col + c;
-            Bs[r][c] = (half)((global_k < K && global_n < N) ? B[global_n * K + global_k] : 0.0f);
+            Bs[r][c] = (half)(clamp((global_k < K && global_n < N) ? B[global_n * K + global_k] : 0.0f, -65504.0f, 65504.0f));
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1319,7 +1319,7 @@ kernel void matmul_trans_a_tiled(
             uint c = flat % TILE_TA;
             uint global_k = tile_row + r;
             uint global_m = m_block + c;
-            As[r][c] = (half)((global_k < K && global_m < M) ? A[global_m * K + global_k] : 0.0f);
+            As[r][c] = (half)(clamp((global_k < K && global_m < M) ? A[global_m * K + global_k] : 0.0f, -65504.0f, 65504.0f));
         }
 
         for (uint i = 0; i < 16; i++) {
@@ -1328,7 +1328,7 @@ kernel void matmul_trans_a_tiled(
             uint c = flat % TILE_TA;
             uint global_m = m_block + r;
             uint global_n = tile_col + c;
-            Bs[r][c] = (half)((global_m < M && global_n < N) ? B[global_m * N + global_n] : 0.0f);
+            Bs[r][c] = (half)(clamp((global_m < M && global_n < N) ? B[global_m * N + global_n] : 0.0f, -65504.0f, 65504.0f));
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2083,7 +2083,9 @@ kernel void cast_f32_to_f16(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid < size) {
-        output[gid] = (half)input[gid];
+        // Clamp to half range [-65504, 65504] to prevent overflow→NaN
+        float val = clamp(input[gid], -65504.0f, 65504.0f);
+        output[gid] = (half)val;
     }
 }
 "#;
@@ -2472,13 +2474,13 @@ kernel void batched_matmul_tiled_trans_a_f16(
             uint flat = thread_index * 16 + i;
             uint r = flat / BM_TILE; uint c = flat % BM_TILE;
             uint gk = tile_row + r; uint gm = m_block + c;
-            As[r][c] = (half)((gk < K && gm < M) ? A_b[gm * K + gk] : 0.0f);
+            As[r][c] = (half)(clamp((gk < K && gm < M) ? A_b[gm * K + gk] : 0.0f, -65504.0f, 65504.0f));
         }
         for (uint i = 0; i < 16; i++) {
             uint flat = thread_index * 16 + i;
             uint r = flat / BM_TILE; uint c = flat % BM_TILE;
             uint gm = m_block + r; uint gn = tile_col + c;
-            Bs[r][c] = (half)((gm < M && gn < N) ? B_b[gm * N + gn] : 0.0f);
+            Bs[r][c] = (half)(clamp((gm < M && gn < N) ? B_b[gm * N + gn] : 0.0f, -65504.0f, 65504.0f));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

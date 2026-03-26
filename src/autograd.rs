@@ -394,19 +394,15 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retain
     let k = a_shape[rank_a - 1];
     let n = b_shape[rank_b - 1];
 
-    // FP16 backward: cast inputs to half for bandwidth savings
-    let grad_f16 = cast_buf_f16(ctx, out_grad, m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], k * n);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], m * k);
-
+    // Backward uses FP32 matmul — FP16 backward causes NaN from gradient accumulation errors
     // dA = dC @ B^T : [M, N] @ [N, K] = [M, K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_trans_b_f16(ctx, &grad_f16, &b_f16, &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = A^T @ dC : [K, M] @ [M, N] = [K, N]
     let db_buf = ctx.alloc_buffer(k * n * 4);
-    compute::gpu_matmul_trans_a_f16(ctx, &a_f16, &grad_f16, &db_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, k * n);
 }
 
@@ -423,19 +419,15 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     let k = a_shape[1];
     let n = b_shape[0];
 
-    // FP16 backward
-    let grad_f16 = cast_buf_f16(ctx, out_grad, m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], n * k);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], m * k);
-
+    // Backward uses FP32 — FP16 gradients cause NaN accumulation
     // dA = dC @ B : [M,N] @ [N,K] = [M,K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_f16(ctx, &grad_f16, &b_f16, &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
     let db_buf = ctx.alloc_buffer(n * k * 4);
-    compute::gpu_matmul_trans_a_f16(ctx, &grad_f16, &a_f16, &db_buf, m as u32, n as u32, k as u32);
+    compute::gpu_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_buf, m as u32, n as u32, k as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, n * k);
 }
 
