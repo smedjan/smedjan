@@ -134,6 +134,15 @@ impl Tensor {
 
     // ===== Operations =====
 
+    /// Cast tensor contents to FP16 buffer. Returns a GpuBuffer with half-precision data.
+    /// Size in bytes = numel * 2. Does NOT create a Tensor — just a raw buffer.
+    pub fn cast_to_f16(&self) -> Retained<crate::metal::GpuBuffer> {
+        let size = self.numel();
+        let f16_buf = self.ctx.alloc_buffer(size * 2);
+        compute::gpu_cast_f32_to_f16(&self.ctx, &self.buffer, &f16_buf, size as u32);
+        f16_buf
+    }
+
     /// Matrix multiplication: self @ other
     /// self: [..., M, K], other: [..., K, N] → [..., M, N]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
@@ -158,9 +167,12 @@ impl Tensor {
         let out_size = total_m * n;
         let out_buf = self.ctx.alloc_buffer(out_size * 4);
 
-        // For batched matmul, dispatch per batch element
+        // For non-batched: use FP16 matmul (cast inputs to half, compute, output float)
+        // Cast cost is amortized by halved memory bandwidth in the matmul kernel.
         if batch == 1 {
-            compute::gpu_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+            let a_f16 = self.cast_to_f16();
+            let b_f16 = other.cast_to_f16();
+            compute::gpu_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
         } else {
             // Sequential batch dispatch — each batch element is a separate matmul
             // All operations stay on GPU — no CPU readback

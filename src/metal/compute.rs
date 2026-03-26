@@ -77,6 +77,48 @@ pub fn gpu_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &Gpu
     );
 }
 
+/// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
+pub fn gpu_cast_f32_to_f16(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let size_buf = params_buffer(ctx, &size);
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "cast_f32_to_f16", grid, tg,
+        0 => input, 1 => output, 2 => &size_buf
+    );
+}
+
+/// Cast float16 buffer to float32. Output buffer must be size * 4 bytes.
+pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let size_buf = params_buffer(ctx, &size);
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "cast_f16_to_f32", grid, tg,
+        0 => input, 1 => output, 2 => &size_buf
+    );
+}
+
+/// C(f32) = A(f16) @ B(f16) — FP16 inputs, FP32 output. Halves memory bandwidth.
+pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, 1);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "matmul_tiled_f16", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
 /// C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
 pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
     #[repr(C)]
