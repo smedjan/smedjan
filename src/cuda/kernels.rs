@@ -3,34 +3,20 @@
 
 /// All kernel names that get loaded into the CUDA module.
 pub const KERNEL_NAMES: &[&str] = &[
-    "matmul_tiled",
-    "matmul_tiled_trans_b",
-    "matmul_trans_a_tiled",
-    "softmax",
-    "rms_norm",
-    "rope",
-    "rope_backward",
-    "add_kernel",
-    "mul_kernel",
-    "silu_gate",
-    "cross_entropy",
-    "reduce_sum",
-    "adamw_update",
-    "embedding_lookup",
-    "scale_kernel",
-    "fill_kernel",
-    "cast_f32_to_f16",
-    "cast_f16_to_f32",
-    "add_inplace",
-    "copy_kernel",
-    "silu_backward",
-    "silu_gate_backward",
-    "rms_norm_backward",
-    "softmax_backward",
-    "embedding_backward",
-    "causal_mask",
-    "l2_norm_check",
-    "buffer_copy",
+    "matmul_tiled", "matmul_tiled_trans_b", "matmul_trans_a_tiled",
+    "batched_matmul_tiled", "batched_matmul_tiled_trans_b", "batched_matmul_tiled_trans_a",
+    "matmul_tiled_f16", "matmul_tiled_trans_b_f16", "matmul_trans_a_tiled_f16",
+    "softmax", "rms_norm", "rms_norm_residual",
+    "rope", "rope_backward",
+    "add_kernel", "add_inplace", "mul_kernel", "scale_kernel", "fill_kernel", "copy_kernel",
+    "silu", "silu_gate",
+    "cross_entropy", "reduce_sum", "kl_divergence",
+    "adamw_update", "embedding_lookup",
+    "cast_f32_to_f16", "cast_f16_to_f32",
+    "transpose_perm_forward", "transpose_perm_backward", "transpose_2d", "causal_mask",
+    "compact_strided_copy", "strided_batch_copy", "buffer_copy",
+    "silu_backward", "silu_gate_backward", "rms_norm_backward", "softmax_backward", "embedding_backward",
+    "l2_norm_check", "argmax", "temperature_scale", "gradient_mask", "zero_rows",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -660,3 +646,483 @@ extern "C" __global__ void embedding_backward(
     atomicAdd(&grad_table[tokens[pos] * dim + d], grad_out[pos * dim + d]);
 }
 "#;
+
+// ============================================================
+// BATCHED MATMUL: C[b] = A[b] @ B[b]
+// ============================================================
+extern "C" __global__ void batched_matmul_tiled(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * K * N;
+    float* C_b = C + batch_idx * M * N;
+
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x * 16 + i, r = f / 32, c = f % 32;
+            int gr = tile_row + r, gc = kb + c;
+            float v = (gr < M && gc < K) ? A_b[gr*K+gc] : 0.0f;
+            As[r][c] = __float2half(fminf(fmaxf(v, -65504.f), 65504.f));
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x * 16 + i, r = f / 32, c = f % 32;
+            int gr = kb + r, gc = tile_col + c;
+            float v = (gr < K && gc < N) ? B_b[gr*N+gc] : 0.0f;
+            Bs[r][c] = __float2half(fminf(fmaxf(v, -65504.f), 65504.f));
+        }
+        __syncthreads();
+        for (int k = 0; k < 32; k++) {
+            __half av[4], bv[4];
+            for (int i=0;i<4;i++) av[i] = As[local_row*4+i][k];
+            for (int j=0;j<4;j++) bv[j] = Bs[k][local_col*4+j];
+            for (int i=0;i<4;i++) for (int j=0;j<4;j++)
+                acc[i][j] += __half2float(__hmul(av[i], bv[j]));
+        }
+        __syncthreads();
+    }
+    for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+        int gr = tile_row + local_row*4+i, gc = tile_col + local_col*4+j;
+        if (gr < M && gc < N) C_b[gr*N+gc] = acc[i][j];
+    }
+}
+
+// Batched C[b] = A[b] @ B[b]^T
+extern "C" __global__ void batched_matmul_tiled_trans_b(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * N * K;
+    float* C_b = C + batch_idx * M * N;
+
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = tile_row+r, gc = kb+c;
+            float v = (gr<M&&gc<K) ? A_b[gr*K+gc] : 0.f;
+            As[r][c] = __float2half(fminf(fmaxf(v,-65504.f),65504.f));
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gk = kb+r, gn = tile_col+c;
+            float v = (gk<K&&gn<N) ? B_b[gn*K+gk] : 0.f;
+            Bs[r][c] = __float2half(fminf(fmaxf(v,-65504.f),65504.f));
+        }
+        __syncthreads();
+        for (int k=0;k<32;k++) {
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+// Batched C[b] = A[b]^T @ B[b]
+extern "C" __global__ void batched_matmul_tiled_trans_a(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * M * N;
+    float* C_b = C + batch_idx * K * N;
+
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+
+    for (int mb = 0; mb < M; mb += 32) {
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gk=tile_row+r, gm=mb+c;
+            float v=(gk<K&&gm<M)?A_b[gm*K+gk]:0.f;
+            As[r][c]=__float2half(fminf(fmaxf(v,-65504.f),65504.f));
+        }
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gm=mb+r, gn=tile_col+c;
+            float v=(gm<M&&gn<N)?B_b[gm*N+gn]:0.f;
+            Bs[r][c]=__float2half(fminf(fmaxf(v,-65504.f),65504.f));
+        }
+        __syncthreads();
+        for(int m=0;m<32;m++){
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][m];
+            for(int j=0;j<4;j++) bv[j]=Bs[m][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<K&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+// ============================================================
+// FP16-INPUT MATMUL VARIANTS (half* inputs, float output)
+// ============================================================
+extern "C" __global__ void matmul_tiled_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    int local_row=threadIdx.x/8, local_col=threadIdx.x%8;
+    int tile_row=blockIdx.y*32, tile_col=blockIdx.x*32;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4]={{0.f}};
+    for(int kb=0;kb<K;kb+=32){
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gr=tile_row+r,gc=kb+c;
+            As[r][c]=(gr<M&&gc<K)?A[gr*K+gc]:__float2half(0.f);
+        }
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gr=kb+r,gc=tile_col+c;
+            Bs[r][c]=(gr<K&&gc<N)?B[gr*N+gc]:__float2half(0.f);
+        }
+        __syncthreads();
+        for(int k=0;k<32;k++){
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i,gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C[gr*N+gc]=acc[i][j];
+    }
+}
+
+extern "C" __global__ void matmul_tiled_trans_b_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    int local_row=threadIdx.x/8, local_col=threadIdx.x%8;
+    int tile_row=blockIdx.y*32, tile_col=blockIdx.x*32;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4]={{0.f}};
+    for(int kb=0;kb<K;kb+=32){
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gr=tile_row+r,gc=kb+c;
+            As[r][c]=(gr<M&&gc<K)?A[gr*K+gc]:__float2half(0.f);
+        }
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gk=kb+r,gn=tile_col+c;
+            Bs[r][c]=(gk<K&&gn<N)?B[gn*K+gk]:__float2half(0.f);
+        }
+        __syncthreads();
+        for(int k=0;k<32;k++){
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i,gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C[gr*N+gc]=acc[i][j];
+    }
+}
+
+extern "C" __global__ void matmul_trans_a_tiled_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int K, unsigned int N
+) {
+    int local_row=threadIdx.x/8, local_col=threadIdx.x%8;
+    int tile_row=blockIdx.y*32, tile_col=blockIdx.x*32;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4]={{0.f}};
+    for(int mb=0;mb<M;mb+=32){
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gk=tile_row+r,gm=mb+c;
+            As[r][c]=(gk<K&&gm<M)?A[gm*K+gk]:__float2half(0.f);
+        }
+        for(int i=0;i<16;i++){
+            int f=threadIdx.x*16+i,r=f/32,c=f%32;
+            int gm=mb+r,gn=tile_col+c;
+            Bs[r][c]=(gm<M&&gn<N)?B[gm*N+gn]:__float2half(0.f);
+        }
+        __syncthreads();
+        for(int m=0;m<32;m++){
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][m];
+            for(int j=0;j<4;j++) bv[j]=Bs[m][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i,gc=tile_col+local_col*4+j;
+        if(gr<K&&gc<N) C[gr*N+gc]=acc[i][j];
+    }
+}
+
+// ============================================================
+// TRANSPOSE PERMUTATION (for attention reshape)
+// ============================================================
+extern "C" __global__ void transpose_perm_forward(
+    const float* input, float* output,
+    unsigned int batch, unsigned int seq_len, unsigned int n_heads, unsigned int head_dim
+) {
+    // [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n_heads * seq_len * head_dim;
+    if (idx >= total) return;
+
+    int hd = idx % head_dim;
+    int s = (idx / head_dim) % seq_len;
+    int h = (idx / (head_dim * seq_len)) % n_heads;
+    int b = idx / (head_dim * seq_len * n_heads);
+
+    int src = (b * seq_len + s) * (n_heads * head_dim) + h * head_dim + hd;
+    output[idx] = input[src];
+}
+
+extern "C" __global__ void transpose_perm_backward(
+    const float* grad_out, float* grad_in,
+    unsigned int batch, unsigned int seq_len, unsigned int n_heads, unsigned int head_dim
+) {
+    // [batch*n_heads, seq, head_dim] → [batch*seq, n_heads*head_dim]
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n_heads * seq_len * head_dim;
+    if (idx >= total) return;
+
+    int hd = idx % head_dim;
+    int s = (idx / head_dim) % seq_len;
+    int h = (idx / (head_dim * seq_len)) % n_heads;
+    int b = idx / (head_dim * seq_len * n_heads);
+
+    int dst = (b * seq_len + s) * (n_heads * head_dim) + h * head_dim + hd;
+    grad_in[dst] = grad_out[idx];
+}
+
+// ============================================================
+// RMS NORM RESIDUAL (fused add + norm)
+// ============================================================
+extern "C" __global__ void rms_norm_residual(
+    const float* a, const float* b, const float* weight,
+    float* output, float* sum_out,
+    unsigned int rows, unsigned int cols, float eps
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x, nt = blockDim.x;
+
+    const float* ra = a + row * cols;
+    const float* rb = b + row * cols;
+    float* ro = output + row * cols;
+    float* rs = sum_out + row * cols;
+
+    // Compute sum and sum-of-squares
+    __shared__ float shared_ss[256];
+    float local_ss = 0.0f;
+    for (int c = tid; c < cols; c += nt) {
+        float s = ra[c] + rb[c];
+        rs[c] = s;
+        local_ss += s * s;
+    }
+    shared_ss[tid] = local_ss;
+    __syncthreads();
+    for (int s = nt/2; s > 0; s >>= 1) {
+        if (tid < s) shared_ss[tid] += shared_ss[tid+s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(shared_ss[0] / (float)cols + eps);
+    for (int c = tid; c < cols; c += nt)
+        ro[c] = rs[c] * inv_rms * weight[c];
+}
+
+// ============================================================
+// KV CACHE OPERATIONS
+// ============================================================
+extern "C" __global__ void compact_strided_copy(
+    const float* src, float* dst,
+    unsigned int src_stride, unsigned int dst_stride,
+    unsigned int copy_len, unsigned int n_rows
+) {
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= n_rows || col >= copy_len) return;
+    dst[row * dst_stride + col] = src[row * src_stride + col];
+}
+
+extern "C" __global__ void strided_batch_copy(
+    const float* src, float* dst,
+    unsigned int src_offset, unsigned int dst_offset,
+    unsigned int copy_len, unsigned int src_stride, unsigned int dst_stride,
+    unsigned int n_rows
+) {
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= n_rows || col >= copy_len) return;
+    dst[row * dst_stride + dst_offset + col] = src[row * src_stride + src_offset + col];
+}
+
+// ============================================================
+// KL DIVERGENCE (for distillation)
+// ============================================================
+extern "C" __global__ void kl_divergence(
+    const float* teacher, const float* student,
+    float* losses, float* grad_student,
+    unsigned int batch, unsigned int vocab, float temperature
+) {
+    int row = blockIdx.x;
+    if (row >= batch) return;
+    int tid = threadIdx.x, nt = blockDim.x;
+    float inv_T = 1.0f / temperature;
+
+    const float* t_row = teacher + row * vocab;
+    const float* s_row = student + row * vocab;
+    float* g_row = grad_student + row * vocab;
+
+    // Teacher max + sum
+    __shared__ float sh_tmax[256], sh_tsum[256];
+    float t_max = -1e30f;
+    for (int c = tid; c < vocab; c += nt) t_max = fmaxf(t_max, t_row[c] * inv_T);
+    sh_tmax[tid] = t_max;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) { if(tid<s) sh_tmax[tid]=fmaxf(sh_tmax[tid],sh_tmax[tid+s]); __syncthreads(); }
+    t_max = sh_tmax[0];
+    float t_sum = 0.0f;
+    for (int c = tid; c < vocab; c += nt) t_sum += expf(t_row[c]*inv_T - t_max);
+    sh_tsum[tid] = t_sum;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) { if(tid<s) sh_tsum[tid]+=sh_tsum[tid+s]; __syncthreads(); }
+    float t_log_sum = logf(sh_tsum[0]) + t_max;
+
+    // Student max + sum
+    __shared__ float sh_smax[256], sh_ssum[256];
+    float s_max = -1e30f;
+    for (int c = tid; c < vocab; c += nt) s_max = fmaxf(s_max, s_row[c] * inv_T);
+    sh_smax[tid] = s_max;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) { if(tid<s) sh_smax[tid]=fmaxf(sh_smax[tid],sh_smax[tid+s]); __syncthreads(); }
+    s_max = sh_smax[0];
+    float s_sum = 0.0f;
+    for (int c = tid; c < vocab; c += nt) s_sum += expf(s_row[c]*inv_T - s_max);
+    sh_ssum[tid] = s_sum;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) { if(tid<s) sh_ssum[tid]+=sh_ssum[tid+s]; __syncthreads(); }
+    float s_log_sum = logf(sh_ssum[0]) + s_max;
+
+    // KL divergence + gradient
+    __shared__ float sh_kl[256];
+    float local_kl = 0.0f;
+    float inv_batch = 1.0f / (float)batch;
+    for (int c = tid; c < vocab; c += nt) {
+        float p = expf(t_row[c]*inv_T - t_max) / sh_tsum[0];
+        float q = expf(s_row[c]*inv_T - s_max) / sh_ssum[0];
+        if (p > 1e-10f) local_kl += p * (logf(p) - logf(q + 1e-10f));
+        g_row[c] = inv_T * (q - p) * inv_batch;
+    }
+    sh_kl[tid] = local_kl;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) { if(tid<s) sh_kl[tid]+=sh_kl[tid+s]; __syncthreads(); }
+    if (tid == 0) losses[row] = sh_kl[0];
+}
+
+// ============================================================
+// UTILITY KERNELS
+// ============================================================
+extern "C" __global__ void argmax(
+    const float* input, unsigned int* output, unsigned int size
+) {
+    __shared__ float shared_vals[256];
+    __shared__ unsigned int shared_idxs[256];
+    int tid = threadIdx.x, nt = blockDim.x;
+    float best_val = -1e30f;
+    unsigned int best_idx = 0;
+    for (int i = tid; i < size; i += nt) {
+        if (input[i] > best_val) { best_val = input[i]; best_idx = i; }
+    }
+    shared_vals[tid] = best_val;
+    shared_idxs[tid] = best_idx;
+    __syncthreads();
+    for (int s=nt/2;s>0;s>>=1) {
+        if (tid<s && shared_vals[tid+s]>shared_vals[tid]) {
+            shared_vals[tid]=shared_vals[tid+s]; shared_idxs[tid]=shared_idxs[tid+s];
+        }
+        __syncthreads();
+    }
+    if (tid==0) output[0] = shared_idxs[0];
+}
+
+extern "C" __global__ void temperature_scale(
+    float* logits, unsigned int offset, unsigned int vocab, float temperature
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vocab) logits[offset + i] /= temperature;
+}
+
+extern "C" __global__ void gradient_mask(
+    float* grad, const unsigned int* mask, unsigned int size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size && mask[i] == 0) grad[i] = 0.0f;
+}
+
+extern "C" __global__ void zero_rows(
+    float* data, const unsigned int* row_indices,
+    unsigned int n_rows, unsigned int cols
+) {
+    int idx = blockIdx.x;
+    int col = threadIdx.x;
+    if (idx >= n_rows || col >= cols) return;
+    data[row_indices[idx] * cols + col] = 0.0f;
+}
+
+extern "C" __global__ void transpose_2d(
+    const float* input, float* output,
+    unsigned int rows, unsigned int cols
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    int r = i / cols, c = i % cols;
+    output[c * rows + r] = input[r * cols + c];
+}
+
+extern "C" __global__ void silu(const float* input, float* output, unsigned int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float x = input[i];
+        output[i] = x / (1.0f + expf(-x));
+    }
+}
