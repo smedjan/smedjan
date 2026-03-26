@@ -173,6 +173,42 @@ pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     );
 }
 
+/// Batched C[b](f32) = A[b](f16) @ B[b](f16). Single dispatch, FP16 inputs.
+pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_tiled_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// Batched C[b](f32) = A[b](f16) @ B[b](f16)^T. Single dispatch, FP16 inputs.
+pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_tiled_trans_b_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// Batched C[b](f32) = A[b](f16)^T @ B[b](f16). Single dispatch, FP16 inputs.
+pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, k: u32, n: u32) {
+    #[repr(C)]
+    struct Params { m: u32, k: u32, n: u32, batch: u32 }
+    let params = Params { m, k, n, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (k as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_tiled_trans_a_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 /// Batched C[b] = A[b] @ B[b] for all b in [0, batch). Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, K, N], C: [batch, M, N]
 pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {

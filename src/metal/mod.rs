@@ -125,6 +125,9 @@ impl MetalContext {
             ("matmul_tiled_f16", shaders::MATMUL_TILED_F16),
             ("matmul_tiled_trans_b_f16", shaders::MATMUL_TILED_TRANS_B_F16),
             ("matmul_trans_a_tiled_f16", shaders::MATMUL_TRANS_A_F16),
+            ("batched_matmul_tiled_f16", shaders::BATCHED_MATMUL_TILED_F16),
+            ("batched_matmul_tiled_trans_b_f16", shaders::BATCHED_MATMUL_TILED_TRANS_B_F16),
+            ("batched_matmul_tiled_trans_a_f16", shaders::BATCHED_MATMUL_TILED_TRANS_A_F16),
         ];
 
         let compile_options = MTLCompileOptions::new();
