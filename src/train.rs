@@ -104,13 +104,20 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
     // Initialize model + optimizer (fresh or from resume checkpoint)
     let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) = config.resume_from {
-        eprintln!("Resuming from: {}", resume_path);
+        eprintln!("=== RESUMING from {} ===", resume_path);
         let (model, opt_states, step, opt_step, tokens) = checkpoint::load_training_state(ctx, resume_path)?;
+        eprintln!(
+            "Resumed model: {}M params, {} layers, d_model={}, {} heads",
+            model.config.param_count() as f32 / 1e6,
+            model.config.n_layers, model.config.d_model, model.config.n_heads
+        );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let mut optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
         optimizer.load_state(&opt_states, opt_step);
-        eprintln!("Resumed at step {}, {} tokens, optimizer step {}", step, tokens, opt_step);
-        (model, optimizer, step, tokens)
+        // Resume from step+1 — the checkpoint was saved AFTER step completed
+        let resume_step = step + 1;
+        eprintln!("Resuming at step {}/{}, {} tokens, optimizer step {}", resume_step, config.total_steps, tokens, opt_step);
+        (model, optimizer, resume_step, tokens)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
