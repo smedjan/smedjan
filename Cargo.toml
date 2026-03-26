@@ -4,11 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure Rust AI engine — own architecture, own training, own tokenizer"
 
+[features]
+default = ["metal"]
+metal = ["objc2", "objc2-foundation", "objc2-metal"]
+cuda = ["cudarc"]
+
 [dependencies]
-# Layer 1: thin FFI bindings to Metal GPU API (~50KB, just type definitions)
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-metal = "0.3"
+# Metal backend (macOS/Apple Silicon)
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+
+# CUDA backend (NVIDIA GPUs)
+cudarc = { version = "0.12", optional = true }
 
 rand = "0.8"
 memmap2 = "0.9"

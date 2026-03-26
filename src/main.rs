@@ -8,7 +8,11 @@ mod dpo;
 mod eval;
 mod generate;
 mod loss;
+#[cfg(feature = "metal")]
 mod metal;
+#[cfg(feature = "cuda")]
+mod cuda;
+mod gpu;
 mod model;
 mod optim;
 pub mod quantize;
