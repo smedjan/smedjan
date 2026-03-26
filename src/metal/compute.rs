@@ -15,6 +15,9 @@ fn next_power_of_2_clamped(n: u64) -> u64 {
 }
 
 /// Create a params buffer from a repr(C) struct.
+/// Create a params buffer. Uses newBufferWithBytes (not the pool) because params
+/// buffers are live within a command batch — pooling would cause aliasing between
+/// kernels encoded in the same batch.
 #[inline]
 fn params_buffer<T>(ctx: &Arc<MetalContext>, params: &T) -> objc2::rc::Retained<GpuBuffer> {
     let ptr = NonNull::new(params as *const T as *mut c_void).unwrap();

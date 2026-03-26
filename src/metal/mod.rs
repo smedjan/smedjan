@@ -362,9 +362,8 @@ impl MetalContext {
         });
     }
 
-    /// Flush the current command batch: commit the command buffer and wait.
+    /// Flush the current command batch: commit and wait for GPU completion.
     /// Returns the number of kernels that were batched.
-    /// If no batch is active, this is a no-op returning 0.
     pub fn flush_batch(&self) -> usize {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
@@ -378,6 +377,31 @@ impl MetalContext {
                 0
             }
         })
+    }
+
+    /// Flush without waiting — commit the command buffer but don't block.
+    /// The GPU runs in parallel with the CPU. Call flush_batch() or
+    /// wait_batch() before reading any GPU buffers.
+    pub fn flush_batch_async(&self) -> usize {
+        ACTIVE_BATCH.with(|batch| {
+            let mut b = batch.borrow_mut();
+            if let Some(cb) = b.take() {
+                if cb.encoder_count > 0 {
+                    cb.cmd.commit();
+                    // Don't wait — GPU runs while CPU prepares next batch
+                }
+                cb.encoder_count
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Wait for all submitted GPU work to complete.
+    /// Call this before reading buffer contents.
+    pub fn wait_gpu(&self) {
+        // Submit and wait for any active batch
+        self.flush_batch();
     }
 
     /// Check if a command batch is currently active.

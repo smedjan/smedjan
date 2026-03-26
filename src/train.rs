@@ -219,14 +219,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // clip_gradients does its own GPU batching internally.
         clip_gradients(ctx, &model, config.max_grad_norm);
 
-        // Optimizer step
+        // Optimizer step — flush async so CPU can prep next batch while GPU updates weights
         ctx.begin_batch();
         if lr > 1e-10 {
             optimizer.step(lr);
         }
-        ctx.flush_batch();
+        ctx.flush_batch_async();
 
-        // Zero gradients for next accumulation cycle
+        // Zero gradients for next accumulation cycle (CPU-side, no GPU wait needed)
         autograd::zero_grads();
 
         let tokens_this_step = (config.batch_size * config.seq_len * grad_accum_steps as usize) as u64;
