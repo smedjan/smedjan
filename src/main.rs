@@ -105,6 +105,15 @@ enum Commands {
         /// Gradient accumulation steps. Effective batch = batch_size * grad_accum. Default: 1
         #[arg(long, default_value = "1")]
         grad_accum: u32,
+        /// Resume training from a saved training state file
+        #[arg(long)]
+        resume: Option<String>,
+        /// Validation dataset path (eval every checkpoint_interval steps)
+        #[arg(long)]
+        val_dataset: Option<String>,
+        /// Dropout rate (0.0 = no dropout). Default: 0.0
+        #[arg(long, default_value = "0.0")]
+        dropout: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -359,6 +368,9 @@ fn main() {
             distill_temperature,
             distill_alpha,
             grad_accum,
+            resume,
+            val_dataset,
+            dropout,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -408,6 +420,9 @@ fn main() {
             config.distill_temperature = distill_temperature;
             config.distill_alpha = distill_alpha;
             config.grad_accum_steps = grad_accum;
+            config.resume_from = resume;
+            config.val_dataset = val_dataset;
+            config.dropout = dropout;
 
             train::train(&ctx, &config).expect("Training failed");
         }

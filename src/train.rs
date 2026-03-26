@@ -34,6 +34,12 @@ pub struct TrainConfig {
     pub distill_alpha: f32,
     /// Gradient accumulation steps. Effective batch = batch_size * grad_accum_steps. Default: 1.
     pub grad_accum_steps: u32,
+    /// Resume from a training state file (saves optimizer + model + step).
+    pub resume_from: Option<String>,
+    /// Path to validation dataset (optional). Eval every checkpoint_interval steps.
+    pub val_dataset: Option<String>,
+    /// Dropout rate for regularization. Default: 0.0 (no dropout).
+    pub dropout: f32,
 }
 
 impl TrainConfig {
@@ -57,6 +63,9 @@ impl TrainConfig {
             distill_temperature: 4.0,
             distill_alpha: 0.5,
             grad_accum_steps: 1,
+            resume_from: None,
+            val_dataset: None,
+            dropout: 0.0,
         }
     }
 }
@@ -93,12 +102,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None => None,
     };
 
-    // Initialize model
-    let model = Transformer::new(ctx, config.model_config.clone());
-
-    // Initialize optimizer
-    let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-    let mut optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
+    // Initialize model + optimizer (fresh or from resume checkpoint)
+    let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) = config.resume_from {
+        eprintln!("Resuming from: {}", resume_path);
+        let (model, opt_states, step, opt_step, tokens) = checkpoint::load_training_state(ctx, resume_path)?;
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let mut optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
+        optimizer.load_state(&opt_states, opt_step);
+        eprintln!("Resumed at step {}, {} tokens, optimizer step {}", step, tokens, opt_step);
+        (model, optimizer, step, tokens)
+    } else {
+        let model = Transformer::new(ctx, config.model_config.clone());
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
+        (model, optimizer, 0, 0u64)
+    };
 
     // Learning rate scheduler
     let scheduler = CosineWarmupScheduler::new(
@@ -112,13 +130,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let batches_per_epoch = data_loader.batches_per_epoch();
     eprintln!("Dataset: {} tokens, ~{} batches/epoch", data_loader.total_tokens(), batches_per_epoch);
 
-    let mut total_tokens: u64 = 0;
+    // total_tokens initialized from resume state or 0
     let start_time = Instant::now();
 
     let grad_accum_steps = config.grad_accum_steps.max(1);
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
-    for step in 0..config.total_steps {
+    for step in start_step..config.total_steps {
         let step_start = Instant::now();
         let lr = scheduler.get_lr(step);
 
@@ -241,20 +259,63 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             );
         }
 
-        // Checkpointing
+        // Checkpointing — save both model-only and full training state for resume
         if step > 0 && step % config.checkpoint_interval == 0 {
             let path = format!("{}/step_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_checkpoint(&path, &model, step)?;
-            eprintln!("Checkpoint saved: {}", path);
+            let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
+            checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
+        }
+
+        // Validation loss (if validation dataset provided)
+        if let Some(ref val_path) = config.val_dataset {
+            if step > 0 && step % config.checkpoint_interval == 0 {
+                let val_loss = compute_validation_loss(ctx, &model, val_path, config.batch_size, config.seq_len)?;
+                eprintln!("  val_loss: {:.4}", val_loss);
+            }
         }
     }
 
     // Final checkpoint
     let path = format!("{}/final.bin", config.checkpoint_dir);
     checkpoint::save_checkpoint(&path, &model, config.total_steps)?;
+    let state_path = format!("{}/state_final.bin", config.checkpoint_dir);
+    checkpoint::save_training_state(&state_path, &model, &optimizer, config.total_steps, total_tokens)?;
     eprintln!("Training complete. Final checkpoint: {}", path);
 
     Ok(())
+}
+
+/// Compute average cross-entropy loss on a validation dataset (no gradients).
+fn compute_validation_loss(
+    ctx: &Arc<MetalContext>,
+    model: &Transformer,
+    val_path: &str,
+    batch_size: usize,
+    seq_len: usize,
+) -> std::io::Result<f32> {
+    let mut val_loader = DataLoader::new(val_path, batch_size, seq_len)?;
+    let n_batches = val_loader.batches_per_epoch().min(50); // cap at 50 batches for speed
+    let mut total_loss = 0.0f32;
+    let mut count = 0u32;
+
+    autograd::no_grad(|| {
+        for _ in 0..n_batches {
+            let (inputs, targets) = val_loader.next_batch();
+            ctx.begin_batch();
+            let logits = model.forward(&inputs, batch_size, seq_len, None, false);
+            let (loss_tensor, _) = loss::cross_entropy_loss(ctx, &logits, &targets);
+            ctx.flush_batch();
+            let val = loss_tensor.to_vec()[0];
+            if val.is_finite() {
+                total_loss += val;
+                count += 1;
+            }
+        }
+    });
+    autograd::clear_tape();
+
+    Ok(if count > 0 { total_loss / count as f32 } else { f32::NAN })
 }
 
 /// Clip gradients by global L2 norm. Also zeroes NaN/Inf gradients.

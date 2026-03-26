@@ -1,5 +1,6 @@
 use crate::metal::MetalContext;
 use crate::model::{ModelConfig, Transformer};
+use crate::optim::AdamW;
 use objc2_metal::MTLBuffer;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -47,6 +48,128 @@ pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::R
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
     eprintln!("Checkpoint saved: {} ({:.1} MB, step {})", path, size_mb, step);
     Ok(())
+}
+
+/// Save full training state: model weights + optimizer state (m, v, step).
+/// This allows resuming training exactly where it left off.
+pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, step: u32, total_tokens: u64) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+
+    // Header: AMDT (AndreAI Model Training state)
+    file.write_all(b"AMDT")?;
+    file.write_all(&VERSION.to_le_bytes())?;
+    file.write_all(&step.to_le_bytes())?;
+    file.write_all(&total_tokens.to_le_bytes())?;
+
+    // Model config
+    write_config(&mut file, &model.config)?;
+
+    // Model weights
+    let params = model.parameters();
+    let n_tensors = params.len() as u32;
+    file.write_all(&n_tensors.to_le_bytes())?;
+
+    for param in &params {
+        let ndims = param.shape.len() as u32;
+        file.write_all(&ndims.to_le_bytes())?;
+        for &dim in &param.shape {
+            file.write_all(&(dim as u32).to_le_bytes())?;
+        }
+        let data = param.to_vec();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&bytes)?;
+    }
+
+    // Optimizer state: step, then m and v for each param
+    file.write_all(&optimizer.step.to_le_bytes())?;
+    for ps in &optimizer.params {
+        let m_data = MetalContext::read_buffer(&ps.m, ps.size);
+        let v_data = MetalContext::read_buffer(&ps.v, ps.size);
+        let m_bytes: Vec<u8> = m_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let v_bytes: Vec<u8> = v_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&m_bytes)?;
+        file.write_all(&v_bytes)?;
+    }
+
+    let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
+    eprintln!("Training state saved: {} ({:.1} MB, step {}, {} tokens)", path, size_mb, step, total_tokens);
+    Ok(())
+}
+
+/// Load full training state for resume. Returns (model, optimizer_data, step, total_tokens).
+/// The optimizer_data is (m_buffers, v_buffers, opt_step) — caller creates the AdamW and loads these.
+pub fn load_training_state(
+    ctx: &Arc<MetalContext>,
+    path: &str,
+) -> std::io::Result<(Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+
+    // Magic
+    file.read_exact(&mut buf4)?;
+    assert_eq!(&buf4, b"AMDT", "Not a valid AndreAI training state file");
+
+    // Version
+    file.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    assert!(version == 2, "Unsupported training state version: {}", version);
+
+    // Step + total_tokens
+    file.read_exact(&mut buf4)?;
+    let step = u32::from_le_bytes(buf4);
+    file.read_exact(&mut buf8)?;
+    let total_tokens = u64::from_le_bytes(buf8);
+
+    // Config
+    let config = read_config(&mut file, version)?;
+    eprintln!("Resuming: step {}, {}M params, {} tokens processed",
+        step, config.param_count() as f32 / 1e6, total_tokens);
+
+    // Model
+    let model = Transformer::new(ctx, config);
+    file.read_exact(&mut buf4)?;
+    let n_tensors = u32::from_le_bytes(buf4) as usize;
+    let params = model.parameters();
+    assert_eq!(params.len(), n_tensors);
+
+    for (i, param) in params.iter().enumerate() {
+        file.read_exact(&mut buf4)?;
+        let ndims = u32::from_le_bytes(buf4) as usize;
+        let mut shape = Vec::with_capacity(ndims);
+        for _ in 0..ndims {
+            file.read_exact(&mut buf4)?;
+            shape.push(u32::from_le_bytes(buf4) as usize);
+        }
+        assert_eq!(shape, param.shape, "Shape mismatch tensor {}", i);
+
+        let n_elements: usize = shape.iter().product();
+        let mut byte_data = vec![0u8; n_elements * 4];
+        file.read_exact(&mut byte_data)?;
+        unsafe {
+            let ptr = param.buffer.contents().as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(byte_data.as_ptr(), ptr, byte_data.len());
+        }
+    }
+
+    // Optimizer state
+    file.read_exact(&mut buf4)?;
+    let opt_step = u32::from_le_bytes(buf4);
+
+    let mut opt_states = Vec::with_capacity(n_tensors);
+    for param in &params {
+        let size = param.numel();
+        let mut m_bytes = vec![0u8; size * 4];
+        let mut v_bytes = vec![0u8; size * 4];
+        file.read_exact(&mut m_bytes)?;
+        file.read_exact(&mut v_bytes)?;
+        let m: Vec<f32> = m_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let v: Vec<f32> = v_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        opt_states.push((m, v));
+    }
+
+    eprintln!("Training state loaded: step {}, opt_step {}", step, opt_step);
+    Ok((model, opt_states, step, opt_step, total_tokens))
 }
 
 /// Load model from a checkpoint file.

@@ -2,6 +2,7 @@ use crate::autograd;
 use crate::metal::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
 use objc2::rc::Retained;
+use objc2_metal::MTLBuffer;
 use std::sync::Arc;
 
 /// AdamW optimizer with decoupled weight decay.
@@ -81,6 +82,22 @@ impl AdamW {
                     step: self.step,
                 },
             );
+        }
+    }
+
+    /// Load optimizer state from checkpoint data. Sets m, v buffers and step counter.
+    pub fn load_state(&mut self, states: &[(Vec<f32>, Vec<f32>)], opt_step: u32) {
+        assert_eq!(states.len(), self.params.len(), "Optimizer state count mismatch");
+        self.step = opt_step;
+        for (ps, (m_data, v_data)) in self.params.iter().zip(states.iter()) {
+            assert_eq!(m_data.len(), ps.size, "m state size mismatch");
+            assert_eq!(v_data.len(), ps.size, "v state size mismatch");
+            unsafe {
+                let m_ptr = ps.m.contents().as_ptr() as *mut f32;
+                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.size);
+                let v_ptr = ps.v.contents().as_ptr() as *mut f32;
+                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.size);
+            }
         }
     }
 

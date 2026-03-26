@@ -2,7 +2,7 @@
 mod tests {
     use crate::autograd;
     use crate::datapipe;
-    use crate::metal::MetalContext;
+    use crate::metal::{compute, MetalContext};
     use crate::model::ModelConfig;
     use crate::tensor::Tensor;
     use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, SPECIAL_TOKENS};
@@ -1383,5 +1383,81 @@ mod tests {
     fn gqa_invalid_group_size_panics() {
         // n_heads=4, n_kv_heads=3 is invalid (4 % 3 != 0)
         ModelConfig::custom_gqa(1000, 64, 4, 3, 2, 2.0, 128);
+    }
+
+    #[test]
+    fn fp16_cast_roundtrip() {
+        let ctx = MetalContext::new();
+        let data = vec![1.0f32, -2.5, 3.14, 0.0, 1e-3, 65504.0]; // 65504 = max half
+        let buf = ctx.buffer_from_slice(&data);
+        let f16_buf = ctx.alloc_buffer(data.len() * 2);
+        let f32_buf = ctx.alloc_buffer(data.len() * 4);
+        compute::gpu_cast_f32_to_f16(&ctx, &buf, &f16_buf, data.len() as u32);
+        compute::gpu_cast_f16_to_f32(&ctx, &f16_buf, &f32_buf, data.len() as u32);
+        let result = MetalContext::read_buffer(&f32_buf, data.len());
+        for (i, (&orig, &back)) in data.iter().zip(result.iter()).enumerate() {
+            let tol = orig.abs() * 0.01 + 1e-3; // half has ~0.1% relative error
+            assert!((orig - back).abs() < tol, "FP16 roundtrip mismatch at {}: {} vs {}", i, orig, back);
+        }
+    }
+
+    #[test]
+    fn fp16_batched_matmul_correctness() {
+        let ctx = MetalContext::new();
+        // [2, 2, 3] @ [2, 3, 2] = [2, 2, 2]
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let a_buf = ctx.buffer_from_slice(&a);
+        let b_buf = ctx.buffer_from_slice(&b);
+
+        // FP32 reference
+        let c_ref = ctx.alloc_buffer(2 * 2 * 2 * 4);
+        compute::gpu_batched_matmul(&ctx, &a_buf, &b_buf, &c_ref, 2, 2, 2, 3);
+        let ref_result = MetalContext::read_buffer(&c_ref, 8);
+
+        // FP16 path
+        let a_f16 = ctx.alloc_buffer(a.len() * 2);
+        let b_f16 = ctx.alloc_buffer(b.len() * 2);
+        compute::gpu_cast_f32_to_f16(&ctx, &a_buf, &a_f16, a.len() as u32);
+        compute::gpu_cast_f32_to_f16(&ctx, &b_buf, &b_f16, b.len() as u32);
+        let c_f16 = ctx.alloc_buffer(2 * 2 * 2 * 4);
+        compute::gpu_batched_matmul_f16(&ctx, &a_f16, &b_f16, &c_f16, 2, 2, 2, 3);
+        let f16_result = MetalContext::read_buffer(&c_f16, 8);
+
+        for i in 0..8 {
+            assert!((ref_result[i] - f16_result[i]).abs() < 1.0,
+                "Batched FP16 mismatch at {}: {} vs {}", i, ref_result[i], f16_result[i]);
+        }
+
+        // Also test batched trans_b and trans_a via the FP16 functions
+        let c_tb = ctx.alloc_buffer(2 * 2 * 2 * 4);
+        compute::gpu_batched_matmul_trans_b_f16(&ctx, &a_f16, &b_f16, &c_tb, 2, 2, 3, 3);
+        let _ = MetalContext::read_buffer(&c_tb, 8); // just verify no crash
+
+        let c_ta = ctx.alloc_buffer(2 * 3 * 2 * 4);
+        compute::gpu_batched_matmul_trans_a_f16(&ctx, &a_f16, &b_f16, &c_ta, 2, 2, 3, 2);
+        let _ = MetalContext::read_buffer(&c_ta, 12); // just verify no crash
+    }
+
+    #[test]
+    fn fp32_matmul_variants_still_work() {
+        // Wire gpu_matmul_trans_b and gpu_matmul_trans_a (FP32 versions replaced by FP16 in hot path)
+        let ctx = MetalContext::new();
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3]
+        let b = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3] for trans_b
+        let a_buf = ctx.buffer_from_slice(&a);
+        let b_buf = ctx.buffer_from_slice(&b);
+
+        // gpu_matmul_trans_b: [2,3] @ [2,3]^T = [2,2]
+        let c1 = ctx.alloc_buffer(4 * 4);
+        compute::gpu_matmul_trans_b(&ctx, &a_buf, &b_buf, &c1, 2, 2, 3);
+        let r1 = MetalContext::read_buffer(&c1, 4);
+        assert!((r1[0] - 14.0).abs() < 0.1); // 1*1+2*2+3*3=14
+
+        // gpu_matmul_trans_a: [2,3]^T @ [2,3] = [3,3]
+        let c2 = ctx.alloc_buffer(9 * 4);
+        compute::gpu_matmul_trans_a(&ctx, &a_buf, &a_buf, &c2, 2, 3, 3);
+        let r2 = MetalContext::read_buffer(&c2, 9);
+        assert!((r2[0] - 17.0).abs() < 0.1); // 1*1+4*4=17
     }
 }
