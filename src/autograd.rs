@@ -801,18 +801,14 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     let k = a_shape[2];
     let n = b_shape[2];
 
-    // FP16 batched backward
-    let grad_f16 = cast_buf_f16(ctx, out_grad, batches * m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], batches * k * n);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], batches * m * k);
-
+    // Batched backward — FP32 (small attention dims, cast overhead not worth it)
     // dA = dC @ B^T : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_trans_b_f16(ctx, &grad_f16, &b_f16, &da_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
 
     // dB = A^T @ dC : [B,K,M] @ [B,M,N] = [B,K,N]
     let db_total = ctx.alloc_buffer(batches * k * n * 4);
-    compute::gpu_batched_matmul_trans_a_f16(ctx, &a_f16, &grad_f16, &db_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_total, batches as u32, m as u32, k as u32, n as u32);
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], &db_total, batches * k * n);
@@ -829,18 +825,14 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     let k = a_shape[2];
     let n = b_shape[1];
 
-    // FP16 batched backward
-    let grad_f16 = cast_buf_f16(ctx, out_grad, batches * m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], batches * n * k);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], batches * m * k);
-
+    // Batched backward — FP32
     // dA = dC @ B : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_f16(ctx, &grad_f16, &b_f16, &da_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
 
     // dB = dC^T @ A : [B,N,M] @ [B,M,K] = [B,N,K]
     let db_total = ctx.alloc_buffer(batches * n * k * 4);
-    compute::gpu_batched_matmul_trans_a_f16(ctx, &grad_f16, &a_f16, &db_total, batches as u32, m as u32, n as u32, k as u32);
+    compute::gpu_batched_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_total, batches as u32, m as u32, n as u32, k as u32);
 
     accumulate_grad(ctx, entry.inputs[0], &da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], &db_total, batches * n * k);

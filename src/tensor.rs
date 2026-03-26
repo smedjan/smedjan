@@ -729,10 +729,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // FP16 batched matmul: cast inputs to half, single dispatch
-        let a_f16 = self.cast_to_f16();
-        let b_f16 = other.cast_to_f16();
-        compute::gpu_batched_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, batches as u32, m as u32, n as u32, k as u32);
+        // Batched matmul — uses FP32 inputs (small attention dims don't benefit from FP16 cast overhead)
+        compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -773,10 +771,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // FP16 batched matmul trans_b: cast inputs to half, single dispatch
-        let a_f16 = self.cast_to_f16();
-        let b_f16 = other.cast_to_f16();
-        compute::gpu_batched_matmul_trans_b_f16(&self.ctx, &a_f16, &b_f16, &out_buf, batches as u32, m as u32, n as u32, k as u32);
+        // Batched matmul trans_b — uses FP32 inputs (small attention dims)
+        compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {
