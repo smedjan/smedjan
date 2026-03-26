@@ -2168,3 +2168,129 @@ kernel void matmul_tiled_f16(
         }
 }
 "#;
+
+/// FP16-input matmul with B transposed: C(f32) = A(f16) @ B(f16)^T
+pub const MATMUL_TILED_TRANS_B_F16: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulParams { uint M; uint N; uint K; };
+#define TILE 32
+#define THREAD_TILE 4
+
+kernel void matmul_tiled_trans_b_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+
+    threadgroup half As[TILE][TILE];
+    threadgroup half Bs[TILE][TILE];
+    float acc[THREAD_TILE][THREAD_TILE] = {{0.0f}};
+
+    uint M = params.M; uint N = params.N; uint K = params.K;
+
+    for (uint k_block = 0; k_block < K; k_block += TILE) {
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE; uint c = flat % TILE;
+            uint gr = tile_row + r; uint gc = k_block + c;
+            As[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : (half)0.0h;
+        }
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE; uint c = flat % TILE;
+            uint gk = k_block + r; uint gn = tile_col + c;
+            Bs[r][c] = (gk < K && gn < N) ? B[gn * K + gk] : (half)0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE; k++) {
+            half a_vals[THREAD_TILE]; half b_vals[THREAD_TILE];
+            for (uint i = 0; i < THREAD_TILE; i++) a_vals[i] = As[local_row * THREAD_TILE + i][k];
+            for (uint j = 0; j < THREAD_TILE; j++) b_vals[j] = Bs[k][local_col * THREAD_TILE + j];
+            for (uint i = 0; i < THREAD_TILE; i++)
+                for (uint j = 0; j < THREAD_TILE; j++)
+                    acc[i][j] += (float)(a_vals[i] * b_vals[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < THREAD_TILE; i++)
+        for (uint j = 0; j < THREAD_TILE; j++) {
+            uint gr = tile_row + local_row * THREAD_TILE + i;
+            uint gc = tile_col + local_col * THREAD_TILE + j;
+            if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
+        }
+}
+"#;
+
+/// FP16-input matmul with A transposed: C(f32) = A(f16)^T @ B(f16)
+pub const MATMUL_TRANS_A_F16: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulTransAParams { uint M; uint K; uint N; };
+#define TILE_TA 32
+#define THREAD_TILE_TA 4
+
+kernel void matmul_trans_a_tiled_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulTransAParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+    uint tile_row = group_id.y * TILE_TA;
+    uint tile_col = group_id.x * TILE_TA;
+
+    threadgroup half As[TILE_TA][TILE_TA];
+    threadgroup half Bs[TILE_TA][TILE_TA];
+    float acc[THREAD_TILE_TA][THREAD_TILE_TA] = {{0.0f}};
+
+    uint M = params.M; uint K = params.K; uint N = params.N;
+
+    for (uint m_block = 0; m_block < M; m_block += TILE_TA) {
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE_TA; uint c = flat % TILE_TA;
+            uint gk = tile_row + r; uint gm = m_block + c;
+            As[r][c] = (half)((gk < K && gm < M) ? A[gm * K + gk] : 0.0f);
+        }
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE_TA; uint c = flat % TILE_TA;
+            uint gm = m_block + r; uint gn = tile_col + c;
+            Bs[r][c] = (half)((gm < M && gn < N) ? B[gm * N + gn] : 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint m = 0; m < TILE_TA; m++) {
+            half a_vals[THREAD_TILE_TA]; half b_vals[THREAD_TILE_TA];
+            for (uint i = 0; i < THREAD_TILE_TA; i++) a_vals[i] = As[local_row * THREAD_TILE_TA + i][m];
+            for (uint j = 0; j < THREAD_TILE_TA; j++) b_vals[j] = Bs[m][local_col * THREAD_TILE_TA + j];
+            for (uint i = 0; i < THREAD_TILE_TA; i++)
+                for (uint j = 0; j < THREAD_TILE_TA; j++)
+                    acc[i][j] += (float)(a_vals[i] * b_vals[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < THREAD_TILE_TA; i++)
+        for (uint j = 0; j < THREAD_TILE_TA; j++) {
+            uint gr = tile_row + local_row * THREAD_TILE_TA + i;
+            uint gc = tile_col + local_col * THREAD_TILE_TA + j;
+            if (gr < K && gc < N) C[gr * N + gc] = acc[i][j];
+        }
+}
+"#;

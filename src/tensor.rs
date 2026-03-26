@@ -238,7 +238,10 @@ impl Tensor {
         assert_eq!(k, other.shape[1], "Inner dim mismatch");
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        compute::gpu_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+        // FP16 path: cast inputs to half, halves bandwidth
+        let a_f16 = self.cast_to_f16();
+        let b_f16 = other.cast_to_f16();
+        compute::gpu_matmul_trans_b_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {

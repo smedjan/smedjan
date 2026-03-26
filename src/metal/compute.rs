@@ -119,6 +119,42 @@ pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: 
     );
 }
 
+/// C(f32) = A(f16) @ B(f16)^T — FP16 inputs, FP32 output.
+pub fn gpu_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, 1);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "matmul_tiled_trans_b_f16", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
+/// C(f32) = A(f16)^T @ B(f16) — FP16 inputs, FP32 output.
+pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) {
+    #[repr(C)]
+    struct Params { m: u32, k: u32, n: u32 }
+    let params = Params { m, k, n };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (k as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, 1);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "matmul_trans_a_tiled_f16", grid, tg,
+        0 => a, 1 => b, 2 => c, 3 => &params_buf
+    );
+}
+
 /// C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
 pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
     #[repr(C)]
