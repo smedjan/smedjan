@@ -68,8 +68,8 @@ pub struct TapeEntry {
     pub output: usize,          // TensorId of output
     pub input_buffers: Vec<Retained<GpuBuffer>>,
     pub output_buffer: Retained<GpuBuffer>,
-    pub shapes: Vec<Vec<usize>>,
-    pub cached: Option<Retained<GpuBuffer>>, // Cached forward-pass data for backward
+    pub shapes: Vec<Vec<usize>>, // TODO: replace with SmallVec or fixed arrays to eliminate heap alloc
+    pub cached: Option<Retained<GpuBuffer>>,
 }
 
 thread_local! {

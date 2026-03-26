@@ -243,6 +243,17 @@ impl MetalContext {
         }
     }
 
+    /// Write u32 data into an existing buffer (shared memory, zero-copy).
+    /// Buffer must be at least data.len() * 4 bytes.
+    pub fn write_u32_to_buffer(buf: &GpuBuffer, data: &[u32]) {
+        use objc2_metal::MTLBuffer;
+        assert!(buf.length() >= data.len() * 4);
+        unsafe {
+            let ptr = buf.contents().as_ptr() as *mut u32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+    }
+
     /// Allocate a buffer and initialize with u32 data.
     pub fn buffer_from_u32_slice(&self, data: &[u32]) -> Retained<GpuBuffer> {
         let byte_len = std::mem::size_of_val(data);

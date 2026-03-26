@@ -95,6 +95,8 @@ pub struct DataLoader {
     seq_len: usize,
     position: usize,
     epoch: usize,
+    inputs_buf: Vec<u32>,
+    targets_buf: Vec<u32>,
 }
 
 impl DataLoader {
@@ -110,26 +112,32 @@ impl DataLoader {
             seq_len + 1,
         );
 
+        // Pre-allocate reusable buffers (avoid allocation every step)
+        let cap = batch_size * seq_len;
+        let inputs_buf = vec![0u32; cap];
+        let targets_buf = vec![0u32; cap];
+
         Ok(Self {
             dataset,
             batch_size,
             seq_len,
             position: 0,
             epoch: 0,
+            inputs_buf,
+            targets_buf,
         })
     }
 
     /// Get next batch of (input_tokens, target_tokens).
     /// input: [batch_size * seq_len], target: [batch_size * seq_len]
     /// Target is input shifted right by 1. Wraps around at dataset end.
-    pub fn next_batch(&mut self) -> (Vec<u32>, Vec<u32>) {
+    pub fn next_batch(&mut self) -> (&[u32], &[u32]) {
         let needed = self.batch_size * (self.seq_len + 1);
 
         // Wrap around if we'd go past the end
         if self.position + needed > self.dataset.len() {
             self.position = 0;
             self.epoch += 1;
-            // Shuffle: use a random offset within the first batch to avoid seeing the exact same data
             use rand::Rng;
             let max_offset = self.dataset.len().saturating_sub(needed);
             if max_offset > 0 {
@@ -139,18 +147,19 @@ impl DataLoader {
 
         let tokens = self.dataset.get_tokens_slice(self.position, needed);
 
-        let mut inputs = Vec::with_capacity(self.batch_size * self.seq_len);
-        let mut targets = Vec::with_capacity(self.batch_size * self.seq_len);
-
+        // Copy into pre-allocated buffers (zero allocation)
         for b in 0..self.batch_size {
             let offset = b * (self.seq_len + 1);
-            inputs.extend_from_slice(&tokens[offset..offset + self.seq_len]);
-            targets.extend_from_slice(&tokens[offset + 1..offset + 1 + self.seq_len]);
+            let dst_offset = b * self.seq_len;
+            self.inputs_buf[dst_offset..dst_offset + self.seq_len]
+                .copy_from_slice(&tokens[offset..offset + self.seq_len]);
+            self.targets_buf[dst_offset..dst_offset + self.seq_len]
+                .copy_from_slice(&tokens[offset + 1..offset + 1 + self.seq_len]);
         }
 
         self.position += needed;
 
-        (inputs, targets)
+        (&self.inputs_buf, &self.targets_buf)
     }
 
     /// Current epoch (how many times we've wrapped around the dataset).
