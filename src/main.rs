@@ -12,6 +12,8 @@ mod loss;
 mod metal;
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "andreos")]
+mod andreos;
 mod gpu;
 mod model;
 mod optim;

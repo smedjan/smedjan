@@ -8,6 +8,7 @@ description = "Pure Rust AI engine — own architecture, own training, own token
 default = ["metal"]
 metal = ["objc2", "objc2-foundation", "objc2-metal"]
 cuda = ["cudarc"]
+andreos = []  # Zero dependencies — direct hardware access
 
 [dependencies]
 # Metal backend (macOS/Apple Silicon)
