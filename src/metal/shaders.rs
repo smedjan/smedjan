@@ -2504,19 +2504,27 @@ kernel void batched_matmul_tiled_trans_a_f16(
 }
 "#;
 
-/// Flash Attention Forward (Dao et al., 2022)
+/// Flash Attention Forward v2 (Dao et al., 2022 — optimized for Apple M-series)
 /// Fuses Q@K^T → causal mask → softmax → @V into ONE kernel.
 /// Never materializes the N×N attention score matrix.
 /// O(n) memory instead of O(n²). 2x faster for seq=256, 4x+ for seq=1024.
+///
+/// v2 improvements over v1:
+///   - Cooperative K/V tile loading into threadgroup shared memory (half precision)
+///   - Half-precision shared memory: 2x bandwidth, fits 32KB threadgroup limit
+///   - Outputs LSE (log-sum-exp) per query row for backward pass (avoids recomputation)
+///   - All 32 threads load K/V cooperatively, then compute dot products from shared mem
 ///
 /// Q: [batch_heads, seq_q, head_dim]
 /// K: [batch_heads, seq_k, head_dim]
 /// V: [batch_heads, seq_k, head_dim]
 /// O: [batch_heads, seq_q, head_dim]
+/// LSE: [batch_heads * seq_q] — log(sum(exp(scores))) per query row (for backward)
 ///
-/// Each threadgroup processes one batch_head and a block of Br query rows.
-/// It iterates over K/V in blocks of Bc columns, accumulating output with
+/// Each threadgroup processes one batch_head and a block of FA_BR query rows.
+/// It iterates over K/V in blocks of FA_BC columns, accumulating output with
 /// online softmax (no second pass needed).
+/// Shared memory: K_shared[FA_BC][128] half + V_shared[FA_BC][128] half = 16KB (fits 32KB limit)
 pub const FLASH_ATTENTION_FORWARD: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2530,14 +2538,15 @@ struct FlashAttnParams {
     uint kv_offset;   // for causal mask: query position offset
 };
 
-#define FA_BR 32   // query block size (rows)
-#define FA_BC 32   // key block size (cols)
+#define FA_BR 32   // query block size (rows) — one thread per row
+#define FA_BC 32   // key block size (cols) — iterated in inner loop
 
 kernel void flash_attention_forward(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
     device const float* V [[buffer(2)]],
     device float* O [[buffer(3)]],
+    device float* LSE [[buffer(5)]],       // log-sum-exp output [batch_heads * seq_q]
     constant FlashAttnParams& params [[buffer(4)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
@@ -2559,6 +2568,12 @@ kernel void flash_attention_forward(
     device const float* K_bh = K + bh * seq_k * d;
     device const float* V_bh = V + bh * seq_k * d;
     device float* O_bh = O + bh * seq_q * d;
+    device float* LSE_bh = LSE + bh * seq_q;
+
+    // Threadgroup shared memory for K/V tiles in half precision
+    // FA_BC=32 rows x 128 cols max = 8KB each = 16KB total (fits 32KB threadgroup limit)
+    threadgroup half K_shared[FA_BC][128];
+    threadgroup half V_shared[FA_BC][128];
 
     // Each thread handles one query row within the block
     uint local_q = thread_index;  // 0..FA_BR-1
@@ -2571,11 +2586,10 @@ kernel void flash_attention_forward(
     float row_sum = 0.0f;
 
     // Output accumulator for this query row: O[global_q, 0..d]
-    // Stored in registers (d values per thread)
     float o_acc[128]; // max head_dim=128
     for (uint i = 0; i < d; i++) o_acc[i] = 0.0f;
 
-    // Load this query row into registers
+    // Load this query row into registers (float — used for dot products)
     float q_row[128];
     for (uint i = 0; i < d; i++) {
         q_row[i] = Q_bh[global_q * d + i];
@@ -2584,13 +2598,31 @@ kernel void flash_attention_forward(
     // Iterate over key/value blocks
     for (uint k_start = 0; k_start < seq_k; k_start += FA_BC) {
         uint k_end = min(k_start + FA_BC, seq_k);
+        uint bc_actual = k_end - k_start;
 
-        // Compute S[local_q, 0..FA_BC] = Q[global_q] @ K[k_start:k_end]^T * scale
-        // + apply causal mask
+        // --- Cooperative K/V tile load into shared memory (half precision) ---
+        // 32 threads load bc_actual * d elements. Each thread loads multiple elements.
+        uint tile_elems = bc_actual * d;
+        for (uint idx = thread_index; idx < tile_elems; idx += FA_BR) {
+            uint row = idx / d;
+            uint col = idx % d;
+            K_shared[row][col] = half(K_bh[(k_start + row) * d + col]);
+            V_shared[row][col] = half(V_bh[(k_start + row) * d + col]);
+        }
+        // Zero-pad unused rows in shared memory (prevents garbage reads)
+        for (uint idx = thread_index; idx < (FA_BC - bc_actual) * d; idx += FA_BR) {
+            uint row = bc_actual + idx / d;
+            uint col = idx % d;
+            K_shared[row][col] = half(0.0f);
+            V_shared[row][col] = half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Compute scores: S[j] = Q[global_q] . K_shared[j] * scale ---
         float s_vals[FA_BC];
         float block_max = -INFINITY;
 
-        for (uint j = 0; j < (k_end - k_start); j++) {
+        for (uint j = 0; j < bc_actual; j++) {
             uint global_k = k_start + j;
 
             // Causal mask: query at position (global_q + kv_offset) can only attend
@@ -2600,20 +2632,20 @@ kernel void flash_attention_forward(
                 continue;
             }
 
-            // Dot product: Q[global_q] . K[global_k]
+            // Dot product from shared memory (half→float promotion)
             float dot = 0.0f;
             for (uint i = 0; i < d; i++) {
-                dot += q_row[i] * K_bh[global_k * d + i];
+                dot += q_row[i] * float(K_shared[j][i]);
             }
             s_vals[j] = dot * scale;
             block_max = max(block_max, s_vals[j]);
         }
         // Pad unused slots
-        for (uint j = k_end - k_start; j < FA_BC; j++) {
+        for (uint j = bc_actual; j < FA_BC; j++) {
             s_vals[j] = -INFINITY;
         }
 
-        // Online softmax update
+        // --- Online softmax update ---
         float new_max = max(row_max, block_max);
         float old_correction = exp(row_max - new_max);
         float new_sum = old_correction * row_sum;
@@ -2623,20 +2655,22 @@ kernel void flash_attention_forward(
             o_acc[i] *= old_correction;
         }
 
-        // Accumulate exp(s - new_max) and update output with V
-        for (uint j = 0; j < (k_end - k_start); j++) {
+        // Accumulate exp(s - new_max) and update output with V from shared memory
+        for (uint j = 0; j < bc_actual; j++) {
             float p = exp(s_vals[j] - new_max);
             new_sum += p;
 
-            // O += p * V[k_start + j]
-            uint global_k = k_start + j;
+            // O += p * V_shared[j] (half→float promotion)
             for (uint i = 0; i < d; i++) {
-                o_acc[i] += p * V_bh[global_k * d + i];
+                o_acc[i] += p * float(V_shared[j][i]);
             }
         }
 
         row_max = new_max;
         row_sum = new_sum;
+
+        // Barrier before next tile load overwrites shared memory
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Final normalization: O = O / row_sum
@@ -2644,18 +2678,26 @@ kernel void flash_attention_forward(
     for (uint i = 0; i < d; i++) {
         O_bh[global_q * d + i] = o_acc[i] * inv_sum;
     }
+
+    // Store LSE for backward pass: lse = row_max + log(row_sum)
+    LSE_bh[global_q] = row_max + log(max(row_sum, 1e-10f));
 }
 "#;
 
-/// Flash Attention Backward (Dao et al., 2022)
+/// Flash Attention Backward v2 (Dao et al., 2022 — race-free, shared-memory optimized)
 /// Recomputes attention scores tile-by-tile during backward.
-/// Never stores N×N matrix. Computes dQ, dK, dV in one pass.
+/// Never stores N×N matrix.
 ///
-/// Inputs: Q, K, V, O (forward output), dO (gradient of output)
+/// v2 improvements over v1:
+///   - Split into 3 kernels: precompute_d, backward_dq, backward_dkv
+///   - backward_dq: one threadgroup per Q block — each thread owns its dQ row (no race)
+///   - backward_dkv: one threadgroup per K block — each thread owns its dK/dV row (no race)
+///   - Uses LSE from forward pass (no recomputation of row_max/row_sum)
+///   - Cooperative K/V/Q tile loading into threadgroup shared memory (half precision)
+///
+/// Inputs: Q, K, V, O (forward output), dO (gradient of output), LSE (from forward)
+/// Precomputed: D[i] = rowsum(dO[i] * O[i]) per query row
 /// Outputs: dQ, dK, dV
-///
-/// Also needs D[i] = rowsum(dO[i] * O[i]) precomputed per query row.
-/// This is passed as a separate buffer.
 pub const FLASH_ATTENTION_BACKWARD: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2669,39 +2711,61 @@ struct FlashAttnBwdParams {
     uint kv_offset;
 };
 
+#define FA_BR 32
+#define FA_BC 32
+
 // Precompute D[i] = sum_j(dO[i][j] * O[i][j]) for each query row.
-// This is needed for the backward softmax computation.
+// Uses threadgroup parallel reduction: one threadgroup per row, threads split head_dim.
 kernel void flash_attn_precompute_d(
     device const float* dO [[buffer(0)]],
     device const float* O [[buffer(1)]],
     device float* D [[buffer(2)]],
     constant uint& total_rows [[buffer(3)]],
     constant uint& head_dim [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
 ) {
-    if (gid >= total_rows) return;
+    uint row = group_id.x;
+    if (row >= total_rows) return;
     uint d = head_dim;
-    float sum = 0.0f;
-    for (uint i = 0; i < d; i++) {
-        sum += dO[gid * d + i] * O[gid * d + i];
+
+    // Each thread accumulates a partial sum over a subset of head_dim
+    float partial = 0.0f;
+    for (uint i = thread_index; i < d; i += threads_per_group) {
+        partial += dO[row * d + i] * O[row * d + i];
     }
-    D[gid] = sum;
+
+    // Threadgroup reduction via shared memory
+    threadgroup float shared_sums[32];
+    shared_sums[thread_index] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride) {
+            shared_sums[thread_index] += shared_sums[thread_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0) {
+        D[row] = shared_sums[0];
+    }
 }
 
-// Flash Attention Backward: compute dQ, dK, dV
-// Each threadgroup handles one batch_head.
-// Each thread handles one query row, iterates over K/V blocks.
-kernel void flash_attention_backward(
+// Flash Attention Backward dQ: compute dQ only (race-free).
+// Grid: (batch_heads, q_blocks, 1), Threadgroup: (32, 1, 1)
+// Each thread owns one Q row -> accumulates dQ across all K blocks -> writes its own dQ row.
+kernel void flash_attention_backward_dq(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
     device const float* V [[buffer(2)]],
-    device const float* O [[buffer(3)]],
-    device const float* dO [[buffer(4)]],
-    device const float* D [[buffer(5)]],  // precomputed rowsum(dO * O)
+    device const float* dO [[buffer(3)]],
+    device const float* LSE [[buffer(4)]],
+    device const float* D [[buffer(5)]],
     device float* dQ [[buffer(6)]],
-    device float* dK [[buffer(7)]],
-    device float* dV [[buffer(8)]],
-    constant FlashAttnBwdParams& params [[buffer(9)]],
+    constant FlashAttnBwdParams& params [[buffer(7)]],
     uint2 group_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
 ) {
