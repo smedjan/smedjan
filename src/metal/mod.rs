@@ -124,6 +124,7 @@ impl MetalContext {
             ("flash_attn_precompute_d", shaders::FLASH_ATTENTION_BACKWARD),
             ("moe_scatter_add", shaders::MOE_SCATTER_ADD),
             ("scale_rows", shaders::SCALE_ROWS),
+            ("row_dot_reduce", shaders::ROW_DOT_REDUCE),
             ("ternary_matmul", shaders::TERNARY_MATMUL),
             ("ternary_absmean", shaders::TERNARY_QUANTIZE),
             ("ternary_pack", shaders::TERNARY_QUANTIZE),

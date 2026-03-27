@@ -981,20 +981,8 @@ fn backward_scale_rows(
     compute::gpu_scale_rows(ctx, out_grad, &entry.input_buffers[1], &d_input, rows as u32, cols as u32);
     accumulate_grad(ctx, entry.inputs[0], &d_input, rows * cols);
 
-    // d_scales[r] = sum_c(d_out[r][c] * input[r][c])
-    // Compute element-wise product, then reduce per row
-    let product = ctx.alloc_buffer(rows * cols * 4);
-    compute::gpu_mul(ctx, out_grad, &entry.input_buffers[0], &product, (rows * cols) as u32);
-
-    // Row-wise sum: for each row, sum cols elements
+    // d_scales[r] = sum_c(d_out[r][c] * input[r][c]) — single GPU dispatch
     let d_scales = ctx.alloc_buffer(rows * 4);
-    // Use reduce_sum per row — iterate on CPU for now (small: just `rows` reductions)
-    for r in 0..rows {
-        let row_buf = ctx.alloc_buffer(cols * 4);
-        compute::gpu_buffer_copy(ctx, &product, &row_buf, (r * cols) as u32, 0, cols as u32);
-        let sum_buf = ctx.alloc_buffer(4);
-        compute::gpu_reduce_sum(ctx, &row_buf, &sum_buf, cols as u32);
-        compute::gpu_buffer_copy(ctx, &sum_buf, &d_scales, 0, r as u32, 1);
-    }
+    compute::gpu_row_dot_reduce(ctx, out_grad, &entry.input_buffers[0], &d_scales, rows as u32, cols as u32);
     accumulate_grad(ctx, entry.inputs[1], &d_scales, rows);
 }

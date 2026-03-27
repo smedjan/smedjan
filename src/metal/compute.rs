@@ -708,6 +708,19 @@ pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBu
     );
 }
 
+/// Row-wise dot reduce: output[r] = sum_c(a[r][c] * b[r][c]). Single dispatch.
+pub fn gpu_row_dot_reduce(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    let rows_buf = params_buffer(ctx, &rows);
+    let cols_buf = params_buffer(ctx, &cols);
+    let tpg = 256u64;
+    let groups = (rows as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups * tpg, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_threads_sync!(ctx, "row_dot_reduce", grid, tg,
+        0 => a, 1 => b, 2 => output, 3 => &rows_buf, 4 => &cols_buf
+    );
+}
+
 /// MoE: gather tokens for one expert into contiguous buffer.
 pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &GpuBuffer, gathered: &GpuBuffer, n_routed: u32, dim: u32) {
     let n_buf = params_buffer(ctx, &n_routed);

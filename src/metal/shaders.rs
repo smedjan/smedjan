@@ -3019,3 +3019,26 @@ kernel void scale_rows(
     output[r * cols + c] = input[r * cols + c] * scales[r];
 }
 "#;
+
+/// Row-wise dot product and reduce: output[r] = sum_c(a[r][c] * b[r][c])
+/// Used for scale_rows backward: d_scales[r] = dot(d_out[r], input[r])
+pub const ROW_DOT_REDUCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void row_dot_reduce(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= rows) return;
+    float sum = 0.0f;
+    for (uint c = 0; c < cols; c++) {
+        sum += a[gid * cols + c] * b[gid * cols + c];
+    }
+    output[gid] = sum;
+}
+"#;
