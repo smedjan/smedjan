@@ -300,6 +300,7 @@ impl TransformerBlock {
     }
 
     /// Mixture of Experts FFN: route tokens to top-K experts, compute, combine.
+    /// GPU-accelerated gather/scatter for token routing.
     fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
@@ -308,88 +309,60 @@ impl TransformerBlock {
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
         let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
 
-        // Read router probs to CPU for token assignment
-        // (small tensor: n_tokens × n_experts, e.g. 1024 × 4 = 4096 floats)
+        // Read router probs to CPU for top-K selection
+        // (small: n_tokens × n_experts, e.g. 1024 × 4 = 16KB)
         let probs_data = router_probs.to_vec();
 
-        // For each token, find top-K experts and their weights
-        let mut token_expert_assignments: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tokens);
+        // Build per-expert routing tables on CPU (fast: just sorting)
+        let mut expert_indices: Vec<Vec<u32>> = vec![Vec::new(); self.n_experts];
+        let mut expert_weights: Vec<Vec<f32>> = vec![Vec::new(); self.n_experts];
+
         for t in 0..n_tokens {
-            let mut expert_scores: Vec<(usize, f32)> = (0..self.n_experts)
+            let mut scores: Vec<(usize, f32)> = (0..self.n_experts)
                 .map(|e| (e, probs_data[t * self.n_experts + e]))
                 .collect();
-            expert_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            expert_scores.truncate(self.top_k);
-
-            // Renormalize weights for selected experts
-            let sum: f32 = expert_scores.iter().map(|&(_, w)| w).sum();
-            let inv_sum = if sum > 0.0 { 1.0 / sum } else { 1.0 };
-            let normalized: Vec<(usize, f32)> = expert_scores.iter()
-                .map(|&(e, w)| (e, w * inv_sum))
-                .collect();
-            token_expert_assignments.push(normalized);
+            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(self.top_k);
+            let sum: f32 = scores.iter().map(|&(_, w)| w).sum();
+            let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+            for &(e, w) in &scores {
+                expert_indices[e].push(t as u32);
+                expert_weights[e].push(w * inv);
+            }
         }
 
-        // Compute expert outputs and combine with router weights
-        // For simplicity: iterate over experts, compute for all tokens assigned to each
+        // Combined output (zero-initialized)
         let output_buf = x_flat.ctx.alloc_buffer(n_tokens * d * 4);
         compute::gpu_fill(&x_flat.ctx, &output_buf, (n_tokens * d) as u32, 0.0);
 
+        // Process each expert: GPU gather → expert FFN → GPU scatter-add
         for expert_idx in 0..self.n_experts {
-            // Find tokens assigned to this expert and their weights
-            let mut token_indices: Vec<usize> = Vec::new();
-            let mut token_weights: Vec<f32> = Vec::new();
-            for (t, assignments) in token_expert_assignments.iter().enumerate() {
-                for &(e, w) in assignments {
-                    if e == expert_idx {
-                        token_indices.push(t);
-                        token_weights.push(w);
-                    }
-                }
-            }
+            let indices = &expert_indices[expert_idx];
+            if indices.is_empty() { continue; }
+            let weights = &expert_weights[expert_idx];
+            let n_routed = indices.len();
 
-            if token_indices.is_empty() { continue; }
+            // Upload routing tables to GPU
+            let indices_buf = x_flat.ctx.buffer_from_u32_slice(indices);
+            let weights_buf = x_flat.ctx.buffer_from_slice(weights);
 
-            // Gather tokens for this expert
-            let n_routed = token_indices.len();
-            let expert_input_buf = x_flat.ctx.alloc_buffer(n_routed * d * 4);
-            for (i, &t) in token_indices.iter().enumerate() {
-                compute::gpu_buffer_copy(
-                    &x_flat.ctx, &x_flat.buffer, &expert_input_buf,
-                    (t * d) as u32, (i * d) as u32, d as u32,
-                );
-            }
+            // GPU gather: collect tokens for this expert
+            let gathered_buf = x_flat.ctx.alloc_buffer(n_routed * d * 4);
+            compute::gpu_moe_gather(&x_flat.ctx, &x_flat.buffer, &indices_buf, &gathered_buf, n_routed as u32, d as u32);
 
-            // Run expert FFN
+            // Expert FFN (standard matmul path — gets FP16 optimization for free)
             let expert = &self.experts[expert_idx];
-            let expert_input = Tensor::from_buffer(Arc::clone(&x_flat.ctx), expert_input_buf, vec![n_routed, d]);
+            let expert_input = Tensor::from_buffer(Arc::clone(&x_flat.ctx), gathered_buf, vec![n_routed, d]);
             let gate = expert_input.matmul(&expert.w1);
             let up = expert_input.matmul(&expert.w3);
             let hidden = gate.silu_gate(&up);
             let expert_out = hidden.matmul(&expert.w2); // [n_routed, d]
 
-            // Scatter expert outputs back, weighted by router probability
-            for (i, &t) in token_indices.iter().enumerate() {
-                let w = token_weights[i];
-                // Scale expert output by router weight and add to combined output
-                let single_buf = x_flat.ctx.alloc_buffer(d * 4);
-                compute::gpu_buffer_copy(
-                    &x_flat.ctx, &expert_out.buffer, &single_buf,
-                    (i * d) as u32, 0, d as u32,
-                );
-                compute::gpu_scale(&x_flat.ctx, &single_buf, d as u32, w);
-                // Add to output at position t
-                let out_slice = x_flat.ctx.alloc_buffer(d * 4);
-                compute::gpu_buffer_copy(
-                    &x_flat.ctx, &output_buf, &out_slice,
-                    (t * d) as u32, 0, d as u32,
-                );
-                compute::gpu_add_inplace(&x_flat.ctx, &out_slice, &single_buf, d as u32);
-                compute::gpu_buffer_copy(
-                    &x_flat.ctx, &out_slice, &output_buf,
-                    0, (t * d) as u32, d as u32,
-                );
-            }
+            // GPU scatter-add: weighted expert output back to combined output
+            compute::gpu_moe_scatter_add(
+                &x_flat.ctx, &expert_out.buffer, &indices_buf, &weights_buf, &output_buf,
+                n_routed as u32, d as u32,
+            );
         }
 
         Tensor::from_buffer(Arc::clone(&x_flat.ctx), output_buf, vec![batch, seq_len, d])

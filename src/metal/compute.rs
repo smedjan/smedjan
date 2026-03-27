@@ -658,6 +658,28 @@ pub fn gpu_flash_attention_backward(
     );
 }
 
+/// MoE: gather tokens for one expert into contiguous buffer.
+pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &GpuBuffer, gathered: &GpuBuffer, n_routed: u32, dim: u32) {
+    let n_buf = params_buffer(ctx, &n_routed);
+    let d_buf = params_buffer(ctx, &dim);
+    let grid = MetalContext::size(n_routed as u64, dim as u64, 1);
+    let tg = MetalContext::size(n_routed.min(32) as u64, dim.min(32) as u64, 1);
+    dispatch_sync!(ctx, "moe_gather", grid, tg,
+        0 => input, 1 => indices, 2 => gathered, 3 => &n_buf, 4 => &d_buf
+    );
+}
+
+/// MoE: scatter-add weighted expert output back to combined output.
+pub fn gpu_moe_scatter_add(ctx: &Arc<MetalContext>, expert_out: &GpuBuffer, indices: &GpuBuffer, weights: &GpuBuffer, combined: &GpuBuffer, n_routed: u32, dim: u32) {
+    let n_buf = params_buffer(ctx, &n_routed);
+    let d_buf = params_buffer(ctx, &dim);
+    let grid = MetalContext::size(n_routed as u64, dim as u64, 1);
+    let tg = MetalContext::size(n_routed.min(32) as u64, dim.min(32) as u64, 1);
+    dispatch_sync!(ctx, "moe_scatter_add", grid, tg,
+        0 => expert_out, 1 => indices, 2 => weights, 3 => combined, 4 => &n_buf, 5 => &d_buf
+    );
+}
+
 /// Apply causal mask
 pub fn gpu_causal_mask(
     ctx: &Arc<MetalContext>,

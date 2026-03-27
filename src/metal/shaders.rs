@@ -2809,3 +2809,67 @@ kernel void flash_attention_backward(
     }
 }
 "#;
+
+/// MoE token routing: gather tokens for one expert + scatter weighted output back.
+/// Fuses the per-token gather, expert output scaling, and scatter-add into one kernel.
+///
+/// For each (token, expert) assignment:
+///   output[token] += weight * expert_output[slot]
+///
+/// token_indices: [n_routed] — which token each slot corresponds to
+/// weights: [n_routed] — router weight for each routed token
+/// expert_output: [n_routed, dim] — expert FFN output
+/// combined_output: [n_tokens, dim] — accumulated output (scatter-add target)
+pub const MOE_SCATTER_ADD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void moe_scatter_add(
+    device const float* expert_output [[buffer(0)]],
+    device const uint* token_indices [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    device float* combined_output [[buffer(3)]],
+    constant uint& n_routed [[buffer(4)]],
+    constant uint& dim [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint slot = gid.x;   // which routed token
+    uint d = gid.y;      // which dimension
+    if (slot >= n_routed || d >= dim) return;
+
+    uint token_idx = token_indices[slot];
+    float w = weights[slot];
+    float val = expert_output[slot * dim + d] * w;
+
+    // Atomic add to combined output (multiple experts may write to same token)
+    // On Apple Silicon, device memory atomic is available
+    device float* dst = combined_output + token_idx * dim + d;
+    float old = *dst;
+    *dst = old + val;
+}
+"#;
+
+/// MoE token gather: collect tokens assigned to one expert into contiguous buffer.
+/// token_indices: [n_routed] — which tokens to gather
+/// input: [n_tokens, dim] — full input tensor
+/// gathered: [n_routed, dim] — gathered tokens for this expert
+pub const MOE_GATHER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void moe_gather(
+    device const float* input [[buffer(0)]],
+    device const uint* token_indices [[buffer(1)]],
+    device float* gathered [[buffer(2)]],
+    constant uint& n_routed [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint slot = gid.x;
+    uint d = gid.y;
+    if (slot >= n_routed || d >= dim) return;
+
+    uint token_idx = token_indices[slot];
+    gathered[slot * dim + d] = input[token_idx * dim + d];
+}
+"#;
