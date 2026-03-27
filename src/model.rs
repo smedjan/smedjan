@@ -284,11 +284,11 @@ impl TransformerBlock {
             Vec::new()
         };
 
-        // Router weight (only used for MoE)
+        // Router weight — larger init std to break expert symmetry from step 1
         let router_weight = if config.n_experts > 1 {
-            Tensor::randn(ctx, vec![d, config.n_experts], (1.0 / d as f32).sqrt())
+            Tensor::randn(ctx, vec![d, config.n_experts], (2.0 / d as f32).sqrt())
         } else {
-            Tensor::zeros(ctx, vec![1]) // placeholder
+            Tensor::zeros(ctx, vec![1])
         };
 
         Self {
@@ -336,36 +336,47 @@ impl TransformerBlock {
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
 
-        // Router: per-token probability for each expert (on tape)
+        // Router logits (on tape — gradients flow to router weights)
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
+
+        // Add noise during training to break symmetry
+        let router_logits = if autograd::is_recording() {
+            let noise = Tensor::randn(&x_flat.ctx, vec![n_tokens, self.n_experts], 1.0);
+            router_logits.add(&noise)
+        } else {
+            router_logits
+        };
+
         let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
         let probs_data = router_probs.to_vec();
 
-        // output = sum_e( expert_e(x) * router_probs[:, e] )
+        // Soft MoE: each expert runs on all tokens, weighted by router_probs.
+        // Router probs extracted ON TAPE via matmul with one-hot selector.
+        // This ensures gradients flow from output → scale_rows → router_probs → router_weight.
         let mut combined: Option<Tensor> = None;
 
         for expert_idx in 0..self.n_experts {
             let expert = &self.experts[expert_idx];
 
-            // Expert FFN (all on tape)
+            // Expert FFN on all tokens (on tape)
             let gate = x_flat.matmul(&expert.w1);
             let up = x_flat.matmul(&expert.w3);
             let hidden = gate.silu_gate(&up);
             let expert_out = hidden.matmul(&expert.w2); // [n_tokens, d]
 
-            // Extract this expert's routing weight ON TAPE via matmul with one-hot selector.
-            // router_probs: [n_tokens, n_experts] @ selector: [n_experts, 1] → [n_tokens, 1]
-            let mut selector_data = vec![0.0f32; self.n_experts];
-            selector_data[expert_idx] = 1.0;
+            // Extract this expert's prob column ON TAPE:
+            // router_probs [n_tokens, n_experts] @ one_hot [n_experts, 1] = [n_tokens, 1]
+            let mut sel = vec![0.0f32; self.n_experts];
+            sel[expert_idx] = 1.0;
             let selector = Tensor::from_buffer(
                 Arc::clone(&x_flat.ctx),
-                x_flat.ctx.buffer_from_slice(&selector_data),
+                x_flat.ctx.buffer_from_slice(&sel),
                 vec![self.n_experts, 1],
             );
-            let weights_2d = router_probs.matmul(&selector); // [n_tokens, 1] ON TAPE
-            let weights = weights_2d.reshape(vec![n_tokens]);
+            let weight_col = router_probs.matmul(&selector); // [n_tokens, 1] ON TAPE
+            let weights = weight_col.reshape(vec![n_tokens]); // [n_tokens]
 
-            // Per-token scaling ON TAPE via scale_rows
+            // Scale expert output by its router probability per token (ON TAPE)
             let scaled = expert_out.scale_rows(&weights);
 
             combined = Some(match combined {
