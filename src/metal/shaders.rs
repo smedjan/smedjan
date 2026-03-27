@@ -3042,3 +3042,43 @@ kernel void row_dot_reduce(
     output[gid] = sum;
 }
 "#;
+
+/// Lion optimizer update (Chen et al., 2023).
+/// Simpler than AdamW: only tracks momentum (no variance).
+/// Update = sign(beta1 * m + (1-beta1) * grad) * lr + weight_decay * param
+/// Then: m = beta2 * m + (1-beta2) * grad
+/// 2x less memory than AdamW (no v buffer needed).
+pub const LION_UPDATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LionParams {
+    float lr;
+    float beta1;
+    float beta2;
+    float weight_decay;
+};
+
+kernel void lion_update(
+    device float* param [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    device float* m [[buffer(2)]],
+    constant LionParams& hp [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    float g = grad[gid];
+    float m_val = m[gid];
+
+    // Update direction: sign(interpolation of m and grad)
+    float update = m_val * hp.beta1 + g * (1.0f - hp.beta1);
+    float sign_update = (update > 0.0f) ? 1.0f : ((update < 0.0f) ? -1.0f : 0.0f);
+
+    // Apply update with weight decay
+    param[gid] = param[gid] * (1.0f - hp.lr * hp.weight_decay) - hp.lr * sign_update;
+
+    // Update momentum
+    m[gid] = m_val * hp.beta2 + g * (1.0f - hp.beta2);
+}
+"#;

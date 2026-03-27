@@ -161,6 +161,14 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_moe_scatter_add(ctx, &gathered, &indices, &weights, &combined, 2, 2);
     tested += 2;
 
+    // Lion optimizer
+    let p = ctx.buffer_from_slice(&[1.0f32, 2.0]);
+    let g = ctx.buffer_from_slice(&[0.1f32, -0.1]);
+    let m = ctx.alloc_buffer(2 * 4);
+    compute::gpu_fill(ctx, &m, 2, 0.0);
+    compute::gpu_lion_update(ctx, &p, &g, &m, 2, 0.01, 0.9, 0.99, 0.0);
+    tested += 1;
+
     // FlashAttention op variant
     let _op = crate::autograd::Op::FlashAttention {
         batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,

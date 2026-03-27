@@ -553,10 +553,11 @@ impl TransformerBlock {
 /// The full transformer model.
 pub struct Transformer {
     pub config: ModelConfig,
-    pub embedding: Tensor,           // [vocab_size, d_model]
+    pub embedding: Tensor,           // [vocab_size, d_model] or [vocab, embed_rank] if factored
+    pub embed_proj: Tensor,          // [embed_rank, d_model] (identity/zeros when not factored)
+    pub embed_rank: usize,           // 0 = full embedding, >0 = factored
     pub blocks: Vec<Arc<TransformerBlock>>,
     pub ln_final_weight: Tensor,     // [d_model]
-    // lm_head shares weights with embedding (weight tying)
     ctx: Arc<MetalContext>,
 }
 
@@ -565,9 +566,19 @@ impl Transformer {
         let d = config.d_model;
         let v = config.vocab_size as usize;
 
-        // Embedding with small init
-        let embed_std = (1.0 / d as f32).sqrt();
-        let embedding = Tensor::randn(ctx, vec![v, d], embed_std);
+        // Embedding — optionally factored: [vocab, rank] × [rank, d] instead of [vocab, d]
+        let embed_rank = config.lowrank.max(0); // reuse lowrank for embedding too
+        let (embedding, embed_proj) = if embed_rank > 0 && embed_rank < d {
+            let e_std = (1.0 / embed_rank as f32).sqrt();
+            let p_std = (1.0 / d as f32).sqrt();
+            (
+                Tensor::randn(ctx, vec![v, embed_rank], e_std),
+                Tensor::randn(ctx, vec![embed_rank, d], p_std),
+            )
+        } else {
+            let embed_std = (1.0 / d as f32).sqrt();
+            (Tensor::randn(ctx, vec![v, d], embed_std), Tensor::zeros(ctx, vec![1]))
+        };
 
         let blocks: Vec<Arc<TransformerBlock>> = (0..config.n_layers)
             .map(|i| Arc::new(TransformerBlock::new(ctx, &config, i)))
@@ -584,6 +595,8 @@ impl Transformer {
         Self {
             config,
             embedding,
+            embed_proj,
+            embed_rank,
             blocks,
             ln_final_weight,
             ctx: Arc::clone(ctx),
@@ -608,20 +621,21 @@ impl Transformer {
         let v = self.config.vocab_size as usize;
         let n_tokens = batch * seq_len;
 
-        // Embedding lookup
+        // Embedding lookup (optionally factored)
         let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * d * 4);
+        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
         compute::gpu_embedding_lookup(
             &self.ctx,
             &tokens_buf,
             &self.embedding.buffer,
             &embed_out_buf,
             n_tokens as u32,
-            d as u32,
+            embed_dim as u32,
         );
 
         // Record embedding on tape
-        let tokens_id = autograd::next_id(); // separate ID for the non-differentiable tokens tensor
+        let tokens_id = autograd::next_id();
         let embed_out_id = autograd::next_id();
         if autograd::is_recording() {
             autograd::record(TapeEntry {
@@ -630,18 +644,26 @@ impl Transformer {
                 output: embed_out_id,
                 input_buffers: vec![tokens_buf, self.embedding.buffer.clone()],
                 output_buffer: embed_out_buf.clone(),
-                shapes: vec![vec![n_tokens], vec![v, d], vec![n_tokens, d]],
+                shapes: vec![vec![n_tokens], vec![v, embed_dim], vec![n_tokens, embed_dim]],
                 cached: None,
             });
         }
 
-        let mut h = Tensor {
+        let embed_tensor = Tensor {
             id: embed_out_id,
             buffer: embed_out_buf,
-            shape: vec![batch, seq_len, d],
+            shape: vec![n_tokens, embed_dim],
             requires_grad: true,
             ctx: Arc::clone(&self.ctx),
         };
+
+        // Project factored embedding to full d_model
+        let h_flat = if self.embed_rank > 0 {
+            embed_tensor.matmul(&self.embed_proj) // [n_tokens, rank] @ [rank, d] = [n_tokens, d]
+        } else {
+            embed_tensor
+        };
+        let mut h = h_flat.reshape(vec![batch, seq_len, d]);
 
         // Run through transformer blocks
         match kv_caches {
@@ -667,9 +689,16 @@ impl Transformer {
         // Final layer norm
         let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
 
-        // LM head (weight-tied with embedding): logits = h @ embedding^T
+        // LM head (weight-tied with embedding)
+        // Full: logits = h @ embedding^T
+        // Factored: logits = h @ embed_proj^T @ embedding^T (two smaller matmuls)
         let h_flat = h.reshape(vec![n_tokens, d]);
-        let logits = h_flat.matmul_trans_b(&self.embedding.detach());
+        let logits = if self.embed_rank > 0 {
+            let h_proj = h_flat.matmul_trans_b(&self.embed_proj.detach()); // [n_tokens, rank]
+            h_proj.matmul_trans_b(&self.embedding.detach()) // [n_tokens, vocab]
+        } else {
+            h_flat.matmul_trans_b(&self.embedding.detach())
+        };
 
         // μP: scale output logits to prevent large activations in wide models
         let mup_scale = self.config.mup_output_scale();
@@ -683,6 +712,9 @@ impl Transformer {
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = vec![&self.embedding, &self.ln_final_weight];
+        if self.embed_rank > 0 {
+            params.push(&self.embed_proj);
+        }
         for block in &self.blocks {
             params.extend(block.parameters());
         }
