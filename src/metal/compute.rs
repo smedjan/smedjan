@@ -658,6 +658,45 @@ pub fn gpu_flash_attention_backward(
     );
 }
 
+/// BitNet: ternary matmul C = A(float) @ W(ternary packed).
+/// W is packed as 2 bits per weight, 16 per u32. No floating point multiply.
+pub fn gpu_ternary_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, w_packed: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+
+    let grid = MetalContext::size(n as u64, m as u64, 1);
+    let tg = MetalContext::size(n.min(32) as u64, m.min(32) as u64, 1);
+
+    dispatch_sync!(ctx, "ternary_matmul", grid, tg,
+        0 => a, 1 => w_packed, 2 => c, 3 => &params_buf
+    );
+}
+
+/// BitNet: compute absmean per column for ternary quantization threshold.
+pub fn gpu_ternary_absmean(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &GpuBuffer, rows: u32, cols: u32) {
+    let rows_buf = params_buffer(ctx, &rows);
+    let cols_buf = params_buffer(ctx, &cols);
+    let grid = MetalContext::size(cols as u64, 1, 1);
+    let tg = MetalContext::size(cols.min(256) as u64, 1, 1);
+    dispatch_threads_sync!(ctx, "ternary_absmean", grid, tg,
+        0 => weights, 1 => absmean, 2 => &rows_buf, 3 => &cols_buf
+    );
+}
+
+/// BitNet: pack float weights to ternary (2 bits per weight, 16 per u32).
+pub fn gpu_ternary_pack(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &GpuBuffer, packed: &GpuBuffer, rows: u32, cols: u32) {
+    let rows_buf = params_buffer(ctx, &rows);
+    let cols_buf = params_buffer(ctx, &cols);
+    let packed_rows = (rows + 15) / 16;
+    let grid = MetalContext::size(cols as u64, packed_rows as u64, 1);
+    let tg = MetalContext::size(cols.min(32) as u64, packed_rows.min(32) as u64, 1);
+    dispatch_sync!(ctx, "ternary_pack", grid, tg,
+        0 => weights, 1 => absmean, 2 => packed, 3 => &rows_buf, 4 => &cols_buf
+    );
+}
+
 /// MoE: gather tokens for one expert into contiguous buffer.
 pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &GpuBuffer, gathered: &GpuBuffer, n_routed: u32, dim: u32) {
     let n_buf = params_buffer(ctx, &n_routed);

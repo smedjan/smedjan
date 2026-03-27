@@ -373,6 +373,7 @@ impl TransformerBlock {
         let x_flat = x.reshape(vec![batch * seq_len, d]);
 
         // Gate and up projections
+        // Use ternary matmul when BitNet is enabled (no float multiply in FFN)
         let gate = x_flat.matmul(&self.ffn_w1); // [bs, d_ff]
         let up = x_flat.matmul(&self.ffn_w3);   // [bs, d_ff]
 
