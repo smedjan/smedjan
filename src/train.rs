@@ -152,6 +152,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         CosineWarmupScheduler::new(effective_lr, config.warmup_steps, config.total_steps)
     };
 
+    // Pre-allocate loss workspace (avoids 33MB+ allocation every step)
+    let batch_seq = config.batch_size * config.seq_len;
+    let loss_ws = loss::LossWorkspace::new(ctx, batch_seq, config.model_config.vocab_size as usize);
+
     // Data loader
     let mut data_loader = DataLoader::new(&config.dataset_path, config.batch_size, config.seq_len)?;
     let batches_per_epoch = data_loader.batches_per_epoch();
@@ -199,7 +203,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     &targets,
                 )
             } else {
-                loss::cross_entropy_loss(ctx, &logits, &targets)
+                loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
             };
 
             // Scale both loss AND gradient by 1/grad_accum_steps.

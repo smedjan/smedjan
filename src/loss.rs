@@ -4,6 +4,25 @@ use crate::tensor::Tensor;
 use objc2::rc::Retained;
 use std::sync::Arc;
 
+/// Pre-allocated buffers for loss computation — avoids 33MB+ allocation every step.
+pub struct LossWorkspace {
+    pub targets_buf: Retained<GpuBuffer>,   // [batch * seq_len] u32
+    pub losses_buf: Retained<GpuBuffer>,    // [batch * seq_len] f32
+    pub grad_logits_buf: Retained<GpuBuffer>, // [batch * seq_len, vocab] f32
+    pub scalar_buf: Retained<GpuBuffer>,    // [1] f32
+}
+
+impl LossWorkspace {
+    pub fn new(ctx: &Arc<MetalContext>, batch_seq: usize, vocab: usize) -> Self {
+        Self {
+            targets_buf: ctx.alloc_buffer(batch_seq * 4),
+            losses_buf: ctx.alloc_buffer(batch_seq * 4),
+            grad_logits_buf: ctx.alloc_buffer(batch_seq * vocab * 4),
+            scalar_buf: ctx.alloc_buffer(4),
+        }
+    }
+}
+
 /// Cross-entropy loss for next-token prediction.
 /// logits: [batch * seq_len, vocab_size], targets: [batch * seq_len] (u32 token IDs)
 /// Returns a scalar loss tensor and the gradient buffer.
@@ -12,15 +31,43 @@ pub fn cross_entropy_loss(
     logits: &Tensor,
     targets: &[u32],
 ) -> (Tensor, Retained<GpuBuffer>) {
+    cross_entropy_loss_impl(ctx, logits, targets, None)
+}
+
+/// Cross-entropy with pre-allocated workspace — avoids 33MB+ allocation per step.
+pub fn cross_entropy_loss_with_workspace(
+    ctx: &Arc<MetalContext>,
+    logits: &Tensor,
+    targets: &[u32],
+    ws: &LossWorkspace,
+) -> (Tensor, Retained<GpuBuffer>) {
+    cross_entropy_loss_impl(ctx, logits, targets, Some(ws))
+}
+
+fn cross_entropy_loss_impl(
+    ctx: &Arc<MetalContext>,
+    logits: &Tensor,
+    targets: &[u32],
+    workspace: Option<&LossWorkspace>,
+) -> (Tensor, Retained<GpuBuffer>) {
     let logits_shape = &logits.shape;
     assert_eq!(logits_shape.len(), 2, "logits must be [batch, vocab]");
     let batch = logits_shape[0];
     let vocab = logits_shape[1];
     assert_eq!(targets.len(), batch, "targets length must match batch size");
 
-    let targets_buf = ctx.buffer_from_u32_slice(targets);
-    let losses_buf = ctx.alloc_buffer(batch * 4);
-    let grad_logits_buf = ctx.alloc_buffer(batch * vocab * 4);
+    // Use workspace buffers if provided, otherwise allocate fresh
+    let (targets_buf, losses_buf, grad_logits_buf, scalar_buf) = match workspace {
+        Some(ws) => {
+            // Write targets into pre-allocated buffer
+            MetalContext::write_u32_to_buffer(&ws.targets_buf, targets);
+            (ws.targets_buf.clone(), ws.losses_buf.clone(), ws.grad_logits_buf.clone(), ws.scalar_buf.clone())
+        }
+        None => {
+            (ctx.buffer_from_u32_slice(targets), ctx.alloc_buffer(batch * 4),
+             ctx.alloc_buffer(batch * vocab * 4), ctx.alloc_buffer(4))
+        }
+    };
 
     compute::gpu_cross_entropy(
         ctx,
@@ -32,8 +79,6 @@ pub fn cross_entropy_loss(
         vocab as u32,
     );
 
-    // Reduce per-sample losses to scalar mean
-    let scalar_buf = ctx.alloc_buffer(4);
     compute::gpu_reduce_sum(ctx, &losses_buf, &scalar_buf, batch as u32);
     compute::gpu_scale(ctx, &scalar_buf, 1, 1.0 / batch as f32);
 
