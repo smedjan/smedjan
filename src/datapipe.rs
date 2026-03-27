@@ -478,3 +478,123 @@ pub fn record_provenance(
 
     Ok(())
 }
+
+// ============================================================
+// Phase 3: Data Quality Pipeline
+// ============================================================
+
+/// MinHash signature for near-duplicate detection.
+/// Uses k independent hash functions to create a signature per document.
+pub struct MinHashSignature {
+    pub hashes: Vec<u64>,
+}
+
+/// Compute MinHash signature for a document (as list of shingle hashes).
+pub fn minhash_signature(text: &str, num_hashes: usize, shingle_size: usize) -> MinHashSignature {
+    // Generate shingles (n-grams of characters)
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < shingle_size {
+        return MinHashSignature { hashes: vec![u64::MAX; num_hashes] };
+    }
+
+    let mut min_hashes = vec![u64::MAX; num_hashes];
+
+    for i in 0..=(chars.len() - shingle_size) {
+        let shingle: String = chars[i..i + shingle_size].iter().collect();
+        let base_hash = fnv_hash(shingle.as_bytes());
+
+        for h in 0..num_hashes {
+            // Use different hash functions by XORing with seed
+            let hash = base_hash.wrapping_mul(6364136223846793005u64.wrapping_add(h as u64 * 1442695040888963407));
+            if hash < min_hashes[h] {
+                min_hashes[h] = hash;
+            }
+        }
+    }
+
+    MinHashSignature { hashes: min_hashes }
+}
+
+/// Jaccard similarity estimate from MinHash signatures.
+pub fn minhash_similarity(a: &MinHashSignature, b: &MinHashSignature) -> f32 {
+    assert_eq!(a.hashes.len(), b.hashes.len());
+    let matches = a.hashes.iter().zip(&b.hashes).filter(|(a, b)| a == b).count();
+    matches as f32 / a.hashes.len() as f32
+}
+
+/// FNV-1a hash (fast, non-cryptographic).
+fn fnv_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Deduplicate documents using MinHash. Returns indices of documents to KEEP.
+/// threshold: Jaccard similarity above which documents are considered duplicates (e.g. 0.8)
+pub fn minhash_dedup(documents: &[String], threshold: f32, num_hashes: usize) -> Vec<usize> {
+    let signatures: Vec<MinHashSignature> = documents.iter()
+        .map(|doc| minhash_signature(doc, num_hashes, 5))
+        .collect();
+
+    let mut keep = Vec::new();
+    let mut kept_sigs: Vec<&MinHashSignature> = Vec::new();
+
+    for (i, sig) in signatures.iter().enumerate() {
+        let is_dup = kept_sigs.iter().any(|kept| minhash_similarity(sig, kept) > threshold);
+        if !is_dup {
+            keep.push(i);
+            kept_sigs.push(sig);
+        }
+    }
+
+    keep
+}
+
+/// Score document quality by simple heuristics (no model needed).
+/// Returns 0.0 (garbage) to 1.0 (high quality).
+pub fn quality_score(text: &str) -> f32 {
+    let len = text.len();
+    if len < 50 { return 0.0; }   // too short
+    if len > 100_000 { return 0.3; } // suspiciously long
+
+    let mut score = 0.5f32;
+
+    // Proportion of alphabetic characters (vs special chars, numbers)
+    let alpha_ratio = text.chars().filter(|c| c.is_alphabetic() || c.is_whitespace()).count() as f32 / len as f32;
+    if alpha_ratio > 0.7 { score += 0.2; }
+    if alpha_ratio < 0.4 { score -= 0.3; }
+
+    // Average word length (gibberish tends to have very long "words")
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if !words.is_empty() {
+        let avg_word_len = words.iter().map(|w| w.len()).sum::<usize>() as f32 / words.len() as f32;
+        if avg_word_len > 2.0 && avg_word_len < 15.0 { score += 0.1; }
+        if avg_word_len > 30.0 { score -= 0.3; }
+    }
+
+    // Sentence structure (has periods, not all caps)
+    if text.contains(". ") || text.contains(".\n") { score += 0.1; }
+    let caps_ratio = text.chars().filter(|c| c.is_uppercase()).count() as f32 / len.max(1) as f32;
+    if caps_ratio > 0.5 { score -= 0.2; } // mostly CAPS = low quality
+
+    // Repetition check (same line repeated)
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > 3 {
+        let unique_lines: HashSet<&str> = lines.iter().copied().collect();
+        let unique_ratio = unique_lines.len() as f32 / lines.len() as f32;
+        if unique_ratio < 0.5 { score -= 0.3; } // very repetitive
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
+/// Filter documents by quality threshold.
+pub fn quality_filter_batch(documents: &[String], min_quality: f32) -> Vec<usize> {
+    documents.iter().enumerate()
+        .filter(|(_, doc)| quality_score(doc) >= min_quality)
+        .map(|(i, _)| i)
+        .collect()
+}

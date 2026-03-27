@@ -14,6 +14,7 @@ mod metal;
 mod cuda;
 #[cfg(feature = "andreos")]
 mod andreos;
+mod distill;
 mod gpu;
 mod model;
 mod optim;
@@ -306,6 +307,44 @@ enum Commands {
         output: String,
         #[arg(long)]
         tokenizer: String,
+    },
+
+    /// Generate training data from Claude/OpenAI/Ollama API (distillation)
+    Distill {
+        /// API endpoint URL
+        #[arg(long, default_value = "http://localhost:11434/api/generate")]
+        api_url: String,
+        /// API key (for Claude/OpenAI, not needed for Ollama)
+        #[arg(long, default_value = "")]
+        api_key: String,
+        /// Model name (e.g. "claude-sonnet-4-20250514", "qwen2.5:7b")
+        #[arg(long, default_value = "qwen2.5:7b")]
+        model: String,
+        /// Output JSONL file
+        #[arg(long)]
+        output: String,
+        /// Number of samples to generate
+        #[arg(long, default_value = "100")]
+        n_samples: usize,
+        /// Max tokens per response
+        #[arg(long, default_value = "512")]
+        max_tokens: usize,
+    },
+
+    /// Deduplicate and filter training documents
+    Dedup {
+        /// Input file (one document per line)
+        #[arg(long)]
+        input: String,
+        /// Output file (filtered)
+        #[arg(long)]
+        output: String,
+        /// MinHash similarity threshold (0.0-1.0). Default: 0.8
+        #[arg(long, default_value = "0.8")]
+        threshold: f32,
+        /// Minimum quality score (0.0-1.0). Default: 0.3
+        #[arg(long, default_value = "0.3")]
+        min_quality: f32,
     },
 }
 
@@ -763,6 +802,47 @@ fn main() {
             let count = dpo::prepare_dpo_dataset(&input, &output, &tok)
                 .expect("DPO data preparation failed");
             println!("Generated {} preference pairs", count);
+        }
+
+        Commands::Distill {
+            api_url, api_key, model, output, n_samples, max_tokens,
+        } => {
+            let config = distill::DistillConfig {
+                api_url, api_key, model, output_path: output,
+                n_samples, max_tokens, temperature: 0.7,
+            };
+            let count = distill::generate_training_data(&config)
+                .expect("Data generation failed");
+            println!("Generated {} training pairs", count);
+        }
+
+        Commands::Dedup {
+            input, output, threshold, min_quality,
+        } => {
+            let docs: Vec<String> = std::fs::read_to_string(&input)
+                .expect("Failed to read input")
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+
+            eprintln!("Input: {} documents", docs.len());
+
+            // Quality filter
+            let quality_keep = datapipe::quality_filter_batch(&docs, min_quality);
+            eprintln!("After quality filter (>{}): {} docs", min_quality, quality_keep.len());
+
+            let quality_docs: Vec<String> = quality_keep.iter().map(|&i| docs[i].clone()).collect();
+
+            // MinHash dedup
+            let dedup_keep = datapipe::minhash_dedup(&quality_docs, threshold, 128);
+            eprintln!("After dedup (thresh={}): {} docs", threshold, dedup_keep.len());
+
+            let mut out = std::fs::File::create(&output).expect("Failed to create output");
+            for &i in &dedup_keep {
+                use std::io::Write;
+                writeln!(out, "{}", quality_docs[i]).expect("Write failed");
+            }
+            eprintln!("Output: {} → {} documents", docs.len(), dedup_keep.len());
         }
     }
 }
