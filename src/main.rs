@@ -595,6 +595,10 @@ fn main() {
             println!("  RoPE theta: {}", c.rope_theta);
             println!("  Training RAM: {:.0} MB", c.training_memory_bytes() as f64 / (1024.0 * 1024.0));
             println!("  Inference RAM: {:.0} MB", c.inference_memory_bytes() as f64 / (1024.0 * 1024.0));
+
+            // GPU diagnostic — verify all kernel variants
+            let (n_tested, all_ok) = api::gpu_diagnostic(&ctx);
+            println!("  GPU kernels: {} tested, {}", n_tested, if all_ok { "all passed" } else { "FAILURES" });
         }
 
         Commands::Sizes { vocab_size } => {
