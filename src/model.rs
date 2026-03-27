@@ -21,6 +21,7 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     pub n_experts: usize,     // MoE: number of expert FFNs (1 = dense, >1 = MoE)
     pub top_k_experts: usize, // MoE: how many experts active per token (typically 1 or 2)
+    pub mup_base_width: usize, // μP: base model width for HP transfer (0 = disabled)
 }
 
 impl ModelConfig {
@@ -78,6 +79,34 @@ impl ModelConfig {
             norm_eps: 1e-5,
             n_experts: 1,
             top_k_experts: 1,
+            mup_base_width: 0,
+        }
+    }
+
+    /// Enable μP scaling. base_width is the proxy model's d_model (e.g. 64).
+    /// When training the target model (e.g. d_model=768), LR scales by base/target.
+    pub fn with_mup(mut self, base_width: usize) -> Self {
+        self.mup_base_width = base_width;
+        self
+    }
+
+    /// Get μP learning rate multiplier for hidden layers.
+    /// Returns base_width / d_model (< 1 for large models).
+    /// Returns 1.0 if μP is disabled.
+    pub fn mup_lr_scale(&self) -> f32 {
+        if self.mup_base_width > 0 {
+            self.mup_base_width as f32 / self.d_model as f32
+        } else {
+            1.0
+        }
+    }
+
+    /// Get μP output logit scale (dampen large model outputs).
+    pub fn mup_output_scale(&self) -> f32 {
+        if self.mup_base_width > 0 {
+            self.mup_base_width as f32 / self.d_model as f32
+        } else {
+            1.0
         }
     }
 
@@ -593,10 +622,16 @@ impl Transformer {
         let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
 
         // LM head (weight-tied with embedding): logits = h @ embedding^T
-        // h: [batch*seq, d_model], embedding: [vocab, d_model]
-        // logits: [batch*seq, vocab]
         let h_flat = h.reshape(vec![n_tokens, d]);
-        h_flat.matmul_trans_b(&self.embedding.detach())
+        let logits = h_flat.matmul_trans_b(&self.embedding.detach());
+
+        // μP: scale output logits to prevent large activations in wide models
+        let mup_scale = self.config.mup_output_scale();
+        if mup_scale < 1.0 {
+            logits.scale(mup_scale)
+        } else {
+            logits
+        }
     }
 
     /// Collect all trainable parameters.

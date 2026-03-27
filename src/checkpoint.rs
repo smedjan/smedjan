@@ -313,7 +313,8 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         max_seq_len,
         rope_theta,
         norm_eps,
-        n_experts: 1,      // TODO: save/load MoE config in checkpoint v3
+        n_experts: 1,
         top_k_experts: 1,
+        mup_base_width: 0,
     })
 }

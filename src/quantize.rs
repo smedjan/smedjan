@@ -416,6 +416,7 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         norm_eps,
         n_experts: 1,
         top_k_experts: 1,
+        mup_base_width: 0,
     })
 }
 

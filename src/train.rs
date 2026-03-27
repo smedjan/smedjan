@@ -137,11 +137,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         (model, optimizer, 0, 0u64)
     };
 
+    // μP: scale learning rate by base_width / d_model
+    let mup_scale = config.model_config.mup_lr_scale();
+    let effective_lr = config.max_lr * mup_scale;
+    if mup_scale < 1.0 {
+        eprintln!("μP enabled: base_width={}, LR scaled {:.4} → {:.4}",
+            config.model_config.mup_base_width, config.max_lr, effective_lr);
+    }
+
     // Learning rate scheduler (with optional warm restarts)
     let scheduler = if config.lr_restart_period > 0 {
-        CosineWarmupScheduler::with_restarts(config.max_lr, config.warmup_steps, config.total_steps, config.lr_restart_period)
+        CosineWarmupScheduler::with_restarts(effective_lr, config.warmup_steps, config.total_steps, config.lr_restart_period)
     } else {
-        CosineWarmupScheduler::new(config.max_lr, config.warmup_steps, config.total_steps)
+        CosineWarmupScheduler::new(effective_lr, config.warmup_steps, config.total_steps)
     };
 
     // Data loader

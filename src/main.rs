@@ -129,6 +129,9 @@ enum Commands {
         /// LR warm restart period (steps). 0 = standard cosine. Default: 0
         #[arg(long, default_value = "0")]
         lr_restart: u32,
+        /// μP base width for hyperparameter transfer. 0 = disabled. Default: 0
+        #[arg(long, default_value = "0")]
+        mup_base: usize,
     },
 
     /// Show available model sizes and their param counts
@@ -389,6 +392,7 @@ fn main() {
             val_dataset,
             dropout,
             lr_restart,
+            mup_base,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -446,6 +450,9 @@ fn main() {
             config.val_dataset = val_dataset;
             config.dropout = dropout;
             config.lr_restart_period = lr_restart;
+            if mup_base > 0 {
+                config.model_config.mup_base_width = mup_base;
+            }
 
             train::train(&ctx, &config).expect("Training failed");
         }
