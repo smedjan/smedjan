@@ -24,6 +24,7 @@ pub struct ModelConfig {
     pub mup_base_width: usize, // μP: base model width for HP transfer (0 = disabled)
     pub bitnet: bool,          // BitNet: use ternary weights in FFN (no float multiply)
     pub lowrank: usize,        // Low-rank training: 0=full rank, >0=rank for FFN decomposition
+    pub shared_layers: bool,   // ALBERT: share weights across all layers (1 unique layer, N iterations)
 }
 
 impl ModelConfig {
@@ -84,6 +85,7 @@ impl ModelConfig {
             mup_base_width: 0,
             bitnet: false,
             lowrank: 0,
+            shared_layers: false,
         }
     }
 
@@ -580,9 +582,14 @@ impl Transformer {
             (Tensor::randn(ctx, vec![v, d], embed_std), Tensor::zeros(ctx, vec![1]))
         };
 
-        let blocks: Vec<Arc<TransformerBlock>> = (0..config.n_layers)
-            .map(|i| Arc::new(TransformerBlock::new(ctx, &config, i)))
-            .collect();
+        let blocks: Vec<Arc<TransformerBlock>> = if config.shared_layers {
+            // ALBERT: one unique layer, shared across all positions
+            let shared = Arc::new(TransformerBlock::new(ctx, &config, 0));
+            eprintln!("ALBERT mode: {} layers sharing 1 set of weights", config.n_layers);
+            (0..config.n_layers).map(|_| Arc::clone(&shared)).collect()
+        } else {
+            (0..config.n_layers).map(|i| Arc::new(TransformerBlock::new(ctx, &config, i))).collect()
+        };
 
         let ln_final_weight = Tensor::ones(ctx, vec![d]);
 

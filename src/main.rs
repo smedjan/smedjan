@@ -139,6 +139,9 @@ enum Commands {
         /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
         #[arg(long, default_value = "0")]
         lowrank: usize,
+        /// ALBERT: share weights across all layers (1 unique layer, N iterations)
+        #[arg(long)]
+        shared_layers: bool,
         /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
         #[arg(long, default_value = "0.0")]
         prune_threshold: f32,
@@ -473,6 +476,7 @@ fn main() {
             mup_base,
             bitnet,
             lowrank,
+            shared_layers,
             prune_threshold,
             galore_rank,
             reference_model,
@@ -540,6 +544,7 @@ fn main() {
             }
             config.model_config.bitnet = bitnet;
             config.model_config.lowrank = lowrank;
+            config.model_config.shared_layers = shared_layers;
             config.prune_threshold = prune_threshold;
             config.galore_rank = galore_rank;
             config.optimizer_type = optimizer;
