@@ -22,6 +22,7 @@ pub struct ModelConfig {
     pub n_experts: usize,     // MoE: number of expert FFNs (1 = dense, >1 = MoE)
     pub top_k_experts: usize, // MoE: how many experts active per token (typically 1 or 2)
     pub mup_base_width: usize, // μP: base model width for HP transfer (0 = disabled)
+    pub bitnet: bool,          // BitNet: use ternary weights in FFN (no float multiply)
 }
 
 impl ModelConfig {
@@ -80,6 +81,7 @@ impl ModelConfig {
             n_experts: 1,
             top_k_experts: 1,
             mup_base_width: 0,
+            bitnet: false,
         }
     }
 
@@ -256,6 +258,7 @@ pub struct TransformerBlock {
     pub router_weight: Tensor,     // [d_model, n_experts] — router logits
     pub n_experts: usize,
     pub top_k: usize,
+    pub bitnet: bool,
     pub ln1_weight: Tensor, // [d_model] — attention norm
     pub ln2_weight: Tensor, // [d_model] — ffn norm
     pub norm_eps: f32,
@@ -300,6 +303,7 @@ impl TransformerBlock {
             router_weight,
             n_experts: config.n_experts,
             top_k: config.top_k_experts,
+            bitnet: config.bitnet,
             ln1_weight: Tensor::ones(ctx, vec![d]),
             ln2_weight: Tensor::ones(ctx, vec![d]),
             norm_eps: config.norm_eps,
@@ -394,16 +398,21 @@ impl TransformerBlock {
     fn swiglu_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let x_flat = x.reshape(vec![batch * seq_len, d]);
 
-        // Gate and up projections
-        // Use ternary matmul when BitNet is enabled (no float multiply in FFN)
-        let gate = x_flat.matmul(&self.ffn_w1); // [bs, d_ff]
-        let up = x_flat.matmul(&self.ffn_w3);   // [bs, d_ff]
+        // Gate and up projections — BitNet uses ternary matmul (add/subtract, no multiply)
+        let (gate, up) = if self.bitnet {
+            (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))
+        } else {
+            (x_flat.matmul(&self.ffn_w1), x_flat.matmul(&self.ffn_w3))
+        };
 
-        // SwiGLU activation (fused: silu(gate) * up in one kernel)
         let hidden = gate.silu_gate(&up);
 
         // Down projection
-        let out = hidden.matmul(&self.ffn_w2); // [bs, d]
+        let out = if self.bitnet {
+            hidden.ternary_matmul(&self.ffn_w2)
+        } else {
+            hidden.matmul(&self.ffn_w2)
+        };
         out.reshape(vec![batch, seq_len, d])
     }
 

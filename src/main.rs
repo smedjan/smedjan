@@ -133,6 +133,9 @@ enum Commands {
         /// μP base width for hyperparameter transfer. 0 = disabled. Default: 0
         #[arg(long, default_value = "0")]
         mup_base: usize,
+        /// BitNet: use ternary weights in FFN (no float multiply). Default: false
+        #[arg(long)]
+        bitnet: bool,
     },
 
     /// Show available model sizes and their param counts
@@ -432,6 +435,7 @@ fn main() {
             dropout,
             lr_restart,
             mup_base,
+            bitnet,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -492,6 +496,7 @@ fn main() {
             if mup_base > 0 {
                 config.model_config.mup_base_width = mup_base;
             }
+            config.model_config.bitnet = bitnet;
 
             train::train(&ctx, &config).expect("Training failed");
         }
