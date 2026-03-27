@@ -19,6 +19,8 @@ pub struct ModelConfig {
     pub max_seq_len: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
+    pub n_experts: usize,     // MoE: number of expert FFNs (1 = dense, >1 = MoE)
+    pub top_k_experts: usize, // MoE: how many experts active per token (typically 1 or 2)
 }
 
 impl ModelConfig {
@@ -74,7 +76,23 @@ impl ModelConfig {
             max_seq_len,
             rope_theta: 10000.0,
             norm_eps: 1e-5,
+            n_experts: 1,
+            top_k_experts: 1,
         }
+    }
+
+    /// Build a MoE config: multiple expert FFNs, router selects top-K per token.
+    pub fn custom_moe(
+        vocab_size: u32, d_model: usize, n_heads: usize, n_kv_heads: usize,
+        n_layers: usize, ffn_multiplier: f32, max_seq_len: usize,
+        n_experts: usize, top_k_experts: usize,
+    ) -> Self {
+        assert!(n_experts > 0, "n_experts must be > 0");
+        assert!(top_k_experts <= n_experts, "top_k ({}) must be <= n_experts ({})", top_k_experts, n_experts);
+        let mut config = Self::custom_gqa(vocab_size, d_model, n_heads, n_kv_heads, n_layers, ffn_multiplier, max_seq_len);
+        config.n_experts = n_experts;
+        config.top_k_experts = top_k_experts;
+        config
     }
 
     /// Tiny: ~1.2M params — dev/test, trains in seconds
@@ -134,7 +152,12 @@ impl ModelConfig {
         //   norms: 2 * d (ln1, ln2)
         let kv_dim = self.kv_dim();
         let attn_params = d * d + d * kv_dim + d * kv_dim + d * d; // Q + K + V + O
-        let per_layer = attn_params + 3 * d * ff + 2 * d;
+        let ffn_params = if self.n_experts > 1 {
+            self.n_experts * 3 * d * ff + d * self.n_experts // expert weights + router
+        } else {
+            3 * d * ff
+        };
+        let per_layer = attn_params + ffn_params + 2 * d;
 
         // Final norm
         let final_norm = d;
@@ -184,12 +207,26 @@ impl ModelConfig {
     }
 }
 
+/// Expert FFN weights for Mixture of Experts.
+pub struct ExpertFFN {
+    pub w1: Tensor,  // [d_model, d_ff] — gate projection
+    pub w2: Tensor,  // [d_ff, d_model] — down projection
+    pub w3: Tensor,  // [d_model, d_ff] — up projection
+}
+
 /// A single transformer block (pre-norm architecture).
+/// Supports both dense FFN and Mixture of Experts (MoE).
 pub struct TransformerBlock {
     pub attn: MultiHeadAttention,
+    // Dense FFN (used when n_experts == 1)
     pub ffn_w1: Tensor,     // [d_model, d_ff] — gate projection
     pub ffn_w2: Tensor,     // [d_ff, d_model] — down projection
     pub ffn_w3: Tensor,     // [d_model, d_ff] — up projection
+    // MoE (used when n_experts > 1)
+    pub experts: Vec<ExpertFFN>,   // n_experts FFN blocks
+    pub router_weight: Tensor,     // [d_model, n_experts] — router logits
+    pub n_experts: usize,
+    pub top_k: usize,
     pub ln1_weight: Tensor, // [d_model] — attention norm
     pub ln2_weight: Tensor, // [d_model] — ffn norm
     pub norm_eps: f32,
@@ -207,11 +244,33 @@ impl TransformerBlock {
 
         let _ = layer_idx;
 
+        // Create expert FFNs for MoE (empty vec for dense)
+        let experts = if config.n_experts > 1 {
+            (0..config.n_experts).map(|_| ExpertFFN {
+                w1: Tensor::randn(ctx, vec![d, ff], ff_std),
+                w2: Tensor::randn(ctx, vec![ff, d], down_std),
+                w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Router weight (only used for MoE)
+        let router_weight = if config.n_experts > 1 {
+            Tensor::randn(ctx, vec![d, config.n_experts], (1.0 / d as f32).sqrt())
+        } else {
+            Tensor::zeros(ctx, vec![1]) // placeholder
+        };
+
         Self {
             attn: MultiHeadAttention::new(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta),
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+            experts,
+            router_weight,
+            n_experts: config.n_experts,
+            top_k: config.top_k_experts,
             ln1_weight: Tensor::ones(ctx, vec![d]),
             ln2_weight: Tensor::ones(ctx, vec![d]),
             norm_eps: config.norm_eps,
@@ -230,10 +289,110 @@ impl TransformerBlock {
         let attn_out = self.attn.forward(&normed, kv_cache);
         let h = x.add(&attn_out);
 
-        // SwiGLU FFN with residual
+        // FFN with residual — dense or MoE
         let normed2 = h.rms_norm(&self.ln2_weight, self.norm_eps);
-        let ffn_out = self.swiglu_ffn(&normed2, batch, seq_len, d);
+        let ffn_out = if self.n_experts > 1 {
+            self.moe_ffn(&normed2, batch, seq_len, d)
+        } else {
+            self.swiglu_ffn(&normed2, batch, seq_len, d)
+        };
         h.add(&ffn_out)
+    }
+
+    /// Mixture of Experts FFN: route tokens to top-K experts, compute, combine.
+    fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
+        let n_tokens = batch * seq_len;
+        let x_flat = x.reshape(vec![n_tokens, d]);
+
+        // Router: compute logits for each token → each expert
+        let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
+        let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
+
+        // Read router probs to CPU for token assignment
+        // (small tensor: n_tokens × n_experts, e.g. 1024 × 4 = 4096 floats)
+        let probs_data = router_probs.to_vec();
+
+        // For each token, find top-K experts and their weights
+        let mut token_expert_assignments: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let mut expert_scores: Vec<(usize, f32)> = (0..self.n_experts)
+                .map(|e| (e, probs_data[t * self.n_experts + e]))
+                .collect();
+            expert_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            expert_scores.truncate(self.top_k);
+
+            // Renormalize weights for selected experts
+            let sum: f32 = expert_scores.iter().map(|&(_, w)| w).sum();
+            let inv_sum = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+            let normalized: Vec<(usize, f32)> = expert_scores.iter()
+                .map(|&(e, w)| (e, w * inv_sum))
+                .collect();
+            token_expert_assignments.push(normalized);
+        }
+
+        // Compute expert outputs and combine with router weights
+        // For simplicity: iterate over experts, compute for all tokens assigned to each
+        let output_buf = x_flat.ctx.alloc_buffer(n_tokens * d * 4);
+        compute::gpu_fill(&x_flat.ctx, &output_buf, (n_tokens * d) as u32, 0.0);
+
+        for expert_idx in 0..self.n_experts {
+            // Find tokens assigned to this expert and their weights
+            let mut token_indices: Vec<usize> = Vec::new();
+            let mut token_weights: Vec<f32> = Vec::new();
+            for (t, assignments) in token_expert_assignments.iter().enumerate() {
+                for &(e, w) in assignments {
+                    if e == expert_idx {
+                        token_indices.push(t);
+                        token_weights.push(w);
+                    }
+                }
+            }
+
+            if token_indices.is_empty() { continue; }
+
+            // Gather tokens for this expert
+            let n_routed = token_indices.len();
+            let expert_input_buf = x_flat.ctx.alloc_buffer(n_routed * d * 4);
+            for (i, &t) in token_indices.iter().enumerate() {
+                compute::gpu_buffer_copy(
+                    &x_flat.ctx, &x_flat.buffer, &expert_input_buf,
+                    (t * d) as u32, (i * d) as u32, d as u32,
+                );
+            }
+
+            // Run expert FFN
+            let expert = &self.experts[expert_idx];
+            let expert_input = Tensor::from_buffer(Arc::clone(&x_flat.ctx), expert_input_buf, vec![n_routed, d]);
+            let gate = expert_input.matmul(&expert.w1);
+            let up = expert_input.matmul(&expert.w3);
+            let hidden = gate.silu_gate(&up);
+            let expert_out = hidden.matmul(&expert.w2); // [n_routed, d]
+
+            // Scatter expert outputs back, weighted by router probability
+            for (i, &t) in token_indices.iter().enumerate() {
+                let w = token_weights[i];
+                // Scale expert output by router weight and add to combined output
+                let single_buf = x_flat.ctx.alloc_buffer(d * 4);
+                compute::gpu_buffer_copy(
+                    &x_flat.ctx, &expert_out.buffer, &single_buf,
+                    (i * d) as u32, 0, d as u32,
+                );
+                compute::gpu_scale(&x_flat.ctx, &single_buf, d as u32, w);
+                // Add to output at position t
+                let out_slice = x_flat.ctx.alloc_buffer(d * 4);
+                compute::gpu_buffer_copy(
+                    &x_flat.ctx, &output_buf, &out_slice,
+                    (t * d) as u32, 0, d as u32,
+                );
+                compute::gpu_add_inplace(&x_flat.ctx, &out_slice, &single_buf, d as u32);
+                compute::gpu_buffer_copy(
+                    &x_flat.ctx, &out_slice, &output_buf,
+                    0, (t * d) as u32, d as u32,
+                );
+            }
+        }
+
+        Tensor::from_buffer(Arc::clone(&x_flat.ctx), output_buf, vec![batch, seq_len, d])
     }
 
     /// SwiGLU feed-forward: output = (SiLU(x @ W1) * (x @ W3)) @ W2
@@ -325,13 +484,19 @@ impl TransformerBlock {
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = self.attn.parameters();
-        params.extend_from_slice(&[
-            &self.ffn_w1,
-            &self.ffn_w2,
-            &self.ffn_w3,
-            &self.ln1_weight,
-            &self.ln2_weight,
-        ]);
+        if self.n_experts > 1 {
+            // MoE: include router + all expert weights
+            params.push(&self.router_weight);
+            for expert in &self.experts {
+                params.push(&expert.w1);
+                params.push(&expert.w2);
+                params.push(&expert.w3);
+            }
+        } else {
+            // Dense: single FFN
+            params.extend_from_slice(&[&self.ffn_w1, &self.ffn_w2, &self.ffn_w3]);
+        }
+        params.extend_from_slice(&[&self.ln1_weight, &self.ln2_weight]);
         params
     }
 }

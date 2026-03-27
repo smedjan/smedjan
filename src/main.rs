@@ -81,6 +81,12 @@ enum Commands {
         /// Custom: number of key/value heads for Grouped Query Attention (defaults to --heads)
         #[arg(long)]
         kv_heads: Option<usize>,
+        /// MoE: number of expert FFNs (1 = dense). Default: 1
+        #[arg(long, default_value = "1")]
+        n_experts: usize,
+        /// MoE: top-K experts per token. Default: 1
+        #[arg(long, default_value = "1")]
+        top_k_experts: usize,
         /// Custom: maximum sequence length
         #[arg(long)]
         max_seq: Option<usize>,
@@ -365,6 +371,8 @@ fn main() {
             heads,
             ffn_mult,
             kv_heads,
+            n_experts,
+            top_k_experts,
             max_seq,
             batch_size,
             seq_len,
@@ -402,7 +410,11 @@ fn main() {
                     let fm = ffn_mult.unwrap_or(2.67);
                     let kvh = kv_heads.unwrap_or(h);
                     let ms = max_seq.unwrap_or(512);
-                    model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
+                    if n_experts > 1 {
+                        model::ModelConfig::custom_moe(vocab_size, d, h, kvh, l, fm, ms, n_experts, top_k_experts)
+                    } else {
+                        model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
+                    }
                 }
                 _ => panic!(
                     "Unknown model size: '{}'. Use: tiny, small, medium, large, xl, max, huge, 8b, custom",

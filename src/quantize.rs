@@ -414,6 +414,8 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         max_seq_len,
         rope_theta,
         norm_eps,
+        n_experts: 1,
+        top_k_experts: 1,
     })
 }
 
