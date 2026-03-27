@@ -1460,4 +1460,53 @@ mod tests {
         let r2 = MetalContext::read_buffer(&c2, 9);
         assert!((r2[0] - 17.0).abs() < 0.1); // 1*1+4*4=17
     }
+
+    #[test]
+    fn moe_gather_scatter_kernels() {
+        let ctx = MetalContext::new();
+        let n_tokens = 4;
+        let d = 3;
+        // Input: [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
+        let input = ctx.buffer_from_slice(&[1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,9.0, 10.0,11.0,12.0]);
+
+        // Gather tokens 1 and 3
+        let indices = ctx.buffer_from_u32_slice(&[1, 3]);
+        let gathered = ctx.alloc_buffer(2 * d * 4);
+        compute::gpu_moe_gather(&ctx, &input, &indices, &gathered, 2, d as u32);
+        let result = MetalContext::read_buffer(&gathered, 2 * d);
+        assert!((result[0] - 4.0).abs() < 0.01); // token 1, dim 0
+        assert!((result[3] - 10.0).abs() < 0.01); // token 3, dim 0
+
+        // Scatter-add with weights
+        let combined = ctx.alloc_buffer(n_tokens * d * 4);
+        compute::gpu_fill(&ctx, &combined, (n_tokens * d) as u32, 0.0);
+        let weights = ctx.buffer_from_slice(&[0.5, 0.5]);
+        compute::gpu_moe_scatter_add(&ctx, &gathered, &indices, &weights, &combined, 2, d as u32);
+        let out = MetalContext::read_buffer(&combined, n_tokens * d);
+        assert!((out[3] - 2.0).abs() < 0.01); // token 1, dim 0: 4.0 * 0.5 = 2.0
+        assert!((out[9] - 5.0).abs() < 0.01); // token 3, dim 0: 10.0 * 0.5 = 5.0
+    }
+
+    #[test]
+    fn flash_attention_op_variant_exists() {
+        // Verify FlashAttention Op variant is constructable (used in inference path)
+        let _op = crate::autograd::Op::FlashAttention {
+            batch_heads: 4, seq_q: 8, seq_k: 8, head_dim: 16, kv_offset: 0,
+        };
+    }
+
+    #[test]
+    fn fp16_reverse_cast() {
+        let ctx = MetalContext::new();
+        let data = vec![1.0f32, 2.5, -3.0, 0.0];
+        let f32_buf = ctx.buffer_from_slice(&data);
+        let f16_buf = ctx.alloc_buffer(data.len() * 2);
+        let back_buf = ctx.alloc_buffer(data.len() * 4);
+        compute::gpu_cast_f32_to_f16(&ctx, &f32_buf, &f16_buf, data.len() as u32);
+        compute::gpu_cast_f16_to_f32(&ctx, &f16_buf, &back_buf, data.len() as u32);
+        let result = MetalContext::read_buffer(&back_buf, data.len());
+        for (i, (&orig, &back)) in data.iter().zip(result.iter()).enumerate() {
+            assert!((orig - back).abs() < 0.01, "fp16 reverse cast mismatch at {}: {} vs {}", i, orig, back);
+        }
+    }
 }

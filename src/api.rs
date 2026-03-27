@@ -1,6 +1,6 @@
 use crate::checkpoint;
 use crate::generate::{self, SamplingConfig};
-use crate::metal::MetalContext;
+use crate::gpu::GpuContext as MetalContext; // backend-agnostic import
 use crate::model::Transformer;
 use crate::tokenizer::BpeTokenizer;
 use std::sync::Arc;
