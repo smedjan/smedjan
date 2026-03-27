@@ -355,6 +355,24 @@ enum Commands {
         #[arg(long, default_value = "0.3")]
         min_quality: f32,
     },
+    /// Grow a small trained model into a larger architecture (progressive training)
+    Grow {
+        /// Input: small model checkpoint
+        #[arg(long)]
+        checkpoint: String,
+        /// Output: grown model checkpoint
+        #[arg(long)]
+        output: String,
+        /// Target d_model
+        #[arg(long)]
+        dim: usize,
+        /// Target layers
+        #[arg(long)]
+        layers: usize,
+        /// Target heads
+        #[arg(long)]
+        heads: usize,
+    },
 }
 
 fn main() {
@@ -862,6 +880,20 @@ fn main() {
                 writeln!(out, "{}", quality_docs[i]).expect("Write failed");
             }
             eprintln!("Output: {} → {} documents", docs.len(), dedup_keep.len());
+        }
+
+        Commands::Grow {
+            checkpoint, output, dim, layers, heads,
+        } => {
+            let (small_model, step) = checkpoint::load_checkpoint(&ctx, &checkpoint)
+                .expect("Failed to load small checkpoint");
+            let large_config = model::ModelConfig::custom(
+                small_model.config.vocab_size, dim, heads, layers,
+                small_model.config.ffn_multiplier, small_model.config.max_seq_len,
+            );
+            let grown = model::grow_model(&ctx, &small_model, large_config);
+            checkpoint::save_checkpoint(&output, &grown, step)
+                .expect("Failed to save grown checkpoint");
         }
     }
 }

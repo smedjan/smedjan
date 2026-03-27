@@ -706,3 +706,92 @@ impl Transformer {
             .collect()
     }
 }
+
+/// Grow a small model's weights into a larger model configuration.
+/// Copies existing weights into the top-left corner of the larger matrices,
+/// initializes the remaining dimensions with small random values.
+///
+/// Requirements:
+/// - small_model.d_model <= large_config.d_model
+/// - small_model.n_layers <= large_config.n_layers
+/// - same vocab_size
+///
+/// Usage: train small → grow → continue training large
+pub fn grow_model(
+    ctx: &Arc<MetalContext>,
+    small: &Transformer,
+    large_config: ModelConfig,
+) -> Transformer {
+    let sd = small.config.d_model;
+    let ld = large_config.d_model;
+    let v = large_config.vocab_size as usize;
+
+    assert!(sd <= ld, "small d_model ({}) must be <= large ({})", sd, ld);
+    assert!(small.config.n_layers <= large_config.n_layers, "small layers must be <= large");
+    assert_eq!(small.config.vocab_size, large_config.vocab_size, "vocab must match");
+
+    eprintln!("Growing model: d={} → d={}, layers={} → layers={}",
+        sd, ld, small.config.n_layers, large_config.n_layers);
+
+    // Create the large model with random init
+    let large = Transformer::new(ctx, large_config.clone());
+
+    // Copy embedding: [vocab, sd] → top-left of [vocab, ld]
+    copy_weight_block(ctx, &small.embedding.buffer, &large.embedding.buffer,
+        v, sd, v, ld);
+
+    // Copy layer weights for shared layers
+    let n_shared = small.config.n_layers.min(large_config.n_layers);
+    for i in 0..n_shared {
+        let sb = &small.blocks[i];
+        let lb = &large.blocks[i];
+
+        // Attention weights: Q, K, V, O
+        let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
+        let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
+        copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sd, ld, ld);
+        copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, small_kv_dim, ld, large_kv_dim);
+        copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, small_kv_dim, ld, large_kv_dim);
+        copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sd, ld, ld);
+
+        // FFN weights (only if both are full rank or same lowrank)
+        if large_config.lowrank == 0 && small.config.lowrank == 0 {
+            let sff = small.config.d_ff();
+            let lff = large_config.d_ff();
+            copy_weight_block(ctx, &sb.ffn_w1.buffer, &lb.ffn_w1.buffer, sd, sff, ld, lff);
+            copy_weight_block(ctx, &sb.ffn_w2.buffer, &lb.ffn_w2.buffer, sff, sd, lff, ld);
+            copy_weight_block(ctx, &sb.ffn_w3.buffer, &lb.ffn_w3.buffer, sd, sff, ld, lff);
+        }
+
+        // Norm weights: [sd] → [ld] (copy first sd elements)
+        compute::gpu_buffer_copy(ctx, &sb.ln1_weight.buffer, &lb.ln1_weight.buffer, 0, 0, sd as u32);
+        compute::gpu_buffer_copy(ctx, &sb.ln2_weight.buffer, &lb.ln2_weight.buffer, 0, 0, sd as u32);
+    }
+
+    // Final norm
+    compute::gpu_buffer_copy(ctx, &small.ln_final_weight.buffer, &large.ln_final_weight.buffer, 0, 0, sd as u32);
+
+    eprintln!("Model grown: {}M → {}M params",
+        small.config.param_count() as f32 / 1e6,
+        large_config.param_count() as f32 / 1e6);
+
+    large
+}
+
+/// Copy a weight matrix block: small [sr, sc] → top-left of large [lr, lc]
+fn copy_weight_block(
+    ctx: &Arc<MetalContext>,
+    src: &GpuBuffer, dst: &GpuBuffer,
+    src_rows: usize, src_cols: usize,
+    _dst_rows: usize, dst_cols: usize,
+) {
+    // Copy row by row (src row stride ≠ dst row stride)
+    for r in 0..src_rows {
+        compute::gpu_buffer_copy(
+            ctx, src, dst,
+            (r * src_cols) as u32,     // src offset
+            (r * dst_cols) as u32,     // dst offset
+            src_cols as u32,           // copy length
+        );
+    }
+}
