@@ -23,6 +23,7 @@ pub struct ModelConfig {
     pub top_k_experts: usize, // MoE: how many experts active per token (typically 1 or 2)
     pub mup_base_width: usize, // μP: base model width for HP transfer (0 = disabled)
     pub bitnet: bool,          // BitNet: use ternary weights in FFN (no float multiply)
+    pub lowrank: usize,        // Low-rank training: 0=full rank, >0=rank for FFN decomposition
 }
 
 impl ModelConfig {
@@ -82,6 +83,7 @@ impl ModelConfig {
             top_k_experts: 1,
             mup_base_width: 0,
             bitnet: false,
+            lowrank: 0,
         }
     }
 
@@ -259,6 +261,11 @@ pub struct TransformerBlock {
     pub n_experts: usize,
     pub top_k: usize,
     pub bitnet: bool,
+    // Low-rank FFN decomposition: W = U × V (when lowrank > 0)
+    pub ffn_w1_u: Tensor, pub ffn_w1_v: Tensor, // gate: [d, r] × [r, ff]
+    pub ffn_w2_u: Tensor, pub ffn_w2_v: Tensor, // down: [ff, r] × [r, d]
+    pub ffn_w3_u: Tensor, pub ffn_w3_v: Tensor, // up:   [d, r] × [r, ff]
+    pub lowrank: usize,
     pub ln1_weight: Tensor, // [d_model] — attention norm
     pub ln2_weight: Tensor, // [d_model] — ffn norm
     pub norm_eps: f32,
@@ -294,11 +301,36 @@ impl TransformerBlock {
             Tensor::zeros(ctx, vec![1])
         };
 
+        // Low-rank FFN decomposition: W = U × V
+        let r = config.lowrank;
+        let (w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
+            let u_std = (2.0 / (d + r) as f32).sqrt() * residual_scale;
+            let v_std = (2.0 / (r + ff) as f32).sqrt();
+            let d_std = (2.0 / (ff + r) as f32).sqrt() * residual_scale;
+            let dv_std = (2.0 / (r + d) as f32).sqrt();
+            (
+                Tensor::randn(ctx, vec![d, r], u_std),
+                Tensor::randn(ctx, vec![r, ff], v_std),
+                Tensor::randn(ctx, vec![ff, r], d_std),
+                Tensor::randn(ctx, vec![r, d], dv_std),
+                Tensor::randn(ctx, vec![d, r], u_std),
+                Tensor::randn(ctx, vec![r, ff], v_std),
+            )
+        } else {
+            // Placeholders (not used when lowrank=0)
+            let z = || Tensor::zeros(ctx, vec![1]);
+            (z(), z(), z(), z(), z(), z())
+        };
+
         Self {
             attn: MultiHeadAttention::new(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta),
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+            ffn_w1_u: w1u, ffn_w1_v: w1v,
+            ffn_w2_u: w2u, ffn_w2_v: w2v,
+            ffn_w3_u: w3u, ffn_w3_v: w3v,
+            lowrank: r,
             experts,
             router_weight,
             n_experts: config.n_experts,
@@ -398,8 +430,13 @@ impl TransformerBlock {
     fn swiglu_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let x_flat = x.reshape(vec![batch * seq_len, d]);
 
-        // Gate and up projections — BitNet uses ternary matmul (add/subtract, no multiply)
-        let (gate, up) = if self.bitnet {
+        // Gate and up projections — dispatch based on mode
+        let (gate, up) = if self.lowrank > 0 {
+            // Low-rank: x @ U @ V instead of x @ W (two smaller matmuls)
+            let g = x_flat.matmul(&self.ffn_w1_u).matmul(&self.ffn_w1_v);
+            let u = x_flat.matmul(&self.ffn_w3_u).matmul(&self.ffn_w3_v);
+            (g, u)
+        } else if self.bitnet {
             (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))
         } else {
             (x_flat.matmul(&self.ffn_w1), x_flat.matmul(&self.ffn_w3))
@@ -408,7 +445,9 @@ impl TransformerBlock {
         let hidden = gate.silu_gate(&up);
 
         // Down projection
-        let out = if self.bitnet {
+        let out = if self.lowrank > 0 {
+            hidden.matmul(&self.ffn_w2_u).matmul(&self.ffn_w2_v)
+        } else if self.bitnet {
             hidden.ternary_matmul(&self.ffn_w2)
         } else {
             hidden.matmul(&self.ffn_w2)
@@ -489,8 +528,14 @@ impl TransformerBlock {
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = self.attn.parameters();
-        if self.n_experts > 1 {
-            // MoE: include router + all expert weights
+        if self.lowrank > 0 {
+            // Low-rank: U and V matrices instead of full W
+            params.extend_from_slice(&[
+                &self.ffn_w1_u, &self.ffn_w1_v,
+                &self.ffn_w2_u, &self.ffn_w2_v,
+                &self.ffn_w3_u, &self.ffn_w3_v,
+            ]);
+        } else if self.n_experts > 1 {
             params.push(&self.router_weight);
             for expert in &self.experts {
                 params.push(&expert.w1);
@@ -498,7 +543,6 @@ impl TransformerBlock {
                 params.push(&expert.w3);
             }
         } else {
-            // Dense: single FFN
             params.extend_from_slice(&[&self.ffn_w1, &self.ffn_w2, &self.ffn_w3]);
         }
         params.extend_from_slice(&[&self.ln1_weight, &self.ln2_weight]);

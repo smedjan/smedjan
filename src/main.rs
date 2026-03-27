@@ -136,6 +136,9 @@ enum Commands {
         /// BitNet: use ternary weights in FFN (no float multiply). Default: false
         #[arg(long)]
         bitnet: bool,
+        /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
+        #[arg(long, default_value = "0")]
+        lowrank: usize,
     },
 
     /// Show available model sizes and their param counts
@@ -436,6 +439,7 @@ fn main() {
             lr_restart,
             mup_base,
             bitnet,
+            lowrank,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -497,6 +501,7 @@ fn main() {
                 config.model_config.mup_base_width = mup_base;
             }
             config.model_config.bitnet = bitnet;
+            config.model_config.lowrank = lowrank;
 
             train::train(&ctx, &config).expect("Training failed");
         }

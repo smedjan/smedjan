@@ -317,5 +317,6 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         top_k_experts: 1,
         mup_base_width: 0,
         bitnet: false,
+        lowrank: 0,
     })
 }
