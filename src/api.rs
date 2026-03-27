@@ -169,6 +169,12 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_lion_update(ctx, &p, &g, &m, 2, 0.01, 0.9, 0.99, 0.0);
     tested += 1;
 
+    // Sophia optimizer
+    let h = ctx.alloc_buffer(2 * 4);
+    compute::gpu_fill(ctx, &h, 2, 0.0);
+    compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
+    tested += 1;
+
     // FlashAttention op variant
     let _op = crate::autograd::Op::FlashAttention {
         batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,

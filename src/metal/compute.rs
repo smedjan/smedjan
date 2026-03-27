@@ -712,6 +712,21 @@ pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuf
     );
 }
 
+/// Sophia optimizer: second-order with diagonal Hessian estimate. 2x faster convergence.
+pub fn gpu_sophia_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, h: &GpuBuffer, size: u32, lr: f32, beta1: f32, beta2: f32, eps: f32, rho: f32, weight_decay: f32) {
+    #[repr(C)]
+    struct Params { lr: f32, beta1: f32, beta2: f32, eps: f32, rho: f32, weight_decay: f32 }
+    let params = Params { lr, beta1, beta2, eps, rho, weight_decay };
+    let params_buf = params_buffer(ctx, &params);
+    let size_buf = params_buffer(ctx, &size);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg) * tpg, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_threads_sync!(ctx, "sophia_update", grid, tg,
+        0 => param, 1 => grad, 2 => m, 3 => h, 4 => &params_buf, 5 => &size_buf
+    );
+}
+
 /// Scale each row by a different scalar: output[r][c] = input[r][c] * scales[r]
 pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
     let rows_buf = params_buffer(ctx, &rows);

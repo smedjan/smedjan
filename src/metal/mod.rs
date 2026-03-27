@@ -126,6 +126,7 @@ impl MetalContext {
             ("scale_rows", shaders::SCALE_ROWS),
             ("row_dot_reduce", shaders::ROW_DOT_REDUCE),
             ("lion_update", shaders::LION_UPDATE),
+            ("sophia_update", shaders::SOPHIA_UPDATE),
             ("ternary_matmul", shaders::TERNARY_MATMUL),
             ("ternary_absmean", shaders::TERNARY_QUANTIZE),
             ("ternary_pack", shaders::TERNARY_QUANTIZE),

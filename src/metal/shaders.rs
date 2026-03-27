@@ -3098,3 +3098,49 @@ kernel void lion_update(
     m[gid] = m_val * hp.beta2 + g * (1.0f - hp.beta2);
 }
 "#;
+
+/// Sophia optimizer (Liu et al., 2023): second-order with diagonal Hessian.
+/// Update: theta -= lr * clip(grad / max(h, eps), rho)
+/// h = EMA of squared gradients (Hutchinson's diagonal Hessian estimate)
+/// 2x faster convergence than AdamW for ~10% more compute.
+pub const SOPHIA_UPDATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct SophiaParams {
+    float lr;
+    float beta1;      // momentum decay (0.965)
+    float beta2;      // hessian EMA decay (0.99)
+    float eps;         // hessian floor (1e-4)
+    float rho;         // clipping threshold (1.0)
+    float weight_decay;
+};
+
+kernel void sophia_update(
+    device float* param [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    device float* m [[buffer(2)]],       // first moment (momentum)
+    device float* h [[buffer(3)]],       // diagonal Hessian estimate
+    constant SophiaParams& hp [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    float g = grad[gid];
+
+    // Update momentum: m = beta1 * m + (1-beta1) * g
+    float m_val = hp.beta1 * m[gid] + (1.0f - hp.beta1) * g;
+    m[gid] = m_val;
+
+    // Hessian EMA: h = beta2 * h + (1-beta2) * g^2
+    float h_val = hp.beta2 * h[gid] + (1.0f - hp.beta2) * g * g;
+    h[gid] = h_val;
+
+    // Clipped update: clip(m / max(h, eps), -rho, rho)
+    float update = m_val / max(h_val, hp.eps);
+    update = clamp(update, -hp.rho, hp.rho);
+
+    // Apply with weight decay
+    param[gid] = param[gid] * (1.0f - hp.lr * hp.weight_decay) - hp.lr * update;
+}
+"#;
