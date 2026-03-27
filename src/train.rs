@@ -47,6 +47,8 @@ pub struct TrainConfig {
     pub prune_threshold: f32,
     /// GALORE: gradient low-rank projection rank. 0 = disabled.
     pub galore_rank: usize,
+    /// Optimizer: "adamw" or "sophia". Default: adamw.
+    pub optimizer_type: String,
     /// Speculative pretraining: path to a tiny reference model.
     /// Skip batches where reference model already has low loss (easy data).
     pub reference_model: Option<String>,
@@ -81,6 +83,7 @@ impl TrainConfig {
             lr_restart_period: 0,
             prune_threshold: 0.0,
             galore_rank: 0,
+            optimizer_type: "adamw".to_string(),
             reference_model: None,
             speculative_threshold: 7.0,
         }
@@ -159,6 +162,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
         (model, optimizer, 0, 0u64)
+    };
+
+    // Create Sophia optimizer if selected (runs ALONGSIDE AdamW for state compatibility)
+    let mut sophia_opt = if config.optimizer_type == "sophia" {
+        eprintln!("Using Sophia optimizer (2x faster convergence)");
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        Some(crate::optim::Sophia::new(ctx, &param_refs, config.weight_decay))
+    } else {
+        None
     };
 
     // Log optimizer info
@@ -294,7 +306,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Optimizer step — flush async so CPU can prep next batch while GPU updates weights
         ctx.begin_batch();
         if lr > 1e-10 {
-            optimizer.step(lr);
+            if let Some(ref mut soph) = sophia_opt {
+                soph.step(lr);
+            } else {
+                optimizer.step(lr);
+            }
         }
         ctx.flush_batch_async();
 

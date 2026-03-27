@@ -175,6 +175,17 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
     tested += 1;
 
+    // Optimizer enum
+    let tiny = crate::tensor::Tensor::zeros(ctx, vec![2, 2]);
+    let tiny_refs: Vec<&crate::tensor::Tensor> = vec![&tiny];
+    let mut opt = crate::optim::Optimizer::AdamW(crate::optim::AdamW::new(ctx, &tiny_refs, 0.0));
+    opt.step(0.0);
+    opt.zero_grad();
+    let _ = opt.adamw_step();
+    let mut soph_opt = crate::optim::Optimizer::Sophia(crate::optim::Sophia::new(ctx, &tiny_refs, 0.0));
+    soph_opt.step(0.0);
+    tested += 2;
+
     // FlashAttention op variant
     let _op = crate::autograd::Op::FlashAttention {
         batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,

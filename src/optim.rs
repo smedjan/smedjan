@@ -195,3 +195,91 @@ impl CosineWarmupScheduler {
         }
     }
 }
+
+/// Sophia optimizer — second-order with diagonal Hessian.
+/// 2x faster convergence than AdamW for ~same compute.
+pub struct Sophia {
+    pub params: Vec<SophiaState>,
+    pub beta1: f32,     // momentum decay (0.965)
+    pub beta2: f32,     // hessian EMA decay (0.99)
+    pub eps: f32,       // hessian floor (1e-4)
+    pub rho: f32,       // clipping threshold (1.0)
+    pub weight_decay: f32,
+    pub step: u32,
+    ctx: Arc<MetalContext>,
+}
+
+pub struct SophiaState {
+    pub tensor_id: usize,
+    pub buffer: Retained<GpuBuffer>,
+    pub size: usize,
+    pub m: Retained<GpuBuffer>, // first moment (momentum)
+    pub h: Retained<GpuBuffer>, // diagonal Hessian estimate
+}
+
+impl Sophia {
+    pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
+        let param_states: Vec<SophiaState> = params.iter().map(|t| {
+            let size = t.numel();
+            let m = ctx.alloc_buffer(size * 4);
+            let h = ctx.alloc_buffer(size * 4);
+            compute::gpu_fill(ctx, &m, size as u32, 0.0);
+            compute::gpu_fill(ctx, &h, size as u32, 0.0);
+            SophiaState { tensor_id: t.id, buffer: t.buffer.clone(), size, m, h }
+        }).collect();
+
+        Self {
+            params: param_states,
+            beta1: 0.965, beta2: 0.99, eps: 1e-4, rho: 1.0,
+            weight_decay, step: 0, ctx: Arc::clone(ctx),
+        }
+    }
+
+    pub fn step(&mut self, lr: f32) {
+        self.step += 1;
+        for ps in &self.params {
+            let grad = autograd::get_grad(ps.tensor_id);
+            let grad = match grad { Some(g) => g, None => continue };
+
+            compute::gpu_sophia_update(
+                &self.ctx, &ps.buffer, &grad, &ps.m, &ps.h,
+                ps.size as u32, lr, self.beta1, self.beta2,
+                self.eps, self.rho, self.weight_decay,
+            );
+        }
+    }
+
+    pub fn zero_grad(&self) {
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+    }
+}
+
+/// Unified optimizer interface for training loop.
+pub enum Optimizer {
+    AdamW(AdamW),
+    Sophia(Sophia),
+}
+
+impl Optimizer {
+    pub fn step(&mut self, lr: f32) {
+        match self {
+            Optimizer::AdamW(o) => o.step(lr),
+            Optimizer::Sophia(o) => o.step(lr),
+        }
+    }
+
+    pub fn zero_grad(&self) {
+        match self {
+            Optimizer::AdamW(o) => o.zero_grad(),
+            Optimizer::Sophia(o) => o.zero_grad(),
+        }
+    }
+
+    pub fn adamw_step(&self) -> u32 {
+        match self {
+            Optimizer::AdamW(o) => o.step,
+            Optimizer::Sophia(o) => o.step,
+        }
+    }
+}

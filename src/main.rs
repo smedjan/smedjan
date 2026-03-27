@@ -151,6 +151,9 @@ enum Commands {
         /// Speculative threshold: skip if reference loss < this value. Default: 7.0
         #[arg(long, default_value = "7.0")]
         speculative_threshold: f32,
+        /// Optimizer: "adamw" or "sophia". Default: adamw
+        #[arg(long, default_value = "adamw")]
+        optimizer: String,
     },
 
     /// Show available model sizes and their param counts
@@ -474,6 +477,7 @@ fn main() {
             galore_rank,
             reference_model,
             speculative_threshold,
+            optimizer,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -538,6 +542,7 @@ fn main() {
             config.model_config.lowrank = lowrank;
             config.prune_threshold = prune_threshold;
             config.galore_rank = galore_rank;
+            config.optimizer_type = optimizer;
             config.reference_model = reference_model;
             config.speculative_threshold = speculative_threshold;
 
