@@ -339,16 +339,17 @@ impl TransformerBlock {
         // Router logits (on tape — gradients flow to router weights)
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
 
-        // Add noise during training to break symmetry
+        // Add small noise to router logits during training to help break expert symmetry.
+        // Only meaningful for first ~100 steps, then router has diverged enough.
+        // Noise is cheap: one alloc + one add vs N expert matmuls.
         let router_logits = if autograd::is_recording() {
-            let noise = Tensor::randn(&x_flat.ctx, vec![n_tokens, self.n_experts], 1.0);
+            let noise = Tensor::randn(&x_flat.ctx, vec![n_tokens, self.n_experts], 0.5);
             router_logits.add(&noise)
         } else {
             router_logits
         };
 
         let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
-        let probs_data = router_probs.to_vec();
 
         // Soft MoE: each expert runs on all tokens, weighted by router_probs.
         // Router probs extracted ON TAPE via matmul with one-hot selector.

@@ -137,19 +137,19 @@ pub fn clear_tape_keep_grads() {
     // or the next micro-step's forward pass would overwrite the gradient via pool reuse.
     let grad_ptrs: std::collections::HashSet<usize> = GRADS.with(|grads| {
         grads.borrow().values().map(|buf| {
-            unsafe { buf.contents().as_ptr() as usize }
+            buf.contents().as_ptr() as usize
         }).collect()
     });
 
     TAPE.with(|tape| {
         let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
         for entry in entries {
-            let out_ptr = unsafe { entry.output_buffer.contents().as_ptr() as usize };
+            let out_ptr = entry.output_buffer.contents().as_ptr() as usize;
             if !grad_ptrs.contains(&out_ptr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
-                let cached_ptr = unsafe { cached.contents().as_ptr() as usize };
+                let cached_ptr = cached.contents().as_ptr() as usize;
                 if !grad_ptrs.contains(&cached_ptr) {
                     MetalContext::recycle_buffer(cached);
                 }
