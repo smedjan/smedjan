@@ -10,10 +10,16 @@ use std::sync::Arc;
 /// of d_model). Each KV head serves `group_size = n_heads / n_kv_heads` query heads.
 /// When `n_kv_heads == n_heads`, this is standard Multi-Head Attention.
 pub struct MultiHeadAttention {
-    pub w_q: Tensor, // [d_model, d_model]
-    pub w_k: Tensor, // [d_model, kv_dim] where kv_dim = head_dim * n_kv_heads
-    pub w_v: Tensor, // [d_model, kv_dim]
-    pub w_o: Tensor, // [d_model, d_model]
+    pub w_q: Tensor, // [d_model, d_model] or [d_model, rank] if low-rank
+    pub w_k: Tensor, // [d_model, kv_dim] or [d_model, rank]
+    pub w_v: Tensor, // [d_model, kv_dim] or [d_model, rank]
+    pub w_o: Tensor, // [d_model, d_model] or [d_model, rank]
+    // Low-rank: W = U × V. These are the V matrices (U is stored in w_q/k/v/o above)
+    pub w_q_v: Tensor, // [rank, d_model]
+    pub w_k_v: Tensor, // [rank, kv_dim]
+    pub w_v_v: Tensor, // [rank, kv_dim]
+    pub w_o_v: Tensor, // [rank, d_model]
+    pub attn_rank: usize, // 0 = full rank
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -102,26 +108,48 @@ impl KvCache {
 
 impl MultiHeadAttention {
     pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32) -> Self {
-        assert_eq!(d_model % n_heads, 0, "d_model must be divisible by n_heads");
-        assert!(n_kv_heads <= n_heads, "n_kv_heads must be <= n_heads");
-        assert_eq!(n_heads % n_kv_heads, 0, "n_heads must be divisible by n_kv_heads");
+        Self::new_with_rank(ctx, d_model, n_heads, n_kv_heads, rope_theta, 0)
+    }
+
+    pub fn new_with_rank(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize) -> Self {
+        assert_eq!(d_model % n_heads, 0);
+        assert!(n_kv_heads <= n_heads);
+        assert_eq!(n_heads % n_kv_heads, 0);
         let head_dim = d_model / n_heads;
         let kv_dim = head_dim * n_kv_heads;
 
-        // Xavier initialization
-        let std_q = (2.0 / (d_model + d_model) as f32).sqrt();
-        let std_kv = (2.0 / (d_model + kv_dim) as f32).sqrt();
+        let z = || Tensor::zeros(ctx, vec![1]);
+
+        let (w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v) = if rank > 0 {
+            let u_std = (2.0 / (d_model + rank) as f32).sqrt();
+            let vq_std = (2.0 / (rank + d_model) as f32).sqrt();
+            let vk_std = (2.0 / (rank + kv_dim) as f32).sqrt();
+            (
+                Tensor::randn(ctx, vec![d_model, rank], u_std),      // Q_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),      // K_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),      // V_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),      // O_U
+                Tensor::randn(ctx, vec![rank, d_model], vq_std),     // Q_V
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),      // K_V
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),      // V_V
+                Tensor::randn(ctx, vec![rank, d_model], vq_std),     // O_V
+            )
+        } else {
+            let std_q = (2.0 / (d_model + d_model) as f32).sqrt();
+            let std_kv = (2.0 / (d_model + kv_dim) as f32).sqrt();
+            (
+                Tensor::randn(ctx, vec![d_model, d_model], std_q),
+                Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+                Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+                Tensor::randn(ctx, vec![d_model, d_model], std_q),
+                z(), z(), z(), z(),
+            )
+        };
 
         Self {
-            w_q: Tensor::randn(ctx, vec![d_model, d_model], std_q),
-            w_k: Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
-            w_v: Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
-            w_o: Tensor::randn(ctx, vec![d_model, d_model], std_q),
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            d_model,
-            rope_theta,
+            w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
+            attn_rank: rank,
+            n_heads, n_kv_heads, head_dim, d_model, rope_theta,
         }
     }
 
@@ -144,10 +172,20 @@ impl MultiHeadAttention {
         // Flatten batch*seq for matmul: [batch*seq, d_model]
         let x_flat = x.reshape(vec![batch * seq_len, d_model]);
 
-        // Project Q, K, V — these go through the tape via matmul
-        let q = x_flat.matmul(&self.w_q); // [batch*seq, d_model]
-        let k = x_flat.matmul(&self.w_k); // [batch*seq, kv_dim]
-        let v = x_flat.matmul(&self.w_v); // [batch*seq, kv_dim]
+        // Project Q, K, V — low-rank: x @ U @ V, full-rank: x @ W
+        let (q, k, v) = if self.attn_rank > 0 {
+            (
+                x_flat.matmul(&self.w_q).matmul(&self.w_q_v),
+                x_flat.matmul(&self.w_k).matmul(&self.w_k_v),
+                x_flat.matmul(&self.w_v).matmul(&self.w_v_v),
+            )
+        } else {
+            (
+                x_flat.matmul(&self.w_q),
+                x_flat.matmul(&self.w_k),
+                x_flat.matmul(&self.w_v),
+            )
+        };
 
         // Transpose Q: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
         let bh_kv = batch * self.n_kv_heads;
@@ -220,13 +258,22 @@ impl MultiHeadAttention {
         let attn_combined = transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
 
         // Output projection
-        let out = attn_combined.matmul(&self.w_o); // [batch*seq, d_model]
+        let out = if self.attn_rank > 0 {
+            attn_combined.matmul(&self.w_o).matmul(&self.w_o_v)
+        } else {
+            attn_combined.matmul(&self.w_o)
+        };
         out.reshape(vec![batch, seq_len, d_model])
     }
 
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
-        vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o]
+        if self.attn_rank > 0 {
+            vec![&self.w_q, &self.w_q_v, &self.w_k, &self.w_k_v,
+                 &self.w_v, &self.w_v_v, &self.w_o, &self.w_o_v]
+        } else {
+            vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o]
+        }
     }
 }
 
