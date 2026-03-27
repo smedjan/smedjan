@@ -43,6 +43,8 @@ pub struct TrainConfig {
     pub dropout: f32,
     /// LR restart period (steps). 0 = standard cosine decay, >0 = warm restarts.
     pub lr_restart_period: u32,
+    /// Data pruning: skip batches where loss < threshold. 0.0 = disabled.
+    pub prune_threshold: f32,
 }
 
 impl TrainConfig {
@@ -70,6 +72,7 @@ impl TrainConfig {
             val_dataset: None,
             dropout: 0.0,
             lr_restart_period: 0,
+            prune_threshold: 0.0,
         }
     }
 }
@@ -206,9 +209,22 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
             };
 
+            // Online data pruning: skip backward if loss is below threshold.
+            // The model already knows this data — training on it wastes compute.
+            if config.prune_threshold > 0.0 {
+                ctx.flush_batch(); // need to read loss value
+                let loss_val = loss_tensor.to_vec()[0];
+                if loss_val < config.prune_threshold && loss_val.is_finite() {
+                    autograd::clear_tape();
+                    autograd::clear_recompute_registry();
+                    // Count as processed but skip gradient update
+                    last_loss_tensor = Some(loss_tensor);
+                    continue; // skip backward + optimizer for this micro-step
+                }
+                ctx.begin_batch(); // resume batch for backward
+            }
+
             // Scale both loss AND gradient by 1/grad_accum_steps.
-            // CrossEntropy backward uses the pre-computed gradient (cached buffer),
-            // NOT the loss value, so scaling only the loss leaves gradients 8x too large.
             if grad_accum_steps > 1 {
                 let grad_size = (config.batch_size * config.seq_len * config.model_config.vocab_size as usize) as u32;
                 compute::gpu_scale(ctx, &grad_logits, grad_size, loss_scale);

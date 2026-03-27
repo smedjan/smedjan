@@ -139,6 +139,9 @@ enum Commands {
         /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
         #[arg(long, default_value = "0")]
         lowrank: usize,
+        /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
+        #[arg(long, default_value = "0.0")]
+        prune_threshold: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -440,6 +443,7 @@ fn main() {
             mup_base,
             bitnet,
             lowrank,
+            prune_threshold,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -502,6 +506,7 @@ fn main() {
             }
             config.model_config.bitnet = bitnet;
             config.model_config.lowrank = lowrank;
+            config.prune_threshold = prune_threshold;
 
             train::train(&ctx, &config).expect("Training failed");
         }
