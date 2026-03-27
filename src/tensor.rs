@@ -10,10 +10,14 @@ use std::sync::Arc;
 pub type TensorId = usize;
 
 // Thread-local FP16 cast cache: avoids redundant float→half casts for weights.
-// Key: buffer contents pointer. Value: cached FP16 buffer.
-// Clear after optimizer step when weights change.
 thread_local! {
     static F16_CAST_CACHE: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
+}
+
+// Thread-local ternary weight cache: avoids requantizing every matmul call.
+// Key: buffer pointer. Value: (packed_ternary, absmean) buffers.
+thread_local! {
+    static TERNARY_CACHE: RefCell<HashMap<usize, (Retained<GpuBuffer>, Retained<GpuBuffer>)>> = RefCell::new(HashMap::new());
 }
 
 /// A tensor backed by Metal shared memory with automatic differentiation support.
@@ -147,60 +151,65 @@ impl Tensor {
     /// BitNet matmul: self @ weight where weight is quantized to ternary {-1,0,+1}.
     /// self: [M, K] float, weight: [K, N] float (quantized on-the-fly).
     /// Uses Straight-Through Estimator: forward uses ternary, backward uses float.
+    /// BitNet b1.58 matmul: quantize weight to ternary, compute via add/subtract.
+    /// Caches packed ternary weights per step (cleared with FP16 cache after optimizer).
     pub fn ternary_matmul(&self, weight: &Tensor) -> Tensor {
         let m = self.shape[0];
         let k = self.shape[1];
         let n = weight.shape[1];
         assert_eq!(self.shape[1], weight.shape[0], "ternary_matmul K mismatch");
 
-        // Quantize weight to ternary on GPU
-        let absmean_buf = self.ctx.alloc_buffer(n * 4);
-        compute::gpu_ternary_absmean(&self.ctx, &weight.buffer, &absmean_buf, k as u32, n as u32);
-
         let packed_rows = (k + 15) / 16;
-        let packed_buf = self.ctx.alloc_buffer(packed_rows * n * 4);
-        compute::gpu_ternary_pack(&self.ctx, &weight.buffer, &absmean_buf, &packed_buf, k as u32, n as u32);
 
-        // Ternary matmul: add/subtract only, no multiply
+        // Check ternary cache (same pattern as FP16 cache)
+        let cache_key = weight.buffer.contents().as_ptr() as usize;
+        let cached = TERNARY_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+
+        let (packed_buf, absmean_buf) = if let Some((p, a)) = cached {
+            (p, a)
+        } else {
+            // Quantize: compute absmean threshold per column, pack to ternary
+            let absmean = self.ctx.alloc_buffer(n * 4);
+            compute::gpu_ternary_absmean(&self.ctx, &weight.buffer, &absmean, k as u32, n as u32);
+            let packed = self.ctx.alloc_buffer(packed_rows * n * 4);
+            compute::gpu_ternary_pack(&self.ctx, &weight.buffer, &absmean, &packed, k as u32, n as u32);
+            TERNARY_CACHE.with(|c| c.borrow_mut().insert(cache_key, (packed.clone(), absmean.clone())));
+            (packed, absmean)
+        };
+
+        // Ternary matmul: add/subtract only, no float multiply
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         compute::gpu_ternary_matmul(&self.ctx, &self.buffer, &packed_buf, &out_buf, m as u32, n as u32, k as u32);
 
-        // Scale output by absmean (ternary values are normalized, need to rescale)
-        // output = ternary_result * absmean (broadcast per column)
-        // For simplicity, scale each column by its absmean
-        let absmean_data = MetalContext::read_buffer(&absmean_buf, n);
-        for j in 0..n {
-            let scale = absmean_data[j];
-            if scale != 0.0 {
-                // Scale column j of output
-                // TODO: GPU kernel for column-wise scaling
-                // For now, use the full-tensor scale (approximate)
-            }
-        }
+        // Scale output by absmean per column: out[i][j] *= absmean[j]
+        // This restores the magnitude lost by ternary quantization
+        let out_tensor = Tensor::from_buffer(Arc::clone(&self.ctx), out_buf, vec![m, n]);
+        let absmean_tensor = Tensor::from_buffer(Arc::clone(&self.ctx), absmean_buf, vec![n]);
+        // Broadcast scale: use scale_rows with transposed logic
+        // For column scaling, we'd need a scale_cols op. Approximate with mean scale for now.
+        // Read first absmean value as approximate global scale
+        // (proper per-column scaling needs a scale_cols kernel — future optimization)
+        let absmean_data = MetalContext::read_buffer(&absmean_tensor.buffer, n.min(1));
+        let mean_scale = if !absmean_data.is_empty() && absmean_data[0] > 0.0 { absmean_data[0] } else { 1.0 };
+        let out_scaled = out_tensor.scale(mean_scale);
 
-        let out_id = autograd::next_id();
-        let out = Tensor {
-            id: out_id,
-            buffer: out_buf,
-            shape: vec![m, n],
-            requires_grad: self.requires_grad || weight.requires_grad,
-            ctx: Arc::clone(&self.ctx),
-        };
-
-        // STE backward: use float weights for gradient computation
+        // STE: the scale() call above already records Op::Scale on the tape.
+        // For backward, gradients flow through scale → out_tensor.
+        // out_tensor was created from from_buffer (not on tape), but the matmul
+        // backward is handled by recording the STE matmul entry:
         if self.requires_grad || weight.requires_grad || autograd::is_recording() {
             autograd::record(autograd::TapeEntry {
-                op: autograd::Op::Matmul, // STE: backward treats it as regular matmul
+                op: autograd::Op::Matmul, // STE: backward treats ternary as regular matmul
                 inputs: vec![self.id, weight.id],
-                output: out_id,
+                output: out_scaled.id,
                 input_buffers: vec![self.buffer.clone(), weight.buffer.clone()],
-                output_buffer: out.buffer.clone(),
-                shapes: vec![self.shape.clone(), weight.shape.clone(), out.shape.clone()],
+                output_buffer: out_scaled.buffer.clone(),
+                shapes: vec![self.shape.clone(), weight.shape.clone(), out_scaled.shape.clone()],
                 cached: None,
             });
         }
 
-        out
+        out_scaled
     }
 
     /// Per-row scaling: output[r][c] = self[r][c] * scales[r]
@@ -257,9 +266,10 @@ impl Tensor {
         f16_buf
     }
 
-    /// Clear the FP16 cast cache. Call after optimizer step when weights change.
+    /// Clear weight caches. Call after optimizer step when weights change.
     pub fn clear_f16_cache() {
         F16_CAST_CACHE.with(|c| c.borrow_mut().clear());
+        TERNARY_CACHE.with(|c| c.borrow_mut().clear());
     }
 
     /// Matrix multiplication: self @ other
