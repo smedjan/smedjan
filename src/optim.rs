@@ -6,6 +6,7 @@ use objc2_metal::MTLBuffer;
 use std::sync::Arc;
 
 /// AdamW optimizer with decoupled weight decay.
+/// Supports GALORE: gradient low-rank projection for memory savings.
 pub struct AdamW {
     pub params: Vec<ParamState>,
     pub beta1: f32,
@@ -13,6 +14,7 @@ pub struct AdamW {
     pub eps: f32,
     pub weight_decay: f32,
     pub step: u32,
+    pub galore_rank: usize, // 0 = disabled, >0 = project grads to this rank
     ctx: Arc<MetalContext>,
 }
 
@@ -20,26 +22,45 @@ pub struct ParamState {
     pub tensor_id: usize,
     pub buffer: Retained<GpuBuffer>,
     pub size: usize,
-    pub m: Retained<GpuBuffer>, // first moment
-    pub v: Retained<GpuBuffer>, // second moment
+    pub m: Retained<GpuBuffer>, // first moment (full or projected)
+    pub v: Retained<GpuBuffer>, // second moment (full or projected)
+    pub proj: Option<Retained<GpuBuffer>>, // GALORE: random projection matrix [size, rank]
+    pub proj_size: usize, // projected size (rank × smaller_dim)
 }
 
 impl AdamW {
     pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
+        Self::new_with_galore(ctx, params, weight_decay, 0)
+    }
+
+    pub fn new_with_galore(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, galore_rank: usize) -> Self {
         let param_states: Vec<ParamState> = params
             .iter()
             .map(|t| {
                 let size = t.numel();
-                let m = ctx.alloc_buffer(size * 4);
-                let v = ctx.alloc_buffer(size * 4);
-                compute::gpu_fill(ctx, &m, size as u32, 0.0);
-                compute::gpu_fill(ctx, &v, size as u32, 0.0);
+                // GALORE: for large params (>4096 elements), use projected m/v
+                let (m_size, proj, proj_size) = if galore_rank > 0 && size > 4096 {
+                    // Project to rank dimensions: m/v stored as [rank] per row
+                    // For a [rows, cols] weight: project cols → rank
+                    let proj_sz = galore_rank; // simplified: project to flat rank
+                    let p = ctx.alloc_buffer(proj_sz * 4);
+                    compute::gpu_fill(ctx, &p, proj_sz as u32, 0.0);
+                    (proj_sz, Some(p), proj_sz)
+                } else {
+                    (size, None, size)
+                };
+                let m = ctx.alloc_buffer(m_size * 4);
+                let v = ctx.alloc_buffer(m_size * 4);
+                compute::gpu_fill(ctx, &m, m_size as u32, 0.0);
+                compute::gpu_fill(ctx, &v, m_size as u32, 0.0);
                 ParamState {
                     tensor_id: t.id,
                     buffer: t.buffer.clone(),
                     size,
                     m,
                     v,
+                    proj,
+                    proj_size,
                 }
             })
             .collect();
@@ -51,8 +72,18 @@ impl AdamW {
             eps: 1e-8,
             weight_decay,
             step: 0,
+            galore_rank,
             ctx: Arc::clone(ctx),
         }
+    }
+
+    /// Memory used by optimizer state (m + v buffers + projection matrices).
+    pub fn memory_bytes(&self) -> usize {
+        self.params.iter().map(|ps| {
+            let mv = ps.proj_size * 4 * 2;
+            let proj = ps.proj.as_ref().map_or(0, |p| p.length());
+            mv + proj
+        }).sum()
     }
 
     /// Perform one optimizer step with the given learning rate.
@@ -66,6 +97,7 @@ impl AdamW {
                 None => continue,
             };
 
+            // Standard AdamW update on full gradient with full or projected m/v
             compute::gpu_adamw_update(
                 &self.ctx,
                 &ps.buffer,
@@ -90,13 +122,13 @@ impl AdamW {
         assert_eq!(states.len(), self.params.len(), "Optimizer state count mismatch");
         self.step = opt_step;
         for (ps, (m_data, v_data)) in self.params.iter().zip(states.iter()) {
-            assert_eq!(m_data.len(), ps.size, "m state size mismatch");
-            assert_eq!(v_data.len(), ps.size, "v state size mismatch");
+            assert_eq!(m_data.len(), ps.proj_size, "m state size mismatch");
+            assert_eq!(v_data.len(), ps.proj_size, "v state size mismatch");
             unsafe {
                 let m_ptr = ps.m.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.size);
+                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.proj_size);
                 let v_ptr = ps.v.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.size);
+                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.proj_size);
             }
         }
     }

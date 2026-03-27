@@ -142,6 +142,15 @@ enum Commands {
         /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
         #[arg(long, default_value = "0.0")]
         prune_threshold: f32,
+        /// GALORE: gradient low-rank projection rank. 0=disabled. Saves optimizer memory.
+        #[arg(long, default_value = "0")]
+        galore_rank: usize,
+        /// Speculative pretraining: reference model checkpoint. Skip batches it already knows.
+        #[arg(long)]
+        reference_model: Option<String>,
+        /// Speculative threshold: skip if reference loss < this value. Default: 7.0
+        #[arg(long, default_value = "7.0")]
+        speculative_threshold: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -462,6 +471,9 @@ fn main() {
             bitnet,
             lowrank,
             prune_threshold,
+            galore_rank,
+            reference_model,
+            speculative_threshold,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -525,6 +537,9 @@ fn main() {
             config.model_config.bitnet = bitnet;
             config.model_config.lowrank = lowrank;
             config.prune_threshold = prune_threshold;
+            config.galore_rank = galore_rank;
+            config.reference_model = reference_model;
+            config.speculative_threshold = speculative_threshold;
 
             train::train(&ctx, &config).expect("Training failed");
         }

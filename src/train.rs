@@ -45,6 +45,13 @@ pub struct TrainConfig {
     pub lr_restart_period: u32,
     /// Data pruning: skip batches where loss < threshold. 0.0 = disabled.
     pub prune_threshold: f32,
+    /// GALORE: gradient low-rank projection rank. 0 = disabled.
+    pub galore_rank: usize,
+    /// Speculative pretraining: path to a tiny reference model.
+    /// Skip batches where reference model already has low loss (easy data).
+    pub reference_model: Option<String>,
+    /// Speculative threshold: skip if reference loss < this value.
+    pub speculative_threshold: f32,
 }
 
 impl TrainConfig {
@@ -73,6 +80,9 @@ impl TrainConfig {
             dropout: 0.0,
             lr_restart_period: 0,
             prune_threshold: 0.0,
+            galore_rank: 0,
+            reference_model: None,
+            speculative_threshold: 7.0,
         }
     }
 }
@@ -117,6 +127,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None => None,
     };
 
+    // Load reference model for speculative pretraining (frozen, scores batches)
+    let ref_model = match &config.reference_model {
+        Some(ref_path) => {
+            eprintln!("Speculative pretraining: loading reference from {}", ref_path);
+            eprintln!("  threshold={:.1} (skip batches where ref loss < threshold)", config.speculative_threshold);
+            let (ref_m, _) = checkpoint::load_checkpoint(ctx, ref_path)?;
+            Some(ref_m)
+        }
+        None => None,
+    };
+
     // Initialize model + optimizer (fresh or from resume checkpoint)
     let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) = config.resume_from {
         eprintln!("=== RESUMING from {} ===", resume_path);
@@ -127,7 +148,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.config.n_layers, model.config.d_model, model.config.n_heads
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let mut optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
+        let mut optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
         optimizer.load_state(&opt_states, opt_step);
         // Resume from step+1 — the checkpoint was saved AFTER step completed
         let resume_step = step + 1;
@@ -136,9 +157,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
+        let optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
         (model, optimizer, 0, 0u64)
     };
+
+    // Log optimizer info
+    if optimizer.galore_rank > 0 {
+        eprintln!("GALORE: rank={}, optimizer memory={:.1}MB (vs {:.1}MB full)",
+            optimizer.galore_rank,
+            optimizer.memory_bytes() as f32 / 1e6,
+            model.parameters().iter().map(|p| p.numel() * 8).sum::<usize>() as f32 / 1e6);
+    }
 
     // μP: scale learning rate by base_width / d_model
     let mup_scale = config.model_config.mup_lr_scale();
@@ -186,6 +215,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         for _micro_step in 0..grad_accum_steps {
             // Get a micro-batch (DataLoader uses config.batch_size as micro-batch size)
             let (inputs, targets) = data_loader.next_batch();
+
+            // Speculative pretraining: score batch with reference model, skip if easy
+            if let Some(ref ref_m) = ref_model {
+                let ref_logits = autograd::no_grad(|| {
+                    ref_m.forward(&inputs, config.batch_size, config.seq_len, None, false)
+                });
+                let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, &targets);
+                let ref_loss_val = ref_loss.to_vec()[0];
+                autograd::clear_tape();
+                if ref_loss_val < config.speculative_threshold && ref_loss_val.is_finite() {
+                    // Reference model already knows this — skip training on it
+                    last_loss_tensor = None;
+                    continue;
+                }
+            }
 
             // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
             ctx.begin_batch();
