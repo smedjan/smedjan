@@ -193,6 +193,42 @@ impl Tensor {
         out
     }
 
+    /// Per-row scaling: output[r][c] = self[r][c] * scales[r]
+    /// self: [rows, cols], scales: [rows] → [rows, cols]
+    /// On autograd tape — gradients flow to both input and scales.
+    pub fn scale_rows(&self, scales: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 2, "scale_rows requires 2D tensor");
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        assert_eq!(scales.shape, vec![rows], "scales must be [rows]");
+
+        let out_buf = self.ctx.alloc_buffer(rows * cols * 4);
+        compute::gpu_scale_rows(&self.ctx, &self.buffer, &scales.buffer, &out_buf, rows as u32, cols as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf.clone(),
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad || scales.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || scales.requires_grad || autograd::is_recording() {
+            autograd::record(autograd::TapeEntry {
+                op: autograd::Op::ScaleRows { rows, cols },
+                inputs: vec![self.id, scales.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), scales.buffer.clone()],
+                output_buffer: out_buf,
+                shapes: vec![self.shape.clone(), scales.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Cast tensor contents to FP16 buffer with safe clamping.
     /// Clamps values to [-65504, 65504] (half max) before cast to prevent overflow→NaN.
     /// Size in bytes = numel * 2. Does NOT create a Tensor — just a raw buffer.

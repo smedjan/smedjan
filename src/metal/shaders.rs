@@ -2997,3 +2997,25 @@ kernel void ternary_pack(
     packed[pack_row * N + col] = packed_val;
 }
 "#;
+
+/// Scale each row of a matrix by a different scalar.
+/// input: [rows, cols], scales: [rows], output: [rows, cols]
+/// output[r][c] = input[r][c] * scales[r]
+pub const SCALE_ROWS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void scale_rows(
+    device const float* input [[buffer(0)]],
+    device const float* scales [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.y;
+    uint c = gid.x;
+    if (r >= rows || c >= cols) return;
+    output[r * cols + c] = input[r * cols + c] * scales[r];
+}
+"#;

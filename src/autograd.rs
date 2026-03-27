@@ -59,6 +59,8 @@ pub enum Op {
     /// GQA KV head expansion: repeat each KV head group_size times.
     /// Backward: sum group_size gradient blocks back into each KV head.
     RepeatKv { n_kv_heads: usize, group_size: usize, head_block: usize },
+    /// Per-row scaling: out[r][c] = input[r][c] * scales[r]
+    ScaleRows { rows: usize, cols: usize },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
     /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
     FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
@@ -325,6 +327,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::RepeatKv { n_kv_heads, group_size, head_block } => {
                     backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *head_block);
+                }
+                Op::ScaleRows { rows, cols } => {
+                    backward_scale_rows(ctx, entry, &out_grad, *rows, *cols);
                 }
                 Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
                     backward_flash_attention(ctx, entry, &out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
@@ -674,6 +679,9 @@ fn backward_checkpoint(
             Op::RepeatKv { n_kv_heads, group_size, head_block } => {
                 backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *head_block);
             }
+            Op::ScaleRows { rows, cols } => {
+                backward_scale_rows(ctx, &sub_entry, &sub_out_grad, *rows, *cols);
+            }
             Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
                 backward_flash_attention(ctx, &sub_entry, &sub_out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
             }
@@ -958,4 +966,35 @@ fn backward_flash_attention(
     accumulate_grad(ctx, entry.inputs[0], &dq_buf, total_q_rows * head_dim); // dQ
     accumulate_grad(ctx, entry.inputs[1], &dk_buf, total_k_rows * head_dim); // dK
     accumulate_grad(ctx, entry.inputs[2], &dv_buf, total_k_rows * head_dim); // dV
+}
+
+/// ScaleRows backward: d_input = d_out * scales (per-row), d_scales = rowsum(d_out * input)
+fn backward_scale_rows(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    rows: usize,
+    cols: usize,
+) {
+    // d_input[r][c] = d_out[r][c] * scales[r]
+    let d_input = ctx.alloc_buffer(rows * cols * 4);
+    compute::gpu_scale_rows(ctx, out_grad, &entry.input_buffers[1], &d_input, rows as u32, cols as u32);
+    accumulate_grad(ctx, entry.inputs[0], &d_input, rows * cols);
+
+    // d_scales[r] = sum_c(d_out[r][c] * input[r][c])
+    // Compute element-wise product, then reduce per row
+    let product = ctx.alloc_buffer(rows * cols * 4);
+    compute::gpu_mul(ctx, out_grad, &entry.input_buffers[0], &product, (rows * cols) as u32);
+
+    // Row-wise sum: for each row, sum cols elements
+    let d_scales = ctx.alloc_buffer(rows * 4);
+    // Use reduce_sum per row — iterate on CPU for now (small: just `rows` reductions)
+    for r in 0..rows {
+        let row_buf = ctx.alloc_buffer(cols * 4);
+        compute::gpu_buffer_copy(ctx, &product, &row_buf, (r * cols) as u32, 0, cols as u32);
+        let sum_buf = ctx.alloc_buffer(4);
+        compute::gpu_reduce_sum(ctx, &row_buf, &sum_buf, cols as u32);
+        compute::gpu_buffer_copy(ctx, &sum_buf, &d_scales, 0, r as u32, 1);
+    }
+    accumulate_grad(ctx, entry.inputs[1], &d_scales, rows);
 }

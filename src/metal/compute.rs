@@ -697,6 +697,17 @@ pub fn gpu_ternary_pack(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &
     );
 }
 
+/// Scale each row by a different scalar: output[r][c] = input[r][c] * scales[r]
+pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    let rows_buf = params_buffer(ctx, &rows);
+    let cols_buf = params_buffer(ctx, &cols);
+    let grid = MetalContext::size(cols as u64, rows as u64, 1);
+    let tg = MetalContext::size(cols.min(32) as u64, rows.min(32) as u64, 1);
+    dispatch_sync!(ctx, "scale_rows", grid, tg,
+        0 => input, 1 => scales, 2 => output, 3 => &rows_buf, 4 => &cols_buf
+    );
+}
+
 /// MoE: gather tokens for one expert into contiguous buffer.
 pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &GpuBuffer, gathered: &GpuBuffer, n_routed: u32, dim: u32) {
     let n_buf = params_buffer(ctx, &n_routed);

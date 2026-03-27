@@ -336,34 +336,37 @@ impl TransformerBlock {
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
 
-        // Router: soft assignment of tokens to experts (fully on tape)
+        // Router: per-token probability for each expert (on tape)
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
         let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
+        let probs_data = router_probs.to_vec();
 
-        // Run each expert and weight by router probability
-        // output = sum_e( prob_e * expert_e(x) )
-        // All matmul/silu/add ops are on the tape → correct backward
+        // output = sum_e( expert_e(x) * router_probs[:, e] )
         let mut combined: Option<Tensor> = None;
 
         for expert_idx in 0..self.n_experts {
             let expert = &self.experts[expert_idx];
 
-            // Expert FFN (on tape — gradients flow to expert weights)
+            // Expert FFN (all on tape)
             let gate = x_flat.matmul(&expert.w1);
             let up = x_flat.matmul(&expert.w3);
             let hidden = gate.silu_gate(&up);
             let expert_out = hidden.matmul(&expert.w2); // [n_tokens, d]
 
-            // Scale by router probability for this expert
-            // expert_out * prob_e = expert_out * scale(prob_e)
-            // We need per-token scaling, so scale the ENTIRE expert_out by the average
-            // router weight. This is approximate but keeps everything on tape.
-            // TODO: add per-row broadcast multiply op for exact scaling.
+            // Extract this expert's routing weight ON TAPE via matmul with one-hot selector.
+            // router_probs: [n_tokens, n_experts] @ selector: [n_experts, 1] → [n_tokens, 1]
+            let mut selector_data = vec![0.0f32; self.n_experts];
+            selector_data[expert_idx] = 1.0;
+            let selector = Tensor::from_buffer(
+                Arc::clone(&x_flat.ctx),
+                x_flat.ctx.buffer_from_slice(&selector_data),
+                vec![self.n_experts, 1],
+            );
+            let weights_2d = router_probs.matmul(&selector); // [n_tokens, 1] ON TAPE
+            let weights = weights_2d.reshape(vec![n_tokens]);
 
-            // For now: use uniform weight (1/n_experts). The router softmax still
-            // differentiates via the logits→softmax path even with uniform scaling.
-            let uniform_weight = 1.0 / self.n_experts as f32;
-            let scaled = expert_out.scale(uniform_weight);
+            // Per-token scaling ON TAPE via scale_rows
+            let scaled = expert_out.scale_rows(&weights);
 
             combined = Some(match combined {
                 Some(prev) => prev.add(&scaled),
