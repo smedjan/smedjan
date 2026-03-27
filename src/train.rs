@@ -234,8 +234,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
         ctx.flush_batch_async();
 
-        // Zero gradients for next accumulation cycle (CPU-side, no GPU wait needed)
+        // Zero gradients + invalidate FP16 weight cache (weights changed by optimizer)
         autograd::zero_grads();
+        crate::tensor::Tensor::clear_f16_cache();
 
         let tokens_this_step = (config.batch_size * config.seq_len * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;

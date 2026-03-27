@@ -1,10 +1,20 @@
 use crate::autograd::{self, Op, TapeEntry};
 use crate::metal::{compute, GpuBuffer, MetalContext};
 use objc2::rc::Retained;
+use objc2_metal::MTLBuffer;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Unique identifier for tensors on the autodiff tape.
 pub type TensorId = usize;
+
+// Thread-local FP16 cast cache: avoids redundant float→half casts for weights.
+// Key: buffer contents pointer. Value: cached FP16 buffer.
+// Clear after optimizer step when weights change.
+thread_local! {
+    static F16_CAST_CACHE: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
+}
 
 /// A tensor backed by Metal shared memory with automatic differentiation support.
 #[derive(Clone)]
@@ -230,13 +240,26 @@ impl Tensor {
     }
 
     /// Cast tensor contents to FP16 buffer with safe clamping.
-    /// Clamps values to [-65504, 65504] (half max) before cast to prevent overflow→NaN.
-    /// Size in bytes = numel * 2. Does NOT create a Tensor — just a raw buffer.
+    /// Uses thread-local cache: same buffer pointer → cached FP16 version.
+    /// Call `Tensor::clear_f16_cache()` after optimizer step when weights change.
     pub fn cast_to_f16(&self) -> Retained<crate::metal::GpuBuffer> {
+        let key = self.buffer.contents().as_ptr() as usize;
+
+        let cached = F16_CAST_CACHE.with(|c| c.borrow().get(&key).cloned());
+        if let Some(buf) = cached {
+            return buf;
+        }
+
         let size = self.numel();
         let f16_buf = self.ctx.alloc_buffer(size * 2);
         compute::gpu_cast_f32_to_f16(&self.ctx, &self.buffer, &f16_buf, size as u32);
+        F16_CAST_CACHE.with(|c| c.borrow_mut().insert(key, f16_buf.clone()));
         f16_buf
+    }
+
+    /// Clear the FP16 cast cache. Call after optimizer step when weights change.
+    pub fn clear_f16_cache() {
+        F16_CAST_CACHE.with(|c| c.borrow_mut().clear());
     }
 
     /// Matrix multiplication: self @ other
