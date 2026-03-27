@@ -59,6 +59,9 @@ pub enum Op {
     /// GQA KV head expansion: repeat each KV head group_size times.
     /// Backward: sum group_size gradient blocks back into each KV head.
     RepeatKv { n_kv_heads: usize, group_size: usize, head_block: usize },
+    /// Flash Attention: fused Q@K^T → mask → softmax → @V
+    /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
+    FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
 }
 
 /// A single entry on the autodiff tape.
@@ -322,6 +325,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::RepeatKv { n_kv_heads, group_size, head_block } => {
                     backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *head_block);
+                }
+                Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
+                    backward_flash_attention(ctx, entry, &out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
                 }
                 Op::Silu => {
                     backward_silu(ctx, entry, &out_grad);
@@ -668,6 +674,9 @@ fn backward_checkpoint(
             Op::RepeatKv { n_kv_heads, group_size, head_block } => {
                 backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *head_block);
             }
+            Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
+                backward_flash_attention(ctx, &sub_entry, &sub_out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
+            }
             Op::Silu => backward_silu(ctx, &sub_entry, &sub_out_grad),
             Op::SiluGate => backward_silu_gate(ctx, &sub_entry, &sub_out_grad),
             Op::Reshape => backward_reshape(ctx, &sub_entry, &sub_out_grad),
@@ -898,4 +907,55 @@ fn backward_repeat_kv(
     }
 
     accumulate_grad(ctx, entry.inputs[0], &kv_grad, n_kv_heads * head_block);
+}
+
+/// Flash Attention backward: compute dQ, dK, dV using Flash Attention backward kernel.
+/// entry.inputs: [Q_id, K_id, V_id]
+/// entry.cached: O (forward output, for D computation)
+fn backward_flash_attention(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>, // dO
+    batch_heads: usize,
+    seq_q: usize,
+    seq_k: usize,
+    head_dim: usize,
+    kv_offset: u32,
+) {
+    let total_q_rows = batch_heads * seq_q;
+    let total_k_rows = batch_heads * seq_k;
+
+    // Get O from cached (saved during forward)
+    let o_buf = entry.cached.as_ref().expect("FlashAttention backward requires cached O buffer");
+
+    // Precompute D[i] = sum_j(dO[i][j] * O[i][j])
+    let d_buf = ctx.alloc_buffer(total_q_rows * 4);
+    compute::gpu_flash_attn_precompute_d(ctx, out_grad, o_buf, &d_buf, total_q_rows as u32, head_dim as u32);
+
+    // Allocate gradient buffers
+    let dq_buf = ctx.alloc_buffer(total_q_rows * head_dim * 4);
+    let dk_buf = ctx.alloc_buffer(total_k_rows * head_dim * 4);
+    let dv_buf = ctx.alloc_buffer(total_k_rows * head_dim * 4);
+
+    // Zero dK and dV (they accumulate from multiple query rows)
+    compute::gpu_fill(ctx, &dk_buf, (total_k_rows * head_dim) as u32, 0.0);
+    compute::gpu_fill(ctx, &dv_buf, (total_k_rows * head_dim) as u32, 0.0);
+
+    // Run Flash Attention backward kernel
+    compute::gpu_flash_attention_backward(
+        ctx,
+        &entry.input_buffers[0], // Q
+        &entry.input_buffers[1], // K
+        &entry.input_buffers[2], // V
+        o_buf,                    // O
+        out_grad,                 // dO
+        &d_buf,                   // D
+        &dq_buf, &dk_buf, &dv_buf,
+        batch_heads as u32, seq_q as u32, seq_k as u32, head_dim as u32, kv_offset,
+    );
+
+    // Accumulate gradients
+    accumulate_grad(ctx, entry.inputs[0], &dq_buf, total_q_rows * head_dim); // dQ
+    accumulate_grad(ctx, entry.inputs[1], &dk_buf, total_k_rows * head_dim); // dK
+    accumulate_grad(ctx, entry.inputs[2], &dv_buf, total_k_rows * head_dim); // dV
 }

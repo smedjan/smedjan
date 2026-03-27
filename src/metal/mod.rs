@@ -121,6 +121,8 @@ impl MetalContext {
             ("batched_matmul_tiled_trans_a", shaders::BATCHED_MATMUL_TILED_TRANS_A),
             ("kl_divergence", shaders::KL_DIVERGENCE),
             ("flash_attention_forward", shaders::FLASH_ATTENTION_FORWARD),
+            ("flash_attn_precompute_d", shaders::FLASH_ATTENTION_BACKWARD),
+            ("flash_attention_backward", shaders::FLASH_ATTENTION_BACKWARD),
             ("cast_f32_to_f16", shaders::CAST_F32_TO_F16),
             ("cast_f16_to_f32", shaders::CAST_F16_TO_F32),
             ("matmul_tiled_f16", shaders::MATMUL_TILED_F16),

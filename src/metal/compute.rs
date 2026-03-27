@@ -616,6 +616,48 @@ pub fn gpu_flash_attention_forward(
     );
 }
 
+/// Precompute D[i] = sum_j(dO[i][j] * O[i][j]) for Flash Attention backward.
+pub fn gpu_flash_attn_precompute_d(
+    ctx: &Arc<MetalContext>,
+    d_out: &GpuBuffer, output: &GpuBuffer, d_buf: &GpuBuffer,
+    total_rows: u32, head_dim: u32,
+) {
+    let total_rows_buf = params_buffer(ctx, &total_rows);
+    let head_dim_buf = params_buffer(ctx, &head_dim);
+    let tpg = 256u64;
+    let groups = (total_rows as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups * tpg, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_threads_sync!(ctx, "flash_attn_precompute_d", grid, tg,
+        0 => d_out, 1 => output, 2 => d_buf, 3 => &total_rows_buf, 4 => &head_dim_buf
+    );
+}
+
+/// Flash Attention Backward: compute dQ, dK, dV.
+pub fn gpu_flash_attention_backward(
+    ctx: &Arc<MetalContext>,
+    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer,
+    output: &GpuBuffer, d_out: &GpuBuffer, d_buf: &GpuBuffer,
+    dq: &GpuBuffer, dk: &GpuBuffer, dv: &GpuBuffer,
+    batch_heads: u32, seq_q: u32, seq_k: u32, head_dim: u32, kv_offset: u32,
+) {
+    #[repr(C)]
+    struct Params { seq_q: u32, seq_k: u32, head_dim: u32, batch_heads: u32, scale: f32, kv_offset: u32 }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let params = Params { seq_q, seq_k, head_dim, batch_heads, scale, kv_offset };
+    let params_buf = params_buffer(ctx, &params);
+
+    let br = 32u64;
+    let q_blocks = (seq_q as u64).div_ceil(br);
+    let grid = MetalContext::size(batch_heads as u64, q_blocks, 1);
+    let tg = MetalContext::size(br, 1, 1);
+
+    dispatch_sync!(ctx, "flash_attention_backward", grid, tg,
+        0 => q, 1 => k, 2 => v, 3 => output, 4 => d_out, 5 => d_buf,
+        6 => dq, 7 => dk, 8 => dv, 9 => &params_buf
+    );
+}
+
 /// Apply causal mask
 pub fn gpu_causal_mask(
     ctx: &Arc<MetalContext>,

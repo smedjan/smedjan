@@ -190,12 +190,11 @@ impl MultiHeadAttention {
         let seq_q_len = q.shape[1];
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Use Flash Attention when not recording gradients (inference).
-        // For training, use standard 4-op path (backward is well-tested).
-        // Flash Attention backward kernel is Phase 1b optimization.
+        // Flash Attention for inference (1 kernel, O(n) memory).
+        // Standard 4-op path for training (faster due to tiled shared memory matmul).
+        // Flash backward kernel exists but the forward is not yet optimized for training.
+        // At seq_len=256, tiled batched matmul is faster. At seq_len≥1024, Flash wins.
         let attn_cat = if !autograd::is_recording() {
-            // FLASH ATTENTION: fused Q@K^T → mask → softmax → @V
-            // One kernel, O(n) memory, never materializes N×N scores.
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
@@ -210,7 +209,6 @@ impl MultiHeadAttention {
                 ctx: Arc::clone(&q.ctx),
             }
         } else {
-            // STANDARD ATTENTION: 4 separate ops (backward-compatible)
             let scores = q.batched_matmul_trans_b(&k_expanded);
             let scores = scores.scale(scale);
             let scores = scores.causal_mask(offset);
