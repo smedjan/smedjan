@@ -593,6 +593,29 @@ pub fn gpu_embedding_lookup(
     );
 }
 
+/// Flash Attention Forward: fused Q@K^T → mask → softmax → @V in one kernel.
+/// Q,K,V: [batch_heads, seq, head_dim], O: [batch_heads, seq_q, head_dim]
+pub fn gpu_flash_attention_forward(
+    ctx: &Arc<MetalContext>,
+    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, o: &GpuBuffer,
+    batch_heads: u32, seq_q: u32, seq_k: u32, head_dim: u32, kv_offset: u32,
+) {
+    #[repr(C)]
+    struct Params { seq_q: u32, seq_k: u32, head_dim: u32, batch_heads: u32, scale: f32, kv_offset: u32 }
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let params = Params { seq_q, seq_k, head_dim, batch_heads, scale, kv_offset };
+    let params_buf = params_buffer(ctx, &params);
+
+    let br = 32u64; // query block size — matches FA_BR in shader
+    let q_blocks = (seq_q as u64).div_ceil(br);
+    let grid = MetalContext::size(batch_heads as u64, q_blocks, 1);
+    let tg = MetalContext::size(br, 1, 1); // one thread per query row in block
+
+    dispatch_sync!(ctx, "flash_attention_forward", grid, tg,
+        0 => q, 1 => k, 2 => v, 3 => o, 4 => &params_buf
+    );
+}
+
 /// Apply causal mask
 pub fn gpu_causal_mask(
     ctx: &Arc<MetalContext>,

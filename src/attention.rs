@@ -185,21 +185,38 @@ impl MultiHeadAttention {
             )
         };
 
-        // --- Attention computation (batched) ---
-        // Q: [bh, seq_q, head_dim], K: [bh, seq_k, head_dim], V: [bh, seq_k, head_dim]
+        // --- Attention computation ---
+        let bh = batch * self.n_heads;
+        let seq_q_len = q.shape[1];
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        let scores = q.batched_matmul_trans_b(&k_expanded); // [bh, seq_q, seq_k]
-        let scores = scores.scale(scale);
-
-        // Causal mask
-        let scores = scores.causal_mask(offset);
-
-        // Softmax over last dim
-        let weights = scores.softmax(); // [bh, seq_q, seq_k]
-
-        // output = weights @ V
-        let attn_cat = weights.batched_matmul(&v_expanded); // [bh, seq_q, head_dim]
+        // Use Flash Attention when not recording gradients (inference).
+        // For training, use standard 4-op path (backward is well-tested).
+        // Flash Attention backward kernel is Phase 1b optimization.
+        let attn_cat = if !autograd::is_recording() {
+            // FLASH ATTENTION: fused Q@K^T → mask → softmax → @V
+            // One kernel, O(n) memory, never materializes N×N scores.
+            let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
+            compute::gpu_flash_attention_forward(
+                &q.ctx,
+                &q.buffer, &k_expanded.buffer, &v_expanded.buffer, &attn_out_buf,
+                bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, offset,
+            );
+            Tensor {
+                id: autograd::next_id(),
+                buffer: attn_out_buf,
+                shape: vec![bh, seq_q_len, self.head_dim],
+                requires_grad: false,
+                ctx: Arc::clone(&q.ctx),
+            }
+        } else {
+            // STANDARD ATTENTION: 4 separate ops (backward-compatible)
+            let scores = q.batched_matmul_trans_b(&k_expanded);
+            let scores = scores.scale(scale);
+            let scores = scores.causal_mask(offset);
+            let weights = scores.softmax();
+            weights.batched_matmul(&v_expanded)
+        };
 
         // Transpose [bh, seq, head_dim] back to [batch*seq, d_model]
         let attn_combined = transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
