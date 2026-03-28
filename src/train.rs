@@ -322,14 +322,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             // Speculative pretraining: score batch with reference model, skip if easy
             if let Some(ref ref_m) = ref_model {
-                let ref_logits = autograd::no_grad(|| {
-                    ref_m.forward(&inputs, config.batch_size, effective_seq, None, false)
+                // Run reference forward + loss entirely in no_grad to avoid tape pollution
+                let ref_loss_val = autograd::no_grad(|| {
+                    ctx.begin_batch();
+                    let ref_logits = ref_m.forward(&inputs, config.batch_size, effective_seq, None, false);
+                    let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, &targets);
+                    ctx.flush_batch();
+                    let val = ref_loss.to_vec()[0];
+                    // Drop all ref-model intermediate buffers before training forward
+                    drop(ref_logits);
+                    drop(ref_loss);
+                    val
                 });
-                let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, &targets);
-                let ref_loss_val = ref_loss.to_vec()[0];
-                autograd::clear_tape();
                 if ref_loss_val < config.speculative_threshold && ref_loss_val.is_finite() {
-                    // Reference model already knows this — skip training on it
                     last_loss_tensor = None;
                     continue;
                 }
