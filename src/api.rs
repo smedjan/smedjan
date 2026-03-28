@@ -194,7 +194,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let _ = opt.adamw_step();
     let mut soph_opt = crate::optim::Optimizer::Sophia(crate::optim::Sophia::new(ctx, &tiny_refs, 0.0));
     soph_opt.step(0.0);
-    tested += 2;
+    let mut muon_opt = crate::optim::Optimizer::Muon(crate::optim::Muon::new(ctx, &tiny_refs, 0.0));
+    muon_opt.step(0.01);
+    tested += 3;
 
     // FlashAttention op variant
     let _op = crate::autograd::Op::FlashAttention {

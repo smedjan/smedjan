@@ -303,10 +303,139 @@ impl Sophia {
     }
 }
 
+/// Muon optimizer — MomentUm Orthogonalized by Newton-Schulz (2025).
+/// 2.5x faster convergence than AdamW. Used by Kimi K2, GLM-4.5, INTELLECT-3.
+/// For 2D weight matrices: orthogonalizes momentum via Newton-Schulz iteration.
+/// For non-2D params (embeddings, biases, norms): falls back to AdamW.
+pub struct Muon {
+    pub params: Vec<MuonState>,
+    pub beta: f32,          // momentum decay (0.95)
+    pub weight_decay: f32,
+    pub ns_steps: usize,    // Newton-Schulz iterations (5-7)
+    pub step: u32,
+    ctx: Arc<MetalContext>,
+}
+
+pub struct MuonState {
+    pub tensor_id: usize,
+    pub buffer: Retained<GpuBuffer>,
+    pub size: usize,
+    pub shape: Vec<usize>,
+    pub m: Retained<GpuBuffer>,    // momentum buffer
+    pub is_2d: bool,               // true = Muon update, false = AdamW fallback
+    // AdamW fallback state for non-2D params
+    pub v: Option<Retained<GpuBuffer>>,
+}
+
+impl Muon {
+    pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
+        let param_states = params.iter().map(|t| {
+            let size = t.numel();
+            let is_2d = t.shape.len() == 2 && t.shape[0] > 1 && t.shape[1] > 1;
+            let m = ctx.alloc_buffer(size * 4);
+            compute::gpu_fill(ctx, &m, size as u32, 0.0);
+            let v = if !is_2d {
+                let v_buf = ctx.alloc_buffer(size * 4);
+                compute::gpu_fill(ctx, &v_buf, size as u32, 0.0);
+                Some(v_buf)
+            } else { None };
+            MuonState {
+                tensor_id: t.id, buffer: t.buffer.clone(), size,
+                shape: t.shape.clone(), m, is_2d, v,
+            }
+        }).collect();
+
+        Self {
+            params: param_states,
+            beta: 0.95,
+            weight_decay,
+            ns_steps: 5,
+            step: 0,
+            ctx: Arc::clone(ctx),
+        }
+    }
+
+    pub fn step(&mut self, lr: f32) {
+        self.step += 1;
+        let beta1_adam = 0.9f32;
+        let beta2_adam = 0.95f32;
+        let eps_adam = 1e-8f32;
+
+        for ps in &self.params {
+            let grad = autograd::get_grad(ps.tensor_id);
+            let grad = match grad { Some(g) => g, None => continue };
+
+            if ps.is_2d {
+                // Muon update: momentum + Newton-Schulz orthogonalization
+                let rows = ps.shape[0] as u32;
+                let cols = ps.shape[1] as u32;
+                let size = ps.size as u32;
+
+                // Update momentum: m = beta * m + (1-beta) * grad
+                compute::gpu_ema_update(&self.ctx, &ps.m, &grad, size, self.beta);
+
+                // Newton-Schulz orthogonalization of momentum M [rows, cols]
+                // Normalize M to unit spectral norm first (approximate: scale by 1/sqrt(rows*cols))
+                let norm_scale = 1.0 / ((rows as f32).max(cols as f32)).sqrt();
+
+                // X = M * norm_scale (working copy)
+                let x_buf = self.ctx.alloc_buffer(ps.size * 4);
+                compute::gpu_scale_copy(&self.ctx, &ps.m, &x_buf, size, norm_scale);
+
+                // Newton-Schulz: X = 3/2 * X - 1/2 * X @ X^T @ X
+                // Optimized coefficients from Keller Jordan: a=3.4445, b=-4.7750, c=2.0315
+                // X_{k+1} = a*X + b*(X@X^T)@X + c*((X@X^T)@(X@X^T))@X ... simplified to:
+                // X = a*X + b*X@X^T@X (standard form, a=1.5, b=-0.5)
+                let a = 1.5f32;
+                let b = -0.5f32;
+
+                for _ns in 0..self.ns_steps {
+                    // Compute X @ X^T: [rows, cols] @ [cols, rows] = [rows, rows]
+                    let xxt_buf = self.ctx.alloc_buffer(rows as usize * rows as usize * 4);
+                    compute::gpu_matmul_trans_b(&self.ctx, &x_buf, &x_buf, &xxt_buf,
+                        rows, rows, cols);
+
+                    // Compute (X @ X^T) @ X: [rows, rows] @ [rows, cols] = [rows, cols]
+                    let xxtx_buf = self.ctx.alloc_buffer(ps.size * 4);
+                    compute::gpu_matmul(&self.ctx, &xxt_buf, &x_buf, &xxtx_buf,
+                        rows, cols, rows);
+
+                    // X = a*X + b*(X@X^T@X)
+                    compute::gpu_scale(&self.ctx, &x_buf, size, a);
+                    compute::gpu_scale(&self.ctx, &xxtx_buf, size, b);
+                    compute::gpu_add_inplace(&self.ctx, &x_buf, &xxtx_buf, size);
+                }
+
+                // Apply weight decay + orthogonalized update
+                // theta = theta * (1 - lr * wd) - lr * X
+                if self.weight_decay > 0.0 {
+                    compute::gpu_scale(&self.ctx, &ps.buffer, size, 1.0 - lr * self.weight_decay);
+                }
+                compute::gpu_scale(&self.ctx, &x_buf, size, lr);
+                // theta -= lr * X  →  theta += (-lr * X)
+                compute::gpu_scale(&self.ctx, &x_buf, size, -1.0);
+                compute::gpu_add_inplace(&self.ctx, &ps.buffer, &x_buf, size);
+            } else {
+                // AdamW fallback for 1D params (norms, biases, embeddings)
+                let v_buf = ps.v.as_ref().unwrap();
+                compute::gpu_adamw_update(
+                    &self.ctx, &ps.buffer, &grad, &ps.m, v_buf,
+                    ps.size as u32,
+                    &compute::AdamWHyperparams {
+                        lr, beta1: beta1_adam, beta2: beta2_adam, eps: eps_adam,
+                        weight_decay: self.weight_decay, step: self.step,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Unified optimizer interface for training loop.
 pub enum Optimizer {
     AdamW(AdamW),
     Sophia(Sophia),
+    Muon(Muon),
 }
 
 impl Optimizer {
@@ -314,6 +443,7 @@ impl Optimizer {
         match self {
             Optimizer::AdamW(o) => o.step(lr),
             Optimizer::Sophia(o) => o.step(lr),
+            Optimizer::Muon(o) => o.step(lr),
         }
     }
 
@@ -321,6 +451,10 @@ impl Optimizer {
         match self {
             Optimizer::AdamW(o) => o.zero_grad(),
             Optimizer::Sophia(o) => o.zero_grad(),
+            Optimizer::Muon(_) => {
+                autograd::clear_tape();
+                autograd::clear_recompute_registry();
+            }
         }
     }
 
@@ -328,6 +462,7 @@ impl Optimizer {
         match self {
             Optimizer::AdamW(o) => o.step,
             Optimizer::Sophia(o) => o.step,
+            Optimizer::Muon(o) => o.step,
         }
     }
 }

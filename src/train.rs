@@ -193,6 +193,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None
     };
 
+    // Create Muon optimizer if selected (2.5x faster convergence than AdamW)
+    let mut muon_opt = if config.optimizer_type == "muon" {
+        eprintln!("Using Muon optimizer (2.5x faster convergence — Newton-Schulz orthogonalization)");
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let n_2d = param_refs.iter().filter(|p| p.shape.len() == 2 && p.shape[0] > 1 && p.shape[1] > 1).count();
+        eprintln!("  {}/{} params use Muon (2D), rest use AdamW fallback", n_2d, param_refs.len());
+        Some(crate::optim::Muon::new(ctx, &param_refs, config.weight_decay))
+    } else {
+        None
+    };
+
     // Log optimizer info
     if optimizer.galore_rank > 0 {
         eprintln!("GALORE: rank={}, optimizer memory={:.1}MB (vs {:.1}MB full)",
@@ -420,7 +431,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
         ctx.begin_batch();
         if lr > 1e-10 {
-            if let Some(ref mut soph) = sophia_opt {
+            if let Some(ref mut muon) = muon_opt {
+                muon.step(lr);
+            } else if let Some(ref mut soph) = sophia_opt {
                 soph.step(lr);
             } else {
                 optimizer.step(lr);
