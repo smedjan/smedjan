@@ -166,6 +166,12 @@ enum Commands {
         /// Z-loss coefficient: penalize large logits. 0=off, 1e-4=recommended for MoE
         #[arg(long, default_value = "0.0")]
         z_loss: f32,
+        /// Stochastic depth: layer drop rate. 0=off, 0.1=recommended for deep models
+        #[arg(long, default_value = "0.0")]
+        stochastic_depth: f32,
+        /// Sliding window attention size. 0=full causal, 1024=attend last 1024 tokens
+        #[arg(long, default_value = "0")]
+        sliding_window: usize,
     },
 
     /// Show available model sizes and their param counts
@@ -494,6 +500,8 @@ fn main() {
             n_predict,
             curriculum,
             z_loss,
+            stochastic_depth,
+            sliding_window,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -565,6 +573,8 @@ fn main() {
             config.model_config.n_predict = n_predict;
             config.curriculum = curriculum;
             config.z_loss_coefficient = z_loss;
+            config.model_config.stochastic_depth = stochastic_depth;
+            config.model_config.sliding_window = sliding_window;
 
             train::train(&ctx, &config).expect("Training failed");
         }
