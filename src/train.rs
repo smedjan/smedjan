@@ -54,6 +54,9 @@ pub struct TrainConfig {
     pub reference_model: Option<String>,
     /// Speculative threshold: skip if reference loss < this value.
     pub speculative_threshold: f32,
+    /// Curriculum learning: ramp sequence length from seq_len/4 → seq_len over first 25% of training.
+    /// Faster early training (short seqs = bigger effective batch), smooth transition to full context.
+    pub curriculum: bool,
 }
 
 impl TrainConfig {
@@ -86,6 +89,7 @@ impl TrainConfig {
             optimizer_type: "adamw".to_string(),
             reference_model: None,
             speculative_threshold: 7.0,
+            curriculum: false,
         }
     }
 }
@@ -220,18 +224,48 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let step_start = Instant::now();
         let lr = scheduler.get_lr(step);
 
+        // Curriculum learning: ramp seq_len from min(64, seq/4) → seq over first 25% of training.
+        // Short sequences = faster steps + bigger effective batch in early training.
+        let effective_seq = if config.curriculum {
+            let ramp_end = config.total_steps / 4;
+            if step < ramp_end {
+                let min_seq = (config.seq_len / 4).max(32);
+                let progress = step as f32 / ramp_end as f32;
+                let seq = min_seq as f32 + progress * (config.seq_len - min_seq) as f32;
+                // Round to multiple of 8 for GPU alignment
+                ((seq as usize + 7) / 8 * 8).min(config.seq_len)
+            } else {
+                config.seq_len
+            }
+        } else {
+            config.seq_len
+        };
+
         // Track the last micro-step's loss for logging
         let mut last_loss_tensor: Option<crate::tensor::Tensor> = None;
 
         // === Gradient accumulation loop ===
         for _micro_step in 0..grad_accum_steps {
-            // Get a micro-batch (DataLoader uses config.batch_size as micro-batch size)
-            let (inputs, targets) = data_loader.next_batch();
+            // Get a micro-batch. With curriculum learning, truncate to effective_seq.
+            let (full_inputs, full_targets) = data_loader.next_batch();
+            let (inputs, targets): (Vec<u32>, Vec<u32>) = if effective_seq < config.seq_len {
+                let bs = config.batch_size;
+                let mut si = Vec::with_capacity(bs * effective_seq);
+                let mut st = Vec::with_capacity(bs * effective_seq);
+                for b in 0..bs {
+                    let start = b * config.seq_len;
+                    si.extend_from_slice(&full_inputs[start..start + effective_seq]);
+                    st.extend_from_slice(&full_targets[start..start + effective_seq]);
+                }
+                (si, st)
+            } else {
+                (full_inputs.to_vec(), full_targets.to_vec())
+            };
 
             // Speculative pretraining: score batch with reference model, skip if easy
             if let Some(ref ref_m) = ref_model {
                 let ref_logits = autograd::no_grad(|| {
-                    ref_m.forward(&inputs, config.batch_size, config.seq_len, None, false)
+                    ref_m.forward(&inputs, config.batch_size, effective_seq, None, false)
                 });
                 let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, &targets);
                 let ref_loss_val = ref_loss.to_vec()[0];
@@ -250,16 +284,16 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Each extra head predicts tokens shifted by k+1 positions.
             let n_predict = config.model_config.n_predict;
             let (logits, extra_logits) = if n_predict > 0 {
-                model.forward_mtp(&inputs, config.batch_size, config.seq_len, config.gradient_checkpointing)
+                model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing)
             } else {
-                let l = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
+                let l = model.forward(&inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
                 (l, Vec::new())
             };
 
             // Compute main loss — distillation or plain cross-entropy
             let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
                 let teacher_logits = autograd::no_grad(|| {
-                    teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
+                    teacher.forward(&inputs, config.batch_size, effective_seq, None, false)
                 });
                 loss::distillation_loss(
                     ctx, &logits, &teacher_logits,
@@ -276,19 +310,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 let mtp_weight = 1.0 / (n_predict + 1) as f32;
                 // Scale main loss
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, mtp_weight);
-                compute::gpu_scale(ctx, &grad_logits, (config.batch_size * config.seq_len * config.model_config.vocab_size as usize) as u32, mtp_weight);
+                compute::gpu_scale(ctx, &grad_logits, (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, mtp_weight);
 
                 for (k, extra_log) in extra_logits.iter().enumerate() {
                     // Shift targets: for head k, target[t] = original_target[t+k+1]
                     // Tokens that go past the sequence end get masked (use token 0 as padding)
                     let shift = k + 1;
-                    let bs = config.batch_size * config.seq_len;
+                    let bs = config.batch_size * effective_seq;
                     let mut shifted_targets = vec![0u32; bs];
                     for b in 0..config.batch_size {
-                        for t in 0..config.seq_len {
-                            let src_idx = b * config.seq_len + t + shift;
-                            if t + shift < config.seq_len {
-                                shifted_targets[b * config.seq_len + t] = targets[src_idx];
+                        for t in 0..effective_seq {
+                            let src_idx = b * effective_seq + t + shift;
+                            if t + shift < effective_seq {
+                                shifted_targets[b * effective_seq + t] = targets[src_idx];
                             }
                             // else: stays 0 (padding), loss will be computed but gradient is small
                         }
@@ -317,7 +351,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             // Scale both loss AND gradient by 1/grad_accum_steps.
             if grad_accum_steps > 1 {
-                let grad_size = (config.batch_size * config.seq_len * config.model_config.vocab_size as usize) as u32;
+                let grad_size = (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32;
                 compute::gpu_scale(ctx, &grad_logits, grad_size, loss_scale);
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
             }
@@ -350,7 +384,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         autograd::zero_grads();
         crate::tensor::Tensor::clear_f16_cache();
 
-        let tokens_this_step = (config.batch_size * config.seq_len * grad_accum_steps as usize) as u64;
+        let tokens_this_step = (config.batch_size * effective_seq * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;
 
         // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)

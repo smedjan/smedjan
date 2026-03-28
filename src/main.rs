@@ -160,6 +160,9 @@ enum Commands {
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
+        /// Curriculum learning: ramp seq_len from short→full over first 25% of training
+        #[arg(long)]
+        curriculum: bool,
     },
 
     /// Show available model sizes and their param counts
@@ -486,6 +489,7 @@ fn main() {
             speculative_threshold,
             optimizer,
             n_predict,
+            curriculum,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -555,6 +559,7 @@ fn main() {
             config.reference_model = reference_model;
             config.speculative_threshold = speculative_threshold;
             config.model_config.n_predict = n_predict;
+            config.curriculum = curriculum;
 
             train::train(&ctx, &config).expect("Training failed");
         }

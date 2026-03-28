@@ -25,6 +25,7 @@ pub struct MultiHeadAttention {
     pub head_dim: usize,
     pub d_model: usize,
     pub rope_theta: f32,
+    pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
 }
 
 /// KV cache for autoregressive inference.
@@ -146,10 +147,13 @@ impl MultiHeadAttention {
             )
         };
 
+        let qk_norm_weight = Tensor::ones(ctx, vec![head_dim]);
+
         Self {
             w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
             attn_rank: rank,
             n_heads, n_kv_heads, head_dim, d_model, rope_theta,
+            qk_norm_weight,
         }
     }
 
@@ -220,6 +224,14 @@ impl MultiHeadAttention {
         };
         let q = q.apply_rope(offset, self.rope_theta);
         let k = k.apply_rope(offset, self.rope_theta);
+
+        // QK-norm: RMS-normalize Q and K per head to prevent attention entropy collapse.
+        // At large d_model, dot products grow proportionally to head_dim, causing
+        // softmax to saturate. Normalizing keeps attention sharp across all scales.
+        // Applied after RoPE so positional info is preserved in direction, not magnitude.
+        // Uses fixed weight=1 (no learned scale) — the attention scale factor handles magnitude.
+        let q = q.rms_norm(&self.qk_norm_weight, 1e-6);
+        let k = k.rms_norm(&self.qk_norm_weight, 1e-6);
 
         // Handle KV cache (inference only — no tape needed)
         // Cache stores n_kv_heads, not n_heads
@@ -307,12 +319,14 @@ impl MultiHeadAttention {
 
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
-        if self.attn_rank > 0 {
+        let mut params = if self.attn_rank > 0 {
             vec![&self.w_q, &self.w_q_v, &self.w_k, &self.w_k_v,
                  &self.w_v, &self.w_v_v, &self.w_o, &self.w_o_v]
         } else {
             vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o]
-        }
+        };
+        params.push(&self.qk_norm_weight);
+        params
     }
 }
 
