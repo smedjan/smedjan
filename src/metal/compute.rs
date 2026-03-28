@@ -834,9 +834,22 @@ pub fn gpu_causal_mask(
     seq_k: u32,
     offset: u32,
 ) {
+    gpu_causal_mask_window(ctx, scores, batch_heads, seq_q, seq_k, offset, 0)
+}
+
+/// Causal mask with optional sliding window.
+pub fn gpu_causal_mask_window(
+    ctx: &Arc<MetalContext>,
+    scores: &GpuBuffer,
+    batch_heads: u32,
+    seq_q: u32,
+    seq_k: u32,
+    offset: u32,
+    window: u32,
+) {
     #[repr(C)]
-    struct Params { batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32 }
-    let params = Params { batch_heads, seq_q, seq_k, offset };
+    struct Params { batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32, window: u32 }
+    let params = Params { batch_heads, seq_q, seq_k, offset, window };
     let params_buf = params_buffer(ctx, &params);
 
     let total = MetalContext::size(seq_k as u64, seq_q as u64, batch_heads as u64);
@@ -1401,9 +1414,17 @@ pub fn gpu_scaled_causal_softmax(
     ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
     total_rows: u32, seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32,
 ) {
+    gpu_scaled_causal_softmax_window(ctx, input, output, total_rows, seq_q, seq_k, scale, kv_offset, 0)
+}
+
+/// Scaled causal softmax with optional sliding window.
+pub fn gpu_scaled_causal_softmax_window(
+    ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
+    total_rows: u32, seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32, window: u32,
+) {
     #[repr(C)]
-    struct Params { seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32 }
-    let params = Params { seq_q, seq_k, scale, kv_offset };
+    struct Params { seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32, window: u32 }
+    let params = Params { seq_q, seq_k, scale, kv_offset, window };
     let params_buf = params_buffer(ctx, &params);
     let threads_per_group = next_power_of_2_clamped(seq_k as u64);
     let grid = MetalContext::size(total_rows as u64, 1, 1);

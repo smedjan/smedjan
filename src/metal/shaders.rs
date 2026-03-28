@@ -368,6 +368,7 @@ struct ScaledCausalSoftmaxParams {
     uint seq_k;
     float scale;
     uint kv_offset;
+    uint window; // 0=full causal, >0=sliding window size
 };
 
 kernel void scaled_causal_softmax(
@@ -392,7 +393,9 @@ kernel void scaled_causal_softmax(
     float local_max = -INFINITY;
     for (uint c = thread_index; c < seq_k; c += threads_per_group) {
         float val = row_in[c] * params.scale;
-        if (c > q_pos + params.kv_offset) val = -INFINITY;
+        bool future = c > q_pos + params.kv_offset;
+        bool too_far = (params.window > 0) && (q_pos + params.kv_offset >= params.window) && (c < q_pos + params.kv_offset - params.window);
+        if (future || too_far) val = -INFINITY;
         local_max = max(local_max, val);
     }
     float simd_mx = simd_max(local_max);
@@ -406,7 +409,9 @@ kernel void scaled_causal_softmax(
     float local_sum = 0.0f;
     for (uint c = thread_index; c < seq_k; c += threads_per_group) {
         float val = row_in[c] * params.scale;
-        if (c > q_pos + params.kv_offset) val = -INFINITY;
+        bool future = c > q_pos + params.kv_offset;
+        bool too_far = (params.window > 0) && (q_pos + params.kv_offset >= params.window) && (c < q_pos + params.kv_offset - params.window);
+        if (future || too_far) val = -INFINITY;
         float e = exp(val - row_max);
         row_out[c] = e;
         local_sum += e;
@@ -1010,6 +1015,7 @@ struct MaskParams {
     uint seq_q;
     uint seq_k;
     uint offset; // for KV cache: offset into key sequence
+    uint window; // sliding window: 0=full causal, >0=attend only last W positions
 };
 
 kernel void causal_mask(
@@ -1023,10 +1029,10 @@ kernel void causal_mask(
 
     if (bh >= params.batch_heads || q >= params.seq_q || k >= params.seq_k) return;
 
-    // q_pos = offset + q (for KV cache, queries start at offset)
-    // k_pos = k
-    // Mask if k_pos > q_pos (future positions)
-    if (k > q + params.offset) {
+    uint q_pos = q + params.offset;
+    bool future = k > q_pos;
+    bool too_far = (params.window > 0) && (q_pos >= params.window) && (k < q_pos - params.window);
+    if (future || too_far) {
         scores[bh * params.seq_q * params.seq_k + q * params.seq_k + k] = -INFINITY;
     }
 }
