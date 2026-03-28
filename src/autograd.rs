@@ -182,6 +182,7 @@ pub fn zero_grads() {
 /// ONLY call after the optimizer's GPU work is complete (sync flush),
 /// otherwise recycled buffers get reused while optimizer is still reading.
 /// Store a gradient for testing purposes (bypasses normal backward flow).
+#[cfg(test)]
 pub fn accumulate_grad_for_test(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
     accumulate_grad(ctx, tensor_id, grad, size);
 }
