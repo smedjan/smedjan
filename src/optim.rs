@@ -86,7 +86,7 @@ impl AdamW {
         }).sum()
     }
 
-    /// Perform one optimizer step with the given learning rate.
+    /// Perform one optimizer step with the given learning rate (GPU dispatch).
     pub fn step(&mut self, lr: f32) {
         self.step += 1;
 
@@ -97,7 +97,6 @@ impl AdamW {
                 None => continue,
             };
 
-            // Standard AdamW update on full gradient with full or projected m/v
             compute::gpu_adamw_update(
                 &self.ctx,
                 &ps.buffer,
@@ -114,6 +113,47 @@ impl AdamW {
                     step: self.step,
                 },
             );
+        }
+    }
+
+    /// Perform optimizer step on CPU using unified memory (Apple Silicon zero-copy).
+    /// On Apple Silicon, CPU and GPU share physical memory — no copy needed.
+    /// The CPU update runs while the GPU can start the next forward pass.
+    /// This hides optimizer latency behind GPU compute.
+    pub fn step_cpu(&mut self, lr: f32) {
+        use objc2_metal::MTLBuffer;
+        self.step += 1;
+
+        let bc1 = 1.0 - self.beta1.powi(self.step as i32);
+        let bc2 = 1.0 - self.beta2.powi(self.step as i32);
+
+        for ps in &self.params {
+            let grad = autograd::get_grad(ps.tensor_id);
+            let grad = match grad { Some(g) => g, None => continue };
+
+            let size = ps.size;
+            // Direct pointer access to unified memory — zero copy on Apple Silicon
+            let param_ptr = ps.buffer.contents().as_ptr() as *mut f32;
+            let grad_ptr = grad.contents().as_ptr() as *const f32;
+            let m_ptr = ps.m.contents().as_ptr() as *mut f32;
+            let v_ptr = ps.v.contents().as_ptr() as *mut f32;
+
+            unsafe {
+                for i in 0..size {
+                    let g = *grad_ptr.add(i);
+                    let m_val = self.beta1 * *m_ptr.add(i) + (1.0 - self.beta1) * g;
+                    let v_val = self.beta2 * *v_ptr.add(i) + (1.0 - self.beta2) * g * g;
+                    *m_ptr.add(i) = m_val;
+                    *v_ptr.add(i) = v_val;
+
+                    let m_hat = m_val / bc1;
+                    let v_hat = v_val / bc2;
+
+                    let p = *param_ptr.add(i);
+                    *param_ptr.add(i) = p * (1.0 - lr * self.weight_decay)
+                        - lr * m_hat / (v_hat.sqrt() + self.eps);
+                }
+            }
         }
     }
 

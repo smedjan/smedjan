@@ -446,15 +446,25 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Gradient clipping: norm computation fused into same batch as backward.
         clip_gradients_fused(ctx, &model, config.max_grad_norm);
 
-        ctx.begin_batch();
+        // Optimizer step: GPU (default) or CPU (Apple Silicon zero-copy)
         if lr > 1e-10 {
             if let Some(ref mut muon) = muon_opt {
+                ctx.begin_batch();
                 muon.step(lr);
             } else if let Some(ref mut soph) = sophia_opt {
+                ctx.begin_batch();
                 soph.step(lr);
+            } else if config.optimizer_type == "adamw-cpu" {
+                // CPU optimizer: runs on unified memory while GPU can start next forward.
+                // Apple Silicon advantage: zero-copy, ~same speed as GPU for small param counts.
+                optimizer.step_cpu(lr);
+                ctx.begin_batch(); // start a dummy batch for the flush below
             } else {
+                ctx.begin_batch();
                 optimizer.step(lr);
             }
+        } else {
+            ctx.begin_batch();
         }
         // Anti-PGD noise: add anticorrelated perturbation to weights for flatter minima
         // noise_t = -0.5 * noise_{t-1} + sqrt(0.75) * fresh_noise (anticorrelation alpha=0.5)
