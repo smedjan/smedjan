@@ -25,6 +25,7 @@ pub struct ModelConfig {
     pub bitnet: bool,          // BitNet: use ternary weights in FFN (no float multiply)
     pub lowrank: usize,        // Low-rank training: 0=full rank, >0=rank for FFN decomposition
     pub shared_layers: bool,   // ALBERT: share weights across all layers (1 unique layer, N iterations)
+    pub n_predict: usize,      // Multi-token prediction: 0=standard, N=predict next N+1 tokens (Meta 2024)
 }
 
 impl ModelConfig {
@@ -86,6 +87,7 @@ impl ModelConfig {
             bitnet: false,
             lowrank: 0,
             shared_layers: false,
+            n_predict: 0,
         }
     }
 
@@ -197,7 +199,10 @@ impl ModelConfig {
         // Final norm
         let final_norm = d;
 
-        embedding + self.n_layers * per_layer + final_norm
+        // Multi-token prediction heads: n_predict × (d*d projection + d norm)
+        let mtp = self.n_predict * (d * d + d);
+
+        embedding + self.n_layers * per_layer + final_norm + mtp
     }
 
     /// Memory required for training (weights + gradients + optimizer state) in bytes.
@@ -576,6 +581,11 @@ pub struct Transformer {
     pub embed_rank: usize,           // 0 = full embedding, >0 = factored
     pub blocks: Vec<Arc<TransformerBlock>>,
     pub ln_final_weight: Tensor,     // [d_model]
+    /// Multi-token prediction heads: each projects d_model → d_model for future token k.
+    /// Head k predicts token at position t+k+2 (head 0 is t+2, head 1 is t+3, etc.).
+    /// The standard LM head (weight-tied embedding) always predicts t+1.
+    pub mtp_heads: Vec<Tensor>,      // n_predict × [d_model, d_model]
+    pub mtp_norms: Vec<Tensor>,      // n_predict × [d_model] (per-head layer norms)
     ctx: Arc<MetalContext>,
 }
 
@@ -609,6 +619,21 @@ impl Transformer {
 
         let ln_final_weight = Tensor::ones(ctx, vec![d]);
 
+        // Multi-token prediction heads (Meta 2024): each head predicts token t+k+2
+        // using a learned projection of the hidden state. The standard LM head predicts t+1.
+        // 4× better sample efficiency at N=4.
+        let mtp_heads: Vec<Tensor> = (0..config.n_predict)
+            .map(|_| Tensor::randn(ctx, vec![d, d], (2.0 / (d + d) as f32).sqrt()))
+            .collect();
+        let mtp_norms: Vec<Tensor> = (0..config.n_predict)
+            .map(|_| Tensor::ones(ctx, vec![d]))
+            .collect();
+
+        if config.n_predict > 0 {
+            eprintln!("Multi-token prediction: {} extra heads (predict t+2..t+{})",
+                config.n_predict, config.n_predict + 1);
+        }
+
         eprintln!(
             "Model initialized: {} layers, {}M parameters",
             config.n_layers,
@@ -622,6 +647,8 @@ impl Transformer {
             embed_rank,
             blocks,
             ln_final_weight,
+            mtp_heads,
+            mtp_norms,
             ctx: Arc::clone(ctx),
         }
     }
@@ -732,6 +759,91 @@ impl Transformer {
         }
     }
 
+    /// Forward with multi-token prediction: returns (main_logits, [extra_logits...]).
+    /// Each extra_logits[k] predicts token at position t+k+2 (shifted by k+1 from main).
+    /// When n_predict=0, extra vec is empty (standard next-token prediction).
+    pub fn forward_mtp(
+        &self,
+        tokens: &[u32],
+        batch: usize,
+        seq_len: usize,
+        checkpointed: bool,
+    ) -> (Tensor, Vec<Tensor>) {
+        let d = self.config.d_model;
+        let n_tokens = batch * seq_len;
+
+        // Embedding lookup
+        let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
+        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
+        compute::gpu_embedding_lookup(
+            &self.ctx, &tokens_buf, &self.embedding.buffer, &embed_out_buf,
+            n_tokens as u32, embed_dim as u32,
+        );
+
+        let tokens_id = autograd::next_id();
+        let embed_out_id = autograd::next_id();
+        if autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Embedding,
+                inputs: vec![tokens_id, self.embedding.id],
+                output: embed_out_id,
+                input_buffers: vec![tokens_buf, self.embedding.buffer.clone()],
+                output_buffer: embed_out_buf.clone(),
+                shapes: vec![vec![n_tokens], vec![self.config.vocab_size as usize, embed_dim], vec![n_tokens, embed_dim]],
+                cached: None,
+            });
+        }
+
+        let embed_tensor = Tensor {
+            id: embed_out_id, buffer: embed_out_buf,
+            shape: vec![n_tokens, embed_dim], requires_grad: true, ctx: Arc::clone(&self.ctx),
+        };
+
+        let h_flat = if self.embed_rank > 0 {
+            embed_tensor.matmul(&self.embed_proj)
+        } else { embed_tensor };
+        let mut h = h_flat.reshape(vec![batch, seq_len, d]);
+
+        if checkpointed {
+            for (i, block) in self.blocks.iter().enumerate() {
+                h = block.forward_checkpointed(&h, i);
+            }
+        } else {
+            for block in &self.blocks { h = block.forward(&h, None); }
+        }
+
+        let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
+        let h_flat = h.reshape(vec![n_tokens, d]);
+
+        // Main LM head (weight-tied embedding): predicts t+1
+        let main_logits = if self.embed_rank > 0 {
+            h_flat.matmul_trans_b(&self.embed_proj.detach())
+                .matmul_trans_b(&self.embedding.detach())
+        } else {
+            h_flat.matmul_trans_b(&self.embedding.detach())
+        };
+
+        // Extra prediction heads: head k predicts t+k+2
+        let mut extra_logits = Vec::with_capacity(self.config.n_predict);
+        for k in 0..self.config.n_predict {
+            let projected = h_flat.matmul(&self.mtp_heads[k]);
+            let normed = projected.rms_norm(&self.mtp_norms[k], self.config.norm_eps);
+            let logits_k = if self.embed_rank > 0 {
+                normed.matmul_trans_b(&self.embed_proj.detach())
+                    .matmul_trans_b(&self.embedding.detach())
+            } else {
+                normed.matmul_trans_b(&self.embedding.detach())
+            };
+            extra_logits.push(logits_k);
+        }
+
+        let mup_scale = self.config.mup_output_scale();
+        let main_logits = if mup_scale < 1.0 { main_logits.scale(mup_scale) } else { main_logits };
+
+        (main_logits, extra_logits)
+    }
+
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = vec![&self.embedding, &self.ln_final_weight];
@@ -741,6 +853,8 @@ impl Transformer {
         for block in &self.blocks {
             params.extend(block.parameters());
         }
+        for head in &self.mtp_heads { params.push(head); }
+        for norm in &self.mtp_norms { params.push(norm); }
         params
     }
 

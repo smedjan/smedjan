@@ -272,6 +272,7 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&(if config.bitnet { 1u32 } else { 0u32 }).to_le_bytes())?;
     file.write_all(&(if config.shared_layers { 1u32 } else { 0u32 }).to_le_bytes())?;
     file.write_all(&(config.mup_base_width as u32).to_le_bytes())?;
+    file.write_all(&(config.n_predict as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -311,7 +312,7 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
     };
 
     // v3: lowrank, MoE, bitnet, shared_layers, mup
-    let (lowrank, n_experts, top_k_experts, bitnet, shared_layers, mup_base_width) = if version >= 3 {
+    let (lowrank, n_experts, top_k_experts, bitnet, shared_layers, mup_base_width, n_predict) = if version >= 3 {
         file.read_exact(&mut buf4)?;
         let lr = u32::from_le_bytes(buf4) as usize;
         file.read_exact(&mut buf4)?;
@@ -324,9 +325,11 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         let sl = u32::from_le_bytes(buf4) != 0;
         file.read_exact(&mut buf4)?;
         let mup = u32::from_le_bytes(buf4) as usize;
-        (lr, ne, tk, bn, sl, mup)
+        file.read_exact(&mut buf4)?;
+        let n_pred = u32::from_le_bytes(buf4) as usize;
+        (lr, ne, tk, bn, sl, mup, n_pred)
     } else {
-        (0, 1, 1, false, false, 0)
+        (0, 1, 1, false, false, 0, 0)  // defaults for v1/v2 checkpoints
     };
 
     Ok(ModelConfig {
@@ -345,5 +348,6 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         shared_layers,
         bitnet,
         lowrank,
+        n_predict,
     })
 }

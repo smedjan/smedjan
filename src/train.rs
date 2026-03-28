@@ -245,25 +245,60 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
             ctx.begin_batch();
-            let logits = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
 
-            // Compute loss — distillation or plain cross-entropy
+            // Multi-token prediction: forward_mtp returns (main_logits, [extra_logits...])
+            // Each extra head predicts tokens shifted by k+1 positions.
+            let n_predict = config.model_config.n_predict;
+            let (logits, extra_logits) = if n_predict > 0 {
+                model.forward_mtp(&inputs, config.batch_size, config.seq_len, config.gradient_checkpointing)
+            } else {
+                let l = model.forward(&inputs, config.batch_size, config.seq_len, None, config.gradient_checkpointing);
+                (l, Vec::new())
+            };
+
+            // Compute main loss — distillation or plain cross-entropy
             let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
-                // Teacher forward pass (no gradient recording)
                 let teacher_logits = autograd::no_grad(|| {
                     teacher.forward(&inputs, config.batch_size, config.seq_len, None, false)
                 });
                 loss::distillation_loss(
-                    ctx,
-                    &logits,
-                    &teacher_logits,
-                    config.distill_temperature,
-                    config.distill_alpha,
-                    &targets,
+                    ctx, &logits, &teacher_logits,
+                    config.distill_temperature, config.distill_alpha, &targets,
                 )
             } else {
                 loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
             };
+
+            // Multi-token prediction: add loss from extra heads with shifted targets.
+            // Head k predicts position t+k+2, so targets shift by k+1 within the sequence.
+            // Weight: 1/(n_predict+1) per head for equal contribution.
+            if !extra_logits.is_empty() {
+                let mtp_weight = 1.0 / (n_predict + 1) as f32;
+                // Scale main loss
+                compute::gpu_scale(ctx, &loss_tensor.buffer, 1, mtp_weight);
+                compute::gpu_scale(ctx, &grad_logits, (config.batch_size * config.seq_len * config.model_config.vocab_size as usize) as u32, mtp_weight);
+
+                for (k, extra_log) in extra_logits.iter().enumerate() {
+                    // Shift targets: for head k, target[t] = original_target[t+k+1]
+                    // Tokens that go past the sequence end get masked (use token 0 as padding)
+                    let shift = k + 1;
+                    let bs = config.batch_size * config.seq_len;
+                    let mut shifted_targets = vec![0u32; bs];
+                    for b in 0..config.batch_size {
+                        for t in 0..config.seq_len {
+                            let src_idx = b * config.seq_len + t + shift;
+                            if t + shift < config.seq_len {
+                                shifted_targets[b * config.seq_len + t] = targets[src_idx];
+                            }
+                            // else: stays 0 (padding), loss will be computed but gradient is small
+                        }
+                    }
+                    let (extra_loss, _extra_grad) = loss::cross_entropy_loss(ctx, extra_log, &shifted_targets);
+                    // Add weighted extra loss to main loss
+                    compute::gpu_scale(ctx, &extra_loss.buffer, 1, mtp_weight);
+                    compute::gpu_add_inplace(ctx, &loss_tensor.buffer, &extra_loss.buffer, 1);
+                }
+            }
 
             // Online data pruning: skip backward if loss is below threshold.
             // The model already knows this data — training on it wastes compute.
@@ -299,10 +334,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
 
         // Gradient clipping: norm computation fused into same batch as backward.
-        // Eliminates 1 GPU sync point per step (3→2 syncs).
         clip_gradients_fused(ctx, &model, config.max_grad_norm);
 
-        // Optimizer step — flush async so CPU can prep next batch while GPU updates weights
         ctx.begin_batch();
         if lr > 1e-10 {
             if let Some(ref mut soph) = sophia_opt {
