@@ -152,7 +152,12 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     // FP16 non-batched matmul backward variant (kept for large-matrix backward path)
     compute::gpu_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2);
     // Utility cast helper (used by FP16 backward when enabled)
-    let _cast_test = crate::autograd::cast_buf_f16(ctx, &ba, 4);
+    let cast_test = crate::autograd::cast_buf_f16(ctx, &ba, 4);
+    // Verify FP16 cast produced valid buffer (read back and check)
+    let cast_back = ctx.alloc_buffer(4 * 4);
+    compute::gpu_cast_f16_to_f32(ctx, &cast_test, &cast_back, 4);
+    let cast_vals = MetalContext::read_buffer(&cast_back, 4);
+    if (cast_vals[0] - 1.0).abs() > 0.1 { passed = false; }
     tested += 5;
 
     // MoE gather/scatter
@@ -236,9 +241,10 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     tested += 3;
 
     // FlashAttention op variant
-    let _op = crate::autograd::Op::FlashAttention {
+    let flash_op = crate::autograd::Op::FlashAttention {
         batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,
     };
+    if !matches!(flash_op, crate::autograd::Op::FlashAttention { .. }) { passed = false; }
     tested += 1;
 
     // Verify grad recycling path exists (safe after sync flush)

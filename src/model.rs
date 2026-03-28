@@ -295,9 +295,11 @@ impl TransformerBlock {
         // Scaled initialization for residual connections
         let residual_scale = (1.0 / (2.0 * config.n_layers as f32)).sqrt();
         let ff_std = (2.0 / (d + ff) as f32).sqrt() * residual_scale;
-        let down_std = (2.0 / (ff + d) as f32).sqrt() * residual_scale;
-
-        let _ = layer_idx;
+        // Scale init std by layer depth for deeper models (GPT-style 1/sqrt(2*N) scaling)
+        let depth_scale = if config.n_layers > 1 {
+            1.0 / (1.0 + layer_idx as f32 / config.n_layers as f32).sqrt()
+        } else { 1.0 };
+        let down_std = (2.0 / (ff + d) as f32).sqrt() * residual_scale * depth_scale;
 
         // Create expert FFNs for MoE (empty vec for dense)
         let experts = if config.n_experts > 1 {

@@ -572,7 +572,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 eprintln!("Tape: {} ops, {:.1} MB activation memory", tape_ops, tape_bytes as f64 / (1024.0 * 1024.0));
             }
 
-            let (_pool_hits, _pool_misses) = MetalContext::pool_stats();
+            let (pool_hits, pool_misses) = MetalContext::pool_stats();
 
             // Periodic weight health check: every 100 steps to avoid GPU→CPU sync overhead.
             // gpu_l2_norm_check forces a batch flush + readback (8 bytes).
@@ -605,15 +605,16 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 format!("{}s", eta_secs)
             };
 
-            // Track loss change for CSV logging
-            let _loss_delta = if prev_loss > 0.0 { (loss_val - prev_loss).abs() } else { 0.0 };
+            let loss_delta = if prev_loss > 0.0 { loss_val - prev_loss } else { 0.0 };
             prev_loss = loss_val;
 
             eprintln!(
-                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | ETA {} | w_norm {:.2}",
-                step, loss_val, lr, tokens_per_sec, step_time,
+                "step {:>6} | loss {:>8.4} ({:+.3}) | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | pool {}/{} | ETA {} | w{:.1}",
+                step, loss_val, loss_delta,
+                lr, tokens_per_sec, step_time,
                 total_tokens / 1_000_000,
                 data_loader.epoch(),
+                pool_hits, pool_hits + pool_misses,
                 eta_str, weight_norm,
             );
 
