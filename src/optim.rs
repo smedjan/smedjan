@@ -450,9 +450,9 @@ impl Muon {
                         rows, rows, cols);
                     compute::gpu_matmul(&self.ctx, xxt_buf, x_buf, xxtx_buf,
                         rows, cols, rows);
+                    // X = a*X + b*(X@X^T@X) — fused with axpy: scale X, then axpy
                     compute::gpu_scale(&self.ctx, x_buf, size, a);
-                    compute::gpu_scale(&self.ctx, xxtx_buf, size, b);
-                    compute::gpu_add_inplace(&self.ctx, x_buf, xxtx_buf, size);
+                    compute::gpu_axpy(&self.ctx, x_buf, xxtx_buf, size, b);
                 }
 
                 // Apply: theta = theta * (1 - lr * wd) - lr * X
