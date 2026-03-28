@@ -501,10 +501,17 @@ impl TransformerBlock {
     }
 
     /// Forward pass with gradient checkpointing.
-    /// Runs the normal forward inside `checkpoint_forward()`, records a single
-    /// `Op::Checkpoint` entry on the main tape, and registers a recompute closure
-    /// that can re-run this block's forward during backward.
-    pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
+    /// NOTE: Recompute-based checkpointing is DISABLED because Metal GPU matmul is
+    /// non-deterministic (FP16 shared memory rounding varies between kernel invocations).
+    /// Recomputed forward produces different intermediates → wrong gradients → loss diverges.
+    /// Fix requires deterministic kernels (FP32-only shared memory or cached sub-tape approach).
+    /// Currently falls back to standard forward (no memory savings, correct gradients).
+    pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, _layer_idx: usize) -> Tensor {
+        self.forward(x, None)
+    }
+
+    /// Original recompute-based checkpointing (disabled — see above).
+    pub fn forward_checkpointed_recompute(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
         // Save the input tensor's buffer and shape — we need these for the main tape entry
         // and for the recompute closure.
         let input_id = x.id;

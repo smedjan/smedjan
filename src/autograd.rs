@@ -149,8 +149,13 @@ pub fn clear_tape_keep_grads() {
     TAPE.with(|tape| {
         let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
         for entry in entries {
+            // Never recycle Checkpoint output buffers — they're input buffers for
+            // the next layer's recompute closure. Recycling them causes the recompute
+            // to read garbage data, producing wrong gradients.
+            let is_checkpoint = matches!(entry.op, Op::Checkpoint { .. });
+
             let out_ptr = entry.output_buffer.contents().as_ptr() as usize;
-            if !grad_ptrs.contains(&out_ptr) {
+            if !is_checkpoint && !grad_ptrs.contains(&out_ptr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
@@ -685,6 +690,7 @@ fn backward_checkpoint(
 
     // Re-run the forward pass to get the sub-tape
     let sub_tape = recompute(ctx);
+
 
     // Put the recompute fn back for potential future use (e.g., gradient accumulation)
     RECOMPUTE_REGISTRY.with(|reg| reg.borrow_mut().insert(layer_idx, recompute));
