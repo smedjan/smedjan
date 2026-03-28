@@ -422,38 +422,38 @@ impl TransformerBlock {
         h.add(&ffn_out)
     }
 
-    /// Soft Mixture of Experts: all experts compute, weighted by router softmax.
-    /// Fully on autograd tape — correct gradients for all expert weights + router.
-    /// Compute: N× forward FFN (trades compute for gradient correctness).
-    /// The router learns to specialize experts by adjusting softmax weights.
+    /// Shared-Expert Mixture of Experts (DeepSeek-V3 style).
+    /// 1 shared expert (the block's own FFN weights) processes ALL tokens.
+    /// N routed experts add specialized deltas, weighted by router softmax.
+    /// output = shared_ffn(x) + sum_i(router_prob_i * expert_i(x))
+    /// The shared expert captures common patterns, freeing routed experts to specialize.
     fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
 
-        // Router logits (on tape — gradients flow to router weights)
+        // Shared expert: always active for ALL tokens (the block's own FFN weights)
+        // This captures common patterns (articles, punctuation, syntax).
+        let shared_out = self.swiglu_ffn(x, batch, seq_len, d)
+            .reshape(vec![n_tokens, d]);
+
+        // Router logits for routed experts
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
 
-        // Bias-based load balancing (DeepSeek-V3): bias shifts routing decisions
-        // but NOT gate values. This achieves load balance without auxiliary loss penalties.
-        // Gate values use unbiased logits → no quality degradation from balancing.
-        let router_probs = router_logits.softmax(); // [n_tokens, n_experts] — unbiased for gating
+        // Unbiased softmax for gate values (bias-based balancing affects routing only)
+        let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
 
-        // Soft MoE: each expert runs on all tokens, weighted by router_probs.
-        // Router probs extracted ON TAPE via matmul with one-hot selector.
-        // This ensures gradients flow from output → scale_rows → router_probs → router_weight.
-        let mut combined: Option<Tensor> = None;
+        // Soft MoE: each routed expert adds a weighted delta on top of the shared output.
+        let mut combined = shared_out;
 
         for expert_idx in 0..self.n_experts {
             let expert = &self.experts[expert_idx];
 
-            // Expert FFN on all tokens (on tape)
             let gate = x_flat.matmul(&expert.w1);
             let up = x_flat.matmul(&expert.w3);
             let hidden = gate.silu_gate(&up);
             let expert_out = hidden.matmul(&expert.w2); // [n_tokens, d]
 
-            // Extract this expert's prob column ON TAPE:
-            // router_probs [n_tokens, n_experts] @ one_hot [n_experts, 1] = [n_tokens, 1]
+            // Extract this expert's routing probability ON TAPE
             let mut sel = vec![0.0f32; self.n_experts];
             sel[expert_idx] = 1.0;
             let selector = Tensor::from_buffer(
@@ -461,20 +461,15 @@ impl TransformerBlock {
                 x_flat.ctx.buffer_from_slice(&sel),
                 vec![self.n_experts, 1],
             );
-            let weight_col = router_probs.matmul(&selector); // [n_tokens, 1] ON TAPE
+            let weight_col = router_probs.matmul(&selector); // [n_tokens, 1]
             let weights = weight_col.reshape(vec![n_tokens]); // [n_tokens]
 
-            // Scale expert output by its router probability per token (ON TAPE)
+            // Add weighted expert delta to combined output
             let scaled = expert_out.scale_rows(&weights);
-
-            combined = Some(match combined {
-                Some(prev) => prev.add(&scaled),
-                None => scaled,
-            });
+            combined = combined.add(&scaled);
         }
 
-        combined.unwrap_or_else(|| Tensor::zeros(&x_flat.ctx, vec![n_tokens, d]))
-            .reshape(vec![batch, seq_len, d])
+        combined.reshape(vec![batch, seq_len, d])
     }
 
     /// SwiGLU feed-forward: output = (SiLU(x @ W1) * (x @ W3)) @ W2
