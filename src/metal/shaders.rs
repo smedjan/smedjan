@@ -1355,7 +1355,10 @@ kernel void rms_norm_backward(
     constant NormBwdParams& params [[buffer(5)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]]
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg [[simdgroups_per_threadgroup]]
 ) {
     uint row = group_id;
     if (row >= params.rows) return;
@@ -1365,34 +1368,29 @@ kernel void rms_norm_backward(
     device const float* go = grad_output + row * cols;
     device float* gi = grad_input + row * cols;
 
-    // Compute rms
-    threadgroup float shared[256];
+    // Compute rms — SIMD reduction
     float local_ss = 0.0f;
-    for (uint c = thread_index; c < cols; c += threads_per_group) {
+    for (uint c = thread_index; c < cols; c += threads_per_group)
         local_ss += x[c] * x[c];
-    }
-    shared[thread_index] = local_ss;
+    float ss = simd_sum(local_ss);
+    threadgroup float sv[8];
+    if (simd_lane_id == 0) sv[simd_group_id] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
-        if (thread_index < stride) shared[thread_index] += shared[thread_index + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float mean_sq = shared[0] / float(cols);
+    float total_ss = 0.0f;
+    for (uint i = 0; i < simd_groups_per_tg; i++) total_ss += sv[i];
+    float mean_sq = total_ss / float(cols);
     float rms = sqrt(mean_sq + params.eps);
     float inv_rms = 1.0f / rms;
 
-    // Compute sum(grad_output * weight * input) for the correction term
+    // Compute dot product — SIMD reduction
     float local_dot = 0.0f;
-    for (uint c = thread_index; c < cols; c += threads_per_group) {
+    for (uint c = thread_index; c < cols; c += threads_per_group)
         local_dot += go[c] * weight[c] * x[c];
-    }
-    shared[thread_index] = local_dot;
+    float sd = simd_sum(local_dot);
+    if (simd_lane_id == 0) sv[simd_group_id] = sd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
-        if (thread_index < stride) shared[thread_index] += shared[thread_index + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float dot_sum = shared[0];
+    float dot_sum = 0.0f;
+    for (uint i = 0; i < simd_groups_per_tg; i++) dot_sum += sv[i];
 
     // grad_input = (grad_output * weight * inv_rms) - (input * dot_sum * inv_rms^3 / cols)
     float correction = dot_sum * inv_rms * inv_rms * inv_rms / float(cols);
@@ -1430,7 +1428,10 @@ kernel void softmax_backward(
     constant SoftmaxBwdParams& params [[buffer(3)]],
     uint group_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]]
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg [[simdgroups_per_threadgroup]]
 ) {
     uint row = group_id;
     if (row >= params.rows) return;
@@ -1440,20 +1441,15 @@ kernel void softmax_backward(
     device const float* go = grad_output + row * cols;
     device float* gi = grad_input + row * cols;
 
-    // Compute dot = sum(grad_output * softmax_out) for this row
-    threadgroup float shared[256];
     float local_dot = 0.0f;
-    for (uint c = thread_index; c < cols; c += threads_per_group) {
+    for (uint c = thread_index; c < cols; c += threads_per_group)
         local_dot += go[c] * s[c];
-    }
-    shared[thread_index] = local_dot;
+    float sd = simd_sum(local_dot);
+    threadgroup float sv[8];
+    if (simd_lane_id == 0) sv[simd_group_id] = sd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
-        if (thread_index < stride) shared[thread_index] += shared[thread_index + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float dot_sum = shared[0];
+    float dot_sum = 0.0f;
+    for (uint i = 0; i < simd_groups_per_tg; i++) dot_sum += sv[i];
 
     // grad_input = softmax_out * (grad_output - dot_sum)
     for (uint c = thread_index; c < cols; c += threads_per_group) {
