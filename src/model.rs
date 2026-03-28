@@ -28,6 +28,7 @@ pub struct ModelConfig {
     pub n_predict: usize,      // Multi-token prediction: 0=standard, N=predict next N+1 tokens (Meta 2024)
     pub stochastic_depth: f32, // Layer drop rate: 0.0=off, 0.1=10% max drop rate for deepest layer
     pub sliding_window: usize, // Sliding window attention: 0=full causal, >0=window size. Saves O(n²)→O(n*w) memory.
+    pub fp16_activations: bool, // Store inter-layer activations in FP16 during forward. Halves activation memory.
 }
 
 impl ModelConfig {
@@ -92,6 +93,7 @@ impl ModelConfig {
             n_predict: 0,
             stochastic_depth: 0.0,
             sliding_window: 0,
+            fp16_activations: false,
         }
     }
 
@@ -781,15 +783,21 @@ impl Transformer {
                     let n_layers = self.blocks.len();
                     for (i, block) in self.blocks.iter().enumerate() {
                         // Stochastic depth: linearly increasing drop probability per layer.
-                        // Layer 0 never dropped, last layer dropped with p=stochastic_depth.
-                        // During training only (is_recording). Saves ~20% compute on average.
                         if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
                             let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
                             if rand::random::<f32>() < drop_prob {
-                                continue; // skip layer — residual passes through unchanged
+                                continue;
                             }
                         }
                         h = block.forward(&h, None);
+
+                        // FP16 activation compression: roundtrip h through FP16 between layers.
+                        // Loses ~0.1% precision but the tape records smaller intermediate values,
+                        // reducing peak memory. Most effective with gradient checkpointing where
+                        // only checkpoint inputs are stored (this makes those inputs smaller).
+                        if self.config.fp16_activations && i + 1 < n_layers {
+                            h = h.fp16_roundtrip();
+                        }
                     }
                 }
             }

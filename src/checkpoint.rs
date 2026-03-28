@@ -351,5 +351,6 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         n_predict,
         stochastic_depth: 0.0,
         sliding_window: 0,
+        fp16_activations: false,
     })
 }

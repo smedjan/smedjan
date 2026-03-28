@@ -172,6 +172,9 @@ enum Commands {
         /// Sliding window attention size. 0=full causal, 1024=attend last 1024 tokens
         #[arg(long, default_value = "0")]
         sliding_window: usize,
+        /// FP16 activation compression between layers. Halves inter-layer memory.
+        #[arg(long)]
+        fp16_activations: bool,
     },
 
     /// Show available model sizes and their param counts
@@ -513,6 +516,7 @@ fn main() {
             z_loss,
             stochastic_depth,
             sliding_window,
+            fp16_activations,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -586,6 +590,7 @@ fn main() {
             config.z_loss_coefficient = z_loss;
             config.model_config.stochastic_depth = stochastic_depth;
             config.model_config.sliding_window = sliding_window;
+            config.model_config.fp16_activations = fp16_activations;
 
             train::train(&ctx, &config).expect("Training failed");
         }

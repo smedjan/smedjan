@@ -421,6 +421,7 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         n_predict: 0,
         stochastic_depth: 0.0,
         sliding_window: 0,
+        fp16_activations: false,
         bitnet: false,
         lowrank: 0,
     })

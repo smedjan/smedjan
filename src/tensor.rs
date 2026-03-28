@@ -266,6 +266,41 @@ impl Tensor {
         f16_buf
     }
 
+    /// FP16 roundtrip: cast FP32→FP16→FP32 to reduce activation precision.
+    /// The roundtrip quantizes values to half precision (~0.1% loss).
+    /// On the autograd tape, this is a no-op for gradient flow (identity backward).
+    /// The purpose: when gradient checkpointing stores this tensor as a checkpoint
+    /// input, the quantized version has less numerical variation, and the tape's
+    /// input_buffers reference a buffer that was written from a smaller source.
+    pub fn fp16_roundtrip(&self) -> Tensor {
+        let size = self.numel();
+        let f16_buf = self.ctx.alloc_buffer(size * 2);
+        compute::gpu_cast_f32_to_f16(&self.ctx, &self.buffer, &f16_buf, size as u32);
+        let f32_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_cast_f16_to_f32(&self.ctx, &f16_buf, &f32_buf, size as u32);
+
+        // Record as identity on tape — gradient passes through unchanged
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id, buffer: f32_buf, shape: self.shape.clone(),
+            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Reshape, // Reuse Reshape — it's a gradient passthrough
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Clear weight caches. Call after optimizer step when weights change.
     pub fn clear_f16_cache() {
         F16_CAST_CACHE.with(|c| c.borrow_mut().clear());
