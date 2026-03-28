@@ -1639,4 +1639,196 @@ mod tests {
         assert!(changed, "Muon should modify weights");
         autograd::clear_tape();
     }
+
+    // =========================================================================
+    // Mega-kernel correctness: mega_ffn output must match standard FFN path
+    // =========================================================================
+
+    #[test]
+    fn mega_ffn_matches_standard_ffn() {
+        let ctx = test_ctx();
+        let d = 256usize;
+        let ff = 768usize;
+        let n_tokens = 32usize;
+
+        // Create input and weights
+        let x = Tensor::randn(&ctx, vec![n_tokens, d], 0.02);
+        let norm_w = Tensor::ones(&ctx, vec![d]);
+        let w1 = Tensor::randn(&ctx, vec![d, ff], (2.0 / (d + ff) as f32).sqrt());
+        let w2 = Tensor::randn(&ctx, vec![ff, d], (2.0 / (ff + d) as f32).sqrt());
+        let w3 = Tensor::randn(&ctx, vec![d, ff], (2.0 / (d + ff) as f32).sqrt());
+        let eps = 1e-5f32;
+
+        // Standard path: rms_norm → matmul w1 → matmul w3 → silu_gate → matmul w2 → add residual
+        let normed = x.rms_norm(&norm_w, eps);
+        let gate = normed.matmul(&w1);
+        let up = normed.matmul(&w3);
+        let hidden = gate.silu_gate(&up);
+        let down = hidden.matmul(&w2);
+        let standard_out = x.add(&down);
+        let standard_vals = standard_out.to_vec();
+
+        // Mega-kernel path: single dispatch
+        let out_buf = ctx.alloc_buffer(n_tokens * d * 4);
+        compute::gpu_mega_ffn(
+            &ctx, &x.buffer, &norm_w.buffer,
+            &w1.buffer, &w2.buffer, &w3.buffer,
+            &out_buf, n_tokens as u32, d as u32, ff as u32, eps,
+        );
+        let mega_out = Tensor::from_buffer(Arc::clone(&ctx), out_buf, vec![n_tokens, d]);
+        let mega_vals = mega_out.to_vec();
+
+        // Compare — FP32 tolerance for accumulated error in fused kernel
+        let mut max_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f64;
+        for i in 0..standard_vals.len() {
+            let diff = (standard_vals[i] - mega_vals[i]).abs();
+            max_diff = max_diff.max(diff);
+            sum_abs_diff += diff as f64;
+        }
+        let avg_diff = sum_abs_diff / standard_vals.len() as f64;
+        eprintln!("mega_ffn vs standard: max_diff={:.6}, avg_diff={:.8}", max_diff, avg_diff);
+
+        // Allow some tolerance — the fused kernel computes norm inline which may differ slightly
+        assert!(max_diff < 0.01, "mega_ffn max_diff too large: {}", max_diff);
+        assert!(avg_diff < 0.001, "mega_ffn avg_diff too large: {}", avg_diff);
+    }
+
+    #[test]
+    fn mega_ffn_backward_produces_gradients() {
+        use crate::autograd::Op;
+        let ctx = test_ctx();
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        let d = 128usize;
+        let ff = 256usize;
+        let n_tokens = 4usize;
+
+        // Create input and weights with requires_grad
+        let x = Tensor::randn(&ctx, vec![n_tokens, d], 0.02).with_grad();
+        let norm_w = Tensor::ones(&ctx, vec![d]).with_grad();
+        let w1 = Tensor::randn(&ctx, vec![d, ff], (2.0 / (d + ff) as f32).sqrt()).with_grad();
+        let w2 = Tensor::randn(&ctx, vec![ff, d], (2.0 / (ff + d) as f32).sqrt()).with_grad();
+        let w3 = Tensor::randn(&ctx, vec![d, ff], (2.0 / (d + ff) as f32).sqrt()).with_grad();
+        let eps = 1e-5f32;
+
+        // Forward via standard ops (which auto-record on tape)
+        let normed = x.rms_norm(&norm_w, eps);
+        let gate = normed.matmul(&w1);
+        let up = normed.matmul(&w3);
+        let hidden = gate.silu_gate(&up);
+        let down = hidden.matmul(&w2);
+        let out = x.add(&down);
+
+        // Reduce to scalar: sum via matmul with ones vector
+        let flat = out.reshape(vec![1, n_tokens * d]);
+        let ones_vec = Tensor::ones(&ctx, vec![n_tokens * d, 1]).with_grad();
+        let scalar = flat.matmul(&ones_vec); // [1, 1]
+
+        autograd::backward(&ctx, scalar.id);
+
+        // All weight tensors should have gradients
+        let get_grad_vec = |id: usize, size: usize| -> Vec<f32> {
+            autograd::get_grad(id).map(|buf| {
+                MetalContext::read_buffer(&buf, size)
+            }).unwrap_or_default()
+        };
+
+        let gx = get_grad_vec(x.id, n_tokens * d);
+        let gw = get_grad_vec(norm_w.id, d);
+        let gw1 = get_grad_vec(w1.id, d * ff);
+        let gw2 = get_grad_vec(w2.id, ff * d);
+        let gw3 = get_grad_vec(w3.id, d * ff);
+
+        assert!(!gx.is_empty(), "x should have gradient");
+        assert!(!gw.is_empty(), "norm_w should have gradient");
+        assert!(!gw1.is_empty(), "w1 should have gradient");
+        assert!(!gw2.is_empty(), "w2 should have gradient");
+        assert!(!gw3.is_empty(), "w3 should have gradient");
+
+        // Check non-zero and finite
+        for (name, g) in [("x", &gx), ("norm_w", &gw), ("w1", &gw1), ("w2", &gw2), ("w3", &gw3)] {
+            assert!(g.iter().any(|&v| v.abs() > 1e-10), "{} gradient is all zeros", name);
+            assert!(g.iter().all(|v| v.is_finite()), "{} gradient has non-finite values", name);
+        }
+
+        autograd::clear_tape();
+        eprintln!("Standard FFN backward: x_grad_norm={:.4}", gx.iter().map(|v| v*v).sum::<f32>().sqrt());
+
+        // Now do the SAME thing via mega kernel to compare gradients
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+
+        // Reuse same weights but fresh tensor IDs (new with_grad calls)
+        let x2 = Tensor::from_buffer(Arc::clone(&ctx), x.buffer.clone(), vec![n_tokens, d]).with_grad();
+        let nw2 = Tensor::from_buffer(Arc::clone(&ctx), norm_w.buffer.clone(), vec![d]).with_grad();
+        let w1b = Tensor::from_buffer(Arc::clone(&ctx), w1.buffer.clone(), vec![d, ff]).with_grad();
+        let w2b = Tensor::from_buffer(Arc::clone(&ctx), w2.buffer.clone(), vec![ff, d]).with_grad();
+        let w3b = Tensor::from_buffer(Arc::clone(&ctx), w3.buffer.clone(), vec![d, ff]).with_grad();
+
+        // Mega kernel forward
+        let out_buf = ctx.alloc_buffer(n_tokens * d * 4);
+        compute::gpu_mega_ffn(
+            &ctx, &x2.buffer, &nw2.buffer,
+            &w1b.buffer, &w2b.buffer, &w3b.buffer,
+            &out_buf, n_tokens as u32, d as u32, ff as u32, eps,
+        );
+        let out2 = Tensor::from_buffer(Arc::clone(&ctx), out_buf, vec![n_tokens, d]).with_grad();
+
+        // Record MegaFfn on tape
+        autograd::record(autograd::TapeEntry {
+            op: Op::MegaFfn { eps },
+            inputs: vec![x2.id, nw2.id, w1b.id, w2b.id, w3b.id],
+            output: out2.id,
+            input_buffers: vec![
+                x2.buffer.clone(), nw2.buffer.clone(),
+                w1b.buffer.clone(), w2b.buffer.clone(), w3b.buffer.clone(),
+            ],
+            output_buffer: out2.buffer.clone(),
+            shapes: vec![vec![n_tokens, d], vec![d, ff], vec![ff, d]],
+            cached: None,
+        });
+
+        // Same reduction to scalar
+        let flat2 = out2.reshape(vec![1, n_tokens * d]);
+        let ones_vec2 = Tensor::ones(&ctx, vec![n_tokens * d, 1]).with_grad();
+        let scalar2 = flat2.matmul(&ones_vec2);
+
+        autograd::backward(&ctx, scalar2.id);
+
+        let gx2 = get_grad_vec(x2.id, n_tokens * d);
+        let gw_2 = get_grad_vec(nw2.id, d);
+        let gw1_2 = get_grad_vec(w1b.id, d * ff);
+        let gw2_2 = get_grad_vec(w2b.id, ff * d);
+        let gw3_2 = get_grad_vec(w3b.id, d * ff);
+
+        assert!(!gx2.is_empty(), "mega x should have gradient");
+        assert!(!gw_2.is_empty(), "mega norm_w should have gradient");
+        assert!(!gw1_2.is_empty(), "mega w1 should have gradient");
+        assert!(!gw2_2.is_empty(), "mega w2 should have gradient");
+        assert!(!gw3_2.is_empty(), "mega w3 should have gradient");
+
+        // Compare mega vs standard gradients — should be close
+        let cosine_sim = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm_a < 1e-12 || norm_b < 1e-12 { return 0.0; }
+            dot / (norm_a * norm_b)
+        };
+
+        let sim_x = cosine_sim(&gx, &gx2);
+        let sim_w1 = cosine_sim(&gw1, &gw1_2);
+        let sim_w2 = cosine_sim(&gw2, &gw2_2);
+        let sim_w3 = cosine_sim(&gw3, &gw3_2);
+        eprintln!("Mega vs standard grad cosine sim: x={:.4}, w1={:.4}, w2={:.4}, w3={:.4}", sim_x, sim_w1, sim_w2, sim_w3);
+
+        assert!(sim_x > 0.99, "x gradient cosine sim too low: {}", sim_x);
+        assert!(sim_w1 > 0.99, "w1 gradient cosine sim too low: {}", sim_w1);
+        assert!(sim_w2 > 0.99, "w2 gradient cosine sim too low: {}", sim_w2);
+        assert!(sim_w3 > 0.99, "w3 gradient cosine sim too low: {}", sim_w3);
+
+        autograd::clear_tape();
+    }
 }

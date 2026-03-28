@@ -453,6 +453,28 @@ enum Commands {
         #[arg(long)]
         heads: usize,
     },
+
+    /// Benchmark inference and training throughput with detailed metrics
+    Bench {
+        /// Model size preset: tiny, small, medium, large
+        #[arg(long, default_value = "small")]
+        size: String,
+        /// Batch size
+        #[arg(long, default_value = "4")]
+        batch_size: usize,
+        /// Sequence length
+        #[arg(long, default_value = "128")]
+        seq_len: usize,
+        /// Low-rank dimension (0 = full rank)
+        #[arg(long, default_value = "0")]
+        lowrank: usize,
+        /// Number of warmup iterations
+        #[arg(long, default_value = "5")]
+        warmup: usize,
+        /// Number of timed iterations
+        #[arg(long, default_value = "20")]
+        iters: usize,
+    },
 }
 
 fn main() {
@@ -1058,6 +1080,272 @@ fn main() {
                 writeln!(out, "{}", quality_docs[i]).expect("Write failed");
             }
             eprintln!("Output: {} → {} documents", docs.len(), dedup_keep.len());
+        }
+
+        Commands::Bench {
+            size, batch_size, seq_len, lowrank, warmup, iters,
+        } => {
+            use std::time::Instant;
+
+            let vocab: u32 = 8192;
+            let mut config = match size.as_str() {
+                "tiny" => model::ModelConfig::tiny(vocab),
+                "small" => model::ModelConfig::small(vocab),
+                "medium" => model::ModelConfig::medium(vocab),
+                "large" => model::ModelConfig::large(vocab),
+                _ => { eprintln!("Unknown size: {}. Use tiny/small/medium/large", size); return; }
+            };
+            config.lowrank = lowrank;
+            config.max_seq_len = seq_len;
+            let d = config.d_model;
+            let ff = config.d_ff();
+            let n_layers = config.n_layers;
+            let params = config.param_count();
+            let fused_eligible = config.n_experts <= 1 && !config.bitnet
+                && d <= 256 && ff <= 1024;
+
+            eprintln!("=== AndreAI Benchmark ===");
+            eprintln!("Model: {}M params, d={}, ff={}, {}L, {}H, lowrank={}",
+                params as f64 / 1e6, d, ff, n_layers, config.n_heads, lowrank);
+            eprintln!("Batch: {}, Seq: {}, Tokens/step: {}",
+                batch_size, seq_len, batch_size * seq_len);
+            eprintln!("Fused kernels: {}", if fused_eligible { "ACTIVE (inference)" } else { "disabled" });
+            eprintln!("Warmup: {}, Timed iters: {}", warmup, iters);
+            eprintln!();
+
+            let model = model::Transformer::new(&ctx, config.clone());
+
+            // Random token input
+            let tokens: Vec<u32> = (0..batch_size * seq_len)
+                .map(|i| (i as u32 * 7 + 13) % vocab)
+                .collect();
+
+            // --- 1. Inference Forward (no_grad) ---
+            eprintln!("--- Inference Forward (no_grad) ---");
+            autograd::no_grad(|| {
+                // Warmup
+                for _ in 0..warmup {
+                    ctx.begin_batch();
+                    let _logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    ctx.flush_batch();
+                }
+
+                // Timed
+                let start = Instant::now();
+                let mut dispatches = 0usize;
+                for _ in 0..iters {
+                    ctx.begin_batch();
+                    let _logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    dispatches += ctx.flush_batch();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let total_tokens = iters * batch_size * seq_len;
+                let tok_s = total_tokens as f64 / elapsed;
+                let ms_per_step = elapsed * 1000.0 / iters as f64;
+                let dispatches_per_step = dispatches / iters;
+                let us_per_dispatch = ms_per_step * 1000.0 / dispatches_per_step as f64;
+                eprintln!("  {:.0} tok/s | {:.2} ms/step | {} dispatches/step | {:.0} μs/dispatch",
+                    tok_s, ms_per_step, dispatches_per_step, us_per_dispatch);
+            });
+
+            // --- 2. Inference Decode (single-token, KV cache) ---
+            eprintln!("--- Inference Decode (single-token, KV cache) ---");
+            autograd::no_grad(|| {
+                let mut kv_caches = model.init_kv_caches_preallocated(1);
+
+                // Prefill with 16 tokens
+                let prompt: Vec<u32> = (0..16).map(|i| (i * 7 + 13) % vocab).collect();
+                ctx.begin_batch();
+                let _logits = model.forward(&prompt, 1, 16, Some(&mut kv_caches), false);
+                ctx.flush_batch();
+
+                // Warmup decode
+                for i in 0..warmup {
+                    let tok = [(i as u32 * 3 + 5) % vocab];
+                    ctx.begin_batch();
+                    let _logits = model.forward(&tok, 1, 1, Some(&mut kv_caches), false);
+                    ctx.flush_batch();
+                }
+
+                // Timed decode
+                let start = Instant::now();
+                for i in 0..iters {
+                    let tok = [(i as u32 * 3 + 5) % vocab];
+                    ctx.begin_batch();
+                    let _logits = model.forward(&tok, 1, 1, Some(&mut kv_caches), false);
+                    ctx.flush_batch();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let tok_s = iters as f64 / elapsed;
+                let ms_per_token = elapsed * 1000.0 / iters as f64;
+                eprintln!("  {:.0} tok/s | {:.2} ms/token | {:.1}s total ({} tokens)",
+                    tok_s, ms_per_token, elapsed, iters);
+            });
+
+            // --- 3. Training Forward+Backward (single batch — matches real training loop) ---
+            let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % vocab).collect();
+            eprintln!("--- Training Forward+Backward ---");
+            {
+                for _ in 0..warmup {
+                    autograd::clear_tape();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    autograd::backward(&ctx, loss.0.id);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                }
+
+                let start = Instant::now();
+                let mut tape_ops = 0usize;
+                let mut tape_mem = 0usize;
+                for _ in 0..iters {
+                    autograd::clear_tape();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    let (ops, mem) = autograd::tape_stats();
+                    tape_ops = ops;
+                    tape_mem = mem;
+                    autograd::backward(&ctx, loss.0.id);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let total_tokens = iters * batch_size * seq_len;
+                let tok_s = total_tokens as f64 / elapsed;
+                let ms_per_step = elapsed * 1000.0 / iters as f64;
+                eprintln!("  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
+                    tok_s, ms_per_step, elapsed, iters);
+                eprintln!("  Tape: {} ops, {:.1} MB activations", tape_ops, tape_mem as f64 / 1e6);
+            }
+
+            // --- 4. Training Forward+Backward with Gradient Checkpointing ---
+            eprintln!("--- Training Forward+Backward (checkpointed) ---");
+            {
+                for _ in 0..warmup {
+                    autograd::clear_tape();
+                    autograd::clear_recompute_registry();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, true);
+                    let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    autograd::backward(&ctx, loss.0.id);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                    autograd::clear_recompute_registry();
+                }
+
+                let start = Instant::now();
+                let mut tape_ops = 0usize;
+                let mut tape_mem = 0usize;
+                for _ in 0..iters {
+                    autograd::clear_tape();
+                    autograd::clear_recompute_registry();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, true);
+                    let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    let (ops, mem) = autograd::tape_stats();
+                    tape_ops = ops;
+                    tape_mem = mem;
+                    autograd::backward(&ctx, loss.0.id);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                    autograd::clear_recompute_registry();
+                }
+                let elapsed = start.elapsed().as_secs_f64();
+                let total_tokens = iters * batch_size * seq_len;
+                let tok_s = total_tokens as f64 / elapsed;
+                let ms_per_step = elapsed * 1000.0 / iters as f64;
+                eprintln!("  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
+                    tok_s, ms_per_step, elapsed, iters);
+                eprintln!("  Tape: {} ops, {:.1} MB activations (checkpointed)", tape_ops, tape_mem as f64 / 1e6);
+            }
+
+            // --- 5. Forward-only vs Backward-only breakdown ---
+            eprintln!("--- Phase Breakdown (forward vs backward) ---");
+            {
+                // Measure forward-only time (with tape recording, no backward)
+                let start = Instant::now();
+                for _ in 0..iters {
+                    autograd::clear_tape();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    let _loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                }
+                let fwd_elapsed = start.elapsed().as_secs_f64();
+                let fwd_ms = fwd_elapsed * 1000.0 / iters as f64;
+
+                // Measure full forward+backward
+                let start = Instant::now();
+                for _ in 0..iters {
+                    autograd::clear_tape();
+                    ctx.begin_batch();
+                    let logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                    let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                    autograd::backward(&ctx, loss.0.id);
+                    ctx.flush_batch();
+                    autograd::clear_tape();
+                }
+                let total_elapsed = start.elapsed().as_secs_f64();
+                let total_ms = total_elapsed * 1000.0 / iters as f64;
+                let bwd_ms = total_ms - fwd_ms;
+                let fwd_pct = fwd_ms / total_ms * 100.0;
+
+                eprintln!("  Forward:  {:.2} ms ({:.0}%)", fwd_ms, fwd_pct);
+                eprintln!("  Backward: {:.2} ms ({:.0}%)", bwd_ms, 100.0 - fwd_pct);
+                eprintln!("  Total:    {:.2} ms/step", total_ms);
+            }
+
+            // --- Allocation profile ---
+            eprintln!();
+            eprintln!("--- Allocation Profile (1 forward+backward step) ---");
+            metal::MetalContext::enable_alloc_log(true);
+            {
+                autograd::clear_tape();
+                ctx.begin_batch();
+                let logits = model.forward(&tokens, batch_size, seq_len, None, false);
+                let loss = loss::cross_entropy_loss(&ctx, &logits, &targets);
+                autograd::backward(&ctx, loss.0.id);
+                ctx.flush_batch();
+                autograd::clear_tape();
+            }
+            metal::MetalContext::dump_alloc_log("1 train step");
+            metal::MetalContext::enable_alloc_log(false);
+
+            // --- 7. Memory & Pool ---
+            eprintln!();
+            eprintln!("--- Memory ---");
+            let param_bytes = params * 4;
+            eprintln!("  Model params: {:.1} MB ({:.2}M params × 4 bytes)",
+                param_bytes as f64 / 1e6, params as f64 / 1e6);
+            eprintln!("  Estimated training RAM: {:.0} MB", config.training_memory_bytes() as f64 / 1e6);
+            eprintln!("  Estimated inference RAM: {:.0} MB", config.inference_memory_bytes() as f64 / 1e6);
+            let (pool_hits, pool_misses) = metal::MetalContext::pool_stats();
+            let pool_total = pool_hits + pool_misses;
+            eprintln!("  Buffer pool: {}/{} hits ({:.0}% reuse), {} new allocs",
+                pool_hits, pool_total,
+                if pool_total > 0 { pool_hits as f64 / pool_total as f64 * 100.0 } else { 0.0 },
+                pool_misses);
+
+            // --- 8. Roofline Analysis ---
+            eprintln!();
+            eprintln!("--- Roofline Analysis ---");
+            let mem_bw_gbs = 68.25; // M1 memory bandwidth
+            let flops_tflops = 2.6; // M1 FP32 TFLOPS
+            // Per forward pass: roughly 2 * params * batch * seq FLOPs (matmul dominated)
+            let fwd_flops = 2.0 * params as f64 * (batch_size * seq_len) as f64;
+            let fwd_bytes = params as f64 * 4.0 + (batch_size * seq_len) as f64 * d as f64 * 4.0 * n_layers as f64 * 2.0;
+            let arithmetic_intensity = fwd_flops / fwd_bytes;
+            let compute_bound_ms = fwd_flops / (flops_tflops * 1e9); // TFLOPS → ms
+            let mem_bound_ms = fwd_bytes / (mem_bw_gbs * 1e6); // GB/s → ms
+            let roofline_ms = compute_bound_ms.max(mem_bound_ms);
+            eprintln!("  Arithmetic intensity: {:.1} FLOP/byte", arithmetic_intensity);
+            eprintln!("  Compute-bound floor: {:.2} ms", compute_bound_ms);
+            eprintln!("  Memory-bound floor:  {:.2} ms", mem_bound_ms);
+            eprintln!("  Roofline (forward):  {:.2} ms ({:.0} tok/s theoretical)",
+                roofline_ms, (batch_size * seq_len) as f64 / (roofline_ms / 1000.0));
         }
 
         Commands::Grow {

@@ -156,6 +156,10 @@ impl MetalContext {
             ("logsumexp", shaders::LOGSUMEXP),
             ("concat_cols", shaders::CONCAT_COLS),
             ("slice_cols", shaders::SLICE_COLS),
+            ("mega_ffn", shaders::MEGA_FFN),
+            ("fused_pre_attn", shaders::FUSED_PRE_ATTN),
+            ("fused_post_attn_ffn", shaders::FUSED_POST_ATTN_FFN),
+            ("persistent_layer", shaders::PERSISTENT_LAYER),
         ];
 
         let compile_options = MTLCompileOptions::new();

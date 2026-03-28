@@ -71,6 +71,11 @@ pub enum Op {
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
     /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
     FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
+    /// Fused FFN mega-kernel: out = x + W2 @ (silu(norm(x) @ W1) * (norm(x) @ W3))
+    /// inputs: [x], input_buffers: [x, norm_w, w1, w2, w3]
+    /// cached: norm_x (pre-computed normalized input for backward reuse)
+    /// shapes[0]: [n_tokens, d], shapes[1]: [d, ff], shapes[2]: [ff, d]
+    MegaFfn { eps: f32 },
 }
 
 /// A single entry on the autodiff tape.
@@ -424,6 +429,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Op::RoPE { seq_len, head_dim, offset, theta } => {
                     backward_rope(ctx, entry, &out_grad, *seq_len, *head_dim, *offset, *theta);
                 }
+                Op::MegaFfn { eps } => {
+                    backward_mega_ffn(ctx, entry, &out_grad, *eps);
+                }
             }
         }
     }
@@ -689,6 +697,99 @@ fn backward_rope(
     accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
 }
 
+/// MegaFfn backward: out = x + W2 @ (silu(norm(x) @ W1) * (norm(x) @ W3))
+/// input_buffers: [x, norm_w, w1, w2, w3]
+/// inputs (tensor IDs): [x_id, norm_w_id, w1_id, w2_id, w3_id]
+/// shapes: [0]=[n_tokens, d], [1]=[d, ff], [2]=[ff, d]
+/// Recomputes intermediates from cached inputs to save forward memory.
+fn backward_mega_ffn(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    eps: f32,
+) {
+    let n_tokens = entry.shapes[0][0];
+    let d = entry.shapes[0][1];
+    let ff = entry.shapes[1][1];
+
+    let x_buf = &entry.input_buffers[0];
+    let norm_w_buf = &entry.input_buffers[1];
+    let w1_buf = &entry.input_buffers[2];
+    let w2_buf = &entry.input_buffers[3];
+    let w3_buf = &entry.input_buffers[4];
+
+    // --- Recompute forward intermediates ---
+    // 1. norm_x = rms_norm(x, norm_w) → [n_tokens, d]
+    let norm_x = ctx.alloc_buffer(n_tokens * d * 4);
+    compute::gpu_rms_norm(ctx, x_buf, norm_w_buf, &norm_x, n_tokens as u32, d as u32, eps);
+
+    // 2. gate = norm_x @ W1 → [n_tokens, ff]
+    let gate = ctx.alloc_buffer(n_tokens * ff * 4);
+    compute::gpu_matmul(ctx, &norm_x, w1_buf, &gate, n_tokens as u32, ff as u32, d as u32);
+
+    // 3. up = norm_x @ W3 → [n_tokens, ff]
+    let up = ctx.alloc_buffer(n_tokens * ff * 4);
+    compute::gpu_matmul(ctx, &norm_x, w3_buf, &up, n_tokens as u32, ff as u32, d as u32);
+
+    // 4. hidden = silu(gate) * up → [n_tokens, ff]
+    let hidden = ctx.alloc_buffer(n_tokens * ff * 4);
+    compute::gpu_silu_gate(ctx, &gate, &up, &hidden, (n_tokens * ff) as u32);
+
+    // --- Backward ---
+    // d_out is gradient of (x + down_proj_output) = gradient flows to both x and down_proj
+
+    // 5. d_hidden = d_out @ W2^T → [n_tokens, ff]
+    //    d_W2 = hidden^T @ d_out → [ff, d]
+    let d_hidden = ctx.alloc_buffer(n_tokens * ff * 4);
+    compute::gpu_matmul_trans_b(ctx, out_grad, w2_buf, &d_hidden, n_tokens as u32, ff as u32, d as u32);
+
+    let d_w2 = ctx.alloc_buffer(ff * d * 4);
+    compute::gpu_matmul_trans_a(ctx, &hidden, out_grad, &d_w2, n_tokens as u32, ff as u32, d as u32);
+    accumulate_grad(ctx, entry.inputs[3], &d_w2, ff * d);
+
+    // 6. d_gate, d_up from silu_gate backward
+    let d_gate = ctx.alloc_buffer(n_tokens * ff * 4);
+    let d_up = ctx.alloc_buffer(n_tokens * ff * 4);
+    compute::gpu_silu_gate_backward(ctx, &gate, &up, &d_hidden, &d_gate, &d_up, (n_tokens * ff) as u32);
+
+    // 7. d_norm_x from gate projection: d_gate @ W1^T → [n_tokens, d]
+    //    d_W1 = norm_x^T @ d_gate → [d, ff]
+    let d_norm_x_gate = ctx.alloc_buffer(n_tokens * d * 4);
+    compute::gpu_matmul_trans_b(ctx, &d_gate, w1_buf, &d_norm_x_gate, n_tokens as u32, d as u32, ff as u32);
+
+    let d_w1 = ctx.alloc_buffer(d * ff * 4);
+    compute::gpu_matmul_trans_a(ctx, &norm_x, &d_gate, &d_w1, n_tokens as u32, d as u32, ff as u32);
+    accumulate_grad(ctx, entry.inputs[2], &d_w1, d * ff);
+
+    // 8. d_norm_x from up projection: d_up @ W3^T → [n_tokens, d]
+    //    d_W3 = norm_x^T @ d_up → [d, ff]
+    let d_norm_x_up = ctx.alloc_buffer(n_tokens * d * 4);
+    compute::gpu_matmul_trans_b(ctx, &d_up, w3_buf, &d_norm_x_up, n_tokens as u32, d as u32, ff as u32);
+
+    let d_w3 = ctx.alloc_buffer(d * ff * 4);
+    compute::gpu_matmul_trans_a(ctx, &norm_x, &d_up, &d_w3, n_tokens as u32, d as u32, ff as u32);
+    accumulate_grad(ctx, entry.inputs[4], &d_w3, d * ff);
+
+    // 9. d_norm_x = d_norm_x_gate + d_norm_x_up
+    let d_norm_x_total = ctx.alloc_buffer(n_tokens * d * 4);
+    compute::gpu_add(ctx, &d_norm_x_gate, &d_norm_x_up, &d_norm_x_total, (n_tokens * d) as u32);
+
+    // 10. d_x_from_norm = rms_norm_backward(d_norm_x_total, x, norm_w, eps)
+    let d_x_from_norm = ctx.alloc_buffer(n_tokens * d * 4);
+    let d_norm_w = ctx.alloc_buffer(d * 4);
+    compute::gpu_rms_norm_backward(
+        ctx, x_buf, norm_w_buf, &d_norm_x_total,
+        &d_x_from_norm, &d_norm_w,
+        &compute::RmsNormBackwardParams { rows: n_tokens as u32, cols: d as u32, eps },
+    );
+    accumulate_grad(ctx, entry.inputs[1], &d_norm_w, d);
+
+    // 11. d_x = d_out (residual) + d_x_from_norm
+    let d_x = ctx.alloc_buffer(n_tokens * d * 4);
+    compute::gpu_add(ctx, out_grad, &d_x_from_norm, &d_x, (n_tokens * d) as u32);
+    accumulate_grad(ctx, entry.inputs[0], &d_x, n_tokens * d);
+}
+
 /// Checkpoint backward: re-run the forward pass to recover the sub-tape,
 /// inject the output gradient, walk the sub-tape in reverse, and extract
 /// the input gradient for the original input tensor.
@@ -797,6 +898,9 @@ fn backward_checkpoint(
             }
             Op::RoPE { seq_len, head_dim, offset, theta } => {
                 backward_rope(ctx, &sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
+            }
+            Op::MegaFfn { eps } => {
+                backward_mega_ffn(ctx, &sub_entry, &sub_out_grad, *eps);
             }
         }
     }

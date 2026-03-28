@@ -530,7 +530,7 @@ fn concat_seq(
 ///
 /// This is a GPU buffer copy operation — each KV head's [seq, head_dim] block
 /// is copied `group_size` times into the output.
-fn repeat_kv(
+pub fn repeat_kv(
     kv: &Tensor,
     n_kv_total: usize,
     seq_len: usize,

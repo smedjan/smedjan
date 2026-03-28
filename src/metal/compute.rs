@@ -1434,6 +1434,225 @@ pub fn gpu_scaled_causal_softmax_window(
     );
 }
 
+/// MEGA-KERNEL: Full SwiGLU FFN block in one dispatch.
+/// Computes: output = x + (silu(norm(x) @ W1) * (norm(x) @ W3)) @ W2
+/// For d_model ≤ 256, d_ff ≤ 1024 (fits in threadgroup memory).
+/// Eliminates 5 dispatches + 4 intermediate buffer allocations.
+pub fn gpu_mega_ffn(
+    ctx: &Arc<MetalContext>,
+    x: &GpuBuffer, norm_w: &GpuBuffer,
+    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
+    output: &GpuBuffer,
+    batch_tokens: u32, d_model: u32, d_ff: u32, eps: f32,
+) {
+    assert!(d_model <= 256, "mega_ffn requires d_model <= 256 (got {})", d_model);
+    assert!(d_ff <= 1024, "mega_ffn requires d_ff <= 1024 (got {})", d_ff);
+
+    #[repr(C)]
+    struct Params { batch_tokens: u32, d_model: u32, d_ff: u32, eps: f32 }
+    let params = Params { batch_tokens, d_model, d_ff, eps };
+    let params_buf = params_buffer(ctx, &params);
+
+    // One threadgroup per token, 256 threads per group
+    let grid = MetalContext::size(batch_tokens as u64, 1, 1);
+    let tg = MetalContext::size(256, 1, 1);
+
+    dispatch_sync!(ctx, "mega_ffn", grid, tg,
+        0 => x, 1 => norm_w, 2 => w1, 3 => w2, 4 => w3, 5 => output, 6 => &params_buf
+    );
+}
+
+/// Fused pre-attention: RMSNorm + QKV projection + transpose + RoPE in 1 dispatch.
+/// Replaces 9-12 dispatches. Outputs Q/K/V in transposed [BH, S, HD] layout.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_fused_pre_attn(
+    ctx: &Arc<MetalContext>,
+    x: &GpuBuffer, norm_w: &GpuBuffer,
+    w_q: &GpuBuffer, w_k: &GpuBuffer, w_v: &GpuBuffer,
+    w_q_v: &GpuBuffer, w_k_v: &GpuBuffer, w_v_v: &GpuBuffer,
+    q_out: &GpuBuffer, k_out: &GpuBuffer, v_out: &GpuBuffer,
+    batch_tokens: u32, d_model: u32, n_heads: u32, n_kv_heads: u32,
+    head_dim: u32, seq_len: u32, rank: u32, eps: f32, rope_theta: f32, kv_offset: u32,
+) {
+    assert!(d_model <= 256, "fused_pre_attn requires d_model <= 256");
+
+    #[repr(C)]
+    struct Params {
+        batch_tokens: u32, d_model: u32, n_heads: u32, n_kv_heads: u32,
+        head_dim: u32, seq_len: u32, rank: u32, eps: f32, rope_theta: f32, kv_offset: u32,
+    }
+    let params = Params {
+        batch_tokens, d_model, n_heads, n_kv_heads,
+        head_dim, seq_len, rank, eps, rope_theta, kv_offset,
+    };
+    let params_buf = params_buffer(ctx, &params);
+
+    let grid = MetalContext::size(batch_tokens as u64, 1, 1);
+    let tg = MetalContext::size(256, 1, 1);
+
+    dispatch_sync!(ctx, "fused_pre_attn", grid, tg,
+        0 => x, 1 => norm_w, 2 => w_q, 3 => w_k, 4 => w_v,
+        5 => w_q_v, 6 => w_k_v, 7 => w_v_v,
+        8 => q_out, 9 => k_out, 10 => v_out, 11 => &params_buf
+    );
+}
+
+/// Fused post-attention + FFN: gather-transpose + W_o + residual + norm + SwiGLU + residual.
+/// Replaces 8 dispatches with 1. Outputs final block result.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_fused_post_attn_ffn(
+    ctx: &Arc<MetalContext>,
+    x_residual: &GpuBuffer, attn_out: &GpuBuffer, norm_w: &GpuBuffer,
+    w_o: &GpuBuffer, w_o_v: &GpuBuffer,
+    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
+    output: &GpuBuffer,
+    batch_tokens: u32, d_model: u32, d_ff: u32,
+    n_heads: u32, head_dim: u32, seq_len: u32, rank: u32, eps: f32,
+) {
+    assert!(d_model <= 256, "fused_post_attn_ffn requires d_model <= 256");
+    assert!(d_ff <= 1024, "fused_post_attn_ffn requires d_ff <= 1024");
+
+    #[repr(C)]
+    struct Params {
+        batch_tokens: u32, d_model: u32, d_ff: u32,
+        n_heads: u32, head_dim: u32, seq_len: u32, rank: u32, eps: f32,
+    }
+    let params = Params { batch_tokens, d_model, d_ff, n_heads, head_dim, seq_len, rank, eps };
+    let params_buf = params_buffer(ctx, &params);
+
+    let grid = MetalContext::size(batch_tokens as u64, 1, 1);
+    let tg = MetalContext::size(256, 1, 1);
+
+    dispatch_sync!(ctx, "fused_post_attn_ffn", grid, tg,
+        0 => x_residual, 1 => attn_out, 2 => norm_w,
+        3 => w_o, 4 => w_o_v, 5 => w1, 6 => w2, 7 => w3,
+        8 => output, 9 => &params_buf
+    );
+}
+
+/// Persistent transformer layer: entire layer in ONE dispatch.
+/// 32 co-resident threadgroups with grid-level atomic barriers.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_persistent_layer(
+    ctx: &Arc<MetalContext>,
+    ln1_w: &GpuBuffer, w_q: &GpuBuffer, w_k: &GpuBuffer, w_v: &GpuBuffer,
+    w_q_v: &GpuBuffer, w_k_v: &GpuBuffer, w_v_v: &GpuBuffer,
+    w_o: &GpuBuffer, w_o_v: &GpuBuffer,
+    ln2_w: &GpuBuffer,
+    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
+    w1_v: &GpuBuffer, w2_v: &GpuBuffer, w3_v: &GpuBuffer,
+    x_in: &GpuBuffer, scratch: &GpuBuffer, barrier: &GpuBuffer,
+    batch_tokens: u32, d_model: u32, rank: u32, d_ff: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, seq_len: u32,
+    eps: f32, rope_theta: f32, kv_offset: u32,
+) {
+    #[repr(C)]
+    struct Params {
+        m: u32, d: u32, r: u32, ff: u32,
+        n_heads: u32, n_kv_heads: u32, head_dim: u32, seq_len: u32,
+        eps: f32, rope_theta: f32, kv_offset: u32,
+    }
+    let params = Params {
+        m: batch_tokens, d: d_model, r: rank, ff: d_ff,
+        n_heads, n_kv_heads, head_dim, seq_len,
+        eps, rope_theta, kv_offset,
+    };
+    let params_buf = params_buffer(ctx, &params);
+
+    // Zero the barrier counter
+    gpu_fill(ctx, barrier, 1, 0.0);
+
+    // 32 co-resident threadgroups × 64 threads = 2048 threads
+    let grid = MetalContext::size(32, 1, 1);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "persistent_layer", grid, tg,
+        0 => ln1_w, 1 => w_q, 2 => w_k, 3 => w_v,
+        4 => w_q_v, 5 => w_k_v, 6 => w_v_v,
+        7 => w_o, 8 => w_o_v, 9 => ln2_w,
+        10 => w1, 11 => w2, 12 => w3,
+        13 => x_in, 14 => scratch, 15 => barrier,
+        16 => &params_buf, 17 => w1_v, 18 => w2_v, 19 => w3_v
+    );
+}
+
+/// Calculate scratch space needed for persistent_layer in bytes.
+pub fn persistent_layer_scratch_size(
+    batch_tokens: usize, d: usize, r: usize, ff: usize,
+    n_heads: usize, n_kv_heads: usize, seq_len: usize,
+) -> usize {
+    let batch = batch_tokens / seq_len;
+    let bh = batch * n_heads;
+    let bh_kv = batch * n_kv_heads;
+    let hd = d / n_heads;
+    let kv_dim = n_kv_heads * hd;
+    let proj = if r > 0 { r } else { d };
+
+    let mut total = 0usize;
+    total += batch_tokens * d;          // norm_x
+    total += batch_tokens * proj;       // temp_q
+    total += batch_tokens * (if r > 0 { r } else { kv_dim }); // temp_k
+    total += batch_tokens * (if r > 0 { r } else { kv_dim }); // temp_v
+    total += bh * seq_len * hd;         // Q
+    total += bh_kv * seq_len * hd;      // K
+    total += bh_kv * seq_len * hd;      // V
+    total += bh * seq_len * seq_len;    // scores
+    total += bh * seq_len * hd;         // attn_out
+    total += batch_tokens * d;          // aflat
+    total += batch_tokens * proj;       // wo_temp
+    total += batch_tokens * d;          // h
+    total += batch_tokens * d;          // norm2
+    total += batch_tokens * (if r > 0 { r } else { ff }); // gate_temp
+    total += batch_tokens * (if r > 0 { r } else { ff }); // up_temp
+    total += batch_tokens * ff;         // gate
+    total += batch_tokens * ff;         // up
+    total += batch_tokens * ff;         // hidden
+    total += batch_tokens * (if r > 0 { r } else { d }); // down_temp
+    total += batch_tokens * d;          // down
+    total * 4 // float = 4 bytes
+}
+
+/// Pre-compute inv_rms per row: inv_rms[i] = 1/sqrt(mean(A[i]^2) + eps)
+pub fn gpu_compute_inv_rms(ctx: &Arc<MetalContext>, input: &GpuBuffer, inv_rms: &GpuBuffer,
+    rows: u32, cols: u32, eps: f32)
+{
+    #[repr(C)]
+    struct Params { rows: u32, cols: u32, eps: f32 }
+    let params = Params { rows, cols, eps };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = next_power_of_2_clamped(cols as u64);
+    let grid = MetalContext::size(rows as u64, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "compute_inv_rms", grid, tg, 0 => input, 1 => inv_rms, 2 => &params_buf);
+}
+
+/// Fused RMSNorm + Matmul: C = rms_norm(A, weight, eps) @ B in 2 dispatches.
+/// Eliminates the intermediate [M, K] normalized buffer.
+pub fn gpu_fused_norm_matmul(ctx: &Arc<MetalContext>,
+    a: &GpuBuffer, norm_weight: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
+    m: u32, n: u32, k: u32, eps: f32,
+) {
+    // Phase 1: compute inv_rms per row
+    let inv_rms = ctx.alloc_buffer(m as usize * 4);
+    gpu_compute_inv_rms(ctx, a, &inv_rms, m, k, eps);
+
+    // Phase 2: fused norm+matmul
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, eps: f32 }
+    let params = Params { m, n, k, eps };
+    let params_buf = params_buffer(ctx, &params);
+
+    let tile = 32u64;
+    let groups_x = (n as u64).div_ceil(tile);
+    let groups_y = (m as u64).div_ceil(tile);
+    let grid = MetalContext::size(groups_x, groups_y, 1);
+    let tg = MetalContext::size(64, 1, 1);
+
+    dispatch_sync!(ctx, "fused_norm_matmul", grid, tg,
+        0 => a, 1 => norm_weight, 2 => b, 3 => c, 4 => &inv_rms, 5 => &params_buf
+    );
+}
+
 /// AXPY: y[i] += alpha * x[i]. Fused scale+add in 1 dispatch.
 pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
     #[repr(C)]
