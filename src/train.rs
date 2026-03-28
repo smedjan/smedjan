@@ -308,7 +308,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             };
 
             // Z-loss: penalize large logit magnitudes (critical for MoE stability)
-            if config.z_loss_coefficient > 0.0 {
+            // TODO: z_loss modifies loss_buf in-place but disrupts loss tracking.
+            // The logsumexp → square → reduce → add_inplace sequence runs correctly
+            // but the resulting loss value shows only the z-component. Needs investigation:
+            // possibly the gpu_add_inplace aliases with the CE scalar buffer in a way
+            // that overwrites rather than adds. Disabled until fixed.
+            if config.z_loss_coefficient > 0.0 && false {
                 loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
             }
 
