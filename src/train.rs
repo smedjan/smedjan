@@ -383,6 +383,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
                 };
 
+                // Z-loss: penalize large logit magnitudes (MoE stability)
+                if config.z_loss_coefficient > 0.0 {
+                    loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
+                }
+
                 // Multi-token prediction: add loss from extra heads
                 if !extra_logits.is_empty() {
                     let mtp_weight = 1.0 / (n_predict + 1) as f32;

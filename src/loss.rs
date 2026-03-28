@@ -136,7 +136,9 @@ pub fn z_loss(
     // z_loss_scalar = coeff * mean(lse^2)
     let lse_sq_buf = ctx.alloc_buffer(batch * 4);
     compute::gpu_mul(ctx, &lse_buf, &lse_buf, &lse_sq_buf, batch as u32);
-    let z_scalar = ctx.alloc_buffer(4);
+    // Allocate z_scalar with unique size (8 bytes instead of 4) to avoid pool aliasing
+    // with the workspace's scalar_buf. The pool is keyed by exact size, so 8 ≠ 4.
+    let z_scalar = ctx.alloc_buffer(8);
     compute::gpu_reduce_sum(ctx, &lse_sq_buf, &z_scalar, batch as u32);
     compute::gpu_scale(ctx, &z_scalar, 1, coefficient / batch as f32);
 
