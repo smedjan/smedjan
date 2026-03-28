@@ -179,6 +179,15 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
     tested += 1;
 
+    // FusedLinearCrossEntropy
+    let fce_hidden = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
+    let fce_embed = crate::tensor::Tensor::randn(ctx, vec![16, 8], 0.1);
+    let fce_targets = vec![0u32, 1, 2, 3];
+    let (_fce_loss, _fce_grad) = crate::loss::fused_linear_cross_entropy(
+        ctx, &fce_hidden, &fce_embed, &fce_targets, 2,
+    );
+    tested += 1;
+
     // WSD scheduler
     let wsd = crate::optim::WSDScheduler::with_phases(1e-3, 10, 80, 10);
     assert_eq!(wsd.total_steps(), 100);

@@ -187,6 +187,9 @@ enum Commands {
         /// ReLoRA merge interval. 0=off, 5000=recommended. Merge lowrank weights for rank growth.
         #[arg(long, default_value = "0")]
         relora_interval: u32,
+        /// Fused linear+cross-entropy: compute logits in chunks, save ~2GB peak memory
+        #[arg(long)]
+        fused_ce: bool,
     },
 
     /// Show available model sizes and their param counts
@@ -533,6 +536,7 @@ fn main() {
             ema_decay,
             noise_scale,
             relora_interval,
+            fused_ce,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -611,6 +615,7 @@ fn main() {
             config.ema_decay = ema_decay;
             config.noise_scale = noise_scale;
             config.relora_interval = relora_interval;
+            config.fused_ce = fused_ce;
 
             train::train(&ctx, &config).expect("Training failed");
         }

@@ -73,6 +73,9 @@ pub struct TrainConfig {
     /// 0=disabled, 5000=recommended. After K merges, effective rank = K × lowrank.
     /// Enables full-rank learning through sequential low-rank updates. (arXiv 2307.05695)
     pub relora_interval: u32,
+    /// Use FusedLinearCrossEntropy: compute logits+loss in chunks, never materialize full logit tensor.
+    /// Saves ~2GB peak memory for vocab=8192. Enable for large vocab or tight memory.
+    pub fused_ce: bool,
 }
 
 impl TrainConfig {
@@ -111,6 +114,7 @@ impl TrainConfig {
             ema_decay: 0.0,
             noise_scale: 0.0,
             relora_interval: 0,
+            fused_ce: false,
         }
     }
 }
