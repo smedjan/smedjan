@@ -483,29 +483,10 @@ impl TransformerBlock {
     fn swiglu_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let x_flat = x.reshape(vec![batch * seq_len, d]);
 
-        // Gate and up projections — dispatch based on mode
+        // Gate and up projections — separate matmuls (fewer dispatches than fused concat+slice)
         let (gate, up) = if self.lowrank > 0 {
-            // Fused gate+up U-projection: concat [W1_U | W3_U] column-wise into [d, 2r],
-            // do ONE matmul reading x once, slice into gate_int and up_int, then V-project.
-            // Saves 1 read of x (64MB at batch=1024 d=256).
-            let r = self.lowrank;
-            let r2 = r * 2;
-            let w_fused_buf = x_flat.ctx.alloc_buffer(d * r2 * 4);
-            compute::gpu_concat_cols(&x_flat.ctx, &self.ffn_w1_u.buffer, &w_fused_buf,
-                d as u32, r as u32, r2 as u32, 0);
-            compute::gpu_concat_cols(&x_flat.ctx, &self.ffn_w3_u.buffer, &w_fused_buf,
-                d as u32, r as u32, r2 as u32, r as u32);
-            let w_fused = Tensor::from_buffer(Arc::clone(&x_flat.ctx), w_fused_buf, vec![d, r2]);
-
-            // Single matmul: [n_tokens, d] @ [d, 2r] → [n_tokens, 2r]
-            let fused_int = x_flat.matmul(&w_fused);
-
-            // Tape-tracked column slices: gradients flow back correctly
-            let gate_int = fused_int.slice_cols(0, r);
-            let up_int = fused_int.slice_cols(r, r);
-
-            let g = gate_int.matmul(&self.ffn_w1_v);
-            let u = up_int.matmul(&self.ffn_w3_v);
+            let g = x_flat.matmul(&self.ffn_w1_u).matmul(&self.ffn_w1_v);
+            let u = x_flat.matmul(&self.ffn_w3_u).matmul(&self.ffn_w3_v);
             (g, u)
         } else if self.bitnet {
             (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))

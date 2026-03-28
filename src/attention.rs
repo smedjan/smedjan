@@ -176,31 +176,12 @@ impl MultiHeadAttention {
         // Flatten batch*seq for matmul: [batch*seq, d_model]
         let x_flat = x.reshape(vec![batch * seq_len, d_model]);
 
-        // Project Q, K, V
+        // Project Q, K, V — separate matmuls (fewer dispatches than fused concat+slice)
         let (q, k, v) = if self.attn_rank > 0 {
-            // Fused Q+K+V U-projection: concat [Uq | Uk | Uv] column-wise into [d, 3r],
-            // one matmul reading x once instead of 3×, then slice + V-project.
-            let r = self.attn_rank;
-            let r3 = r * 3;
-            let w_fused_buf = x_flat.ctx.alloc_buffer(d_model * r3 * 4);
-            compute::gpu_concat_cols(&x_flat.ctx, &self.w_q.buffer, &w_fused_buf,
-                d_model as u32, r as u32, r3 as u32, 0);
-            compute::gpu_concat_cols(&x_flat.ctx, &self.w_k.buffer, &w_fused_buf,
-                d_model as u32, r as u32, r3 as u32, r as u32);
-            compute::gpu_concat_cols(&x_flat.ctx, &self.w_v.buffer, &w_fused_buf,
-                d_model as u32, r as u32, r3 as u32, (r * 2) as u32);
-            let w_fused = Tensor::from_buffer(Arc::clone(&x_flat.ctx), w_fused_buf, vec![d_model, r3]);
-
-            let fused_int = x_flat.matmul(&w_fused); // [n_tokens, 3r]
-
-            let q_int = fused_int.slice_cols(0, r);
-            let k_int = fused_int.slice_cols(r, r);
-            let v_int = fused_int.slice_cols(r * 2, r);
-
             (
-                q_int.matmul(&self.w_q_v),
-                k_int.matmul(&self.w_k_v),
-                v_int.matmul(&self.w_v_v),
+                x_flat.matmul(&self.w_q).matmul(&self.w_q_v),
+                x_flat.matmul(&self.w_k).matmul(&self.w_k_v),
+                x_flat.matmul(&self.w_v).matmul(&self.w_v_v),
             )
         } else {
             (
@@ -225,13 +206,10 @@ impl MultiHeadAttention {
         let q = q.apply_rope(offset, self.rope_theta);
         let k = k.apply_rope(offset, self.rope_theta);
 
-        // QK-norm: RMS-normalize Q and K per head to prevent attention entropy collapse.
-        // At large d_model, dot products grow proportionally to head_dim, causing
-        // softmax to saturate. Normalizing keeps attention sharp across all scales.
-        // Applied after RoPE so positional info is preserved in direction, not magnitude.
-        // Uses fixed weight=1 (no learned scale) — the attention scale factor handles magnitude.
-        let q = q.rms_norm(&self.qk_norm_weight, 1e-6);
-        let k = k.rms_norm(&self.qk_norm_weight, 1e-6);
+        // QK-norm: only at d_model≥512 where attention entropy collapse is a real risk.
+        // At d<512, the overhead (~4% throughput) isn't worth it.
+        let q = if self.d_model >= 512 { q.rms_norm(&self.qk_norm_weight, 1e-6) } else { q };
+        let k = if self.d_model >= 512 { k.rms_norm(&self.qk_norm_weight, 1e-6) } else { k };
 
         // Handle KV cache (inference only — no tape needed)
         // Cache stores n_kv_heads, not n_heads
