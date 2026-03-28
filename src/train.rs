@@ -343,69 +343,72 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Forward pass (batched GPU dispatch — all kernels encode into one command buffer)
             ctx.begin_batch();
 
-            // Multi-token prediction: forward_mtp returns (main_logits, [extra_logits...])
-            // Each extra head predicts tokens shifted by k+1 positions.
+            // Two paths: standard (compute logits, then CE) or fused (LM head + CE in chunks)
             let n_predict = config.model_config.n_predict;
-            let (logits, extra_logits) = if n_predict > 0 {
-                model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing)
+
+            let (loss_tensor, grad_logits) = if config.fused_ce && n_predict == 0 && config.teacher_checkpoint.is_none() {
+                // FusedLinearCrossEntropy: compute logits+loss in chunks, never materialize full logit tensor.
+                // Saves ~2GB peak memory. Incompatible with MTP and distillation (they need full logits).
+                let hidden = model.forward_hidden(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                // For factored embedding, we need the un-factored embedding for the fused CE.
+                // Use the full vocab embedding (either direct or projected).
+                let embed_for_ce = if model.embed_rank > 0 {
+                    // Factored: need embed_proj @ embedding for the effective [d_model, vocab] weight.
+                    // FusedLinearCE handles matmul_trans_b internally, so pass [vocab, d_model].
+                    // For factored case, fall back to standard CE (fused CE doesn't handle two-step projection yet).
+                    let logits = model.apply_lm_head(&hidden);
+                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
+                } else {
+                    loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, &targets, 1024)
+                };
+                embed_for_ce
             } else {
-                let l = model.forward(&inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
-                (l, Vec::new())
-            };
+                // Standard path: compute full logits, then CE
+                let (logits, extra_logits) = if n_predict > 0 {
+                    model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing)
+                } else {
+                    let l = model.forward(&inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
+                    (l, Vec::new())
+                };
 
-            // Compute main loss — distillation or plain cross-entropy
-            let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
-                let teacher_logits = autograd::no_grad(|| {
-                    teacher.forward(&inputs, config.batch_size, effective_seq, None, false)
-                });
-                loss::distillation_loss(
-                    ctx, &logits, &teacher_logits,
-                    config.distill_temperature, config.distill_alpha, &targets,
-                )
-            } else {
-                loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
-            };
+                let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
+                    let teacher_logits = autograd::no_grad(|| {
+                        teacher.forward(&inputs, config.batch_size, effective_seq, None, false)
+                    });
+                    loss::distillation_loss(
+                        ctx, &logits, &teacher_logits,
+                        config.distill_temperature, config.distill_alpha, &targets,
+                    )
+                } else {
+                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
+                };
 
-            // Z-loss: penalize large logit magnitudes (critical for MoE stability)
-            // TODO: z_loss modifies loss_buf in-place but disrupts loss tracking.
-            // The logsumexp → square → reduce → add_inplace sequence runs correctly
-            // but the resulting loss value shows only the z-component. Needs investigation:
-            // possibly the gpu_add_inplace aliases with the CE scalar buffer in a way
-            // that overwrites rather than adds. Disabled until fixed.
-            if config.z_loss_coefficient > 0.0 && false {
-                loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
-            }
+                // Multi-token prediction: add loss from extra heads
+                if !extra_logits.is_empty() {
+                    let mtp_weight = 1.0 / (n_predict + 1) as f32;
+                    compute::gpu_scale(ctx, &loss_tensor.buffer, 1, mtp_weight);
+                    compute::gpu_scale(ctx, &grad_logits, (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, mtp_weight);
 
-            // Multi-token prediction: add loss from extra heads with shifted targets.
-            // Head k predicts position t+k+2, so targets shift by k+1 within the sequence.
-            // Weight: 1/(n_predict+1) per head for equal contribution.
-            if !extra_logits.is_empty() {
-                let mtp_weight = 1.0 / (n_predict + 1) as f32;
-                // Scale main loss
-                compute::gpu_scale(ctx, &loss_tensor.buffer, 1, mtp_weight);
-                compute::gpu_scale(ctx, &grad_logits, (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, mtp_weight);
-
-                for (k, extra_log) in extra_logits.iter().enumerate() {
-                    // Shift targets: for head k, target[t] = original_target[t+k+1]
-                    // Tokens that go past the sequence end get masked (use token 0 as padding)
-                    let shift = k + 1;
-                    let bs = config.batch_size * effective_seq;
-                    let mut shifted_targets = vec![0u32; bs];
-                    for b in 0..config.batch_size {
-                        for t in 0..effective_seq {
-                            let src_idx = b * effective_seq + t + shift;
-                            if t + shift < effective_seq {
-                                shifted_targets[b * effective_seq + t] = targets[src_idx];
+                    for (k, extra_log) in extra_logits.iter().enumerate() {
+                        let shift = k + 1;
+                        let bs = config.batch_size * effective_seq;
+                        let mut shifted_targets = vec![0u32; bs];
+                        for b in 0..config.batch_size {
+                            for t in 0..effective_seq {
+                                let src_idx = b * effective_seq + t + shift;
+                                if t + shift < effective_seq {
+                                    shifted_targets[b * effective_seq + t] = targets[src_idx];
+                                }
                             }
-                            // else: stays 0 (padding), loss will be computed but gradient is small
                         }
+                        let (extra_loss, _extra_grad) = loss::cross_entropy_loss(ctx, extra_log, &shifted_targets);
+                        compute::gpu_scale(ctx, &extra_loss.buffer, 1, mtp_weight);
+                        compute::gpu_add_inplace(ctx, &loss_tensor.buffer, &extra_loss.buffer, 1);
                     }
-                    let (extra_loss, _extra_grad) = loss::cross_entropy_loss(ctx, extra_log, &shifted_targets);
-                    // Add weighted extra loss to main loss
-                    compute::gpu_scale(ctx, &extra_loss.buffer, 1, mtp_weight);
-                    compute::gpu_add_inplace(ctx, &loss_tensor.buffer, &extra_loss.buffer, 1);
                 }
-            }
+
+                (loss_tensor, grad_logits)
+            };
 
             // Online data pruning: skip backward if loss is below threshold.
             // The model already knows this data — training on it wastes compute.

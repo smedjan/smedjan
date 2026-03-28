@@ -788,23 +788,76 @@ impl Transformer {
         let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
 
         // LM head (weight-tied with embedding)
-        // Full: logits = h @ embedding^T
-        // Factored: logits = h @ embed_proj^T @ embedding^T (two smaller matmuls)
         let h_flat = h.reshape(vec![n_tokens, d]);
+        self.apply_lm_head(&h_flat)
+    }
+
+    /// Apply LM head to hidden states: h → logits via weight-tied embedding.
+    pub fn apply_lm_head(&self, h_flat: &Tensor) -> Tensor {
         let logits = if self.embed_rank > 0 {
-            let h_proj = h_flat.matmul_trans_b(&self.embed_proj.detach()); // [n_tokens, rank]
-            h_proj.matmul_trans_b(&self.embedding.detach()) // [n_tokens, vocab]
+            let h_proj = h_flat.matmul_trans_b(&self.embed_proj.detach());
+            h_proj.matmul_trans_b(&self.embedding.detach())
         } else {
             h_flat.matmul_trans_b(&self.embedding.detach())
         };
-
-        // μP: scale output logits to prevent large activations in wide models
         let mup_scale = self.config.mup_output_scale();
-        if mup_scale < 1.0 {
-            logits.scale(mup_scale)
-        } else {
-            logits
+        if mup_scale < 1.0 { logits.scale(mup_scale) } else { logits }
+    }
+
+    /// Forward pass returning hidden states BEFORE the LM head.
+    /// Used by FusedLinearCrossEntropy which handles LM head + CE in chunks.
+    pub fn forward_hidden(
+        &self, tokens: &[u32], batch: usize, seq_len: usize, _checkpointed: bool,
+    ) -> Tensor {
+        let d = self.config.d_model;
+        let n_tokens = batch * seq_len;
+
+        let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
+        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
+        compute::gpu_embedding_lookup(
+            &self.ctx, &tokens_buf, &self.embedding.buffer, &embed_out_buf,
+            n_tokens as u32, embed_dim as u32,
+        );
+
+        let tokens_id = autograd::next_id();
+        let embed_out_id = autograd::next_id();
+        if autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Embedding,
+                inputs: vec![tokens_id, self.embedding.id],
+                output: embed_out_id,
+                input_buffers: vec![tokens_buf, self.embedding.buffer.clone()],
+                output_buffer: embed_out_buf.clone(),
+                shapes: vec![vec![n_tokens], vec![self.config.vocab_size as usize, embed_dim], vec![n_tokens, embed_dim]],
+                cached: None,
+            });
         }
+
+        let embed_tensor = Tensor {
+            id: embed_out_id, buffer: embed_out_buf,
+            shape: vec![n_tokens, embed_dim], requires_grad: true, ctx: Arc::clone(&self.ctx),
+        };
+
+        let h_flat = if self.embed_rank > 0 {
+            embed_tensor.matmul(&self.embed_proj)
+        } else { embed_tensor };
+        let mut h = h_flat.reshape(vec![batch, seq_len, d]);
+
+        let n_layers = self.blocks.len();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
+                let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
+                if rand::random::<f32>() < drop_prob { continue; }
+            }
+            h = block.forward(&h, None);
+            if self.config.fp16_activations && i + 1 < n_layers {
+                h = h.fp16_roundtrip();
+            }
+        }
+
+        let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
+        h.reshape(vec![n_tokens, d])
     }
 
     /// Forward with multi-token prediction: returns (main_logits, [extra_logits...]).

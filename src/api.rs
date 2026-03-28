@@ -179,6 +179,20 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
     tested += 1;
 
+    // LogSumExp + Z-loss
+    let lse_data = ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]); // [2, 3]
+    let lse_out = ctx.alloc_buffer(2 * 4);
+    compute::gpu_logsumexp(ctx, &lse_data, &lse_out, 2, 3);
+    let lse_vals = MetalContext::read_buffer(&lse_out, 2);
+    if (lse_vals[0] - lse_vals[1]).abs() > 0.01 { passed = false; } // same rows → same lse
+    // Z-loss (disabled in training but function exists)
+    let z_logits = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
+    let z_loss_buf = ctx.alloc_buffer(4);
+    compute::gpu_fill(ctx, &z_loss_buf, 1, 0.0);
+    let z_grad_buf = ctx.alloc_buffer(4 * 8 * 4);
+    crate::loss::z_loss(ctx, &z_logits, &z_loss_buf, &z_grad_buf, 1e-4);
+    tested += 2;
+
     // FusedLinearCrossEntropy
     let fce_hidden = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
     let fce_embed = crate::tensor::Tensor::randn(ctx, vec![16, 8], 0.1);
