@@ -419,6 +419,8 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         mup_base_width: 0,
         shared_layers: false,
         n_predict: 0,
+        stochastic_depth: 0.0,
+        sliding_window: 0,
         bitnet: false,
         lowrank: 0,
     })
