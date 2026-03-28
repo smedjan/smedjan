@@ -395,12 +395,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 };
                 embed_for_ce
             } else {
-                // Standard path: compute full logits, then CE
-                let (logits, extra_logits) = if n_predict > 0 {
-                    model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing)
+                // Standard path: compute hidden → LM head → CE
+                let (logits, extra_logits, hidden_for_distill) = if n_predict > 0 {
+                    let (l, e) = model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    (l, e, None)
+                } else if config.ema_decay > 0.0 {
+                    // When EMA active: use forward_hidden to get hidden states for self-distillation
+                    let hidden = model.forward_hidden(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    let logits = model.apply_lm_head(&hidden);
+                    (logits, Vec::new(), Some(hidden))
                 } else {
                     let l = model.forward(&inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
-                    (l, Vec::new())
+                    (l, Vec::new(), None)
                 };
 
                 let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
@@ -418,6 +424,51 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 // Z-loss: penalize large logit magnitudes (MoE stability)
                 if config.z_loss_coefficient > 0.0 {
                     loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
+                }
+
+                // EMA self-distillation: teacher logits from hidden @ ema_embedding^T
+                // One extra matmul — no full teacher forward needed.
+                // KL(teacher || student) as auxiliary loss with weight 0.1.
+                // Self-distillation every 10 steps to amortize the cost (~40% overhead per step)
+                if let Some(ref h) = hidden_for_distill {
+                    if !ema_buffers.is_empty() && step % 10 == 0 {
+                        // Self-distillation: compute teacher logits from hidden + EMA LM head.
+                        // Uses EMA embedding (ema_buffers[0]) for the weight-tied LM head.
+                        // One extra matmul — no full teacher forward needed.
+                        let ema_embed = &ema_buffers[0];
+                        let teacher_logits = autograd::no_grad(|| {
+                            let vocab = config.model_config.vocab_size as usize;
+                            let n = h.shape[0];
+                            if model.embed_rank > 0 {
+                                // Factored: h @ ema_embed_proj^T @ ema_embedding^T
+                                let ema_proj = &ema_buffers[2]; // embed_proj is 3rd param
+                                let d = config.model_config.d_model;
+                                let r = model.embed_rank;
+                                let h_proj_buf = ctx.alloc_buffer(n * r * 4);
+                                compute::gpu_matmul_trans_b(ctx, &h.buffer, ema_proj, &h_proj_buf,
+                                    n as u32, r as u32, d as u32);
+                                let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
+                                compute::gpu_matmul_trans_b(ctx, &h_proj_buf, ema_embed, &teacher_buf,
+                                    n as u32, vocab as u32, r as u32);
+                                crate::tensor::Tensor::from_buffer(Arc::clone(&h.ctx), teacher_buf, vec![n, vocab])
+                            } else {
+                                let d = config.model_config.d_model;
+                                let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
+                                compute::gpu_matmul_trans_b(ctx, &h.buffer, ema_embed, &teacher_buf,
+                                    n as u32, vocab as u32, d as u32);
+                                crate::tensor::Tensor::from_buffer(Arc::clone(&h.ctx), teacher_buf, vec![n, vocab])
+                            }
+                        });
+                        // KL distillation: alpha=0.1, temperature=2.0
+                        let (distill_loss, distill_grad) = loss::distillation_loss(
+                            ctx, &logits, &teacher_logits, 2.0, 0.1, &targets,
+                        );
+                        // Add distillation loss to main loss for display
+                        compute::gpu_axpy(ctx, &loss_tensor.buffer, &distill_loss.buffer, 1, 0.1);
+                        // Add distillation gradient to CE gradient
+                        compute::gpu_axpy(ctx, &grad_logits, &distill_grad,
+                            (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, 0.1);
+                    }
                 }
 
                 // Multi-token prediction: add loss from extra heads
