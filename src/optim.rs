@@ -196,6 +196,54 @@ impl CosineWarmupScheduler {
     }
 }
 
+/// WSD (Warmup-Stable-Decay) learning rate schedule.
+/// Three phases: linear warmup → constant plateau → linear decay to zero.
+/// Beats cosine by 5-10% on final loss. Key advantage: stable phase can continue
+/// indefinitely — branch off with decay at any point to get a good model.
+/// Used by OLMo 2, Phi-4, LongCat-Flash. (arXiv 2410.05192)
+pub struct WSDScheduler {
+    pub max_lr: f32,
+    pub warmup_steps: u32,
+    pub stable_steps: u32,   // constant LR phase after warmup
+    pub decay_steps: u32,    // linear decay to zero after stable
+}
+
+impl WSDScheduler {
+    /// Create WSD schedule. stable_fraction = fraction of total steps at constant LR.
+    /// Typical: warmup=2%, stable=70%, decay=28%.
+    pub fn new(max_lr: f32, warmup_steps: u32, total_steps: u32) -> Self {
+        let after_warmup = total_steps.saturating_sub(warmup_steps);
+        let stable = (after_warmup as f32 * 0.7) as u32;
+        let decay = after_warmup - stable;
+        Self { max_lr, warmup_steps, stable_steps: stable, decay_steps: decay }
+    }
+
+    pub fn with_phases(max_lr: f32, warmup_steps: u32, stable_steps: u32, decay_steps: u32) -> Self {
+        Self { max_lr, warmup_steps, stable_steps, decay_steps }
+    }
+
+    pub fn get_lr(&self, step: u32) -> f32 {
+        if step < self.warmup_steps {
+            // Linear warmup
+            if self.warmup_steps == 0 { return self.max_lr; }
+            self.max_lr * (step as f32 / self.warmup_steps as f32)
+        } else if step < self.warmup_steps + self.stable_steps {
+            // Stable plateau — constant max_lr
+            self.max_lr
+        } else {
+            // Linear decay to zero
+            let decay_step = step - self.warmup_steps - self.stable_steps;
+            if self.decay_steps == 0 { return 0.0; }
+            let progress = (decay_step as f32 / self.decay_steps as f32).min(1.0);
+            self.max_lr * (1.0 - progress)
+        }
+    }
+
+    pub fn total_steps(&self) -> u32 {
+        self.warmup_steps + self.stable_steps + self.decay_steps
+    }
+}
+
 /// Sophia optimizer — second-order with diagonal Hessian.
 /// 2x faster convergence than AdamW for ~same compute.
 pub struct Sophia {

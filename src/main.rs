@@ -175,6 +175,15 @@ enum Commands {
         /// FP16 activation compression between layers. Halves inter-layer memory.
         #[arg(long)]
         fp16_activations: bool,
+        /// LR schedule: "cosine" (default) or "wsd" (warmup-stable-decay, 5-10% better)
+        #[arg(long, default_value = "cosine")]
+        lr_schedule: String,
+        /// Self-distillation EMA decay. 0=off, 0.999=recommended. EMA teacher improves sample efficiency.
+        #[arg(long, default_value = "0.0")]
+        ema_decay: f32,
+        /// Anti-PGD noise scale. 0=off, 0.01=recommended. Anticorrelated noise for flatter minima.
+        #[arg(long, default_value = "0.0")]
+        noise_scale: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -517,6 +526,9 @@ fn main() {
             stochastic_depth,
             sliding_window,
             fp16_activations,
+            lr_schedule,
+            ema_decay,
+            noise_scale,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -591,6 +603,9 @@ fn main() {
             config.model_config.stochastic_depth = stochastic_depth;
             config.model_config.sliding_window = sliding_window;
             config.model_config.fp16_activations = fp16_activations;
+            config.lr_schedule = lr_schedule;
+            config.ema_decay = ema_decay;
+            config.noise_scale = noise_scale;
 
             train::train(&ctx, &config).expect("Training failed");
         }

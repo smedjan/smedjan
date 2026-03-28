@@ -1193,6 +1193,27 @@ kernel void scale_copy(
 /// Fill buffer with a constant value
 /// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j])))
 /// Numerically stable: output[i] = max + log(sum(exp(x - max)))
+/// EMA update: ema[i] = decay * ema[i] + (1-decay) * src[i]
+pub const EMA_UPDATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct EmaParams {
+    uint size;
+    float decay;
+};
+
+kernel void ema_update(
+    device float* ema [[buffer(0)]],
+    device const float* src [[buffer(1)]],
+    constant EmaParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    ema[gid] = params.decay * ema[gid] + (1.0f - params.decay) * src[gid];
+}
+"#;
+
 pub const LOGSUMEXP: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

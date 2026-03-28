@@ -179,6 +179,12 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
     tested += 1;
 
+    // WSD scheduler
+    let wsd = crate::optim::WSDScheduler::with_phases(1e-3, 10, 80, 10);
+    assert_eq!(wsd.total_steps(), 100);
+    assert!(wsd.get_lr(50) > 0.0); // stable phase
+    tested += 1;
+
     // Optimizer enum
     let tiny = crate::tensor::Tensor::zeros(ctx, vec![2, 2]);
     let tiny_refs: Vec<&crate::tensor::Tensor> = vec![&tiny];
