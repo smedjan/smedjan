@@ -1434,6 +1434,18 @@ pub fn gpu_scaled_causal_softmax_window(
     );
 }
 
+/// AXPY: y[i] += alpha * x[i]. Fused scale+add in 1 dispatch.
+pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
+    #[repr(C)]
+    struct Params { size: u32, alpha: f32 }
+    let params = Params { size, alpha };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "axpy", grid, tg, 0 => y, 1 => x, 2 => &params_buf);
+}
+
 /// ReLU: output[i] = max(input[i], 0)
 pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     #[repr(C)]

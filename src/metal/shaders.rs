@@ -799,6 +799,24 @@ kernel void rms_norm_residual(
 
 /// Fused SiLU-gate: output[i] = silu(gate[i]) * up[i]
 /// Saves one kernel dispatch and one temporary buffer vs separate silu + mul.
+/// AXPY: y[i] += alpha * x[i]. Fused scale+add in 1 dispatch (was 2).
+pub const AXPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct AxpyParams { uint size; float alpha; };
+
+kernel void axpy(
+    device float* y [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    constant AxpyParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    y[gid] += params.alpha * x[gid];
+}
+"#;
+
 /// ReLU activation: output[i] = max(input[i], 0). Used for ReMoE routing.
 pub const RELU: &str = r#"
 #include <metal_stdlib>
