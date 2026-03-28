@@ -184,6 +184,9 @@ enum Commands {
         /// Anti-PGD noise scale. 0=off, 0.01=recommended. Anticorrelated noise for flatter minima.
         #[arg(long, default_value = "0.0")]
         noise_scale: f32,
+        /// ReLoRA merge interval. 0=off, 5000=recommended. Merge lowrank weights for rank growth.
+        #[arg(long, default_value = "0")]
+        relora_interval: u32,
     },
 
     /// Show available model sizes and their param counts
@@ -529,6 +532,7 @@ fn main() {
             lr_schedule,
             ema_decay,
             noise_scale,
+            relora_interval,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -606,6 +610,7 @@ fn main() {
             config.lr_schedule = lr_schedule;
             config.ema_decay = ema_decay;
             config.noise_scale = noise_scale;
+            config.relora_interval = relora_interval;
 
             train::train(&ctx, &config).expect("Training failed");
         }

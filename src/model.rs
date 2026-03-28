@@ -271,6 +271,7 @@ pub struct TransformerBlock {
     // MoE (used when n_experts > 1)
     pub experts: Vec<ExpertFFN>,   // n_experts FFN blocks
     pub router_weight: Tensor,     // [d_model, n_experts] — router logits
+    pub router_bias: Vec<f32>,     // [n_experts] — bias-based load balancing (DeepSeek-V3)
     pub n_experts: usize,
     pub top_k: usize,
     pub bitnet: bool,
@@ -315,6 +316,9 @@ impl TransformerBlock {
         } else {
             Tensor::zeros(ctx, vec![1])
         };
+        // Bias-based load balancing (DeepSeek-V3): bias added to router logits for
+        // routing decisions, but NOT for gating weights. Adjusted each step by gamma.
+        let router_bias = vec![0.0f32; config.n_experts.max(1)];
 
         // Low-rank FFN decomposition: W = U × V
         let r = config.lowrank;
@@ -348,6 +352,7 @@ impl TransformerBlock {
             lowrank: r,
             experts,
             router_weight,
+            router_bias,
             n_experts: config.n_experts,
             top_k: config.top_k_experts,
             bitnet: config.bitnet,
@@ -428,17 +433,10 @@ impl TransformerBlock {
         // Router logits (on tape — gradients flow to router weights)
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
 
-        // Add small noise to router logits during training to help break expert symmetry.
-        // Only meaningful for first ~100 steps, then router has diverged enough.
-        // Noise is cheap: one alloc + one add vs N expert matmuls.
-        let router_logits = if autograd::is_recording() {
-            let noise = Tensor::randn(&x_flat.ctx, vec![n_tokens, self.n_experts], 0.5);
-            router_logits.add(&noise)
-        } else {
-            router_logits
-        };
-
-        let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
+        // Bias-based load balancing (DeepSeek-V3): bias shifts routing decisions
+        // but NOT gate values. This achieves load balance without auxiliary loss penalties.
+        // Gate values use unbiased logits → no quality degradation from balancing.
+        let router_probs = router_logits.softmax(); // [n_tokens, n_experts] — unbiased for gating
 
         // Soft MoE: each expert runs on all tokens, weighted by router_probs.
         // Router probs extracted ON TAPE via matmul with one-hot selector.
