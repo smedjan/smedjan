@@ -233,12 +233,36 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             config.model_config.mup_base_width, config.max_lr, effective_lr);
     }
 
-    // Learning rate scheduler — cosine (default) or WSD (5-10% better final loss)
+    // Learning rate scheduler — multiple options from research
     let get_lr: Box<dyn Fn(u32) -> f32> = if config.lr_schedule == "wsd" {
         let wsd = crate::optim::WSDScheduler::new(effective_lr, config.warmup_steps, config.total_steps);
         eprintln!("LR schedule: WSD (warmup={}, stable={}, decay={})",
             wsd.warmup_steps, wsd.stable_steps, wsd.decay_steps);
         Box::new(move |step| wsd.get_lr(step))
+    } else if config.lr_schedule == "wso" {
+        // Warmup-Stable-Only: no decay. Best before SFT. (arXiv 2602.06797)
+        let warmup = config.warmup_steps;
+        let lr = effective_lr;
+        eprintln!("LR schedule: WSO (warmup={}, then constant)", warmup);
+        Box::new(move |step| {
+            if step < warmup { lr * (step as f32 / warmup.max(1) as f32) }
+            else { lr }
+        })
+    } else if config.lr_schedule == "invsqrt" {
+        // Inverse sqrt: original Transformer schedule (Vaswani 2017)
+        let warmup = config.warmup_steps;
+        let lr = effective_lr;
+        eprintln!("LR schedule: inverse-sqrt (warmup={})", warmup);
+        Box::new(move |step| crate::optim::inverse_sqrt_lr(lr, warmup, step))
+    } else if config.lr_schedule == "trapezoid" {
+        // Trapezoidal: warmup → stable → linear decay to 10% of max
+        let warmup = config.warmup_steps;
+        let total = config.total_steps;
+        let after_warmup = total.saturating_sub(warmup);
+        let stable = (after_warmup as f32 * 0.6) as u32;
+        let lr = effective_lr;
+        eprintln!("LR schedule: trapezoid (warmup={}, stable={}, decay to 10%)", warmup, stable);
+        Box::new(move |step| crate::optim::trapezoidal_lr(lr, lr * 0.1, warmup, stable, total, step))
     } else {
         let scheduler = if config.lr_restart_period > 0 {
             CosineWarmupScheduler::with_restarts(effective_lr, config.warmup_steps, config.total_steps, config.lr_restart_period)
@@ -280,8 +304,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut best_val_loss = f32::INFINITY;
     let mut val_no_improve = 0u32;
     let early_stop_patience = 3;
-    let mut ema_loss = 0.0f32; // exponential moving average of loss for smooth tracking
-    let mut peak_tok_s = 0.0f32; // track peak throughput
+    let mut ema_loss = 0.0f32;
+    let mut peak_tok_s = 0.0f32;
+    let mut best_train_loss = f32::INFINITY; // track best for auto-save
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     for step in start_step..config.total_steps {
@@ -651,6 +676,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             checkpoint::save_checkpoint(&path, &model, step)?;
             let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
+
+            // Auto-save best model based on EMA loss
+            if ema_loss > 0.0 && ema_loss < best_train_loss {
+                best_train_loss = ema_loss;
+                let best_path = format!("{}/best.bin", config.checkpoint_dir);
+                checkpoint::save_checkpoint(&best_path, &model, step)?;
+                eprintln!("  → New best model (EMA loss {:.4})", ema_loss);
+            }
         }
 
         // Validation loss + early stopping (if validation dataset provided)

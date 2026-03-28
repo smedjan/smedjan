@@ -284,6 +284,34 @@ impl WSDScheduler {
     }
 }
 
+/// Inverse-sqrt schedule: lr = max_lr * sqrt(warmup) / sqrt(max(step, warmup)).
+/// The original Transformer schedule (Vaswani et al., 2017).
+/// Gentle decay — never reaches zero. Good for continued pretraining.
+pub fn inverse_sqrt_lr(max_lr: f32, warmup_steps: u32, step: u32) -> f32 {
+    if step < warmup_steps {
+        if warmup_steps == 0 { return max_lr; }
+        max_lr * (step as f32 / warmup_steps as f32)
+    } else {
+        max_lr * (warmup_steps as f32).sqrt() / (step as f32).sqrt()
+    }
+}
+
+/// Trapezoidal schedule: warmup → stable → linear decay.
+/// Like WSD but with configurable decay endpoint (not necessarily zero).
+pub fn trapezoidal_lr(max_lr: f32, min_lr: f32, warmup_steps: u32, stable_steps: u32, total_steps: u32, step: u32) -> f32 {
+    if step < warmup_steps {
+        if warmup_steps == 0 { return max_lr; }
+        min_lr + (max_lr - min_lr) * (step as f32 / warmup_steps as f32)
+    } else if step < warmup_steps + stable_steps {
+        max_lr
+    } else {
+        let decay_steps = total_steps.saturating_sub(warmup_steps + stable_steps);
+        if decay_steps == 0 { return min_lr; }
+        let progress = ((step - warmup_steps - stable_steps) as f32 / decay_steps as f32).min(1.0);
+        max_lr + (min_lr - max_lr) * progress
+    }
+}
+
 /// Sophia optimizer — second-order with diagonal Hessian.
 /// 2x faster convergence than AdamW for ~same compute.
 pub struct Sophia {
