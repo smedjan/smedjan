@@ -306,7 +306,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let early_stop_patience = 3;
     let mut ema_loss = 0.0f32;
     let mut peak_tok_s = 0.0f32;
-    let mut best_train_loss = f32::INFINITY; // track best for auto-save
+    let mut best_train_loss = f32::INFINITY;
+    let mut prev_loss = 0.0f32; // for gradient noise estimation
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     for step in start_step..config.total_steps {
@@ -603,6 +604,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             } else {
                 format!("{}s", eta_secs)
             };
+
+            // Track loss change for CSV logging
+            let _loss_delta = if prev_loss > 0.0 { (loss_val - prev_loss).abs() } else { 0.0 };
+            prev_loss = loss_val;
 
             eprintln!(
                 "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | ETA {} | w_norm {:.2}",
