@@ -193,6 +193,20 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     crate::loss::z_loss(ctx, &z_logits, &z_loss_buf, &z_grad_buf, 1e-4);
     tested += 2;
 
+    // DataMixer (verify construction works)
+    if std::path::Path::new("data/train_v3.bin").exists() {
+        let mixer = crate::data::DataMixer::new(
+            &["data/train_v3.bin", "data/train_v3.bin"],
+            &[0.7, 0.3], 4, 16,
+        );
+        if let Ok(mut m) = mixer {
+            let _ = m.total_tokens();
+            let _ = m.source_weights();
+            let _ = m.next_batch();
+            tested += 1;
+        }
+    }
+
     // FusedLinearCrossEntropy
     let fce_hidden = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
     let fce_embed = crate::tensor::Tensor::randn(ctx, vec![16, 8], 0.1);

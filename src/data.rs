@@ -237,3 +237,61 @@ pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_si
     eprintln!("Dataset verification passed: {} tokens round-tripped through GPU (transpose OK)", count);
     count
 }
+
+/// Multi-source data mixer: samples from multiple datasets with configurable weights.
+/// Useful for mixing code, text, math data in specific proportions.
+/// weights[i] = relative probability of sampling from source i.
+pub struct DataMixer {
+    loaders: Vec<DataLoader>,
+    weights: Vec<f32>,
+    cumulative: Vec<f32>,
+}
+
+impl DataMixer {
+    /// Create a mixer from multiple dataset paths and their sampling weights.
+    /// Weights are normalized to sum to 1.0.
+    pub fn new(
+        paths: &[&str],
+        weights: &[f32],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> std::io::Result<Self> {
+        assert_eq!(paths.len(), weights.len(), "paths and weights must match");
+        assert!(!paths.is_empty(), "need at least one data source");
+
+        let total: f32 = weights.iter().sum();
+        let norm_weights: Vec<f32> = weights.iter().map(|w| w / total).collect();
+        let mut cumulative = Vec::with_capacity(norm_weights.len());
+        let mut cum = 0.0f32;
+        for w in &norm_weights {
+            cum += w;
+            cumulative.push(cum);
+        }
+
+        let loaders = paths.iter()
+            .map(|p| DataLoader::new(p, batch_size, seq_len))
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        eprintln!("DataMixer: {} sources, weights={:?}", paths.len(),
+            norm_weights.iter().map(|w| format!("{:.1}%", w * 100.0)).collect::<Vec<_>>());
+
+        Ok(Self { loaders, weights: norm_weights, cumulative })
+    }
+
+    /// Get next batch from a randomly selected source (weighted).
+    pub fn next_batch(&mut self) -> (&[u32], &[u32]) {
+        let r: f32 = rand::random();
+        let idx = self.cumulative.iter().position(|&c| r < c).unwrap_or(self.loaders.len() - 1);
+        self.loaders[idx].next_batch()
+    }
+
+    /// Total tokens across all sources.
+    pub fn total_tokens(&self) -> usize {
+        self.loaders.iter().map(|l| l.total_tokens()).sum()
+    }
+
+    /// Get the normalized weights for each source.
+    pub fn source_weights(&self) -> &[f32] {
+        &self.weights
+    }
+}
