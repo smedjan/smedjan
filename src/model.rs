@@ -1020,30 +1020,77 @@ pub fn grow_model(
         let sb = &small.blocks[i];
         let lb = &large.blocks[i];
 
-        // Attention weights: Q, K, V, O
-        let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
-        let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
-        copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sd, ld, ld);
-        copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, small_kv_dim, ld, large_kv_dim);
-        copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, small_kv_dim, ld, large_kv_dim);
-        copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sd, ld, ld);
+        // Attention weights — handle lowrank and full-rank
+        if sb.attn.attn_rank > 0 && lb.attn.attn_rank > 0 {
+            let sr = sb.attn.attn_rank;
+            let lr = lb.attn.attn_rank;
+            let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
+            let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
+            // U matrices: [d, r]
+            copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sr, ld, lr);
+            copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, sr, ld, lr);
+            copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, sr, ld, lr);
+            copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sr, ld, lr);
+            // V matrices: [r, d/kv_dim]
+            copy_weight_block(ctx, &sb.attn.w_q_v.buffer, &lb.attn.w_q_v.buffer, sr, sd, lr, ld);
+            copy_weight_block(ctx, &sb.attn.w_k_v.buffer, &lb.attn.w_k_v.buffer, sr, small_kv_dim, lr, large_kv_dim);
+            copy_weight_block(ctx, &sb.attn.w_v_v.buffer, &lb.attn.w_v_v.buffer, sr, small_kv_dim, lr, large_kv_dim);
+            copy_weight_block(ctx, &sb.attn.w_o_v.buffer, &lb.attn.w_o_v.buffer, sr, sd, lr, ld);
+        } else if sb.attn.attn_rank == 0 && lb.attn.attn_rank == 0 {
+            let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
+            let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
+            copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sd, ld, ld);
+            copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, small_kv_dim, ld, large_kv_dim);
+            copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, small_kv_dim, ld, large_kv_dim);
+            copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sd, ld, ld);
+        }
 
-        // FFN weights (only if both are full rank or same lowrank)
-        if large_config.lowrank == 0 && small.config.lowrank == 0 {
+        // FFN weights — handle both full-rank and lowrank cases
+        if small.config.lowrank > 0 && large_config.lowrank > 0 {
+            // Both lowrank: copy U and V matrices (may have different rank)
+            let sr = small.config.lowrank;
+            let lr = large_config.lowrank;
+            let sff = small.config.d_ff();
+            let lff = large_config.d_ff();
+            // U matrices: [d, r] — copy top-left [min(sd,ld), min(sr,lr)]
+            copy_weight_block(ctx, &sb.ffn_w1_u.buffer, &lb.ffn_w1_u.buffer, sd, sr, ld, lr);
+            copy_weight_block(ctx, &sb.ffn_w3_u.buffer, &lb.ffn_w3_u.buffer, sd, sr, ld, lr);
+            copy_weight_block(ctx, &sb.ffn_w2_u.buffer, &lb.ffn_w2_u.buffer, sff, sr, lff, lr);
+            // V matrices: [r, ff/d] — copy top-left [min_r, min(sff,lff)]
+            copy_weight_block(ctx, &sb.ffn_w1_v.buffer, &lb.ffn_w1_v.buffer, sr, sff, lr, lff);
+            copy_weight_block(ctx, &sb.ffn_w3_v.buffer, &lb.ffn_w3_v.buffer, sr, sff, lr, lff);
+            copy_weight_block(ctx, &sb.ffn_w2_v.buffer, &lb.ffn_w2_v.buffer, sr, sd, lr, ld);
+        } else if large_config.lowrank == 0 && small.config.lowrank == 0 {
             let sff = small.config.d_ff();
             let lff = large_config.d_ff();
             copy_weight_block(ctx, &sb.ffn_w1.buffer, &lb.ffn_w1.buffer, sd, sff, ld, lff);
             copy_weight_block(ctx, &sb.ffn_w2.buffer, &lb.ffn_w2.buffer, sff, sd, lff, ld);
             copy_weight_block(ctx, &sb.ffn_w3.buffer, &lb.ffn_w3.buffer, sd, sff, ld, lff);
         }
+        // Mixed (one lowrank, one full-rank): skip FFN copy — random init is fine
 
         // Norm weights: [sd] → [ld] (copy first sd elements)
         compute::gpu_buffer_copy(ctx, &sb.ln1_weight.buffer, &lb.ln1_weight.buffer, 0, 0, sd as u32);
         compute::gpu_buffer_copy(ctx, &sb.ln2_weight.buffer, &lb.ln2_weight.buffer, 0, 0, sd as u32);
+
+        // QK-norm: [head_dim] — copy if both have same or smaller head_dim
+        let s_hd = sd / small.config.n_heads;
+        let l_hd = ld / large_config.n_heads;
+        let min_hd = s_hd.min(l_hd);
+        compute::gpu_buffer_copy(ctx, &sb.attn.qk_norm_weight.buffer, &lb.attn.qk_norm_weight.buffer, 0, 0, min_hd as u32);
     }
 
     // Final norm
     compute::gpu_buffer_copy(ctx, &small.ln_final_weight.buffer, &large.ln_final_weight.buffer, 0, 0, sd as u32);
+
+    // MTP heads: copy if both have same n_predict
+    let min_predict = small.config.n_predict.min(large_config.n_predict);
+    for k in 0..min_predict {
+        // MTP projection: [d, d] → copy top-left block
+        copy_weight_block(ctx, &small.mtp_heads[k].buffer, &large.mtp_heads[k].buffer, sd, sd, ld, ld);
+        // MTP norm: [d] → copy first sd elements
+        compute::gpu_buffer_copy(ctx, &small.mtp_norms[k].buffer, &large.mtp_norms[k].buffer, 0, 0, sd as u32);
+    }
 
     eprintln!("Model grown: {}M → {}M params",
         small.config.param_count() as f32 / 1e6,
