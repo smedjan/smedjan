@@ -308,6 +308,17 @@ enum Commands {
         bits: u8,
     },
 
+    /// Export model to GGUF format for llama.cpp inference
+    ExportGguf {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long, default_value = "model.gguf")]
+        output: String,
+        /// Quantization: "f32" or "q8_0"
+        #[arg(long, default_value = "f32")]
+        quant: String,
+    },
+
     /// Direct Preference Optimization — align a model using preference pairs
     Dpo {
         /// Pre-trained/SFT model checkpoint (policy — will be updated)
@@ -853,6 +864,18 @@ fn main() {
         } => {
             quantize::quantize_checkpoint(&ckpt_path, &output, bits)
                 .expect("Quantization failed");
+        }
+
+        Commands::ExportGguf {
+            checkpoint: ckpt_path,
+            output,
+            quant,
+        } => {
+            let (model, step) = checkpoint::load_checkpoint(&ctx, &ckpt_path)
+                .expect("Failed to load checkpoint");
+            eprintln!("Loaded checkpoint: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
+            quantize::export_gguf(&model, &output, &quant)
+                .expect("GGUF export failed");
         }
 
         Commands::Dpo {

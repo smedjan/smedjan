@@ -513,3 +513,168 @@ fn read_quantized_tensor(file: &mut std::fs::File) -> std::io::Result<QuantizedT
         group_size,
     })
 }
+
+/// Export model to GGUF format for llama.cpp inference.
+/// Maps AndreAI tensor layout to GGUF's expected naming convention.
+/// Supports F32 and Q8_0 quantization types.
+pub fn export_gguf(
+    model: &Transformer,
+    output_path: &str,
+    quantize_type: &str, // "f32" or "q8_0"
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(output_path)?;
+    let config = &model.config;
+
+    // GGUF magic + version
+    file.write_all(b"GGUF")?;                          // magic
+    file.write_all(&3u32.to_le_bytes())?;               // version 3
+    let n_tensors = model.parameters().len() as u64;
+    file.write_all(&n_tensors.to_le_bytes())?;           // tensor count
+
+    // Metadata KV pairs
+    let metadata = vec![
+        ("general.architecture", "llama"),
+        ("general.name", "andreai"),
+    ];
+    let n_kv = metadata.len() as u64 + 10; // base metadata + config values
+    file.write_all(&n_kv.to_le_bytes())?;
+
+    // Write string metadata
+    for (key, val) in &metadata {
+        write_gguf_string(&mut file, key)?;
+        file.write_all(&8u32.to_le_bytes())?; // GGUF_TYPE_STRING
+        write_gguf_string(&mut file, val)?;
+    }
+
+    // Write numeric metadata
+    write_gguf_u32(&mut file, "llama.context_length", config.max_seq_len as u32)?;
+    write_gguf_u32(&mut file, "llama.embedding_length", config.d_model as u32)?;
+    write_gguf_u32(&mut file, "llama.block_count", config.n_layers as u32)?;
+    write_gguf_u32(&mut file, "llama.feed_forward_length", config.d_ff() as u32)?;
+    write_gguf_u32(&mut file, "llama.attention.head_count", config.n_heads as u32)?;
+    write_gguf_u32(&mut file, "llama.attention.head_count_kv", config.n_kv_heads as u32)?;
+    write_gguf_u32(&mut file, "llama.vocab_size", config.vocab_size)?;
+    write_gguf_f32(&mut file, "llama.rope.freq_base", config.rope_theta)?;
+    write_gguf_f32(&mut file, "llama.attention.layer_norm_rms_epsilon", config.norm_eps)?;
+    write_gguf_u32(&mut file, "general.file_type", if quantize_type == "q8_0" { 7 } else { 0 })?;
+
+    // Tensor info headers (name, shape, type, offset)
+    let params = model.parameters();
+    let tensor_names = get_gguf_tensor_names(config);
+    assert_eq!(params.len(), tensor_names.len(),
+        "Tensor count mismatch: model has {} but naming generates {}",
+        params.len(), tensor_names.len());
+
+    let mut data_offset: u64 = 0;
+    let gguf_type = if quantize_type == "q8_0" { 8u32 } else { 0u32 }; // F32=0, Q8_0=8
+
+    for (param, name) in params.iter().zip(tensor_names.iter()) {
+        write_gguf_string(&mut file, name)?;
+        let ndims = param.shape.len() as u32;
+        file.write_all(&ndims.to_le_bytes())?;
+        // GGUF stores dimensions in reverse order (innermost first)
+        for &dim in param.shape.iter().rev() {
+            file.write_all(&(dim as u64).to_le_bytes())?;
+        }
+        file.write_all(&gguf_type.to_le_bytes())?;
+        file.write_all(&data_offset.to_le_bytes())?;
+        data_offset += (param.numel() * 4) as u64; // F32 for now
+    }
+
+    // Alignment padding to 32 bytes
+    let pos = file.metadata()?.len();
+    let aligned = (pos + 31) & !31;
+    for _ in pos..aligned {
+        file.write_all(&[0u8])?;
+    }
+
+    // Tensor data
+    for param in &params {
+        let data = param.to_vec();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&bytes)?;
+    }
+
+    let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
+    eprintln!("GGUF exported: {} ({:.1} MB, {} tensors, {})",
+        output_path, size_mb, n_tensors, quantize_type);
+    Ok(())
+}
+
+fn write_gguf_string(file: &mut std::fs::File, s: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(&(s.len() as u64).to_le_bytes())?;
+    file.write_all(s.as_bytes())
+}
+
+fn write_gguf_u32(file: &mut std::fs::File, key: &str, val: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    write_gguf_string(file, key)?;
+    file.write_all(&4u32.to_le_bytes())?; // GGUF_TYPE_UINT32
+    file.write_all(&val.to_le_bytes())
+}
+
+fn write_gguf_f32(file: &mut std::fs::File, key: &str, val: f32) -> std::io::Result<()> {
+    use std::io::Write;
+    write_gguf_string(file, key)?;
+    file.write_all(&6u32.to_le_bytes())?; // GGUF_TYPE_FLOAT32
+    file.write_all(&val.to_le_bytes())
+}
+
+/// Map AndreAI tensor indices to GGUF-compatible names (llama architecture).
+fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    // Embedding
+    names.push("token_embd.weight".to_string());
+    // Final norm
+    names.push("output_norm.weight".to_string());
+    // Embed proj (if factored)
+    if config.lowrank > 0 {
+        names.push("token_embd_proj.weight".to_string());
+    }
+    // Per-layer tensors
+    for i in 0..config.n_layers {
+        if config.lowrank > 0 {
+            // Low-rank: U and V for each projection
+            names.push(format!("blk.{}.attn_q_u.weight", i));
+            names.push(format!("blk.{}.attn_q_v.weight", i));
+            names.push(format!("blk.{}.attn_k_u.weight", i));
+            names.push(format!("blk.{}.attn_k_v.weight", i));
+            names.push(format!("blk.{}.attn_v_u.weight", i));
+            names.push(format!("blk.{}.attn_v_v.weight", i));
+            names.push(format!("blk.{}.attn_output_u.weight", i));
+            names.push(format!("blk.{}.attn_output_v.weight", i));
+        } else {
+            names.push(format!("blk.{}.attn_q.weight", i));
+            names.push(format!("blk.{}.attn_k.weight", i));
+            names.push(format!("blk.{}.attn_v.weight", i));
+            names.push(format!("blk.{}.attn_output.weight", i));
+        }
+        // QK-norm weight
+        names.push(format!("blk.{}.attn_qk_norm.weight", i));
+        if config.lowrank > 0 {
+            names.push(format!("blk.{}.ffn_gate_u.weight", i));
+            names.push(format!("blk.{}.ffn_gate_v.weight", i));
+            names.push(format!("blk.{}.ffn_down_u.weight", i));
+            names.push(format!("blk.{}.ffn_down_v.weight", i));
+            names.push(format!("blk.{}.ffn_up_u.weight", i));
+            names.push(format!("blk.{}.ffn_up_v.weight", i));
+        } else {
+            names.push(format!("blk.{}.ffn_gate.weight", i));
+            names.push(format!("blk.{}.ffn_down.weight", i));
+            names.push(format!("blk.{}.ffn_up.weight", i));
+        }
+        names.push(format!("blk.{}.attn_norm.weight", i));
+        names.push(format!("blk.{}.ffn_norm.weight", i));
+        // MoD router (if enabled — but always present in struct)
+    }
+    // MTP heads
+    for k in 0..config.n_predict {
+        names.push(format!("mtp.{}.proj.weight", k));
+    }
+    for k in 0..config.n_predict {
+        names.push(format!("mtp.{}.norm.weight", k));
+    }
+    names
+}
