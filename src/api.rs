@@ -149,7 +149,11 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_batched_matmul_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
     compute::gpu_batched_matmul_trans_b_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
     compute::gpu_batched_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
-    tested += 3;
+    // FP16 non-batched matmul backward variant (kept for large-matrix backward path)
+    compute::gpu_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2);
+    // Utility cast helper (used by FP16 backward when enabled)
+    let _cast_test = crate::autograd::cast_buf_f16(ctx, &ba, 4);
+    tested += 5;
 
     // MoE gather/scatter
     let indices = ctx.buffer_from_u32_slice(&[0, 1]);
@@ -191,6 +195,35 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
         batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,
     };
     tested += 1;
+
+    // Verify grad recycling path exists (safe after sync flush)
+    crate::autograd::zero_grads_recycle();
+    // Column concat+slice (infrastructure for fused projections)
+    let col_src = ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0, 4.0]); // [2, 2]
+    let col_dst = ctx.alloc_buffer(2 * 4 * 4); // [2, 4]
+    compute::gpu_fill(ctx, &col_dst, 8, 0.0);
+    compute::gpu_concat_cols(ctx, &col_src, &col_dst, 2, 2, 4, 0);
+    compute::gpu_concat_cols(ctx, &col_src, &col_dst, 2, 2, 4, 2);
+    let col_slice = ctx.alloc_buffer(2 * 2 * 4); // [2, 2]
+    compute::gpu_slice_cols(ctx, &col_dst, &col_slice, 2, 4, 2, 2);
+    tested += 3;
+
+    // In-place rope backward (kept for potential future use)
+    let rope_buf = ctx.buffer_from_slice(&[1.0f32, 0.0, 0.0, 1.0]);
+    let rope_copy = ctx.alloc_buffer(4 * 4);
+    compute::gpu_copy(ctx, &rope_buf, &rope_copy, 4);
+    compute::gpu_rope_backward(ctx, &rope_copy, 1, 1, 4, 0, 10000.0);
+    tested += 2;
+
+    // L2 norm variants — verify sync and into-buffer paths agree
+    let norm_data = ctx.buffer_from_slice(&[3.0f32, 4.0]); // norm = 5.0
+    let norm_sync = compute::gpu_l2_norm(ctx, &norm_data, 2);
+    if (norm_sync - 5.0).abs() > 0.01 { passed = false; }
+    let norm_out = ctx.alloc_buffer(4);
+    compute::gpu_l2_norm_into(ctx, &norm_data, 2, &norm_out);
+    let norm_async = MetalContext::read_buffer(&norm_out, 1)[0];
+    if (norm_async - 5.0).abs() > 0.01 { passed = false; }
+    tested += 2;
 
     (tested, passed)
 }

@@ -58,9 +58,14 @@ pub enum Op {
     RmsNormResidual { eps: f32 },
     /// GQA KV head expansion: repeat each KV head group_size times.
     /// Backward: sum group_size gradient blocks back into each KV head.
-    RepeatKv { n_kv_heads: usize, group_size: usize, head_block: usize },
+    RepeatKv { n_kv_heads: usize, group_size: usize, seq_len: usize, head_dim: usize },
     /// Per-row scaling: out[r][c] = input[r][c] * scales[r]
     ScaleRows { rows: usize, cols: usize },
+    /// Column slice: extract columns [col_offset..col_offset+dst_cols) from [rows, src_cols].
+    /// Backward: scatter gradient columns back into a zero-filled [rows, src_cols] buffer.
+    SliceCols { rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize },
+    /// Fused scale + causal mask + softmax. Backward: softmax_backward * scale.
+    ScaledCausalSoftmax { scale: f32 },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
     /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
     FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
@@ -158,10 +163,22 @@ pub fn clear_tape_keep_grads() {
     });
 }
 
-/// Zero all stored gradient buffers. Call after optimizer.step() when using gradient
-/// accumulation to prepare for the next accumulation cycle.
+/// Zero all stored gradient buffers (drop without recycling).
+/// Safe to call even if optimizer is still running async on GPU.
 pub fn zero_grads() {
     GRADS.with(|grads| grads.borrow_mut().clear());
+}
+
+/// Zero all stored gradient buffers and recycle them to the buffer pool.
+/// ONLY call after the optimizer's GPU work is complete (sync flush),
+/// otherwise recycled buffers get reused while optimizer is still reading.
+pub fn zero_grads_recycle() {
+    GRADS.with(|grads| {
+        let mut g = grads.borrow_mut();
+        for (_id, buf) in g.drain() {
+            MetalContext::recycle_buffer(buf);
+        }
+    });
 }
 
 /// Scale all stored gradient buffers by a constant factor.
@@ -319,14 +336,20 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Op::Softmax => {
                     backward_softmax(ctx, entry, &out_grad);
                 }
+                Op::ScaledCausalSoftmax { scale } => {
+                    backward_scaled_causal_softmax(ctx, entry, &out_grad, *scale);
+                }
+                Op::SliceCols { rows, src_cols, dst_cols, col_offset } => {
+                    backward_slice_cols(ctx, entry, &out_grad, *rows, *src_cols, *dst_cols, *col_offset);
+                }
                 Op::RmsNorm { eps } => {
                     backward_rms_norm(ctx, entry, &out_grad, *eps);
                 }
                 Op::RmsNormResidual { eps } => {
                     backward_rms_norm_residual(ctx, entry, &out_grad, *eps);
                 }
-                Op::RepeatKv { n_kv_heads, group_size, head_block } => {
-                    backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *head_block);
+                Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
+                    backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
                 }
                 Op::ScaleRows { rows, cols } => {
                     backward_scale_rows(ctx, entry, &out_grad, *rows, *cols);
@@ -387,8 +410,10 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
     TAPE.with(|t| *t.borrow_mut() = tape);
 }
 
-/// Cast a float buffer to half for FP16 matmul backward. Returns FP16 buffer (size*2 bytes).
-fn cast_buf_f16(ctx: &Arc<MetalContext>, buf: &Retained<GpuBuffer>, num_elements: usize) -> Retained<GpuBuffer> {
+/// Cast a float buffer to half. Used for FP16 matmul backward (large matrices)
+/// and API diagnostics. The standard FP32 matmul kernels cast internally in shared
+/// memory, making this redundant for most backward passes.
+pub fn cast_buf_f16(ctx: &Arc<MetalContext>, buf: &Retained<GpuBuffer>, num_elements: usize) -> Retained<GpuBuffer> {
     let f16_buf = ctx.alloc_buffer(num_elements * 2);
     compute::gpu_cast_f32_to_f16(ctx, buf, &f16_buf, num_elements as u32);
     f16_buf
@@ -405,28 +430,25 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retain
     let k = a_shape[rank_a - 1];
     let n = b_shape[rank_b - 1];
 
-    // FP16 backward: cast to half for bandwidth savings (shared mem is half anyway)
-    let grad_f16 = cast_buf_f16(ctx, out_grad, m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], k * n);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], m * k);
-
+    // FP32 backward: the standard matmul kernels already cast float→half internally
+    // in shared memory tile loading. Separate FP16 pre-cast is redundant — it casts
+    // data to half, writes to buffer, then the matmul reads it back and casts again.
+    // Skipping the pre-cast eliminates 3 GPU dispatches + 3 buffer allocations per op.
     // dA = dC @ B^T : [M, N] @ [N, K] = [M, K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_trans_b_f16(ctx, &grad_f16, &b_f16, &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = A^T @ dC : [K, M] @ [M, N] = [K, N]
     let db_buf = ctx.alloc_buffer(k * n * 4);
-    compute::gpu_matmul_trans_a_f16(ctx, &a_f16, &grad_f16, &db_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, k * n);
 }
 
 fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
     // C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
     // dA = dC @ B : [M,N] @ [N,K] = [M,K]
-    // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]  — but dC^T @ A = (A^T @ dC)^T hmm
-    // Actually: dB_ij = sum_m dC_mi * A_mj → dB = dC^T @ A
-    // matmul_trans_b(dC, B_transposed_back) ... this gets complicated. Let's do it directly.
+    // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
 
     let a_shape = &entry.shapes[0];
     let b_shape = &entry.shapes[1];
@@ -434,19 +456,15 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     let k = a_shape[1];
     let n = b_shape[0];
 
-    // FP16 backward with clamped casts
-    let grad_f16 = cast_buf_f16(ctx, out_grad, m * n);
-    let b_f16 = cast_buf_f16(ctx, &entry.input_buffers[1], n * k);
-    let a_f16 = cast_buf_f16(ctx, &entry.input_buffers[0], m * k);
-
+    // FP32 backward — matmul kernels cast to half internally in shared memory
     // dA = dC @ B : [M,N] @ [N,K] = [M,K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_f16(ctx, &grad_f16, &b_f16, &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
 
     // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
     let db_buf = ctx.alloc_buffer(n * k * 4);
-    compute::gpu_matmul_trans_a_f16(ctx, &grad_f16, &a_f16, &db_buf, m as u32, n as u32, k as u32);
+    compute::gpu_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_buf, m as u32, n as u32, k as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, n * k);
 }
 
@@ -480,6 +498,37 @@ fn backward_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retai
     let grad_input = ctx.alloc_buffer(rows * cols * 4);
     compute::gpu_softmax_backward(ctx, softmax_out, out_grad, &grad_input, rows as u32, cols as u32);
     accumulate_grad(ctx, entry.inputs[0], &grad_input, rows * cols);
+}
+
+/// Backward for fused scaled_causal_softmax.
+/// d(softmax(x * scale, masked))/dx = softmax_backward(d_out, cached_output) * scale
+fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, scale: f32) {
+    let shape = &entry.shapes[0];
+    let cols = *shape.last().unwrap();
+    let rows: usize = shape.iter().product::<usize>() / cols;
+    let size = rows * cols;
+
+    let softmax_out = entry.cached.as_ref().expect("scaled_causal_softmax backward needs cached output");
+    let grad_input = ctx.alloc_buffer(size * 4);
+    compute::gpu_softmax_backward(ctx, softmax_out, out_grad, &grad_input, rows as u32, cols as u32);
+    // Chain rule: pre-softmax input = raw_scores * scale, so d/d(raw_scores) = d_presoftmax * scale
+    compute::gpu_scale(ctx, &grad_input, size as u32, scale);
+    accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
+}
+
+/// SliceCols backward: scatter gradient back to source column positions.
+/// out_grad: [rows, dst_cols] → grad_source: [rows, src_cols] (zeros with grad at col_offset)
+fn backward_slice_cols(
+    ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>,
+    rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize,
+) {
+    let source_size = rows * src_cols;
+    let grad_source = ctx.alloc_buffer(source_size * 4);
+    compute::gpu_fill(ctx, &grad_source, source_size as u32, 0.0);
+    // Scatter: place out_grad [rows, dst_cols] into grad_source [rows, src_cols] at col_offset
+    compute::gpu_concat_cols(ctx, out_grad, &grad_source,
+        rows as u32, dst_cols as u32, src_cols as u32, col_offset as u32);
+    accumulate_grad(ctx, entry.inputs[0], &grad_source, source_size);
 }
 
 fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, eps: f32) {
@@ -593,10 +642,10 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Ret
 }
 
 fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, factor: f32) {
+    // Fused: dst[i] = src[i] * factor in 1 dispatch (was copy + scale = 2)
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_copy(ctx, out_grad, &grad_input, size as u32);
-    compute::gpu_scale(ctx, &grad_input, size as u32, factor);
+    compute::gpu_scale_copy(ctx, out_grad, &grad_input, size as u32, factor);
     accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
 }
 
@@ -611,11 +660,11 @@ fn backward_rope(
     offset: u32,
     theta: f32,
 ) {
+    // Out-of-place: dst = rotate(src, -θ) in 1 dispatch (was copy + in-place = 2)
     let size: usize = entry.shapes[0].iter().product();
     let total_rows = entry.shapes[0][0] as u32;
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_copy(ctx, out_grad, &grad_input, size as u32);
-    compute::gpu_rope_backward(ctx, &grad_input, total_rows, seq_len, head_dim, offset, theta);
+    compute::gpu_rope_backward_copy(ctx, out_grad, &grad_input, total_rows, seq_len, head_dim, offset, theta);
     accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
 }
 
@@ -674,10 +723,12 @@ fn backward_checkpoint(
             Op::Add => backward_add(ctx, &sub_entry, &sub_out_grad),
             Op::Mul => backward_mul(ctx, &sub_entry, &sub_out_grad),
             Op::Softmax => backward_softmax(ctx, &sub_entry, &sub_out_grad),
+            Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, &sub_entry, &sub_out_grad, *scale),
+            Op::SliceCols { rows, src_cols, dst_cols, col_offset } => backward_slice_cols(ctx, &sub_entry, &sub_out_grad, *rows, *src_cols, *dst_cols, *col_offset),
             Op::RmsNorm { eps } => backward_rms_norm(ctx, &sub_entry, &sub_out_grad, *eps),
             Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, &sub_entry, &sub_out_grad, *eps),
-            Op::RepeatKv { n_kv_heads, group_size, head_block } => {
-                backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *head_block);
+            Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
+                backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
             }
             Op::ScaleRows { rows, cols } => {
                 backward_scale_rows(ctx, &sub_entry, &sub_out_grad, *rows, *cols);
@@ -889,30 +940,17 @@ fn backward_repeat_kv(
     out_grad: &Retained<GpuBuffer>,
     n_kv_heads: usize,
     group_size: usize,
-    head_block: usize,
+    seq_len: usize,
+    head_dim: usize,
 ) {
-    // For each KV head, sum the gradients from its group_size copies
+    let head_block = seq_len * head_dim;
     let kv_grad = ctx.alloc_buffer(n_kv_heads * head_block * 4);
 
-    for h in 0..n_kv_heads {
-        // First copy: initialize the KV head's gradient with the first group member
-        let src_offset = (h * group_size) * head_block;
-        let dst_offset = h * head_block;
-        compute::gpu_buffer_copy(ctx, out_grad, &kv_grad, src_offset as u32, dst_offset as u32, head_block as u32);
-
-        // Remaining copies: add (in-place) the other group members
-        for g in 1..group_size {
-            let src_offset = (h * group_size + g) * head_block;
-            // Need a temp buffer to add from
-            let tmp = ctx.alloc_buffer(head_block * 4);
-            compute::gpu_buffer_copy(ctx, out_grad, &tmp, src_offset as u32, 0, head_block as u32);
-            // Add tmp into kv_grad at the right offset — use a sub-buffer view
-            let dst_sub = ctx.alloc_buffer(head_block * 4);
-            compute::gpu_buffer_copy(ctx, &kv_grad, &dst_sub, dst_offset as u32, 0, head_block as u32);
-            compute::gpu_add_inplace(ctx, &dst_sub, &tmp, head_block as u32);
-            compute::gpu_buffer_copy(ctx, &dst_sub, &kv_grad, 0, dst_offset as u32, head_block as u32);
-        }
-    }
+    // Single kernel: each thread sums group_size gradient blocks for one element
+    compute::gpu_repeat_kv_backward(
+        ctx, out_grad, &kv_grad,
+        n_kv_heads as u32, group_size as u32, seq_len as u32, head_dim as u32,
+    );
 
     accumulate_grad(ctx, entry.inputs[0], &kv_grad, n_kv_heads * head_block);
 }

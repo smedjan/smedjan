@@ -69,15 +69,27 @@ pub fn gpu_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &Gpu
     let params = Params { m, n, k };
     let params_buf = params_buffer(ctx, &params);
 
-    let tile = 32u64;
-    let groups_x = (n as u64).div_ceil(tile);
-    let groups_y = (m as u64).div_ceil(tile);
-    let grid = MetalContext::size(groups_x, groups_y, 1);
-    let tg = MetalContext::size(64, 1, 1);
-
-    dispatch_sync!(ctx, "matmul_tiled", grid, tg,
-        0 => a, 1 => b, 2 => c, 3 => &params_buf
-    );
+    // Auto-select narrow kernel when N is small — eliminates 50% wasted compute at N=16
+    if n <= 32 {
+        let tile_n = 16u64;
+        let tile_m = 32u64;
+        let groups_x = (n as u64).div_ceil(tile_n);
+        let groups_y = (m as u64).div_ceil(tile_m);
+        let grid = MetalContext::size(groups_x, groups_y, 1);
+        let tg = MetalContext::size(32, 1, 1);
+        dispatch_sync!(ctx, "matmul_narrow", grid, tg,
+            0 => a, 1 => b, 2 => c, 3 => &params_buf
+        );
+    } else {
+        let tile = 32u64;
+        let groups_x = (n as u64).div_ceil(tile);
+        let groups_y = (m as u64).div_ceil(tile);
+        let grid = MetalContext::size(groups_x, groups_y, 1);
+        let tg = MetalContext::size(64, 1, 1);
+        dispatch_sync!(ctx, "matmul_tiled", grid, tg,
+            0 => a, 1 => b, 2 => c, 3 => &params_buf
+        );
+    }
 }
 
 /// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
@@ -390,6 +402,29 @@ pub fn gpu_rope_backward(
 
     dispatch_threads_sync!(ctx, "rope_backward", total, tg,
         0 => data, 1 => &params_buf,
+    );
+}
+
+/// Out-of-place RoPE backward: dst = rotate(src, -θ). Single dispatch replaces copy + in-place.
+pub fn gpu_rope_backward_copy(
+    ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
+    total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32,
+) {
+    #[repr(C)]
+    struct Params { seq_len: u32, head_dim: u32, total_rows: u32, offset: u32, theta: f32 }
+    let params = Params { seq_len, head_dim, total_rows, offset, theta };
+    let params_buf = params_buffer(ctx, &params);
+
+    let half_dim = head_dim / 2;
+    let total = MetalContext::size(seq_len as u64, total_rows as u64, half_dim as u64);
+    let tg = MetalContext::size(
+        8.min(seq_len as u64).max(1),
+        8.min(total_rows as u64).max(1),
+        8.min(half_dim as u64).max(1),
+    );
+
+    dispatch_threads_sync!(ctx, "rope_backward_copy", total, tg,
+        0 => src, 1 => dst, 2 => &params_buf,
     );
 }
 
@@ -1342,4 +1377,94 @@ pub fn gpu_kl_divergence(
     dispatch_sync!(ctx, "kl_divergence", grid, tg,
         0 => teacher_logits, 1 => student_logits, 2 => losses, 3 => grad_student, 4 => &params_buf
     );
+}
+
+/// Fused scale + causal mask + softmax. Input: [total_rows, seq_k].
+pub fn gpu_scaled_causal_softmax(
+    ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
+    total_rows: u32, seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32,
+) {
+    #[repr(C)]
+    struct Params { seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32 }
+    let params = Params { seq_q, seq_k, scale, kv_offset };
+    let params_buf = params_buffer(ctx, &params);
+    let threads_per_group = next_power_of_2_clamped(seq_k as u64);
+    let grid = MetalContext::size(total_rows as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
+    dispatch_sync!(ctx, "scaled_causal_softmax", grid, tg,
+        0 => input, 1 => output, 2 => &params_buf
+    );
+}
+
+/// Out-of-place scale: dst[i] = src[i] * factor. Replaces copy+scale_inplace (2→1 dispatch).
+pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32, scale: f32) {
+    #[repr(C)]
+    struct Params { size: u32, scale: f32 }
+    let params = Params { size, scale };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "scale_copy", grid, tg, 0 => src, 1 => dst, 2 => &params_buf);
+}
+
+/// Column-wise copy: src[rows, src_cols] → dst[rows, dst_cols] at col_offset.
+pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
+    rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)
+{
+    #[repr(C)]
+    struct Params { rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32 }
+    let params = Params { rows, src_cols, dst_cols, col_offset };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (rows as u64) * (src_cols as u64);
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "concat_cols", grid, tg, 0 => src, 1 => dst, 2 => &params_buf);
+}
+
+/// Column-wise slice: extract cols [offset..offset+dst_cols) from [rows, src_cols].
+pub fn gpu_slice_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
+    rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)
+{
+    #[repr(C)]
+    struct Params { rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32 }
+    let params = Params { rows, src_cols, dst_cols, col_offset };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (rows as u64) * (dst_cols as u64);
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "slice_cols", grid, tg, 0 => src, 1 => dst, 2 => &params_buf);
+}
+
+/// Single-kernel KV head expansion for GQA forward.
+pub fn gpu_repeat_kv(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
+    n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)
+{
+    #[repr(C)]
+    struct Params { n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32 }
+    let params = Params { n_kv_total, group_size, seq_len, head_dim };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (n_kv_total as u64) * (group_size as u64) * (seq_len as u64) * (head_dim as u64);
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "repeat_kv", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
+}
+
+/// Single-kernel backward for repeat_kv: sum group_size gradient blocks.
+pub fn gpu_repeat_kv_backward(ctx: &Arc<MetalContext>, out_grad: &GpuBuffer, kv_grad: &GpuBuffer,
+    n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)
+{
+    #[repr(C)]
+    struct Params { n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32 }
+    let params = Params { n_kv_total, group_size, seq_len, head_dim };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (n_kv_total as u64) * (seq_len as u64) * (head_dim as u64);
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "repeat_kv_backward", grid, tg, 0 => out_grad, 1 => kv_grad, 2 => &params_buf);
 }

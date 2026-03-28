@@ -29,6 +29,8 @@ thread_local! {
     static BUFFER_POOL: RefCell<BufferPool> =
         RefCell::new(HashMap::new());
     static POOL_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (hits, misses)
+    // Allocation size log for debugging pool behavior. Enable with enable_alloc_log().
+    static ALLOC_SIZE_LOG: RefCell<(bool, HashMap<usize, usize>)> = RefCell::new((false, HashMap::new()));
 }
 
 // Link CoreGraphics — required for MTLCreateSystemDefaultDevice
@@ -140,6 +142,14 @@ impl MetalContext {
             ("batched_matmul_tiled_f16", shaders::BATCHED_MATMUL_TILED_F16),
             ("batched_matmul_tiled_trans_b_f16", shaders::BATCHED_MATMUL_TILED_TRANS_B_F16),
             ("batched_matmul_tiled_trans_a_f16", shaders::BATCHED_MATMUL_TILED_TRANS_A_F16),
+            ("repeat_kv", shaders::REPEAT_KV),
+            ("repeat_kv_backward", shaders::REPEAT_KV_BACKWARD),
+            ("scaled_causal_softmax", shaders::SCALED_CAUSAL_SOFTMAX),
+            ("scale_copy", shaders::SCALE_COPY),
+            ("rope_backward_copy", shaders::ROPE_BACKWARD_COPY),
+            ("matmul_narrow", shaders::MATMUL_NARROW),
+            ("concat_cols", shaders::CONCAT_COLS),
+            ("slice_cols", shaders::SLICE_COLS),
         ];
 
         let compile_options = MTLCompileOptions::new();
@@ -179,6 +189,14 @@ impl MetalContext {
     /// Allocate a shared-mode Metal buffer (CPU + GPU accessible, zero-copy on M1).
     /// Checks the buffer pool first for a cached buffer of the same size.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Retained<GpuBuffer> {
+        // Debug: track allocation sizes on first step
+        ALLOC_SIZE_LOG.with(|log| {
+            let mut l = log.borrow_mut();
+            if l.0 { // logging enabled
+                *l.1.entry(size_bytes).or_insert(0) += 1;
+            }
+        });
+
         // Try pool first
         let pooled = BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
@@ -218,6 +236,29 @@ impl MetalContext {
     /// Get buffer pool statistics: (hits, misses)
     pub fn pool_stats() -> (usize, usize) {
         POOL_STATS.with(|s| *s.borrow())
+    }
+
+    /// Enable/disable allocation size logging for debugging.
+    pub fn enable_alloc_log(enabled: bool) {
+        ALLOC_SIZE_LOG.with(|log| {
+            let mut l = log.borrow_mut();
+            l.0 = enabled;
+            l.1.clear();
+        });
+    }
+
+    /// Dump allocation size log: prints each unique size and count, sorted by count desc.
+    pub fn dump_alloc_log(label: &str) {
+        ALLOC_SIZE_LOG.with(|log| {
+            let l = log.borrow();
+            let mut sizes: Vec<_> = l.1.iter().collect();
+            sizes.sort_by(|a, b| b.1.cmp(a.1));
+            let total: usize = sizes.iter().map(|(_, c)| **c).sum();
+            eprintln!("[ALLOC LOG] {} — {} unique sizes, {} total allocs:", label, sizes.len(), total);
+            for (size, count) in sizes.iter().take(20) {
+                eprintln!("  {:>10} bytes × {:>4}", size, count);
+            }
+        });
     }
 
     /// Clear the buffer pool (e.g., between training runs to free memory)

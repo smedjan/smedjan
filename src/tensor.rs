@@ -760,6 +760,82 @@ impl Tensor {
         }
     }
 
+    /// Fused scale + causal mask + softmax in one kernel.
+    /// self shape: [batch_heads, seq_q, seq_k] (raw attention scores)
+    /// Returns softmax(self * scale, causal_masked).
+    pub fn scaled_causal_softmax(&self, scale: f32, kv_offset: u32) -> Tensor {
+        assert_eq!(self.shape.len(), 3, "scaled_causal_softmax needs 3D [batch_heads, seq_q, seq_k]");
+        let batch_heads = self.shape[0];
+        let seq_q = self.shape[1];
+        let seq_k = self.shape[2];
+        let total_rows = batch_heads * seq_q;
+
+        let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
+        compute::gpu_scaled_causal_softmax(
+            &self.ctx, &self.buffer, &out_buf,
+            total_rows as u32, seq_q as u32, seq_k as u32, scale, kv_offset,
+        );
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf.clone(),
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::ScaledCausalSoftmax { scale },
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: Some(out_buf),
+            });
+        }
+
+        out
+    }
+
+    /// Column-wise slice: extract columns [col_offset..col_offset+dst_cols) from [rows, src_cols].
+    /// Returns [rows, dst_cols]. Tape-tracked for gradient flow.
+    pub fn slice_cols(&self, col_offset: usize, dst_cols: usize) -> Tensor {
+        assert_eq!(self.shape.len(), 2, "slice_cols needs 2D, got {:?}", self.shape);
+        let rows = self.shape[0];
+        let src_cols = self.shape[1];
+        assert!(col_offset + dst_cols <= src_cols);
+
+        let out_buf = self.ctx.alloc_buffer(rows * dst_cols * 4);
+        compute::gpu_slice_cols(&self.ctx, &self.buffer, &out_buf,
+            rows as u32, src_cols as u32, dst_cols as u32, col_offset as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![rows, dst_cols],
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::SliceCols { rows, src_cols, dst_cols, col_offset },
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Slice a contiguous region from the flat buffer. Tape-tracked for gradient flow.
     /// Returns a tensor with `length` elements starting at `offset` in the flat buffer.
     pub fn slice_flat(&self, offset: usize, length: usize, new_shape: Vec<usize>) -> Tensor {
@@ -928,9 +1004,9 @@ impl Tensor {
 
     /// Scale: self * scalar
     pub fn scale(&self, factor: f32) -> Tensor {
+        // Fused out-of-place: dst = src * factor in 1 dispatch (was copy + scale = 2)
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
-        compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_scale(&self.ctx, &out_buf, self.numel() as u32, factor);
+        compute::gpu_scale_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32, factor);
 
         let out_id = autograd::next_id();
         let out = Tensor {

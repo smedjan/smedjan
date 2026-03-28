@@ -172,12 +172,31 @@ impl MultiHeadAttention {
         // Flatten batch*seq for matmul: [batch*seq, d_model]
         let x_flat = x.reshape(vec![batch * seq_len, d_model]);
 
-        // Project Q, K, V — low-rank: x @ U @ V, full-rank: x @ W
+        // Project Q, K, V
         let (q, k, v) = if self.attn_rank > 0 {
+            // Fused Q+K+V U-projection: concat [Uq | Uk | Uv] column-wise into [d, 3r],
+            // one matmul reading x once instead of 3×, then slice + V-project.
+            let r = self.attn_rank;
+            let r3 = r * 3;
+            let w_fused_buf = x_flat.ctx.alloc_buffer(d_model * r3 * 4);
+            compute::gpu_concat_cols(&x_flat.ctx, &self.w_q.buffer, &w_fused_buf,
+                d_model as u32, r as u32, r3 as u32, 0);
+            compute::gpu_concat_cols(&x_flat.ctx, &self.w_k.buffer, &w_fused_buf,
+                d_model as u32, r as u32, r3 as u32, r as u32);
+            compute::gpu_concat_cols(&x_flat.ctx, &self.w_v.buffer, &w_fused_buf,
+                d_model as u32, r as u32, r3 as u32, (r * 2) as u32);
+            let w_fused = Tensor::from_buffer(Arc::clone(&x_flat.ctx), w_fused_buf, vec![d_model, r3]);
+
+            let fused_int = x_flat.matmul(&w_fused); // [n_tokens, 3r]
+
+            let q_int = fused_int.slice_cols(0, r);
+            let k_int = fused_int.slice_cols(r, r);
+            let v_int = fused_int.slice_cols(r * 2, r);
+
             (
-                x_flat.matmul(&self.w_q).matmul(&self.w_q_v),
-                x_flat.matmul(&self.w_k).matmul(&self.w_k_v),
-                x_flat.matmul(&self.w_v).matmul(&self.w_v_v),
+                q_int.matmul(&self.w_q_v),
+                k_int.matmul(&self.w_k_v),
+                v_int.matmul(&self.w_v_v),
             )
         } else {
             (
@@ -226,27 +245,47 @@ impl MultiHeadAttention {
         // --- Attention computation ---
         let bh = batch * self.n_heads;
         let seq_q_len = q.shape[1];
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Flash Attention for inference (1 kernel, O(n) memory).
-        // Standard 4-op path for training (faster due to tiled shared memory matmul).
-        // Flash backward kernel exists but the forward is not yet optimized for training.
-        // At seq_len=256, tiled batched matmul is faster. At seq_len≥1024, Flash wins.
-        let attn_cat = if !autograd::is_recording() {
+        // Flash Attention for seq_len≥128 (fused, O(n) memory).
+        // Standard path for seq_len<128 (tiled matmuls faster at small seq).
+        // Flash Attention wins at very long sequences (≥2048) where O(n²) memory
+        // becomes the bottleneck. At shorter seq, the standard tiled matmul path is
+        // faster due to higher GPU occupancy (256 threads vs 32 in Flash).
+        let attn_cat = if seq_q_len >= 2048 {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
                 &q.buffer, &k_expanded.buffer, &v_expanded.buffer, &attn_out_buf,
                 bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, offset,
             );
-            Tensor {
-                id: autograd::next_id(),
-                buffer: attn_out_buf,
+
+            let attn_out_id = autograd::next_id();
+            let attn = Tensor {
+                id: attn_out_id,
+                buffer: attn_out_buf.clone(),
                 shape: vec![bh, seq_q_len, self.head_dim],
-                requires_grad: false,
+                requires_grad: q.requires_grad,
                 ctx: Arc::clone(&q.ctx),
+            };
+
+            if autograd::is_recording() {
+                autograd::record(autograd::TapeEntry {
+                    op: autograd::Op::FlashAttention {
+                        batch_heads: bh, seq_q: seq_q_len, seq_k, head_dim: self.head_dim, kv_offset: offset,
+                    },
+                    inputs: vec![q.id, k_expanded.id, v_expanded.id],
+                    output: attn_out_id,
+                    input_buffers: vec![q.buffer.clone(), k_expanded.buffer.clone(), v_expanded.buffer.clone()],
+                    output_buffer: attn_out_buf.clone(),
+                    shapes: vec![q.shape.clone(), k_expanded.shape.clone(), v_expanded.shape.clone(),
+                                 attn.shape.clone()],
+                    cached: Some(attn_out_buf),
+                });
             }
+            attn
         } else {
+            // Standard 4-op path: faster at short sequences due to tiled matmul efficiency
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores = q.batched_matmul_trans_b(&k_expanded);
             let scores = scores.scale(scale);
             let scores = scores.causal_mask(offset);
@@ -505,20 +544,10 @@ fn repeat_kv(
     let head_block = seq_len * head_dim;
     let out_buf = kv.ctx.alloc_buffer(n_heads_total * head_block * 4);
 
-    for h in 0..n_kv_total {
-        let src_offset = h * head_block;
-        for g in 0..group_size {
-            let dst_offset = (h * group_size + g) * head_block;
-            compute::gpu_buffer_copy(
-                &kv.ctx,
-                &kv.buffer,
-                &out_buf,
-                src_offset as u32,
-                dst_offset as u32,
-                head_block as u32,
-            );
-        }
-    }
+    compute::gpu_repeat_kv(
+        &kv.ctx, &kv.buffer, &out_buf,
+        n_kv_total as u32, group_size as u32, seq_len as u32, head_dim as u32,
+    );
 
     let out_id = autograd::next_id();
     let out = Tensor {
@@ -532,7 +561,7 @@ fn repeat_kv(
     // Record on tape: backward sums group_size gradient blocks into each KV head
     if kv.requires_grad || autograd::is_recording() {
         autograd::record(autograd::TapeEntry {
-            op: autograd::Op::RepeatKv { n_kv_heads: n_kv_total, group_size, head_block },
+            op: autograd::Op::RepeatKv { n_kv_heads: n_kv_total, group_size, seq_len, head_dim },
             inputs: vec![kv.id],
             output: out_id,
             input_buffers: vec![kv.buffer.clone()],

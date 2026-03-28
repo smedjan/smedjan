@@ -351,13 +351,11 @@ impl TransformerBlock {
         let seq_len = x.shape[1];
         let d = x.shape[2];
 
-        // Attention sub-layer with residual
+        // Attention sub-layer with fused residual+norm
         let normed = x.rms_norm(&self.ln1_weight, self.norm_eps);
         let attn_out = self.attn.forward(&normed, kv_cache);
-        let h = x.add(&attn_out);
-
-        // FFN with residual — dense or MoE
-        let normed2 = h.rms_norm(&self.ln2_weight, self.norm_eps);
+        // Fused: h = x + attn_out, normed2 = rms_norm(h) — 1 kernel instead of 2
+        let (normed2, h) = attn_out.rms_norm_residual_with_sum(x, &self.ln2_weight, self.norm_eps);
         let ffn_out = if self.n_experts > 1 {
             self.moe_ffn(&normed2, batch, seq_len, d)
         } else {
@@ -434,9 +432,27 @@ impl TransformerBlock {
 
         // Gate and up projections — dispatch based on mode
         let (gate, up) = if self.lowrank > 0 {
-            // Low-rank: x @ U @ V instead of x @ W (two smaller matmuls)
-            let g = x_flat.matmul(&self.ffn_w1_u).matmul(&self.ffn_w1_v);
-            let u = x_flat.matmul(&self.ffn_w3_u).matmul(&self.ffn_w3_v);
+            // Fused gate+up U-projection: concat [W1_U | W3_U] column-wise into [d, 2r],
+            // do ONE matmul reading x once, slice into gate_int and up_int, then V-project.
+            // Saves 1 read of x (64MB at batch=1024 d=256).
+            let r = self.lowrank;
+            let r2 = r * 2;
+            let w_fused_buf = x_flat.ctx.alloc_buffer(d * r2 * 4);
+            compute::gpu_concat_cols(&x_flat.ctx, &self.ffn_w1_u.buffer, &w_fused_buf,
+                d as u32, r as u32, r2 as u32, 0);
+            compute::gpu_concat_cols(&x_flat.ctx, &self.ffn_w3_u.buffer, &w_fused_buf,
+                d as u32, r as u32, r2 as u32, r as u32);
+            let w_fused = Tensor::from_buffer(Arc::clone(&x_flat.ctx), w_fused_buf, vec![d, r2]);
+
+            // Single matmul: [n_tokens, d] @ [d, 2r] → [n_tokens, 2r]
+            let fused_int = x_flat.matmul(&w_fused);
+
+            // Tape-tracked column slices: gradients flow back correctly
+            let gate_int = fused_int.slice_cols(0, r);
+            let up_int = fused_int.slice_cols(r, r);
+
+            let g = gate_int.matmul(&self.ffn_w1_v);
+            let u = up_int.matmul(&self.ffn_w3_v);
             (g, u)
         } else if self.bitnet {
             (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))

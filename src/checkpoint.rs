@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 2; // v2: added n_kv_heads for GQA support
+const VERSION: u32 = 3; // v3: added lowrank, bitnet, n_experts, top_k, shared_layers, mup
 
 /// Save model weights and config to a binary checkpoint file.
 pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::Result<()> {
@@ -113,7 +113,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version == 2, "Unsupported training state version: {}", version);
+    assert!(version >= 2 && version <= 3, "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -187,7 +187,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version == 1 || version == 2, "Unsupported checkpoint version: {} (expected 1 or 2)", version);
+    assert!(version >= 1 && version <= 3, "Unsupported checkpoint version: {} (expected 1-3)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -265,6 +265,13 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&config.norm_eps.to_le_bytes())?;
     // v2: GQA support
     file.write_all(&(config.n_kv_heads as u32).to_le_bytes())?;
+    // v3: lowrank, MoE, bitnet, shared_layers, mup
+    file.write_all(&(config.lowrank as u32).to_le_bytes())?;
+    file.write_all(&(config.n_experts as u32).to_le_bytes())?;
+    file.write_all(&(config.top_k_experts as u32).to_le_bytes())?;
+    file.write_all(&(if config.bitnet { 1u32 } else { 0u32 }).to_le_bytes())?;
+    file.write_all(&(if config.shared_layers { 1u32 } else { 0u32 }).to_le_bytes())?;
+    file.write_all(&(config.mup_base_width as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -303,6 +310,25 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         n_heads
     };
 
+    // v3: lowrank, MoE, bitnet, shared_layers, mup
+    let (lowrank, n_experts, top_k_experts, bitnet, shared_layers, mup_base_width) = if version >= 3 {
+        file.read_exact(&mut buf4)?;
+        let lr = u32::from_le_bytes(buf4) as usize;
+        file.read_exact(&mut buf4)?;
+        let ne = u32::from_le_bytes(buf4) as usize;
+        file.read_exact(&mut buf4)?;
+        let tk = u32::from_le_bytes(buf4) as usize;
+        file.read_exact(&mut buf4)?;
+        let bn = u32::from_le_bytes(buf4) != 0;
+        file.read_exact(&mut buf4)?;
+        let sl = u32::from_le_bytes(buf4) != 0;
+        file.read_exact(&mut buf4)?;
+        let mup = u32::from_le_bytes(buf4) as usize;
+        (lr, ne, tk, bn, sl, mup)
+    } else {
+        (0, 1, 1, false, false, 0)
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
@@ -313,11 +339,11 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         max_seq_len,
         rope_theta,
         norm_eps,
-        n_experts: 1,
-        top_k_experts: 1,
-        mup_base_width: 0,
-        shared_layers: false,
-        bitnet: false,
-        lowrank: 0,
+        n_experts,
+        top_k_experts,
+        mup_base_width,
+        shared_layers,
+        bitnet,
+        lowrank,
     })
 }

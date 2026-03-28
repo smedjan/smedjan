@@ -396,7 +396,6 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         ctx.flush_batch();
 
         // Gradient clipping + optimizer step (batched)
-        ctx.begin_batch();
         clip_gradients_sft(ctx, &model, config.max_grad_norm);
 
         // Optimizer step
@@ -464,32 +463,9 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
     Ok(())
 }
 
-/// Clip gradients by global L2 norm. Zeroes NaN/Inf gradients.
-/// (Same logic as train::clip_gradients but avoids cross-module privacy issues.)
+/// Clip gradients — delegates to the shared batched implementation.
 fn clip_gradients_sft(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
-    let params = model.parameters();
-
-    let mut total_norm_sq = 0.0f32;
-    for param in &params {
-        if let Some(grad) = autograd::get_grad(param.id) {
-            let norm = compute::gpu_l2_norm(ctx, &grad, param.numel() as u32);
-            if norm.is_nan() || norm.is_infinite() {
-                compute::gpu_fill(ctx, &grad, param.numel() as u32, 0.0);
-            } else {
-                total_norm_sq += norm * norm;
-            }
-        }
-    }
-    let total_norm = total_norm_sq.sqrt();
-
-    if total_norm > max_norm && total_norm.is_finite() {
-        let scale = max_norm / (total_norm + 1e-6);
-        for param in &params {
-            if let Some(grad) = autograd::get_grad(param.id) {
-                compute::gpu_scale(ctx, &grad, param.numel() as u32, scale);
-            }
-        }
-    }
+    crate::train::clip_gradients(ctx, model, max_norm);
 }
 
 /// Convert NL2Bash-style data into JSONL SFT format.

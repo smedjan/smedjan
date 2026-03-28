@@ -289,7 +289,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             // Backward pass in the SAME command batch as forward — one fewer GPU sync
             autograd::backward(ctx, loss_tensor.id);
-            ctx.flush_batch();
+            // DON'T flush — gradient norm kernels encode into same batch below
 
             // Free the tape (activations) but keep accumulated gradients
             autograd::clear_tape_keep_grads();
@@ -298,10 +298,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             last_loss_tensor = Some(loss_tensor);
         }
 
-        // === After all micro-steps: clip, step, zero ===
-        // Gradient clipping every step (required for stability).
-        // clip_gradients does its own GPU batching internally.
-        clip_gradients(ctx, &model, config.max_grad_norm);
+        // Gradient clipping: norm computation fused into same batch as backward.
+        // Eliminates 1 GPU sync point per step (3→2 syncs).
+        clip_gradients_fused(ctx, &model, config.max_grad_norm);
 
         // Optimizer step — flush async so CPU can prep next batch while GPU updates weights
         ctx.begin_batch();
@@ -447,7 +446,67 @@ fn compute_validation_loss(
 }
 
 /// Clip gradients by global L2 norm. Also zeroes NaN/Inf gradients.
-fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
+/// Fused variant: expects a command batch already open (from backward pass).
+/// Encodes norm kernels into the existing batch — 1 sync for backward+norms.
+fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
+    let params = model.parameters();
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+
+    // Encode norm kernels into the EXISTING batch (no begin_batch — reuses backward's)
+    for param in &params {
+        if let Some(grad) = autograd::get_grad(param.id) {
+            let norm_out = ctx.alloc_buffer(std::mem::size_of::<f32>() * 2);
+            compute::gpu_l2_norm_check_into(ctx, &grad, param.numel() as u32, &norm_out);
+            norm_bufs.push(Some((norm_out, param.numel())));
+        } else {
+            norm_bufs.push(None);
+        }
+    }
+    ctx.flush_batch(); // Single flush: backward + norms
+
+    let mut total_norm_sq = 0.0f32;
+    let mut nan_indices = Vec::new();
+    for (i, entry) in norm_bufs.iter().enumerate() {
+        if let Some((norm_buf, _size)) = entry {
+            let vals = MetalContext::read_buffer(norm_buf, 2);
+            let sum_sq = vals[0];
+            let has_nan = vals[1] > 0.5;
+            if has_nan || sum_sq.is_nan() || sum_sq.is_infinite() {
+                nan_indices.push(i);
+            } else {
+                total_norm_sq += sum_sq;
+            }
+        }
+    }
+    let total_norm = total_norm_sq.sqrt();
+
+    if !nan_indices.is_empty() {
+        eprintln!("[WARN] NaN/Inf detected in {} gradient(s) (param indices: {:?}) — zeroing affected gradients",
+            nan_indices.len(), &nan_indices[..nan_indices.len().min(10)]);
+    }
+    let needs_scale = total_norm > max_norm && total_norm.is_finite();
+    let scale = if needs_scale { max_norm / (total_norm + 1e-6) } else { 1.0 };
+
+    if !nan_indices.is_empty() || needs_scale {
+        ctx.begin_batch();
+        for &i in &nan_indices {
+            if let Some(grad) = autograd::get_grad(params[i].id) {
+                compute::gpu_fill(ctx, &grad, params[i].numel() as u32, 0.0);
+            }
+        }
+        if needs_scale {
+            for param in &params {
+                if let Some(grad) = autograd::get_grad(param.id) {
+                    compute::gpu_scale(ctx, &grad, param.numel() as u32, scale);
+                }
+            }
+        }
+        ctx.flush_batch();
+    }
+}
+
+/// Standalone clip_gradients — public so SFT/DPO can use the batched implementation.
+pub fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
 
     // Phase 1: Compute all per-parameter L2 norms + NaN checks on GPU (batched).

@@ -105,6 +105,97 @@ kernel void matmul_tiled(
 }
 "#;
 
+/// Narrow matmul for small N (≤32): C = A @ B where A:[M,K], B:[K,N], C:[M,N].
+/// TILE_M=32, TILE_N=16, 32 threads. Each thread computes 4×4 subtile.
+/// Eliminates 50% wasted compute when N=16 with the standard 32-wide tile.
+pub const MATMUL_NARROW: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulParams {
+    uint M;
+    uint N;
+    uint K;
+};
+
+#define NM_TILE_M 32
+#define NM_TILE_N 16
+#define NM_TILE_K 32
+#define NM_THREAD_TILE 4
+#define NM_THREADS 32  // 8 rows × 4 cols
+
+kernel void matmul_narrow(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint local_row = thread_index / 4;  // 0..7
+    uint local_col = thread_index % 4;  // 0..3
+
+    uint tile_row = group_id.y * NM_TILE_M;
+    uint tile_col = group_id.x * NM_TILE_N;
+
+    threadgroup half As[NM_TILE_M][NM_TILE_K];
+    threadgroup half Bs[NM_TILE_K][NM_TILE_N];
+
+    float acc[NM_THREAD_TILE][NM_THREAD_TILE] = {{0.0f}};
+
+    uint M = params.M;
+    uint N = params.N;
+    uint K = params.K;
+
+    for (uint k_block = 0; k_block < K; k_block += NM_TILE_K) {
+        // Load A tile [32][32]: 32 threads load 32 elements each = 1024 elements
+        for (uint i = 0; i < 32; i++) {
+            uint flat = thread_index * 32 + i;
+            uint r = flat / NM_TILE_K;
+            uint c = flat % NM_TILE_K;
+            uint gr = tile_row + r;
+            uint gc = k_block + c;
+            As[r][c] = (half)(clamp((gr < M && gc < K) ? A[gr * K + gc] : 0.0f, -65504.0f, 65504.0f));
+        }
+
+        // Load B tile [32][16]: 32 threads load 16 elements each = 512 elements
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / NM_TILE_N;
+            uint c = flat % NM_TILE_N;
+            uint gr = k_block + r;
+            uint gc = tile_col + c;
+            Bs[r][c] = (half)(clamp((gr < K && gc < N) ? B[gr * N + gc] : 0.0f, -65504.0f, 65504.0f));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < NM_TILE_K; k++) {
+            half a_vals[NM_THREAD_TILE];
+            half b_vals[NM_THREAD_TILE];
+            for (uint i = 0; i < NM_THREAD_TILE; i++)
+                a_vals[i] = As[local_row * NM_THREAD_TILE + i][k];
+            for (uint j = 0; j < NM_THREAD_TILE; j++)
+                b_vals[j] = Bs[k][local_col * NM_THREAD_TILE + j];
+            for (uint i = 0; i < NM_THREAD_TILE; i++)
+                for (uint j = 0; j < NM_THREAD_TILE; j++)
+                    acc[i][j] += (float)(a_vals[i] * b_vals[j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < NM_THREAD_TILE; i++) {
+        for (uint j = 0; j < NM_THREAD_TILE; j++) {
+            uint gr = tile_row + local_row * NM_THREAD_TILE + i;
+            uint gc = tile_col + local_col * NM_THREAD_TILE + j;
+            if (gr < M && gc < N)
+                C[gr * N + gc] = acc[i][j];
+        }
+    }
+}
+"#;
+
 /// Matrix multiply with B transposed: C = A @ B^T
 /// A: [M, K], B: [N, K] (stored row-major, but we treat it as transposed), C: [M, N]
 /// Used for attention: scores = Q @ K^T
@@ -272,6 +363,82 @@ kernel void softmax(
 }
 "#;
 
+/// Fused scale + causal mask + softmax in one kernel.
+/// Eliminates 2 buffer allocations and 4 GPU dispatches vs separate ops.
+/// Input: raw attention scores [batch_heads * seq_q, seq_k]
+/// Output: softmax probabilities after scaling and causal masking.
+pub const SCALED_CAUSAL_SOFTMAX: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ScaledCausalSoftmaxParams {
+    uint seq_q;
+    uint seq_k;
+    float scale;
+    uint kv_offset;
+};
+
+kernel void scaled_causal_softmax(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ScaledCausalSoftmaxParams& params [[buffer(2)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    uint row = group_id;
+    uint seq_k = params.seq_k;
+    // q_pos within the batch_head (for causal mask)
+    uint q_pos = row % params.seq_q;
+
+    device const float* row_in = input + row * seq_k;
+    device float* row_out = output + row * seq_k;
+
+    // Pass 1: scale + mask + find max
+    threadgroup float shared_max[256];
+    float local_max = -INFINITY;
+    for (uint c = thread_index; c < seq_k; c += threads_per_group) {
+        float val = row_in[c] * params.scale;
+        if (c > q_pos + params.kv_offset) val = -INFINITY;
+        local_max = max(local_max, val);
+    }
+    shared_max[thread_index] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride)
+            shared_max[thread_index] = max(shared_max[thread_index], shared_max[thread_index + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = shared_max[0];
+
+    // Pass 2: exp + sum
+    threadgroup float shared_sum[256];
+    float local_sum = 0.0f;
+    for (uint c = thread_index; c < seq_k; c += threads_per_group) {
+        float val = row_in[c] * params.scale;
+        if (c > q_pos + params.kv_offset) val = -INFINITY;
+        float e = exp(val - row_max);
+        row_out[c] = e;
+        local_sum += e;
+    }
+    shared_sum[thread_index] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
+        if (thread_index < stride)
+            shared_sum[thread_index] += shared_sum[thread_index + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float total = shared_sum[0];
+
+    float inv_sum = 1.0f / total;
+    for (uint c = thread_index; c < seq_k; c += threads_per_group) {
+        row_out[c] *= inv_sum;
+    }
+}
+"#;
+
 /// RMS Layer Normalization: output = (x / rms(x)) * weight
 /// where rms(x) = sqrt(mean(x^2) + eps)
 /// Input: [rows, cols], weight: [cols], output: [rows, cols]
@@ -411,6 +578,48 @@ kernel void rope_backward(
     // Inverse rotation: rotate by -θ (negate sin)
     data[i0] = x0 * cos_val + x1 * sin_val;
     data[i1] = -x0 * sin_val + x1 * cos_val;
+}
+"#;
+
+/// Out-of-place RoPE backward: dst = rotate(src, -θ). Replaces copy+rope_backward (2→1 dispatch).
+pub const ROPE_BACKWARD_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RopeParams {
+    uint seq_len;
+    uint head_dim;
+    uint total_rows;
+    uint offset;
+    float theta;
+};
+
+kernel void rope_backward_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant RopeParams& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint pos = gid.x;
+    uint pair = gid.z;
+
+    if (row >= params.total_rows || pos >= params.seq_len || pair >= params.head_dim / 2) return;
+
+    float freq = 1.0 / pow(params.theta, float(2 * pair) / float(params.head_dim));
+    float angle = float(pos + params.offset) * freq;
+    float cos_val;
+    float sin_val = sincos(angle, cos_val);
+
+    uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
+    uint i0 = base + 2 * pair;
+    uint i1 = i0 + 1;
+
+    float x0 = src[i0];
+    float x1 = src[i1];
+
+    dst[i0] = x0 * cos_val + x1 * sin_val;
+    dst[i1] = -x0 * sin_val + x1 * cos_val;
 }
 "#;
 
@@ -915,6 +1124,28 @@ kernel void scale(
 ) {
     if (gid < params.size) {
         data[gid] *= params.scale;
+    }
+}
+"#;
+
+/// Out-of-place scale: dst[i] = src[i] * scale. Replaces copy+scale (2 dispatches → 1).
+pub const SCALE_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ScaleParams {
+    uint size;
+    float scale;
+};
+
+kernel void scale_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant ScaleParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < params.size) {
+        dst[gid] = src[gid] * params.scale;
     }
 }
 "#;
@@ -3099,6 +3330,59 @@ kernel void lion_update(
 }
 "#;
 
+/// Column-wise copy: src[rows, src_cols] → dst[rows, dst_cols] at column offset.
+/// Used for building concatenated weight matrices and scattering column gradients.
+pub const CONCAT_COLS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ConcatColsParams {
+    uint rows;
+    uint src_cols;
+    uint dst_cols;
+    uint col_offset;
+};
+
+kernel void concat_cols(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant ConcatColsParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = params.rows * params.src_cols;
+    if (tid >= total) return;
+    uint r = tid / params.src_cols;
+    uint c = tid % params.src_cols;
+    dst[r * params.dst_cols + params.col_offset + c] = src[tid];
+}
+"#;
+
+/// Column-wise slice: extract cols [offset..offset+dst_cols) from [rows, src_cols] tensor.
+pub const SLICE_COLS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct SliceColsParams {
+    uint rows;
+    uint src_cols;
+    uint dst_cols;
+    uint col_offset;
+};
+
+kernel void slice_cols(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant SliceColsParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = params.rows * params.dst_cols;
+    if (tid >= total) return;
+    uint r = tid / params.dst_cols;
+    uint c = tid % params.dst_cols;
+    dst[tid] = src[r * params.src_cols + params.col_offset + c];
+}
+"#;
+
 /// Sophia optimizer (Liu et al., 2023): second-order with diagonal Hessian.
 /// Update: theta -= lr * clip(grad / max(h, eps), rho)
 /// h = EMA of squared gradients (Hutchinson's diagonal Hessian estimate)
@@ -3142,5 +3426,66 @@ kernel void sophia_update(
 
     // Apply with weight decay
     param[gid] = param[gid] * (1.0f - hp.lr * hp.weight_decay) - hp.lr * update;
+}
+"#;
+
+/// Single-kernel KV head expansion for GQA. Replaces N×group_size separate dispatches.
+pub const REPEAT_KV: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RepeatKvParams {
+    uint n_kv_total;
+    uint group_size;
+    uint seq_len;
+    uint head_dim;
+};
+
+kernel void repeat_kv(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant RepeatKvParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint head_block = params.seq_len * params.head_dim;
+    uint n_heads_total = params.n_kv_total * params.group_size;
+    uint total = n_heads_total * head_block;
+    if (tid >= total) return;
+    uint out_head = tid / head_block;
+    uint in_head = out_head / params.group_size;
+    uint offset_in_block = tid % head_block;
+    output[tid] = input[in_head * head_block + offset_in_block];
+}
+"#;
+
+/// Single-kernel backward for repeat_kv: sum group_size gradient blocks per KV head.
+pub const REPEAT_KV_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RepeatKvParams {
+    uint n_kv_total;
+    uint group_size;
+    uint seq_len;
+    uint head_dim;
+};
+
+kernel void repeat_kv_backward(
+    device const float* out_grad [[buffer(0)]],
+    device float* kv_grad [[buffer(1)]],
+    constant RepeatKvParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint head_block = params.seq_len * params.head_dim;
+    uint total = params.n_kv_total * head_block;
+    if (tid >= total) return;
+    uint kv_head = tid / head_block;
+    uint offset_in_block = tid % head_block;
+    float sum = 0.0f;
+    for (uint g = 0; g < params.group_size; g++) {
+        uint out_head = kv_head * params.group_size + g;
+        sum += out_grad[out_head * head_block + offset_in_block];
+    }
+    kv_grad[tid] = sum;
 }
 "#;
