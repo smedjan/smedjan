@@ -181,6 +181,11 @@ pub fn zero_grads() {
 /// Zero all stored gradient buffers and recycle them to the buffer pool.
 /// ONLY call after the optimizer's GPU work is complete (sync flush),
 /// otherwise recycled buffers get reused while optimizer is still reading.
+/// Store a gradient for testing purposes (bypasses normal backward flow).
+pub fn accumulate_grad_for_test(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
+    accumulate_grad(ctx, tensor_id, grad, size);
+}
+
 pub fn zero_grads_recycle() {
     GRADS.with(|grads| {
         let mut g = grads.borrow_mut();

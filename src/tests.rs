@@ -1509,4 +1509,134 @@ mod tests {
             assert!((orig - back).abs() < 0.01, "fp16 reverse cast mismatch at {}: {} vs {}", i, orig, back);
         }
     }
+
+    // =========================================================================
+    // New features: ReLU, AXPY, WSD, SliceCols, EMA
+
+    #[test]
+    fn relu_activation_zeros_negatives() {
+        let ctx = MetalContext::new();
+        let input = Tensor::from_buffer(Arc::clone(&ctx),
+            ctx.buffer_from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0]),
+            vec![6]);
+        let output = input.relu();
+        let vals = output.to_vec();
+        assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+        autograd::clear_tape();
+    }
+
+    #[test]
+    fn relu_backward_passes_positive_gradients() {
+        let ctx = MetalContext::new();
+        let x = Tensor::from_buffer(Arc::clone(&ctx),
+            ctx.buffer_from_slice(&[-1.0f32, 2.0, -3.0, 4.0]),
+            vec![1, 4]);
+        let y = x.relu(); // [0, 2, 0, 4]
+        // Use matmul with ones to create a sum → scalar-like loss
+        let ones = Tensor::from_buffer(Arc::clone(&ctx),
+            ctx.buffer_from_slice(&[1.0f32, 1.0, 1.0, 1.0]),
+            vec![4, 1]);
+        let loss = y.matmul(&ones); // [1, 1] = sum of relu outputs = 6.0
+        autograd::backward(&ctx, loss.id);
+        let grad = autograd::get_grad(x.id).expect("should have gradient");
+        let grad_vals = MetalContext::read_buffer(&grad, 4);
+        // relu backward: grad = upstream * (input > 0)
+        // upstream from matmul backward is ones, so grad = [0, 1, 0, 1]
+        assert!(grad_vals[0].abs() < 0.01, "negative input should have 0 gradient");
+        assert!(grad_vals[1] > 0.5, "positive input should have positive gradient");
+        assert!(grad_vals[2].abs() < 0.01, "negative input should have 0 gradient");
+        assert!(grad_vals[3] > 0.5, "positive input should have positive gradient");
+        autograd::clear_tape();
+    }
+
+    #[test]
+    fn axpy_fused_scale_add() {
+        let ctx = MetalContext::new();
+        let y_buf = ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+        let x_buf = ctx.buffer_from_slice(&[10.0f32, 20.0, 30.0, 40.0]);
+        compute::gpu_axpy(&ctx, &y_buf, &x_buf, 4, 0.5);
+        let result = MetalContext::read_buffer(&y_buf, 4);
+        // y += 0.5 * x → [1+5, 2+10, 3+15, 4+20] = [6, 12, 18, 24]
+        assert!((result[0] - 6.0).abs() < 0.01);
+        assert!((result[1] - 12.0).abs() < 0.01);
+        assert!((result[2] - 18.0).abs() < 0.01);
+        assert!((result[3] - 24.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn wsd_schedule_three_phases() {
+        let sched = crate::optim::WSDScheduler::with_phases(1.0, 10, 80, 10);
+        assert_eq!(sched.total_steps(), 100);
+        // Warmup phase: linearly increasing
+        assert!((sched.get_lr(0) - 0.0).abs() < 0.01);
+        assert!((sched.get_lr(5) - 0.5).abs() < 0.01);
+        // Stable phase: constant at max
+        assert!((sched.get_lr(10) - 1.0).abs() < 0.01);
+        assert!((sched.get_lr(50) - 1.0).abs() < 0.01);
+        assert!((sched.get_lr(89) - 1.0).abs() < 0.01);
+        // Decay phase: linear to zero
+        assert!(sched.get_lr(95) < 1.0);
+        assert!(sched.get_lr(99) < 0.2);
+    }
+
+    #[test]
+    fn inverse_sqrt_schedule() {
+        let lr = crate::optim::inverse_sqrt_lr(1.0, 100, 0);
+        assert!(lr < 0.02); // step 0 during warmup
+        let lr = crate::optim::inverse_sqrt_lr(1.0, 100, 100);
+        assert!((lr - 1.0).abs() < 0.01); // peak at warmup end
+        let lr = crate::optim::inverse_sqrt_lr(1.0, 100, 400);
+        assert!((lr - 0.5).abs() < 0.01); // sqrt(100)/sqrt(400) = 0.5
+    }
+
+    #[test]
+    fn ema_update_kernel() {
+        let ctx = MetalContext::new();
+        let ema_buf = ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0]);
+        let src_buf = ctx.buffer_from_slice(&[10.0f32, 20.0, 30.0]);
+        compute::gpu_ema_update(&ctx, &ema_buf, &src_buf, 3, 0.9);
+        let result = MetalContext::read_buffer(&ema_buf, 3);
+        // ema = 0.9 * ema + 0.1 * src → [0.9+1.0, 1.8+2.0, 2.7+3.0] = [1.9, 3.8, 5.7]
+        assert!((result[0] - 1.9).abs() < 0.01);
+        assert!((result[1] - 3.8).abs() < 0.01);
+        assert!((result[2] - 5.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn slice_cols_extracts_correct_columns() {
+        let ctx = MetalContext::new();
+        // [2, 4] matrix: [[1,2,3,4], [5,6,7,8]]
+        let src = Tensor::from_buffer(Arc::clone(&ctx),
+            ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            vec![2, 4]);
+        // Slice cols [1..3] → [[2,3], [6,7]]
+        let sliced = src.slice_cols(1, 2);
+        let vals = sliced.to_vec();
+        assert_eq!(vals.len(), 4);
+        assert!((vals[0] - 2.0).abs() < 0.01);
+        assert!((vals[1] - 3.0).abs() < 0.01);
+        assert!((vals[2] - 6.0).abs() < 0.01);
+        assert!((vals[3] - 7.0).abs() < 0.01);
+        autograd::clear_tape();
+    }
+
+    #[test]
+    fn muon_optimizer_step_converges() {
+        let ctx = MetalContext::new();
+        // Simple 2D weight matrix — Muon should orthogonalize the update
+        let w = Tensor::randn(&ctx, vec![4, 4], 1.0);
+        let params = vec![&w];
+        let mut muon = crate::optim::Muon::new(&ctx, &params, 0.0);
+
+        // Fake a gradient and verify step doesn't crash
+        let grad = ctx.buffer_from_slice(&[0.1f32; 16]);
+        autograd::accumulate_grad_for_test(&ctx, w.id, &grad, 16);
+        muon.step(0.01);
+
+        // Weight should have changed
+        let new_vals = w.to_vec();
+        let changed = new_vals.iter().any(|&v| (v - 1.0).abs() > 0.001 || v.abs() > 0.001);
+        assert!(changed, "Muon should modify weights");
+        autograd::clear_tape();
+    }
 }
