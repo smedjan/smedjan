@@ -679,3 +679,53 @@ fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
     }
     names
 }
+
+/// Export model to Safetensors format for HuggingFace ecosystem.
+/// Safetensors is a simple, safe format: JSON header + raw tensor data.
+pub fn export_safetensors(
+    model: &Transformer,
+    output_path: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let config = &model.config;
+    let params = model.parameters();
+    let tensor_names = get_gguf_tensor_names(config); // reuse naming
+    assert_eq!(params.len(), tensor_names.len());
+
+    // Build JSON header: { "tensor_name": { "dtype": "F32", "shape": [...], "data_offsets": [start, end] } }
+    let mut header = String::from("{");
+    let mut offset: usize = 0;
+    for (i, (param, name)) in params.iter().zip(tensor_names.iter()).enumerate() {
+        if i > 0 { header.push(','); }
+        let nbytes = param.numel() * 4;
+        let shape_str: Vec<String> = param.shape.iter().map(|d| d.to_string()).collect();
+        header.push_str(&format!(
+            "\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+            name, shape_str.join(","), offset, offset + nbytes
+        ));
+        offset += nbytes;
+    }
+    // Add __metadata__
+    header.push_str(",\"__metadata__\":{\"format\":\"andreai\",\"description\":\"AndreAI model\"}");
+    header.push('}');
+
+    let header_bytes = header.as_bytes();
+    let header_len = header_bytes.len() as u64;
+
+    let mut file = std::fs::File::create(output_path)?;
+    // Safetensors format: 8 bytes header length (LE u64) + header JSON + tensor data
+    file.write_all(&header_len.to_le_bytes())?;
+    file.write_all(header_bytes)?;
+
+    // Write tensor data (F32, little-endian)
+    for param in &params {
+        let data = param.to_vec();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&bytes)?;
+    }
+
+    let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
+    eprintln!("Safetensors exported: {} ({:.1} MB, {} tensors)",
+        output_path, size_mb, params.len());
+    Ok(())
+}

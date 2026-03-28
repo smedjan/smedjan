@@ -340,6 +340,14 @@ enum Commands {
         quant: String,
     },
 
+    /// Export model to Safetensors format (HuggingFace ecosystem)
+    ExportSafetensors {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long, default_value = "model.safetensors")]
+        output: String,
+    },
+
     /// Average multiple checkpoints (WSM — +3.5% benchmark improvement)
     Merge {
         /// Checkpoint files to average (2+)
@@ -921,6 +929,17 @@ fn main() {
             eprintln!("Loaded checkpoint: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
             quantize::export_gguf(&model, &output, &quant)
                 .expect("GGUF export failed");
+        }
+
+        Commands::ExportSafetensors {
+            checkpoint: ckpt_path,
+            output,
+        } => {
+            let (model, step) = checkpoint::load_checkpoint(&ctx, &ckpt_path)
+                .expect("Failed to load checkpoint");
+            eprintln!("Loaded: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
+            quantize::export_safetensors(&model, &output)
+                .expect("Safetensors export failed");
         }
 
         Commands::Merge {

@@ -716,13 +716,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let total_time_str = if total_time > 3600 {
         format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
     } else { format!("{}m{}s", total_time / 60, total_time % 60) };
+    let avg_tok_s = if total_time > 0 { total_tokens as f64 / total_time as f64 } else { 0.0 };
+    let tok_per_day = avg_tok_s * 86400.0;
     eprintln!("Training complete. Final checkpoint: {}", path);
     eprintln!("=== Training Summary ===");
     eprintln!("  Total time: {}", total_time_str);
-    eprintln!("  Total tokens: {}M", total_tokens / 1_000_000);
-    eprintln!("  Peak throughput: {:.0} tok/s", peak_tok_s);
-    eprintln!("  Final EMA loss: {:.4}", ema_loss);
-    eprintln!("  Epochs: {}", data_loader.epoch());
+    eprintln!("  Total tokens: {}M ({:.1}B/day at avg throughput)", total_tokens / 1_000_000, tok_per_day / 1e9);
+    eprintln!("  Peak throughput: {:.0} tok/s | Avg: {:.0} tok/s", peak_tok_s, avg_tok_s);
+    eprintln!("  Final EMA loss: {:.4} | Best: {:.4}", ema_loss, best_train_loss);
+    eprintln!("  Epochs: {} | Steps: {}", data_loader.epoch(), config.total_steps);
+    eprintln!("  Model: {}M params, d={}, {}L, {} heads",
+        config.model_config.param_count() as f32 / 1e6,
+        config.model_config.d_model, config.model_config.n_layers, config.model_config.n_heads);
 
     Ok(())
 }
