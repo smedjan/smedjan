@@ -279,7 +279,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Early stopping state
     let mut best_val_loss = f32::INFINITY;
     let mut val_no_improve = 0u32;
-    let early_stop_patience = 3; // stop after 3 checkpoint intervals without val improvement
+    let early_stop_patience = 3;
+    let mut ema_loss = 0.0f32; // exponential moving average of loss for smooth tracking
+    let mut peak_tok_s = 0.0f32; // track peak throughput
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     for step in start_step..config.total_steps {
@@ -531,6 +533,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
                 break;
             }
+            // Auto-detect loss spikes: if loss > 2× EMA, warn (may need lower LR)
+            if ema_loss > 0.0 && loss_val > ema_loss * 2.0 && step > config.warmup_steps {
+                eprintln!("[WARN] Loss spike: {:.4} > 2× EMA {:.4} at step {}. Consider lowering --lr.",
+                    loss_val, ema_loss, step);
+            }
             let step_time = step_start.elapsed().as_secs_f32();
             let tokens_per_sec = tokens_this_step as f32 / step_time;
             let elapsed = start_time.elapsed().as_secs();
@@ -539,7 +546,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 eprintln!("Tape: {} ops, {:.1} MB activation memory", tape_ops, tape_bytes as f64 / (1024.0 * 1024.0));
             }
 
-            let (pool_hits, pool_misses) = MetalContext::pool_stats();
+            let (_pool_hits, _pool_misses) = MetalContext::pool_stats();
 
             // Periodic weight health check: every 100 steps to avoid GPU→CPU sync overhead.
             // gpu_l2_norm_check forces a batch flush + readback (8 bytes).
@@ -554,21 +561,30 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 0.0
             };
 
+            // Track EMA loss and peak throughput
+            if ema_loss == 0.0 { ema_loss = loss_val; }
+            else { ema_loss = 0.95 * ema_loss + 0.05 * loss_val; }
+            if tokens_per_sec > peak_tok_s { peak_tok_s = tokens_per_sec; }
+
+            // ETA estimation
+            let steps_done = (step - start_step + 1) as f32;
+            let steps_remaining = config.total_steps.saturating_sub(step + 1) as f32;
+            let avg_step_time = start_time.elapsed().as_secs_f32() / steps_done;
+            let eta_secs = (steps_remaining * avg_step_time) as u64;
+            let eta_str = if eta_secs > 3600 {
+                format!("{}h{}m", eta_secs / 3600, (eta_secs % 3600) / 60)
+            } else if eta_secs > 60 {
+                format!("{}m{}s", eta_secs / 60, eta_secs % 60)
+            } else {
+                format!("{}s", eta_secs)
+            };
+
             eprintln!(
-                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}s elapsed | {}M tokens | epoch {} ({}/{}) | pool {}/{} | w_norm {:.4}",
-                step,
-                loss_val,
-                lr,
-                tokens_per_sec,
-                step_time,
-                elapsed,
+                "step {:>6} | loss {:>8.4} | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | ETA {} | w_norm {:.2}",
+                step, loss_val, lr, tokens_per_sec, step_time,
                 total_tokens / 1_000_000,
                 data_loader.epoch(),
-                step as usize % batches_per_epoch,
-                batches_per_epoch,
-                pool_hits,
-                pool_hits + pool_misses,
-                weight_norm,
+                eta_str, weight_norm,
             );
 
             // Write to CSV log file
@@ -663,7 +679,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     checkpoint::save_checkpoint(&path, &model, config.total_steps)?;
     let state_path = format!("{}/state_final.bin", config.checkpoint_dir);
     checkpoint::save_training_state(&state_path, &model, &optimizer, config.total_steps, total_tokens)?;
+    let total_time = start_time.elapsed().as_secs();
+    let total_time_str = if total_time > 3600 {
+        format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
+    } else { format!("{}m{}s", total_time / 60, total_time % 60) };
     eprintln!("Training complete. Final checkpoint: {}", path);
+    eprintln!("=== Training Summary ===");
+    eprintln!("  Total time: {}", total_time_str);
+    eprintln!("  Total tokens: {}M", total_tokens / 1_000_000);
+    eprintln!("  Peak throughput: {:.0} tok/s", peak_tok_s);
+    eprintln!("  Final EMA loss: {:.4}", ema_loss);
+    eprintln!("  Epochs: {}", data_loader.epoch());
 
     Ok(())
 }

@@ -340,6 +340,16 @@ enum Commands {
         quant: String,
     },
 
+    /// Average multiple checkpoints (WSM — +3.5% benchmark improvement)
+    Merge {
+        /// Checkpoint files to average (2+)
+        #[arg(long, num_args = 2..)]
+        checkpoints: Vec<String>,
+        /// Output averaged checkpoint
+        #[arg(long, default_value = "merged.bin")]
+        output: String,
+    },
+
     /// Direct Preference Optimization — align a model using preference pairs
     Dpo {
         /// Pre-trained/SFT model checkpoint (policy — will be updated)
@@ -911,6 +921,47 @@ fn main() {
             eprintln!("Loaded checkpoint: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
             quantize::export_gguf(&model, &output, &quant)
                 .expect("GGUF export failed");
+        }
+
+        Commands::Merge {
+            checkpoints,
+            output,
+        } => {
+            assert!(checkpoints.len() >= 2, "Need at least 2 checkpoints to merge");
+            eprintln!("Merging {} checkpoints...", checkpoints.len());
+
+            // Load first checkpoint as base
+            let (base_model, base_step) = checkpoint::load_checkpoint(&ctx, &checkpoints[0])
+                .expect("Failed to load first checkpoint");
+            let n = checkpoints.len() as f32;
+            eprintln!("  Base: {} (step {})", checkpoints[0], base_step);
+
+            // Average weights: for each param, compute mean across all checkpoints
+            let base_params = base_model.parameters();
+            for ckpt_path in &checkpoints[1..] {
+                let (other_model, other_step) = checkpoint::load_checkpoint(&ctx, ckpt_path)
+                    .expect(&format!("Failed to load checkpoint: {}", ckpt_path));
+                eprintln!("  + {} (step {})", ckpt_path, other_step);
+                let other_params = other_model.parameters();
+                assert_eq!(base_params.len(), other_params.len(), "Checkpoint param count mismatch");
+
+                // Accumulate: base += other
+                for (bp, op) in base_params.iter().zip(other_params.iter()) {
+                    crate::metal::compute::gpu_add_inplace(&ctx, &bp.buffer, &op.buffer, bp.numel() as u32);
+                }
+            }
+
+            // Divide by N to get mean
+            for bp in &base_params {
+                crate::metal::compute::gpu_scale(&ctx, &bp.buffer, bp.numel() as u32, 1.0 / n);
+            }
+
+            // Save merged checkpoint
+            checkpoint::save_checkpoint(&output, &base_model, base_step)
+                .expect("Failed to save merged checkpoint");
+            eprintln!("Merged {} checkpoints → {} ({:.1} MB)",
+                checkpoints.len(), output,
+                std::fs::metadata(&output).map(|m| m.len() as f32 / 1e6).unwrap_or(0.0));
         }
 
         Commands::Dpo {
