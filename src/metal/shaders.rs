@@ -1087,11 +1087,11 @@ kernel void l2_norm_check(
     device float* output [[buffer(1)]],
     constant NormCheckParams& params [[buffer(2)]],
     uint thread_index [[thread_index_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]]
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg [[simdgroups_per_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
-    threadgroup float shared_nan[256];
-
     float local_sum = 0.0f;
     float local_nan = 0.0f;
     for (uint i = thread_index; i < params.size; i += threads_per_group) {
@@ -1102,21 +1102,17 @@ kernel void l2_norm_check(
             local_sum += val * val;
         }
     }
-    shared_sum[thread_index] = local_sum;
-    shared_nan[thread_index] = local_nan;
+    float ss = simd_sum(local_sum);
+    float sn = simd_max(local_nan);
+    threadgroup float sv[8];
+    threadgroup float nv[8];
+    if (simd_lane_id == 0) { sv[simd_group_id] = ss; nv[simd_group_id] = sn; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_group / 2; stride > 0; stride >>= 1) {
-        if (thread_index < stride) {
-            shared_sum[thread_index] += shared_sum[thread_index + stride];
-            shared_nan[thread_index] = max(shared_nan[thread_index], shared_nan[thread_index + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     if (thread_index == 0) {
-        output[0] = shared_sum[0];
-        output[1] = shared_nan[0];
+        float total = 0.0f; float nan_flag = 0.0f;
+        for (uint i = 0; i < simd_groups_per_tg; i++) { total += sv[i]; nan_flag = max(nan_flag, nv[i]); }
+        output[0] = total;
+        output[1] = nan_flag;
     }
 }
 "#;
