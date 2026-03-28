@@ -148,6 +148,7 @@ impl MetalContext {
             ("scale_copy", shaders::SCALE_COPY),
             ("rope_backward_copy", shaders::ROPE_BACKWARD_COPY),
             ("matmul_narrow", shaders::MATMUL_NARROW),
+            ("logsumexp", shaders::LOGSUMEXP),
             ("concat_cols", shaders::CONCAT_COLS),
             ("slice_cols", shaders::SLICE_COLS),
         ];

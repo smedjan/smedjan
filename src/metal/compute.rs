@@ -1396,6 +1396,18 @@ pub fn gpu_scaled_causal_softmax(
     );
 }
 
+/// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j]))). Numerically stable.
+pub fn gpu_logsumexp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    #[repr(C)]
+    struct Params { rows: u32, cols: u32 }
+    let params = Params { rows, cols };
+    let params_buf = params_buffer(ctx, &params);
+    let threads_per_group = next_power_of_2_clamped(cols as u64);
+    let grid = MetalContext::size(rows as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
+    dispatch_sync!(ctx, "logsumexp", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
+}
+
 /// Out-of-place scale: dst[i] = src[i] * factor. Replaces copy+scale_inplace (2→1 dispatch).
 pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32, scale: f32) {
     #[repr(C)]

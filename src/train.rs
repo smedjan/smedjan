@@ -57,6 +57,9 @@ pub struct TrainConfig {
     /// Curriculum learning: ramp sequence length from seq_len/4 → seq_len over first 25% of training.
     /// Faster early training (short seqs = bigger effective batch), smooth transition to full context.
     pub curriculum: bool,
+    /// Z-loss coefficient: penalize large logit magnitudes. 0.0=disabled, 1e-4=recommended for MoE.
+    /// Prevents router/logit explosion that causes expert collapse (PaLM, ST-MoE).
+    pub z_loss_coefficient: f32,
 }
 
 impl TrainConfig {
@@ -90,6 +93,7 @@ impl TrainConfig {
             reference_model: None,
             speculative_threshold: 7.0,
             curriculum: false,
+            z_loss_coefficient: 0.0,
         }
     }
 }
@@ -302,6 +306,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             } else {
                 loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
             };
+
+            // Z-loss: penalize large logit magnitudes (critical for MoE stability)
+            if config.z_loss_coefficient > 0.0 {
+                loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
+            }
 
             // Multi-token prediction: add loss from extra heads with shifted targets.
             // Head k predicts position t+k+2, so targets shift by k+1 within the sequence.

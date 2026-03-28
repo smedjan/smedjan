@@ -163,6 +163,9 @@ enum Commands {
         /// Curriculum learning: ramp seq_len from short→full over first 25% of training
         #[arg(long)]
         curriculum: bool,
+        /// Z-loss coefficient: penalize large logits. 0=off, 1e-4=recommended for MoE
+        #[arg(long, default_value = "0.0")]
+        z_loss: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -490,6 +493,7 @@ fn main() {
             optimizer,
             n_predict,
             curriculum,
+            z_loss,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -560,6 +564,7 @@ fn main() {
             config.speculative_threshold = speculative_threshold;
             config.model_config.n_predict = n_predict;
             config.curriculum = curriculum;
+            config.z_loss_coefficient = z_loss;
 
             train::train(&ctx, &config).expect("Training failed");
         }

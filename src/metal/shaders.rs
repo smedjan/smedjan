@@ -1151,6 +1151,60 @@ kernel void scale_copy(
 "#;
 
 /// Fill buffer with a constant value
+/// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j])))
+/// Numerically stable: output[i] = max + log(sum(exp(x - max)))
+pub const LOGSUMEXP: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LSEParams {
+    uint rows;
+    uint cols;
+};
+
+kernel void logsumexp(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant LSEParams& params [[buffer(2)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]]
+) {
+    uint row = group_id;
+    if (row >= params.rows) return;
+    uint cols = params.cols;
+    device const float* row_in = input + row * cols;
+
+    // Find max
+    threadgroup float shared_max[256];
+    float local_max = -INFINITY;
+    for (uint c = thread_index; c < cols; c += threads_per_group)
+        local_max = max(local_max, row_in[c]);
+    shared_max[thread_index] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = threads_per_group / 2; s > 0; s >>= 1) {
+        if (thread_index < s) shared_max[thread_index] = max(shared_max[thread_index], shared_max[thread_index + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = shared_max[0];
+
+    // Sum exp(x - max)
+    threadgroup float shared_sum[256];
+    float local_sum = 0.0f;
+    for (uint c = thread_index; c < cols; c += threads_per_group)
+        local_sum += exp(row_in[c] - row_max);
+    shared_sum[thread_index] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = threads_per_group / 2; s > 0; s >>= 1) {
+        if (thread_index < s) shared_sum[thread_index] += shared_sum[thread_index + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0)
+        output[row] = row_max + log(shared_sum[0]);
+}
+"#;
+
 pub const FILL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
