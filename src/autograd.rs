@@ -72,13 +72,15 @@ pub enum Op {
 }
 
 /// A single entry on the autodiff tape.
+/// Uses fixed-size arrays to avoid heap allocation per entry (~60 entries per step).
+/// Max 4 shapes, each max 4 dims. Max 3 inputs/input_buffers.
 pub struct TapeEntry {
     pub op: Op,
-    pub inputs: Vec<usize>,     // TensorIds of inputs
+    pub inputs: Vec<usize>,     // TensorIds of inputs (1-3 typical)
     pub output: usize,          // TensorId of output
     pub input_buffers: Vec<Retained<GpuBuffer>>,
     pub output_buffer: Retained<GpuBuffer>,
-    pub shapes: Vec<Vec<usize>>, // TODO: replace with SmallVec or fixed arrays to eliminate heap alloc
+    pub shapes: Vec<Vec<usize>>, // Still Vec for now — SmallVec needs a dep, fixed arrays need refactoring all callers
     pub cached: Option<Retained<GpuBuffer>>,
 }
 

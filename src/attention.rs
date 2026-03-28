@@ -26,6 +26,7 @@ pub struct MultiHeadAttention {
     pub d_model: usize,
     pub rope_theta: f32,
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
+    pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
 }
 
 /// KV cache for autoregressive inference.
@@ -153,7 +154,7 @@ impl MultiHeadAttention {
             w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
             attn_rank: rank,
             n_heads, n_kv_heads, head_dim, d_model, rope_theta,
-            qk_norm_weight,
+            qk_norm_weight, sliding_window: 0,
         }
     }
 
@@ -278,7 +279,11 @@ impl MultiHeadAttention {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores = q.batched_matmul_trans_b(&k_expanded);
             let scores = scores.scale(scale);
-            let scores = scores.causal_mask(offset);
+            let scores = if self.sliding_window > 0 {
+                scores.causal_mask_window(offset, self.sliding_window as u32)
+            } else {
+                scores.causal_mask(offset)
+            };
             let weights = scores.softmax();
             weights.batched_matmul(&v_expanded)
         };

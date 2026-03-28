@@ -795,6 +795,27 @@ impl Tensor {
         }
     }
 
+    /// Causal mask with sliding window: mask future AND positions beyond window distance.
+    pub fn causal_mask_window(&self, offset: u32, window: u32) -> Tensor {
+        assert_eq!(self.shape.len(), 3);
+        let batch_heads = self.shape[0];
+        let seq_q = self.shape[1];
+        let seq_k = self.shape[2];
+
+        let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
+        compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
+        compute::gpu_causal_mask_window(&self.ctx, &out_buf, batch_heads as u32, seq_q as u32, seq_k as u32, offset, window);
+
+        let out_id = autograd::next_id();
+        Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: false,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+
     /// Fused scale + causal mask + softmax in one kernel.
     /// self shape: [batch_heads, seq_q, seq_k] (raw attention scores)
     /// Returns softmax(self * scale, causal_masked).

@@ -341,8 +341,11 @@ impl TransformerBlock {
             (z(), z(), z(), z(), z(), z())
         };
 
+        let mut attn = MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
+        attn.sliding_window = config.sliding_window;
+
         Self {
-            attn: MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank),
+            attn,
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),

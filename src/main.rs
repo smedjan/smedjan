@@ -190,6 +190,9 @@ enum Commands {
         /// Fused linear+cross-entropy: compute logits in chunks, save ~2GB peak memory
         #[arg(long)]
         fused_ce: bool,
+        /// Progressive layer freezing fraction. 0=off, 0.5=freeze bottom 50% gradually.
+        #[arg(long, default_value = "0.0")]
+        freeze_fraction: f32,
     },
 
     /// Show available model sizes and their param counts
@@ -537,6 +540,7 @@ fn main() {
             noise_scale,
             relora_interval,
             fused_ce,
+            freeze_fraction,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -616,6 +620,7 @@ fn main() {
             config.noise_scale = noise_scale;
             config.relora_interval = relora_interval;
             config.fused_ce = fused_ce;
+            config.freeze_fraction = freeze_fraction;
 
             train::train(&ctx, &config).expect("Training failed");
         }
