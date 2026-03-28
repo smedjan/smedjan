@@ -1434,6 +1434,30 @@ pub fn gpu_scaled_causal_softmax_window(
     );
 }
 
+/// ReLU: output[i] = max(input[i], 0)
+pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "relu", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
+}
+
+/// ReLU backward: grad_input = grad_output * (input > 0)
+pub fn gpu_relu_backward(ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "relu_backward", grid, tg, 0 => input, 1 => grad_output, 2 => grad_input, 3 => &params_buf);
+}
+
 /// EMA update: ema[i] = decay * ema[i] + (1-decay) * src[i]. Single dispatch for all elements.
 pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer, size: u32, decay: f32) {
     #[repr(C)]

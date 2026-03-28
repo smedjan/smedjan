@@ -425,25 +425,24 @@ impl TransformerBlock {
         h.add(&ffn_out)
     }
 
-    /// Shared-Expert Mixture of Experts (DeepSeek-V3 style).
-    /// 1 shared expert (the block's own FFN weights) processes ALL tokens.
-    /// N routed experts add specialized deltas, weighted by router softmax.
-    /// output = shared_ffn(x) + sum_i(router_prob_i * expert_i(x))
-    /// The shared expert captures common patterns, freeing routed experts to specialize.
+    /// Shared-Expert Mixture of Experts with ReLU routing (DeepSeek-V3 + ReMoE).
+    /// 1 shared expert (block's FFN weights) always active for ALL tokens.
+    /// N routed experts use ReLU gating instead of softmax+topk (ICLR 2025, ReMoE):
+    ///   gate_i = ReLU(x @ W_router_i) — positive → active, zero → inactive
+    /// ReLU is fully differentiable, naturally sparse, no load balancing loss needed.
     fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
 
-        // Shared expert: always active for ALL tokens (the block's own FFN weights)
-        // This captures common patterns (articles, punctuation, syntax).
+        // Shared expert: always active for ALL tokens
         let shared_out = self.swiglu_ffn(x, batch, seq_len, d)
             .reshape(vec![n_tokens, d]);
 
-        // Router logits for routed experts
+        // ReMoE routing (ICLR 2025): ReLU gate instead of softmax+topk.
+        // gate_i = ReLU(x @ W_router_i) — positive activates, zero deactivates.
+        // Fully differentiable, naturally sparse, no auxiliary balance loss needed.
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
-
-        // Unbiased softmax for gate values (bias-based balancing affects routing only)
-        let router_probs = router_logits.softmax(); // [n_tokens, n_experts]
+        let router_probs = router_logits.relu(); // ReLU: natural sparsity
 
         // Soft MoE: each routed expert adds a weighted delta on top of the shared output.
         let mut combined = shared_out;

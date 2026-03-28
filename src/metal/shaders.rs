@@ -799,6 +799,43 @@ kernel void rms_norm_residual(
 
 /// Fused SiLU-gate: output[i] = silu(gate[i]) * up[i]
 /// Saves one kernel dispatch and one temporary buffer vs separate silu + mul.
+/// ReLU activation: output[i] = max(input[i], 0). Used for ReMoE routing.
+pub const RELU: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReluParams { uint size; };
+
+kernel void relu(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReluParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    output[gid] = max(input[gid], 0.0f);
+}
+"#;
+
+/// ReLU backward: grad_input = grad_output * (input > 0 ? 1 : 0)
+pub const RELU_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReluParams { uint size; };
+
+kernel void relu_backward(
+    device const float* input [[buffer(0)]],
+    device const float* grad_output [[buffer(1)]],
+    device float* grad_input [[buffer(2)]],
+    constant ReluParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    grad_input[gid] = (input[gid] > 0.0f) ? grad_output[gid] : 0.0f;
+}
+"#;
+
 pub const SILU_GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

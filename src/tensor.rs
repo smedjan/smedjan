@@ -795,6 +795,32 @@ impl Tensor {
         }
     }
 
+    /// ReLU activation: output = max(input, 0). Tape-tracked for gradient flow.
+    pub fn relu(&self) -> Tensor {
+        let size = self.numel();
+        let out_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_relu(&self.ctx, &self.buffer, &out_buf, size as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id, buffer: out_buf, shape: self.shape.clone(),
+            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Relu,
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+        out
+    }
+
     /// Causal mask with sliding window: mask future AND positions beyond window distance.
     pub fn causal_mask_window(&self, offset: u32, window: u32) -> Tensor {
         assert_eq!(self.shape.len(), 3);

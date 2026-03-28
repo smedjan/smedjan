@@ -64,6 +64,8 @@ pub enum Op {
     /// Column slice: extract columns [col_offset..col_offset+dst_cols) from [rows, src_cols].
     /// Backward: scatter gradient columns back into a zero-filled [rows, src_cols] buffer.
     SliceCols { rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize },
+    /// ReLU activation. Backward: grad * (input > 0).
+    Relu,
     /// Fused scale + causal mask + softmax. Backward: softmax_backward * scale.
     ScaledCausalSoftmax { scale: f32 },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
@@ -339,6 +341,12 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 }
                 Op::Mul => {
                     backward_mul(ctx, entry, &out_grad);
+                }
+                Op::Relu => {
+                    let size: usize = entry.shapes[0].iter().product();
+                    let grad_input = ctx.alloc_buffer(size * 4);
+                    compute::gpu_relu_backward(ctx, &entry.input_buffers[0], &out_grad, &grad_input, size as u32);
+                    accumulate_grad(ctx, entry.inputs[0], &grad_input, size);
                 }
                 Op::Softmax => {
                     backward_softmax(ctx, entry, &out_grad);
@@ -730,6 +738,12 @@ fn backward_checkpoint(
             Op::MatmulTransB => backward_matmul_trans_b(ctx, &sub_entry, &sub_out_grad),
             Op::Add => backward_add(ctx, &sub_entry, &sub_out_grad),
             Op::Mul => backward_mul(ctx, &sub_entry, &sub_out_grad),
+            Op::Relu => {
+                let size: usize = sub_entry.shapes[0].iter().product();
+                let gi = ctx.alloc_buffer(size * 4);
+                compute::gpu_relu_backward(ctx, &sub_entry.input_buffers[0], &sub_out_grad, &gi, size as u32);
+                accumulate_grad(ctx, sub_entry.inputs[0], &gi, size);
+            }
             Op::Softmax => backward_softmax(ctx, &sub_entry, &sub_out_grad),
             Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, &sub_entry, &sub_out_grad, *scale),
             Op::SliceCols { rows, src_cols, dst_cols, col_offset } => backward_slice_cols(ctx, &sub_entry, &sub_out_grad, *rows, *src_cols, *dst_cols, *col_offset),
