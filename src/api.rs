@@ -208,12 +208,13 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_slice_cols(ctx, &col_dst, &col_slice, 2, 4, 2, 2);
     tested += 3;
 
-    // In-place rope backward (kept for potential future use)
+    // In-place rope variants (kept for potential future use)
     let rope_buf = ctx.buffer_from_slice(&[1.0f32, 0.0, 0.0, 1.0]);
     let rope_copy = ctx.alloc_buffer(4 * 4);
     compute::gpu_copy(ctx, &rope_buf, &rope_copy, 4);
+    compute::gpu_rope(ctx, &rope_copy, 1, 1, 4, 0, 10000.0);
     compute::gpu_rope_backward(ctx, &rope_copy, 1, 1, 4, 0, 10000.0);
-    tested += 2;
+    tested += 3;
 
     // L2 norm variants — verify sync and into-buffer paths agree
     let norm_data = ctx.buffer_from_slice(&[3.0f32, 4.0]); // norm = 5.0

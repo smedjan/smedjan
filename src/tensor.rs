@@ -709,10 +709,10 @@ impl Tensor {
         let seq_len = self.shape[1];
         let head_dim = self.shape[2];
 
-        // Copy data since rope is in-place
+        // Out-of-place RoPE: dst = rotate(src, θ) in 1 dispatch (was copy + in-place = 2)
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
-        compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_rope(&self.ctx, &out_buf, total_rows as u32, seq_len as u32, head_dim as u32, offset, theta);
+        compute::gpu_rope_copy(&self.ctx, &self.buffer, &out_buf,
+            total_rows as u32, seq_len as u32, head_dim as u32, offset, theta);
 
         let out_id = autograd::next_id();
         let out = Tensor {

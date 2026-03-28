@@ -146,6 +146,7 @@ impl MetalContext {
             ("repeat_kv_backward", shaders::REPEAT_KV_BACKWARD),
             ("scaled_causal_softmax", shaders::SCALED_CAUSAL_SOFTMAX),
             ("scale_copy", shaders::SCALE_COPY),
+            ("rope_copy", shaders::ROPE_COPY),
             ("rope_backward_copy", shaders::ROPE_BACKWARD_COPY),
             ("matmul_narrow", shaders::MATMUL_NARROW),
             ("logsumexp", shaders::LOGSUMEXP),

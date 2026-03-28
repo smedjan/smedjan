@@ -538,6 +538,46 @@ kernel void rope(
 }
 "#;
 
+/// Out-of-place RoPE forward: dst = rotate(src, θ). Eliminates copy+in-place (2→1 dispatch).
+pub const ROPE_COPY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RopeParams {
+    uint seq_len;
+    uint head_dim;
+    uint total_rows;
+    uint offset;
+    float theta;
+};
+
+kernel void rope_copy(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant RopeParams& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint pos = gid.x;
+    uint pair = gid.z;
+    if (row >= params.total_rows || pos >= params.seq_len || pair >= params.head_dim / 2) return;
+
+    float freq = 1.0f / pow(params.theta, float(2 * pair) / float(params.head_dim));
+    float angle = float(pos + params.offset) * freq;
+    float cos_val;
+    float sin_val = sincos(angle, cos_val);
+
+    uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
+    uint i0 = base + pair * 2;
+    uint i1 = base + pair * 2 + 1;
+
+    float x0 = src[i0];
+    float x1 = src[i1];
+    dst[i0] = x0 * cos_val - x1 * sin_val;
+    dst[i1] = x0 * sin_val + x1 * cos_val;
+}
+"#;
+
 /// RoPE backward pass: inverse rotation (negate sin to undo forward rotation).
 /// Given grad_output with RoPE applied, produces grad_input by rotating by -θ.
 pub const ROPE_BACKWARD: &str = r#"

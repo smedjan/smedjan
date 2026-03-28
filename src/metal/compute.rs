@@ -377,6 +377,23 @@ pub fn gpu_rope(
     );
 }
 
+/// Out-of-place RoPE forward: dst = rotate(src, θ). Single dispatch replaces copy + in-place.
+pub fn gpu_rope_copy(
+    ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
+    total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32,
+) {
+    #[repr(C)]
+    struct Params { seq_len: u32, head_dim: u32, total_rows: u32, offset: u32, theta: f32 }
+    let params = Params { seq_len, head_dim, total_rows, offset, theta };
+    let params_buf = params_buffer(ctx, &params);
+    let half_dim = head_dim / 2;
+    let total = MetalContext::size(seq_len as u64, total_rows as u64, half_dim as u64);
+    let tg = MetalContext::size(
+        8.min(seq_len as u64).max(1), 8.min(total_rows as u64).max(1), 8.min(half_dim as u64).max(1),
+    );
+    dispatch_threads_sync!(ctx, "rope_copy", total, tg, 0 => src, 1 => dst, 2 => &params_buf);
+}
+
 /// RoPE backward: apply inverse rotation (rotate by -θ) to propagate gradients.
 pub fn gpu_rope_backward(
     ctx: &Arc<MetalContext>,
