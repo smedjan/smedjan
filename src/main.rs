@@ -193,6 +193,10 @@ enum Commands {
         /// Progressive layer freezing fraction. 0=off, 0.5=freeze bottom 50% gradually.
         #[arg(long, default_value = "0.0")]
         freeze_fraction: f32,
+        /// Load pretrained model checkpoint (weights only, fresh optimizer).
+        /// For progressive training: grow a small model, then continue training larger.
+        #[arg(long)]
+        pretrained: Option<String>,
     },
 
     /// Show available model sizes and their param counts
@@ -581,6 +585,7 @@ fn main() {
             relora_interval,
             fused_ce,
             freeze_fraction,
+            pretrained,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -661,6 +666,7 @@ fn main() {
             config.relora_interval = relora_interval;
             config.fused_ce = fused_ce;
             config.freeze_fraction = freeze_fraction;
+            config.pretrained = pretrained;
 
             train::train(&ctx, &config).expect("Training failed");
         }

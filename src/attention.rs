@@ -113,6 +113,34 @@ impl MultiHeadAttention {
         Self::new_with_rank(ctx, d_model, n_heads, n_kv_heads, rope_theta, 0)
     }
 
+    /// Create attention with all weights zeroed (norm weights = 1).
+    /// Used by grow_model for stable progressive training.
+    pub fn new_zeroed(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize) -> Self {
+        let head_dim = d_model / n_heads;
+        let kv_dim = head_dim * n_kv_heads;
+        let z = || Tensor::zeros(ctx, vec![1]);
+
+        let (w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v) = if rank > 0 {
+            (
+                Tensor::zeros(ctx, vec![d_model, rank]), Tensor::zeros(ctx, vec![d_model, rank]),
+                Tensor::zeros(ctx, vec![d_model, rank]), Tensor::zeros(ctx, vec![d_model, rank]),
+                Tensor::zeros(ctx, vec![rank, d_model]), Tensor::zeros(ctx, vec![rank, kv_dim]),
+                Tensor::zeros(ctx, vec![rank, kv_dim]), Tensor::zeros(ctx, vec![rank, d_model]),
+            )
+        } else {
+            (
+                Tensor::zeros(ctx, vec![d_model, d_model]), Tensor::zeros(ctx, vec![d_model, kv_dim]),
+                Tensor::zeros(ctx, vec![d_model, kv_dim]), Tensor::zeros(ctx, vec![d_model, d_model]),
+                z(), z(), z(), z(),
+            )
+        };
+        Self {
+            w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
+            attn_rank: rank, n_heads, n_kv_heads, head_dim, d_model, rope_theta,
+            qk_norm_weight: Tensor::ones(ctx, vec![head_dim]), sliding_window: 0,
+        }
+    }
+
     pub fn new_with_rank(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize) -> Self {
         assert_eq!(d_model % n_heads, 0);
         assert!(n_kv_heads <= n_heads);

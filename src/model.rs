@@ -369,6 +369,50 @@ impl TransformerBlock {
         }
     }
 
+    /// Create a block with all weights zeroed (norm weights = 1).
+    /// Used by grow_model for stable progressive training.
+    pub fn new_zeroed(ctx: &Arc<MetalContext>, config: &ModelConfig, _layer_idx: usize) -> Self {
+        let d = config.d_model;
+        let ff = config.d_ff();
+        let r = config.lowrank;
+        let z = || Tensor::zeros(ctx, vec![1]);
+
+        let (w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
+            (
+                Tensor::zeros(ctx, vec![d, r]), Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::zeros(ctx, vec![ff, r]), Tensor::zeros(ctx, vec![r, d]),
+                Tensor::zeros(ctx, vec![d, r]), Tensor::zeros(ctx, vec![r, ff]),
+            )
+        } else {
+            (z(), z(), z(), z(), z(), z())
+        };
+
+        let mut attn = MultiHeadAttention::new_zeroed(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
+        attn.sliding_window = config.sliding_window;
+
+        Self {
+            attn,
+            ffn_w1: Tensor::zeros(ctx, vec![d, ff]),
+            ffn_w2: Tensor::zeros(ctx, vec![ff, d]),
+            ffn_w3: Tensor::zeros(ctx, vec![d, ff]),
+            ffn_w1_u: w1u, ffn_w1_v: w1v,
+            ffn_w2_u: w2u, ffn_w2_v: w2v,
+            ffn_w3_u: w3u, ffn_w3_v: w3v,
+            lowrank: r,
+            experts: Vec::new(),
+            router_weight: z(),
+            router_bias: vec![0.0f32; config.n_experts.max(1)],
+            n_experts: config.n_experts,
+            top_k: config.top_k_experts,
+            bitnet: config.bitnet,
+            ln1_weight: Tensor::ones(ctx, vec![d]),
+            ln2_weight: Tensor::ones(ctx, vec![d]),
+            norm_eps: config.norm_eps,
+            mod_router: Tensor::zeros(ctx, vec![d, 1]),
+            mod_capacity: 0.0,
+        }
+    }
+
     /// Forward pass: pre-norm transformer block.
     /// x: [batch, seq_len, d_model] → [batch, seq_len, d_model]
     ///
@@ -800,6 +844,53 @@ impl Transformer {
         }
     }
 
+    /// Create a model with all weights zeroed (except norm weights = 1).
+    /// Used by grow_model so new dimensions start at zero — the grown model
+    /// behaves identically to the small model at init, preventing logit explosion.
+    pub fn new_zeroed(ctx: &Arc<MetalContext>, config: ModelConfig) -> Self {
+        let d = config.d_model;
+        let v = config.vocab_size as usize;
+
+        let embed_rank = config.lowrank.max(0);
+        let (embedding, embed_proj) = if embed_rank > 0 && embed_rank < d {
+            (
+                Tensor::zeros(ctx, vec![v, embed_rank]),
+                Tensor::zeros(ctx, vec![embed_rank, d]),
+            )
+        } else {
+            (Tensor::zeros(ctx, vec![v, d]), Tensor::zeros(ctx, vec![1]))
+        };
+
+        let blocks: Vec<Arc<TransformerBlock>> = (0..config.n_layers)
+            .map(|i| Arc::new(TransformerBlock::new_zeroed(ctx, &config, i)))
+            .collect();
+
+        let ln_final_weight = Tensor::ones(ctx, vec![d]);
+        let mtp_heads: Vec<Tensor> = (0..config.n_predict)
+            .map(|_| Tensor::zeros(ctx, vec![d, d]))
+            .collect();
+        let mtp_norms: Vec<Tensor> = (0..config.n_predict)
+            .map(|_| Tensor::ones(ctx, vec![d]))
+            .collect();
+
+        eprintln!(
+            "Model initialized (zeroed): {} layers, {}M parameters",
+            config.n_layers, config.param_count() as f32 / 1e6
+        );
+
+        Self {
+            config,
+            embedding,
+            embed_proj,
+            embed_rank,
+            blocks,
+            ln_final_weight,
+            mtp_heads,
+            mtp_norms,
+            ctx: Arc::clone(ctx),
+        }
+    }
+
     /// Forward pass: tokens → logits.
     /// tokens: [batch, seq_len] (u32), kv_caches: one per layer
     /// When `checkpointed` is true, transformer blocks use gradient checkpointing
@@ -1160,8 +1251,11 @@ pub fn grow_model(
     eprintln!("Growing model: d={} → d={}, layers={} → layers={}",
         sd, ld, small.config.n_layers, large_config.n_layers);
 
-    // Create the large model with random init
-    let large = Transformer::new(ctx, large_config.clone());
+    // Create the large model with ZERO init for all weights.
+    // Small model weights are copied into the top-left corner.
+    // New dimensions start at zero — model behaves exactly like small model at init.
+    // Random init causes scale mismatch → logit explosion during progressive training.
+    let large = Transformer::new_zeroed(ctx, large_config.clone());
 
     // Copy embedding: [vocab, sd] → top-left of [vocab, ld]
     copy_weight_block(ctx, &small.embedding.buffer, &large.embedding.buffer,

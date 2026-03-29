@@ -79,6 +79,9 @@ pub struct TrainConfig {
     /// Progressive layer freezing: freeze bottom N% of layers after this fraction of training.
     /// 0.0=disabled, 0.5=freeze bottom 50% after halfway. Saves 10-30% compute in late training.
     pub freeze_fraction: f32,
+    /// Load a pretrained model checkpoint (weights only, fresh optimizer).
+    /// Used for progressive training: grow a small model, then continue training the larger one.
+    pub pretrained: Option<String>,
 }
 
 impl TrainConfig {
@@ -119,6 +122,7 @@ impl TrainConfig {
             relora_interval: 0,
             fused_ce: false,
             freeze_fraction: 0.0,
+            pretrained: None,
         }
     }
 }
@@ -190,6 +194,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let resume_step = step + 1;
         eprintln!("Resuming at step {}/{}, {} tokens, optimizer step {}", resume_step, config.total_steps, tokens, opt_step);
         (model, optimizer, resume_step, tokens)
+    } else if let Some(ref pretrained_path) = config.pretrained {
+        // Load pretrained model weights (fresh optimizer, step 0).
+        // Used for progressive training: grow small → large, then continue.
+        eprintln!("=== Loading pretrained model from {} ===", pretrained_path);
+        let (model, step) = checkpoint::load_checkpoint(ctx, pretrained_path)?;
+        eprintln!(
+            "Pretrained model: {}M params, {} layers, d_model={}, {} heads (trained to step {})",
+            model.config.param_count() as f32 / 1e6,
+            model.config.n_layers, model.config.d_model, model.config.n_heads, step
+        );
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
+        (model, optimizer, 0, 0u64)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
