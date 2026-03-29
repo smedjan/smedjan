@@ -130,34 +130,34 @@ impl DataLoader {
 
     /// Get next batch of (input_tokens, target_tokens).
     /// input: [batch_size * seq_len], target: [batch_size * seq_len]
-    /// Target is input shifted right by 1. Wraps around at dataset end.
+    /// Target is input shifted right by 1.
+    /// Each sequence in the batch samples from a RANDOM position in the dataset
+    /// to ensure diverse domain coverage per batch (prevents loss spikes from
+    /// contiguous domain boundaries in mixed datasets).
     pub fn next_batch(&mut self) -> (&[u32], &[u32]) {
-        let needed = self.batch_size * (self.seq_len + 1);
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let seq_tokens = self.seq_len + 1; // +1 for target shift
+        let max_start = self.dataset.len().saturating_sub(seq_tokens);
 
-        // Wrap around if we'd go past the end
-        if self.position + needed > self.dataset.len() {
-            self.position = 0;
-            self.epoch += 1;
-            use rand::Rng;
-            let max_offset = self.dataset.len().saturating_sub(needed);
-            if max_offset > 0 {
-                self.position = rand::thread_rng().gen_range(0..max_offset);
-            }
-        }
-
-        let tokens = self.dataset.get_tokens_slice(self.position, needed);
-
-        // Copy into pre-allocated buffers (zero allocation)
         for b in 0..self.batch_size {
-            let offset = b * (self.seq_len + 1);
+            // Random position for each sequence in the batch
+            let start = if max_start > 0 { rng.gen_range(0..max_start) } else { 0 };
+            let tokens = self.dataset.get_tokens_slice(start, seq_tokens);
+
             let dst_offset = b * self.seq_len;
             self.inputs_buf[dst_offset..dst_offset + self.seq_len]
-                .copy_from_slice(&tokens[offset..offset + self.seq_len]);
+                .copy_from_slice(&tokens[..self.seq_len]);
             self.targets_buf[dst_offset..dst_offset + self.seq_len]
-                .copy_from_slice(&tokens[offset + 1..offset + 1 + self.seq_len]);
+                .copy_from_slice(&tokens[1..self.seq_len + 1]);
         }
 
-        self.position += needed;
+        // Track position for epoch counting (approximate)
+        self.position += self.batch_size * seq_tokens;
+        if self.position >= self.dataset.len() {
+            self.position = 0;
+            self.epoch += 1;
+        }
 
         (&self.inputs_buf, &self.targets_buf)
     }
