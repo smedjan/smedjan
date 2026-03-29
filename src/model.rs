@@ -369,32 +369,42 @@ impl TransformerBlock {
         }
     }
 
-    /// Create a block with all weights zeroed (norm weights = 1).
-    /// Used by grow_model for stable progressive training.
-    pub fn new_zeroed(ctx: &Arc<MetalContext>, config: &ModelConfig, _layer_idx: usize) -> Self {
+    /// Create a block with scaled-down random init. scale × normal init std.
+    pub fn new_scaled(ctx: &Arc<MetalContext>, config: &ModelConfig, layer_idx: usize, scale: f32) -> Self {
         let d = config.d_model;
         let ff = config.d_ff();
         let r = config.lowrank;
         let z = || Tensor::zeros(ctx, vec![1]);
 
+        let rs = (1.0 / (2.0 * config.n_layers as f32)).sqrt() * scale;
+        let ff_std = (2.0 / (d + ff) as f32).sqrt() * rs;
+        let depth_scale = if config.n_layers > 1 {
+            1.0 / (1.0 + layer_idx as f32 / config.n_layers as f32).sqrt()
+        } else { 1.0 };
+        let down_std = (2.0 / (ff + d) as f32).sqrt() * rs * depth_scale;
+
         let (w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
+            let u_std = (2.0 / (d + r) as f32).sqrt() * rs;
+            let v_std = (2.0 / (r + ff) as f32).sqrt() * scale;
+            let d_std = (2.0 / (ff + r) as f32).sqrt() * rs;
+            let dv_std = (2.0 / (r + d) as f32).sqrt() * scale;
             (
-                Tensor::zeros(ctx, vec![d, r]), Tensor::zeros(ctx, vec![r, ff]),
-                Tensor::zeros(ctx, vec![ff, r]), Tensor::zeros(ctx, vec![r, d]),
-                Tensor::zeros(ctx, vec![d, r]), Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::randn(ctx, vec![d, r], u_std), Tensor::randn(ctx, vec![r, ff], v_std),
+                Tensor::randn(ctx, vec![ff, r], d_std), Tensor::randn(ctx, vec![r, d], dv_std),
+                Tensor::randn(ctx, vec![d, r], u_std), Tensor::randn(ctx, vec![r, ff], v_std),
             )
         } else {
             (z(), z(), z(), z(), z(), z())
         };
 
-        let mut attn = MultiHeadAttention::new_zeroed(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
+        let mut attn = MultiHeadAttention::new_scaled(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank, scale);
         attn.sliding_window = config.sliding_window;
 
         Self {
             attn,
-            ffn_w1: Tensor::zeros(ctx, vec![d, ff]),
-            ffn_w2: Tensor::zeros(ctx, vec![ff, d]),
-            ffn_w3: Tensor::zeros(ctx, vec![d, ff]),
+            ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
+            ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
+            ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w1_u: w1u, ffn_w1_v: w1v,
             ffn_w2_u: w2u, ffn_w2_v: w2v,
             ffn_w3_u: w3u, ffn_w3_v: w3v,
@@ -408,7 +418,7 @@ impl TransformerBlock {
             ln1_weight: Tensor::ones(ctx, vec![d]),
             ln2_weight: Tensor::ones(ctx, vec![d]),
             norm_eps: config.norm_eps,
-            mod_router: Tensor::zeros(ctx, vec![d, 1]),
+            mod_router: Tensor::randn(ctx, vec![d, 1], (1.0 / d as f32).sqrt() * scale),
             mod_capacity: 0.0,
         }
     }
@@ -844,38 +854,41 @@ impl Transformer {
         }
     }
 
-    /// Create a model with all weights zeroed (except norm weights = 1).
-    /// Used by grow_model so new dimensions start at zero — the grown model
-    /// behaves identically to the small model at init, preventing logit explosion.
-    pub fn new_zeroed(ctx: &Arc<MetalContext>, config: ModelConfig) -> Self {
+    /// Create a model with scaled-down random init (scale × normal init std).
+    /// Used by grow_model: new dimensions get tiny noise (enough for gradient flow),
+    /// while pretrained weights are copied on top. scale=0.01 means 1% of normal init.
+    pub fn new_scaled(ctx: &Arc<MetalContext>, config: ModelConfig, scale: f32) -> Self {
         let d = config.d_model;
         let v = config.vocab_size as usize;
 
         let embed_rank = config.lowrank.max(0);
         let (embedding, embed_proj) = if embed_rank > 0 && embed_rank < d {
+            let e_std = (1.0 / embed_rank as f32).sqrt() * scale;
+            let p_std = (1.0 / d as f32).sqrt() * scale;
             (
-                Tensor::zeros(ctx, vec![v, embed_rank]),
-                Tensor::zeros(ctx, vec![embed_rank, d]),
+                Tensor::randn(ctx, vec![v, embed_rank], e_std),
+                Tensor::randn(ctx, vec![embed_rank, d], p_std),
             )
         } else {
-            (Tensor::zeros(ctx, vec![v, d]), Tensor::zeros(ctx, vec![1]))
+            let embed_std = (1.0 / d as f32).sqrt() * scale;
+            (Tensor::randn(ctx, vec![v, d], embed_std), Tensor::zeros(ctx, vec![1]))
         };
 
         let blocks: Vec<Arc<TransformerBlock>> = (0..config.n_layers)
-            .map(|i| Arc::new(TransformerBlock::new_zeroed(ctx, &config, i)))
+            .map(|i| Arc::new(TransformerBlock::new_scaled(ctx, &config, i, scale)))
             .collect();
 
         let ln_final_weight = Tensor::ones(ctx, vec![d]);
         let mtp_heads: Vec<Tensor> = (0..config.n_predict)
-            .map(|_| Tensor::zeros(ctx, vec![d, d]))
+            .map(|_| Tensor::randn(ctx, vec![d, d], (2.0 / (d + d) as f32).sqrt() * scale))
             .collect();
         let mtp_norms: Vec<Tensor> = (0..config.n_predict)
             .map(|_| Tensor::ones(ctx, vec![d]))
             .collect();
 
         eprintln!(
-            "Model initialized (zeroed): {} layers, {}M parameters",
-            config.n_layers, config.param_count() as f32 / 1e6
+            "Model initialized (scale={:.3}): {} layers, {}M parameters",
+            scale, config.n_layers, config.param_count() as f32 / 1e6
         );
 
         Self {
@@ -1251,11 +1264,13 @@ pub fn grow_model(
     eprintln!("Growing model: d={} → d={}, layers={} → layers={}",
         sd, ld, small.config.n_layers, large_config.n_layers);
 
-    // Create the large model with ZERO init for all weights.
+    // Create the large model with SMALL random init (1/100 of normal scale).
     // Small model weights are copied into the top-left corner.
-    // New dimensions start at zero — model behaves exactly like small model at init.
-    // Random init causes scale mismatch → logit explosion during progressive training.
-    let large = Transformer::new_zeroed(ctx, large_config.clone());
+    // New dimensions get tiny noise — enough gradient signal to learn,
+    // but small enough to not destabilize the pretrained portion.
+    // Zero init was too aggressive: 6 dead layers, no gradient flow.
+    // Full random init was too aggressive: logit explosion from scale mismatch.
+    let large = Transformer::new_scaled(ctx, large_config.clone(), 0.01);
 
     // Copy embedding: [vocab, sd] → top-left of [vocab, ld]
     copy_weight_block(ctx, &small.embedding.buffer, &large.embedding.buffer,

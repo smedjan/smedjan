@@ -113,24 +113,34 @@ impl MultiHeadAttention {
         Self::new_with_rank(ctx, d_model, n_heads, n_kv_heads, rope_theta, 0)
     }
 
-    /// Create attention with all weights zeroed (norm weights = 1).
-    /// Used by grow_model for stable progressive training.
-    pub fn new_zeroed(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize) -> Self {
+    /// Create attention with scaled-down random init. scale × normal init std.
+    pub fn new_scaled(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize, scale: f32) -> Self {
         let head_dim = d_model / n_heads;
         let kv_dim = head_dim * n_kv_heads;
         let z = || Tensor::zeros(ctx, vec![1]);
 
         let (w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v) = if rank > 0 {
+            let u_std = (2.0 / (d_model + rank) as f32).sqrt() * scale;
+            let vq_std = (2.0 / (rank + d_model) as f32).sqrt() * scale;
+            let vk_std = (2.0 / (rank + kv_dim) as f32).sqrt() * scale;
             (
-                Tensor::zeros(ctx, vec![d_model, rank]), Tensor::zeros(ctx, vec![d_model, rank]),
-                Tensor::zeros(ctx, vec![d_model, rank]), Tensor::zeros(ctx, vec![d_model, rank]),
-                Tensor::zeros(ctx, vec![rank, d_model]), Tensor::zeros(ctx, vec![rank, kv_dim]),
-                Tensor::zeros(ctx, vec![rank, kv_dim]), Tensor::zeros(ctx, vec![rank, d_model]),
+                Tensor::randn(ctx, vec![d_model, rank], u_std),
+                Tensor::randn(ctx, vec![d_model, rank], u_std),
+                Tensor::randn(ctx, vec![d_model, rank], u_std),
+                Tensor::randn(ctx, vec![d_model, rank], u_std),
+                Tensor::randn(ctx, vec![rank, d_model], vq_std),
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),
+                Tensor::randn(ctx, vec![rank, d_model], vq_std),
             )
         } else {
+            let std_q = (2.0 / (d_model + d_model) as f32).sqrt() * scale;
+            let std_kv = (2.0 / (d_model + kv_dim) as f32).sqrt() * scale;
             (
-                Tensor::zeros(ctx, vec![d_model, d_model]), Tensor::zeros(ctx, vec![d_model, kv_dim]),
-                Tensor::zeros(ctx, vec![d_model, kv_dim]), Tensor::zeros(ctx, vec![d_model, d_model]),
+                Tensor::randn(ctx, vec![d_model, d_model], std_q),
+                Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+                Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
+                Tensor::randn(ctx, vec![d_model, d_model], std_q),
                 z(), z(), z(), z(),
             )
         };
