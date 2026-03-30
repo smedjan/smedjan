@@ -1054,15 +1054,14 @@ impl Transformer {
     }
 
     /// Apply LM head to hidden states: h → logits via weight-tied embedding.
-    /// Embedding is detached: LM head backward produces NaN from FP16 overflow
-    /// when accumulating dB = dC^T @ A across batch*seq tokens (8192+ outer products).
-    /// The embedding gets gradient from the forward lookup path.
+    /// Gradients flow to embedding from both lookup and LM head (standard weight-tying).
+    /// Use grad_accum with micro-batch ≤16 to avoid FP16 overflow in backward.
     pub fn apply_lm_head(&self, h_flat: &Tensor) -> Tensor {
         let logits = if self.embed_rank > 0 {
-            let h_proj = h_flat.matmul_trans_b(&self.embed_proj.detach());
-            h_proj.matmul_trans_b(&self.embedding.detach())
+            let h_proj = h_flat.matmul_trans_b(&self.embed_proj);
+            h_proj.matmul_trans_b(&self.embedding)
         } else {
-            h_flat.matmul_trans_b(&self.embedding.detach())
+            h_flat.matmul_trans_b(&self.embedding)
         };
         let mup_scale = self.config.mup_output_scale();
         if mup_scale < 1.0 { logits.scale(mup_scale) } else { logits }
