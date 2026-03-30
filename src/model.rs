@@ -1054,15 +1054,15 @@ impl Transformer {
     }
 
     /// Apply LM head to hidden states: h → logits via weight-tied embedding.
-    /// Gradients flow to embedding through BOTH the lookup and the LM head.
-    /// Weight-tying means the same matrix learns from both paths — this is
-    /// standard practice (GPT-2, LLaMA) and provides 2× gradient signal.
+    /// Embedding is detached: LM head backward produces NaN from FP16 overflow
+    /// when accumulating dB = dC^T @ A across batch*seq tokens (8192+ outer products).
+    /// The embedding gets gradient from the forward lookup path.
     pub fn apply_lm_head(&self, h_flat: &Tensor) -> Tensor {
         let logits = if self.embed_rank > 0 {
-            let h_proj = h_flat.matmul_trans_b(&self.embed_proj);
-            h_proj.matmul_trans_b(&self.embedding)
+            let h_proj = h_flat.matmul_trans_b(&self.embed_proj.detach());
+            h_proj.matmul_trans_b(&self.embedding.detach())
         } else {
-            h_flat.matmul_trans_b(&self.embedding)
+            h_flat.matmul_trans_b(&self.embedding.detach())
         };
         let mup_scale = self.config.mup_output_scale();
         if mup_scale < 1.0 { logits.scale(mup_scale) } else { logits }
