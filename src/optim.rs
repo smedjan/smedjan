@@ -26,6 +26,7 @@ pub struct ParamState {
     pub v: Retained<GpuBuffer>, // second moment (full or projected)
     pub proj: Option<Retained<GpuBuffer>>, // GALORE: random projection matrix [size, rank]
     pub proj_size: usize, // projected size (rank × smaller_dim)
+    pub no_decay: bool, // skip weight decay for norms and embeddings
 }
 
 impl AdamW {
@@ -53,6 +54,10 @@ impl AdamW {
                 let v = ctx.alloc_buffer(m_size * 4);
                 compute::gpu_fill(ctx, &m, m_size as u32, 0.0);
                 compute::gpu_fill(ctx, &v, m_size as u32, 0.0);
+                // Skip weight decay for 1D params (norm weights, biases).
+                // Norm weights are initialized to 1.0 — decay pushes them toward 0,
+                // attenuating signal through the network (0.9^12_norms ≈ 0.28 after 20K steps).
+                let no_decay = t.shape.len() <= 1;
                 ParamState {
                     tensor_id: t.id,
                     buffer: t.buffer.clone(),
@@ -61,6 +66,7 @@ impl AdamW {
                     v,
                     proj,
                     proj_size,
+                    no_decay,
                 }
             })
             .collect();
@@ -109,7 +115,7 @@ impl AdamW {
                     beta1: self.beta1,
                     beta2: self.beta2,
                     eps: self.eps,
-                    weight_decay: self.weight_decay,
+                    weight_decay: if ps.no_decay { 0.0 } else { self.weight_decay },
                     step: self.step,
                 },
             );
@@ -149,8 +155,9 @@ impl AdamW {
                     let m_hat = m_val / bc1;
                     let v_hat = v_val / bc2;
 
+                    let wd = if ps.no_decay { 0.0 } else { self.weight_decay };
                     let p = *param_ptr.add(i);
-                    *param_ptr.add(i) = p * (1.0 - lr * self.weight_decay)
+                    *param_ptr.add(i) = p * (1.0 - lr * wd)
                         - lr * m_hat / (v_hat.sqrt() + self.eps);
                 }
             }
