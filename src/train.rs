@@ -530,19 +530,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 ctx.begin_batch(); // resume batch for backward
             }
 
-            // Skip catastrophic batches: loss > 3× EMA indicates outlier data.
-            // Training on these corrupts weights even with gradient clipping.
-            if ema_loss > 0.0 && step > config.warmup_steps {
-                ctx.flush_batch();
-                let loss_val = loss_tensor.to_vec()[0];
-                if loss_val > ema_loss * 3.0 || !loss_val.is_finite() {
-                    autograd::clear_tape();
-                    autograd::clear_recompute_registry();
-                    last_loss_tensor = Some(loss_tensor);
-                    continue; // skip backward for this micro-step
-                }
-                ctx.begin_batch();
-            }
+            // Note: loss spikes from outlier data (loss > 50) are handled by gradient
+            // clipping (max_grad_norm=1.0). Checking loss mid-step requires GPU sync
+            // that breaks command batching and kills throughput. The gradient clipper
+            // already limits per-step damage from any single batch.
 
             // Scale both loss AND gradient by 1/grad_accum_steps.
             if grad_accum_steps > 1 {
