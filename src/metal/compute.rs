@@ -262,6 +262,38 @@ pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
     );
 }
 
+/// GQA-aware batched C[b] = A[b] @ B[b/group_size]^T. Eliminates repeat_kv copy.
+/// A: [batch_q, M, K], B: [batch_kv, N, K], C: [batch_q, M, N]
+/// batch_q = batch * n_heads, batch_kv = batch * n_kv_heads, group_size = n_heads / n_kv_heads
+pub fn gpu_batched_matmul_gqa_trans_b(
+    ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
+    batch_q: u32, m: u32, n: u32, k: u32, group_size: u32,
+) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32, group_size: u32 }
+    let params = Params { m, n, k, batch: batch_q, group_size };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch_q as u64);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_gqa_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// GQA-aware batched C[b] = A[b] @ B[b/group_size]. Eliminates repeat_kv copy.
+pub fn gpu_batched_matmul_gqa(
+    ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
+    batch_q: u32, m: u32, n: u32, k: u32, group_size: u32,
+) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32, group_size: u32 }
+    let params = Params { m, n, k, batch: batch_q, group_size };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch_q as u64);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_gqa", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 /// Batched C[b] = A[b]^T @ B[b] for all b. Single GPU dispatch.
 /// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
 pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, k: u32, n: u32) {

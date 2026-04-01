@@ -257,32 +257,36 @@ impl MultiHeadAttention {
             None => (k, v),
         };
 
-        // Expand KV heads to match Q heads for attention computation.
-        // k_full: [batch*n_kv_heads, seq_k, head_dim] → [batch*n_heads, seq_k, head_dim]
+        // --- Attention computation ---
         let group_size = self.n_heads / self.n_kv_heads;
         let seq_k = k_full.shape[1];
-        let (k_expanded, v_expanded) = if group_size == 1 {
-            // Standard MHA — no expansion needed
+        let bh = batch * self.n_heads;
+        let seq_q_len = q.shape[1];
+
+        // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
+        // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
+        let use_gqa_strided = group_size > 1 && !autograd::is_recording();
+
+        // For training or MHA: expand KV heads to match Q heads
+        let (k_for_attn, v_for_attn) = if use_gqa_strided {
+            // Strided: pass unexpanded K/V, GQA matmuls handle indexing
             (k_full, v_full)
-        } else {
+        } else if group_size > 1 {
             (
                 repeat_kv(&k_full, bh_kv, seq_k, self.head_dim, group_size),
                 repeat_kv(&v_full, bh_kv, seq_k, self.head_dim, group_size),
             )
+        } else {
+            (k_full, v_full)
         };
 
-        // --- Attention computation ---
-        let bh = batch * self.n_heads;
-        let seq_q_len = q.shape[1];
-
         // Flash Attention for seq_len≥2048 (fused, O(n) memory).
-        // Standard path for seq_len<2048 (tiled matmuls faster at short seq due to
-        // higher GPU occupancy: 256 threads vs 32 in Flash).
-        let attn_cat = if seq_q_len >= 2048 {
+        // Standard path for seq_len<2048 (tiled matmuls faster at short seq).
+        let attn_cat = if seq_q_len >= 2048 && !use_gqa_strided {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
-                &q.buffer, &k_expanded.buffer, &v_expanded.buffer, &attn_out_buf,
+                &q.buffer, &k_for_attn.buffer, &v_for_attn.buffer, &attn_out_buf,
                 bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, offset,
             );
 
@@ -300,20 +304,25 @@ impl MultiHeadAttention {
                     op: autograd::Op::FlashAttention {
                         batch_heads: bh, seq_q: seq_q_len, seq_k, head_dim: self.head_dim, kv_offset: offset,
                     },
-                    inputs: vec![q.id, k_expanded.id, v_expanded.id],
+                    inputs: vec![q.id, k_for_attn.id, v_for_attn.id],
                     output: attn_out_id,
-                    input_buffers: vec![q.buffer.clone(), k_expanded.buffer.clone(), v_expanded.buffer.clone()],
+                    input_buffers: vec![q.buffer.clone(), k_for_attn.buffer.clone(), v_for_attn.buffer.clone()],
                     output_buffer: attn_out_buf.clone(),
-                    shapes: vec![q.shape.clone(), k_expanded.shape.clone(), v_expanded.shape.clone(),
+                    shapes: vec![q.shape.clone(), k_for_attn.shape.clone(), v_for_attn.shape.clone(),
                                  attn.shape.clone()],
                     cached: Some(attn_out_buf),
                 });
             }
             attn
-        } else {
-            // Standard 4-op path: faster at short sequences due to tiled matmul efficiency
+        } else if use_gqa_strided {
+            // GQA strided: Q@K^T and attn@V use modular head indexing, no KV copy
             let scale = 1.0 / (self.head_dim as f32).sqrt();
-            let scores = q.batched_matmul_trans_b(&k_expanded);
+            let scores_buf = q.ctx.alloc_buffer(bh * seq_q_len * seq_k * 4);
+            compute::gpu_batched_matmul_gqa_trans_b(
+                &q.ctx, &q.buffer, &k_for_attn.buffer, &scores_buf,
+                bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, group_size as u32,
+            );
+            let scores = Tensor::from_buffer(Arc::clone(&q.ctx), scores_buf, vec![bh, seq_q_len, seq_k]);
             let scores = scores.scale(scale);
             let scores = if self.sliding_window > 0 {
                 scores.causal_mask_window(offset, self.sliding_window as u32)
@@ -321,7 +330,24 @@ impl MultiHeadAttention {
                 scores.causal_mask(offset)
             };
             let weights = scores.softmax();
-            weights.batched_matmul(&v_expanded)
+            let attn_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
+            compute::gpu_batched_matmul_gqa(
+                &q.ctx, &weights.buffer, &v_for_attn.buffer, &attn_buf,
+                bh as u32, seq_q_len as u32, self.head_dim as u32, seq_k as u32, group_size as u32,
+            );
+            Tensor::from_buffer(Arc::clone(&q.ctx), attn_buf, vec![bh, seq_q_len, self.head_dim])
+        } else {
+            // Standard 4-op path
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let scores = q.batched_matmul_trans_b(&k_for_attn);
+            let scores = scores.scale(scale);
+            let scores = if self.sliding_window > 0 {
+                scores.causal_mask_window(offset, self.sliding_window as u32)
+            } else {
+                scores.causal_mask(offset)
+            };
+            let weights = scores.softmax();
+            weights.batched_matmul(&v_for_attn)
         };
 
         // Transpose [bh, seq, head_dim] back to [batch*seq, d_model]
