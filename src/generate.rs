@@ -223,8 +223,8 @@ fn sample_token(logits: &[f32], config: &SamplingConfig) -> u32 {
         }
     }
 
-    // Fallback: return the highest probability token
-    probs[0].0 as u32
+    // Fallback: return the highest probability token (or token 0 if probs empty)
+    probs.first().map_or(0, |p| p.0 as u32)
 }
 
 /// Generate and stream tokens, calling the callback for each new token.

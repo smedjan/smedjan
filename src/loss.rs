@@ -207,20 +207,18 @@ pub fn fused_linear_cross_entropy(
         let h_offset = start * d_model;
         let h_chunk_size = c * d_model;
 
+        // Copy chunk of hidden states to temp buffer (matmul reads from offset 0).
+        // This costs one extra copy per chunk but ensures correct offset.
+        let h_chunk_buf = ctx.alloc_buffer(h_chunk_size * 4);
+        compute::gpu_buffer_copy(ctx, &hidden.buffer, &h_chunk_buf,
+            h_offset as u32, 0, h_chunk_size as u32);
+
         // Compute chunk logits: h_chunk @ embedding^T → [c, vocab]
         let chunk_logits_buf = ctx.alloc_buffer(c * vocab * 4);
         compute::gpu_matmul_trans_b(
-            ctx, &hidden.buffer, &embedding.buffer, &chunk_logits_buf,
+            ctx, &h_chunk_buf, &embedding.buffer, &chunk_logits_buf,
             c as u32, vocab as u32, d_model as u32,
         );
-        // Note: gpu_matmul_trans_b reads from A starting at offset 0, but we need offset h_offset.
-        // For proper chunking, we'd need offset-aware matmul. Workaround: copy chunk first.
-        // Actually, the buffer pointer starts at 0 — we need to pass the right sub-buffer.
-        // For now, use a simpler approach: copy the chunk to a temp buffer.
-
-        // TODO: This copies h_chunk which partially defeats the purpose. To fully benefit,
-        // we need offset-aware matmul that reads from hidden.buffer at byte offset h_offset*4.
-        // For now, the memory savings come from not storing all chunk_logits simultaneously.
 
         // Compute cross-entropy loss + gradient for this chunk
         let chunk_targets = &targets[start..end];
