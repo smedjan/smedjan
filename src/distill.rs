@@ -165,7 +165,7 @@ fn call_claude_api(url: &str, api_key: &str, model: &str, system: &str, prompt: 
     // Extract text from Claude response (simple JSON parsing)
     if let Some(start) = response.find("\"text\":\"") {
         let start = start + 8;
-        if let Some(end) = response[start..].find("\"}") {
+        if let Some(end) = find_json_string_end(&response[start..]) {
             return Ok(response[start..start + end].to_string());
         }
     }
@@ -193,7 +193,7 @@ fn call_openai_api(url: &str, api_key: &str, model: &str, system: &str, prompt: 
 
     if let Some(start) = response.find("\"content\":\"") {
         let start = start + 11;
-        if let Some(end) = response[start..].find("\"}") {
+        if let Some(end) = find_json_string_end(&response[start..]) {
             return Ok(response[start..start + end].to_string());
         }
     }
@@ -218,9 +218,27 @@ fn call_ollama_api(url: &str, model: &str, prompt: &str, max_tokens: usize, temp
 
     if let Some(start) = response.find("\"response\":\"") {
         let start = start + 12;
-        if let Some(end) = response[start..].find("\",\"") {
+        // Walk the string respecting escape sequences to find the real closing quote
+        if let Some(end) = find_json_string_end(&response[start..]) {
             return Ok(response[start..start + end].to_string());
         }
     }
     Err(format!("Failed to parse Ollama response: {}", &response[..response.len().min(200)]))
+}
+
+/// Find the byte offset of the closing quote of a JSON string value,
+/// correctly skipping over escaped characters. The input `s` starts
+/// immediately after the opening `"`. Returns the byte offset of the
+/// closing `"` (i.e., `s[..offset]` is the raw JSON string content).
+fn find_json_string_end(s: &str) -> Option<usize> {
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(i),
+            b'\\' => i += 2, // skip escaped character
+            _ => i += 1,
+        }
+    }
+    None // unterminated string
 }

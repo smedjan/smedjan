@@ -15,8 +15,8 @@ pub struct SamplingConfig {
     pub max_tokens: usize,
 }
 
-impl SamplingConfig {
-    pub fn default() -> Self {
+impl Default for SamplingConfig {
+    fn default() -> Self {
         Self {
             temperature: 0.8,
             top_p: 0.95,

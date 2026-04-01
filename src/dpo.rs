@@ -813,10 +813,46 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
+                Some('b') => result.push('\u{0008}'),
+                Some('f') => result.push('\u{000C}'),
                 Some('"') => result.push('"'),
                 Some('\\') => result.push('\\'),
                 Some('/') => result.push('/'),
+                Some('u') => {
+                    // Parse \uXXXX unicode escape
+                    let mut hex = String::with_capacity(4);
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some(h) if h.is_ascii_hexdigit() => hex.push(h),
+                            _ => return None, // malformed \uXXXX
+                        }
+                    }
+                    let codepoint = u32::from_str_radix(&hex, 16).ok()?;
+                    // Handle UTF-16 surrogate pairs: \uD800-\uDBFF followed by \uDC00-\uDFFF
+                    if (0xD800..=0xDBFF).contains(&codepoint) {
+                        // High surrogate — expect \uDCxx low surrogate
+                        if chars.next() != Some('\\') || chars.next() != Some('u') {
+                            return None;
+                        }
+                        let mut hex2 = String::with_capacity(4);
+                        for _ in 0..4 {
+                            match chars.next() {
+                                Some(h) if h.is_ascii_hexdigit() => hex2.push(h),
+                                _ => return None,
+                            }
+                        }
+                        let low = u32::from_str_radix(&hex2, 16).ok()?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return None; // invalid surrogate pair
+                        }
+                        let combined = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                        result.push(char::from_u32(combined)?);
+                    } else {
+                        result.push(char::from_u32(codepoint)?);
+                    }
+                }
                 Some(c) => {
+                    // Unknown escape: preserve literally (non-standard but lenient)
                     result.push('\\');
                     result.push(c);
                 }

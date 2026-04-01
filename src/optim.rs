@@ -35,6 +35,13 @@ impl AdamW {
     }
 
     pub fn new_with_galore(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, galore_rank: usize) -> Self {
+        assert!(
+            galore_rank == 0,
+            "GALORE (galore_rank={}) is not yet implemented. The current code allocates \
+             m/v buffers of size `rank` but passes the full param size to the AdamW kernel, \
+             causing out-of-bounds GPU memory access. Set galore_rank=0 to use standard AdamW.",
+            galore_rank,
+        );
         let param_states: Vec<ParamState> = params
             .iter()
             .map(|t| {
@@ -295,10 +302,15 @@ impl WSDScheduler {
 /// The original Transformer schedule (Vaswani et al., 2017).
 /// Gentle decay — never reaches zero. Good for continued pretraining.
 pub fn inverse_sqrt_lr(max_lr: f32, warmup_steps: u32, step: u32) -> f32 {
-    if step < warmup_steps {
-        if warmup_steps == 0 { return max_lr; }
+    if warmup_steps == 0 {
+        // No warmup: apply inverse-sqrt decay from step 1 onward, max_lr at step 0
+        if step == 0 { return max_lr; }
+        max_lr / (step as f32).sqrt()
+    } else if step < warmup_steps {
+        // Linear warmup
         max_lr * (step as f32 / warmup_steps as f32)
     } else {
+        // Inverse-sqrt decay: lr = max_lr * sqrt(warmup) / sqrt(step)
         max_lr * (warmup_steps as f32).sqrt() / (step as f32).sqrt()
     }
 }
