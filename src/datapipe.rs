@@ -413,6 +413,7 @@ pub fn mix_shards(
 
     // Normalize weights
     let total_weight: f32 = shards.iter().map(|(_, w)| w).sum();
+    assert!(total_weight > 0.0, "Data mixing weights must sum to > 0 (got {})", total_weight);
 
     // Compute how many tokens to take from each shard
     let total_tokens: usize = shards.iter().map(|(t, _)| t.len()).sum();
