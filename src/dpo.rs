@@ -77,22 +77,35 @@ impl DpoDataset {
     }
 
     /// Get a preference pair by index.
+    ///
+    /// Validates all byte offsets against the mmap length before reading,
+    /// preventing out-of-bounds access on truncated or malformed files.
     pub fn get_pair(&self, idx: usize) -> PreferencePair {
         assert!(idx < self.num_pairs, "Pair index {} out of bounds ({})", idx, self.num_pairs);
+        let mmap_len = self.mmap.len();
         let mut pos = self.offsets[idx];
 
+        // --- prompt ---
+        assert!(pos + 4 <= mmap_len, "get_pair({}): prompt_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
         let prompt_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        assert!(pos + prompt_len * 4 <= mmap_len, "get_pair({}): prompt tokens ({}) at offset {} exceed mmap ({})", idx, prompt_len, pos, mmap_len);
         let prompt = read_u32_slice(&self.mmap, pos, prompt_len);
         pos += prompt_len * 4;
 
+        // --- chosen ---
+        assert!(pos + 4 <= mmap_len, "get_pair({}): chosen_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
         let chosen_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        assert!(pos + chosen_len * 4 <= mmap_len, "get_pair({}): chosen tokens ({}) at offset {} exceed mmap ({})", idx, chosen_len, pos, mmap_len);
         let chosen = read_u32_slice(&self.mmap, pos, chosen_len);
         pos += chosen_len * 4;
 
+        // --- rejected ---
+        assert!(pos + 4 <= mmap_len, "get_pair({}): rejected_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
         let rejected_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        assert!(pos + rejected_len * 4 <= mmap_len, "get_pair({}): rejected tokens ({}) at offset {} exceed mmap ({})", idx, rejected_len, pos, mmap_len);
         let rejected = read_u32_slice(&self.mmap, pos, rejected_len);
         let _ = pos; // suppress unused after last read
 
@@ -106,7 +119,14 @@ impl DpoDataset {
 }
 
 /// Read a little-endian u32 from a byte slice at the given offset.
+/// Panics if `offset + 4` exceeds the slice length.
 fn read_u32(data: &[u8], offset: usize) -> u32 {
+    assert!(
+        offset + 4 <= data.len(),
+        "read_u32: offset {} + 4 exceeds mmap length {}",
+        offset,
+        data.len(),
+    );
     u32::from_le_bytes([
         data[offset],
         data[offset + 1],
@@ -116,7 +136,16 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 }
 
 /// Read a slice of u32 values from a byte slice.
+/// Panics if the requested range exceeds the slice length.
 fn read_u32_slice(data: &[u8], offset: usize, len: usize) -> Vec<u32> {
+    let required_bytes = len * 4;
+    assert!(
+        offset + required_bytes <= data.len(),
+        "read_u32_slice: offset {} + {} bytes exceeds mmap length {}",
+        offset,
+        required_bytes,
+        data.len(),
+    );
     (0..len).map(|i| read_u32(data, offset + i * 4)).collect()
 }
 

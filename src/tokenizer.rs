@@ -234,7 +234,10 @@ impl BpeTokenizer {
                     split -= 1;
                 }
                 if split <= start + chunk_size / 2 {
-                    target // no whitespace found, just split at chunk boundary
+                    // No whitespace found — include the entire remaining text
+                    // in this chunk rather than splitting mid-word, which would
+                    // break BPE merges at the boundary.
+                    bytes.len()
                 } else {
                     split
                 }
