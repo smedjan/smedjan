@@ -494,7 +494,7 @@ impl Tensor {
 
     /// Row-wise softmax (last dimension).
     pub fn softmax(&self) -> Tensor {
-        assert!(self.shape.len() >= 2, "softmax needs at least 2D");
+        assert!(!self.shape.is_empty(), "softmax needs at least 1D");
         let cols = *self.shape.last().unwrap();
         let rows: usize = self.numel() / cols;
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);

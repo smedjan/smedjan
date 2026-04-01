@@ -275,11 +275,9 @@ impl MultiHeadAttention {
         let bh = batch * self.n_heads;
         let seq_q_len = q.shape[1];
 
-        // Flash Attention for seq_len≥128 (fused, O(n) memory).
-        // Standard path for seq_len<128 (tiled matmuls faster at small seq).
-        // Flash Attention wins at very long sequences (≥2048) where O(n²) memory
-        // becomes the bottleneck. At shorter seq, the standard tiled matmul path is
-        // faster due to higher GPU occupancy (256 threads vs 32 in Flash).
+        // Flash Attention for seq_len≥2048 (fused, O(n) memory).
+        // Standard path for seq_len<2048 (tiled matmuls faster at short seq due to
+        // higher GPU occupancy: 256 threads vs 32 in Flash).
         let attn_cat = if seq_q_len >= 2048 {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(

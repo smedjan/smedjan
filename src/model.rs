@@ -437,7 +437,7 @@ impl TransformerBlock {
         // Mixture of Depths: soft routing (multiply block output by sigmoid router score)
         // All tokens still run through the block but "easy" tokens get near-zero contribution.
         // Gradients flow through sigmoid, teaching the router which tokens to skip.
-        if self.mod_capacity > 0.0 && autograd::is_recording() {
+        if self.mod_capacity > 0.0 {
             let x_flat = x.reshape(vec![batch * seq_len, d]);
             // Router: score each token. High → process, low → skip.
             // Using x@W → tanh for smooth [−1,1] gating, then shift to [0,1].
