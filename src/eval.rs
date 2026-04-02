@@ -122,10 +122,11 @@ pub fn evaluate(
     examples: &[EvalExample],
 ) -> EvalResults {
     let config = SamplingConfig {
-        temperature: 0.1, // Low temperature for deterministic evaluation
+        temperature: 0.1,
         top_p: 0.9,
         top_k: 10,
         max_tokens: 64,
+        repetition_penalty: 1.2,
     };
 
     let mut outputs = Vec::with_capacity(examples.len());

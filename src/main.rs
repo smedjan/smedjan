@@ -221,6 +221,9 @@ enum Commands {
         top_p: f32,
         #[arg(long, default_value = "50")]
         top_k: usize,
+        /// Repetition penalty (>1.0 penalizes, 1.0 = disabled)
+        #[arg(long, default_value = "1.2")]
+        repetition_penalty: f32,
         #[arg(long, default_value = "false")]
         stream: bool,
         /// Enable speculative decoding with a smaller draft model
@@ -679,6 +682,7 @@ fn main() {
             temperature,
             top_p,
             top_k,
+            repetition_penalty,
             stream,
             speculative,
             draft_checkpoint,
@@ -697,6 +701,7 @@ fn main() {
             config.top_p = top_p;
             config.top_k = top_k;
             config.max_tokens = max_tokens;
+            config.repetition_penalty = repetition_penalty;
 
             if speculative {
                 let draft_ckpt = draft_checkpoint.expect(

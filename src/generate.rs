@@ -13,6 +13,7 @@ pub struct SamplingConfig {
     pub top_p: f32,
     pub top_k: usize,
     pub max_tokens: usize,
+    pub repetition_penalty: f32, // >1.0 penalizes repetition, 1.0 = disabled
 }
 
 impl Default for SamplingConfig {
@@ -22,6 +23,7 @@ impl Default for SamplingConfig {
             top_p: 0.95,
             top_k: 50,
             max_tokens: 256,
+            repetition_penalty: 1.2,
         }
     }
 }
@@ -59,11 +61,11 @@ pub fn generate(
             // This is a one-time cost; the hot loop below uses gpu_argmax on single-token logits.
             let all_logits = logits.to_vec();
             let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-            sample_token(last_logits, config)
+            sample_token(last_logits, config, &[])
         } else {
             let all_logits = logits.to_vec();
             let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-            sample_token(last_logits, config)
+            sample_token(last_logits, config, &[])
         };
 
         let mut generated = Vec::new();
@@ -88,7 +90,7 @@ pub fn generate(
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
                 // Zero-copy: shared memory on Apple Silicon means direct pointer access
                 let token_logits = &logits.as_slice()[..vocab_size];
-                sample_token_prescaled(token_logits, config)
+                sample_token_prescaled(token_logits, config, &generated)
             };
             generated.push(next_token);
         }
@@ -103,12 +105,26 @@ pub fn generate(
 }
 
 /// Sample a token from pre-scaled logits (temperature already applied on GPU).
-/// Uses top-k, top-p filtering and softmax sampling.
-fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig) -> u32 {
+/// Uses repetition penalty, top-k, top-p filtering and softmax sampling.
+fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u32 {
     let mut rng = rand::thread_rng();
 
-    // Logits are already temperature-scaled, just enumerate
-    let mut scaled: Vec<(usize, f32)> = logits
+    // Apply repetition penalty before top-k/softmax
+    let mut penalized: Vec<f32> = logits.to_vec();
+    if config.repetition_penalty != 1.0 {
+        for &tok in generated {
+            let idx = tok as usize;
+            if idx < penalized.len() {
+                if penalized[idx] > 0.0 {
+                    penalized[idx] /= config.repetition_penalty;
+                } else {
+                    penalized[idx] *= config.repetition_penalty;
+                }
+            }
+        }
+    }
+
+    let mut scaled: Vec<(usize, f32)> = penalized
         .iter()
         .enumerate()
         .map(|(i, &l)| (i, l))
@@ -164,12 +180,27 @@ fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig) -> u32 {
     probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0)
 }
 
-/// Sample a token from logits using temperature, top-k, and top-p.
-fn sample_token(logits: &[f32], config: &SamplingConfig) -> u32 {
+/// Sample a token from logits using temperature, top-k, top-p, and repetition penalty.
+fn sample_token(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u32 {
     let mut rng = rand::thread_rng();
 
+    // Apply repetition penalty: penalize tokens that already appeared in generated text
+    let mut penalized: Vec<f32> = logits.to_vec();
+    if config.repetition_penalty != 1.0 {
+        for &tok in generated {
+            let idx = tok as usize;
+            if idx < penalized.len() {
+                if penalized[idx] > 0.0 {
+                    penalized[idx] /= config.repetition_penalty;
+                } else {
+                    penalized[idx] *= config.repetition_penalty;
+                }
+            }
+        }
+    }
+
     // Apply temperature
-    let mut scaled: Vec<(usize, f32)> = logits
+    let mut scaled: Vec<(usize, f32)> = penalized
         .iter()
         .enumerate()
         .map(|(i, &l)| (i, l / config.temperature.max(1e-8)))
@@ -257,13 +288,15 @@ pub fn generate_streaming<F>(
         let all_logits = logits.as_slice();
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
 
-        let mut next_token = sample_token(last_logits, config);
+        let mut next_token = sample_token(last_logits, config, &[]);
+        let mut generated: Vec<u32> = Vec::new();
 
         for _ in 0..config.max_tokens {
             if next_token == EOS_TOKEN {
                 break;
             }
 
+            generated.push(next_token);
             let text = tokenizer.decode(&[next_token]);
             on_token(&text);
 
@@ -279,7 +312,7 @@ pub fn generate_streaming<F>(
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
                 let logits_data = logits.to_vec();
                 let token_logits = &logits_data[..vocab_size];
-                sample_token_prescaled(token_logits, config)
+                sample_token_prescaled(token_logits, config, &generated)
             };
         }
     });
@@ -437,7 +470,7 @@ fn generate_speculative_inner<F>(
         // Get last token prediction from main model after prefill (this is the first generated token)
         let main_all = main_logits.to_vec();
         let main_last = &main_all[(prompt_len - 1) * main_vocab..prompt_len * main_vocab];
-        let mut last_main_token = sample_token(main_last, config);
+        let mut last_main_token = sample_token(main_last, config, &[]);
 
         // Also get the draft model's prediction for the same position
         let draft_all = draft_logits.to_vec();
@@ -528,7 +561,7 @@ fn generate_speculative_inner<F>(
                     }
                 } else {
                     // Rejection: use main model's sampled token instead
-                    let sampled = sample_token(position_logits, config);
+                    let sampled = sample_token(position_logits, config, &[]);
                     generated.push(sampled);
                     emit_token(tokenizer, sampled, &mut on_token);
 
@@ -549,7 +582,7 @@ fn generate_speculative_inner<F>(
                 // main model's prediction at position n_drafted (the last logit row)
                 let bonus_offset = n_drafted * main_vocab;
                 let bonus_logits = &all_logits[bonus_offset..bonus_offset + main_vocab];
-                let bonus_token = sample_token(bonus_logits, config);
+                let bonus_token = sample_token(bonus_logits, config, &[]);
                 generated.push(bonus_token);
                 emit_token(tokenizer, bonus_token, &mut on_token);
 
