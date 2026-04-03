@@ -114,6 +114,8 @@ impl MetalContext {
             ("buffer_copy", shaders::BUFFER_COPY),
             ("transpose_perm_backward", shaders::TRANSPOSE_PERM_BACKWARD),
             ("transpose_perm_forward", shaders::TRANSPOSE_PERM_FORWARD),
+            ("transpose_rope", shaders::TRANSPOSE_ROPE),
+            ("transpose_rope_backward", shaders::TRANSPOSE_ROPE_BACKWARD),
             ("gradient_mask", shaders::GRADIENT_MASK),
             ("argmax", shaders::ARGMAX),
             ("temperature_scale", shaders::TEMPERATURE_SCALE),

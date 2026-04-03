@@ -1562,6 +1562,53 @@ pub fn gpu_fused_post_attn_ffn(
     );
 }
 
+/// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
+/// Eliminates the intermediate buffer and 1 dispatch (transpose + RoPE → 1 kernel).
+pub fn gpu_transpose_rope(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    output: &GpuBuffer,
+    batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32,
+) {
+    #[repr(C)]
+    struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32 }
+    let params = Params { batch, seq, n_heads, head_dim, offset, theta };
+    let params_buf = params_buffer(ctx, &params);
+
+    let total = (batch * n_heads * seq * head_dim) as u64;
+    let tpg = 256u64;
+    let groups = total.div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_threads_sync!(ctx, "transpose_rope", grid, tg,
+        0 => input, 1 => output, 2 => &params_buf
+    );
+}
+
+/// Backward for fused transpose+RoPE: inverse RoPE + inverse transpose in one dispatch.
+pub fn gpu_transpose_rope_backward(
+    ctx: &Arc<MetalContext>,
+    grad_out: &GpuBuffer,
+    grad_in: &GpuBuffer,
+    batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32,
+) {
+    #[repr(C)]
+    struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32 }
+    let params = Params { batch, seq, n_heads, head_dim, offset, theta };
+    let params_buf = params_buffer(ctx, &params);
+
+    let total = (batch * seq * n_heads * head_dim) as u64;
+    let tpg = 256u64;
+    let groups = total.div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+
+    dispatch_threads_sync!(ctx, "transpose_rope_backward", grid, tg,
+        0 => grad_out, 1 => grad_in, 2 => &params_buf
+    );
+}
+
 /// Persistent transformer layer: entire layer in ONE dispatch.
 /// 32 co-resident threadgroups with grid-level atomic barriers.
 #[allow(clippy::too_many_arguments)]

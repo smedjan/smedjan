@@ -230,20 +230,17 @@ impl MultiHeadAttention {
             )
         };
 
-        // Transpose Q: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
+        // Fused transpose + RoPE: [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] with rotation.
+        // Eliminates intermediate buffer and saves 2 dispatches per Q/K (transpose + RoPE → 1 each).
         let bh_kv = batch * self.n_kv_heads;
-        let q = transpose_bsh_to_bhs(&q, batch, seq_len, self.n_heads, self.head_dim);
-        // Transpose K, V: [batch*seq, n_kv_heads*head_dim] → [batch*n_kv_heads, seq, head_dim]
-        let k = transpose_bsh_to_bhs(&k, batch, seq_len, self.n_kv_heads, self.head_dim);
-        let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
-
-        // Apply RoPE to Q and K
         let offset = match &kv_cache {
             Some(cache) => cache.cached_len() as u32,
             None => 0,
         };
-        let q = q.apply_rope(offset, self.rope_theta);
-        let k = k.apply_rope(offset, self.rope_theta);
+        let q = fused_transpose_rope(&q, batch, seq_len, self.n_heads, self.head_dim, offset, self.rope_theta);
+        let k = fused_transpose_rope(&k, batch, seq_len, self.n_kv_heads, self.head_dim, offset, self.rope_theta);
+        // V only needs transpose (no RoPE)
+        let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
 
         // QK-norm: only at d_model≥512 where attention entropy collapse is a real risk.
         // At d<512, the overhead (~4% throughput) isn't worth it.
@@ -337,16 +334,17 @@ impl MultiHeadAttention {
             );
             Tensor::from_buffer(Arc::clone(&q.ctx), attn_buf, vec![bh, seq_q_len, self.head_dim])
         } else {
-            // Standard 4-op path
+            // Fused scale+mask+softmax: 1 dispatch instead of 3
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores = q.batched_matmul_trans_b(&k_for_attn);
-            let scores = scores.scale(scale);
-            let scores = if self.sliding_window > 0 {
-                scores.causal_mask_window(offset, self.sliding_window as u32)
+            let weights = if self.sliding_window > 0 {
+                // Windowed attention can't use fused kernel — fall back to separate ops
+                let scores = scores.scale(scale);
+                let scores = scores.causal_mask_window(offset, self.sliding_window as u32);
+                scores.softmax()
             } else {
-                scores.causal_mask(offset)
+                scores.scaled_causal_softmax(scale, offset)
             };
-            let weights = scores.softmax();
             weights.batched_matmul(&v_for_attn)
         };
 
@@ -377,6 +375,50 @@ impl MultiHeadAttention {
 
 /// Transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
 /// Records a tape entry so gradients flow through.
+/// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
+/// Saves 2 dispatches (transpose + RoPE → 1) and eliminates the intermediate buffer.
+fn fused_transpose_rope(
+    t: &Tensor,
+    batch: usize,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    offset: u32,
+    theta: f32,
+) -> Tensor {
+    let bh = batch * n_heads;
+    let size = bh * seq_len * head_dim;
+    let out_buf = t.ctx.alloc_buffer(size * 4);
+
+    compute::gpu_transpose_rope(
+        &t.ctx, &t.buffer, &out_buf,
+        batch as u32, seq_len as u32, n_heads as u32, head_dim as u32, offset, theta,
+    );
+
+    let out_id = autograd::next_id();
+    let result = Tensor {
+        id: out_id,
+        buffer: out_buf.clone(),
+        shape: vec![bh, seq_len, head_dim],
+        requires_grad: false,
+        ctx: Arc::clone(&t.ctx),
+    };
+
+    if t.requires_grad || autograd::is_recording() {
+        autograd::record(TapeEntry {
+            op: Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta },
+            inputs: vec![t.id],
+            output: out_id,
+            input_buffers: vec![t.buffer.clone()],
+            output_buffer: out_buf,
+            shapes: vec![t.shape.clone(), result.shape.clone()],
+            cached: None,
+        });
+    }
+
+    result
+}
+
 fn transpose_bsh_to_bhs(
     t: &Tensor,
     batch: usize,

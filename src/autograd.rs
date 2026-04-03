@@ -42,6 +42,9 @@ pub enum Op {
         forward_dir: bool, // true = bsh→bhs, false = bhs→bsh
     },
     RoPE { seq_len: u32, head_dim: u32, offset: u32, theta: f32 },
+    /// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
+    /// Backward: inverse RoPE + inverse transpose in one dispatch.
+    TransposeRoPE { batch: usize, seq_len: usize, n_heads: usize, head_dim: usize, offset: u32, theta: f32 },
     Checkpoint { layer_idx: usize },
     /// Slice a contiguous region from a flat buffer. offset and length in elements.
     Slice { offset: usize, length: usize, source_size: usize },
@@ -440,6 +443,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Op::RoPE { seq_len, head_dim, offset, theta } => {
                     backward_rope(ctx, entry, &out_grad, *seq_len, *head_dim, *offset, *theta);
                 }
+                Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
+                    backward_transpose_rope(ctx, entry, &out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
+                }
                 Op::MegaFfn { eps } => {
                     backward_mega_ffn(ctx, entry, &out_grad, *eps);
                 }
@@ -727,6 +733,23 @@ fn backward_rope(
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
+/// Fused transpose+RoPE backward: inverse RoPE + inverse transpose in one dispatch.
+fn backward_transpose_rope(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &Retained<GpuBuffer>,
+    batch: usize, seq_len: usize, n_heads: usize, head_dim: usize,
+    offset: u32, theta: f32,
+) {
+    let size = batch * seq_len * n_heads * head_dim;
+    let grad_input = ctx.alloc_buffer(size * 4);
+    compute::gpu_transpose_rope_backward(
+        ctx, out_grad, &grad_input,
+        batch as u32, seq_len as u32, n_heads as u32, head_dim as u32, offset, theta,
+    );
+    accumulate_grad(ctx, entry.inputs[0], grad_input, size);
+}
+
 /// MegaFfn backward: out = x + W2 @ (silu(norm(x) @ W1) * (norm(x) @ W3))
 /// input_buffers: [x, norm_w, w1, w2, w3]
 /// inputs (tensor IDs): [x_id, norm_w_id, w1_id, w2_id, w3_id]
@@ -929,6 +952,9 @@ fn backward_checkpoint(
             }
             Op::RoPE { seq_len, head_dim, offset, theta } => {
                 backward_rope(ctx, &sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
+            }
+            Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
+                backward_transpose_rope(ctx, &sub_entry, &sub_out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
             }
             Op::MegaFfn { eps } => {
                 backward_mega_ffn(ctx, &sub_entry, &sub_out_grad, *eps);

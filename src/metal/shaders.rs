@@ -1848,6 +1848,118 @@ kernel void transpose_perm_forward(
 }
 "#;
 
+/// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE rotation.
+/// Eliminates the intermediate buffer between transpose and RoPE (2 dispatches → 1).
+pub const TRANSPOSE_ROPE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TransposeRopeParams {
+    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta;
+};
+
+kernel void transpose_rope(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant TransposeRopeParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.batch * params.n_heads * params.seq * params.head_dim;
+    if (gid >= total) return;
+
+    uint head_dim = params.head_dim;
+    uint seq = params.seq;
+    uint n_heads = params.n_heads;
+
+    // Output index decomposition: [batch*n_heads, seq, head_dim]
+    uint rem = gid;
+    uint b = rem / (n_heads * seq * head_dim);
+    rem %= n_heads * seq * head_dim;
+    uint h = rem / (seq * head_dim);
+    rem %= seq * head_dim;
+    uint s = rem / head_dim;
+    uint d = rem % head_dim;
+
+    // Input layout: [batch*seq, n_heads*head_dim]
+    uint in_idx = (b * seq + s) * (n_heads * head_dim) + h * head_dim + d;
+    float val = input[in_idx];
+
+    // Apply RoPE: rotate pairs (d, d+1) by angle based on position
+    uint pair = d / 2;
+    float freq = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float angle = float(s + params.offset) * freq;
+    float cos_val;
+    float sin_val = sincos(angle, cos_val);
+
+    // Read the paired element
+    uint d_pair = (d % 2 == 0) ? d + 1 : d - 1;
+    uint in_pair = (b * seq + s) * (n_heads * head_dim) + h * head_dim + d_pair;
+    float val_pair = input[in_pair];
+
+    if (d % 2 == 0) {
+        output[gid] = val * cos_val - val_pair * sin_val;
+    } else {
+        output[gid] = val_pair * sin_val + val * cos_val;
+    }
+}
+"#;
+
+/// Backward for fused transpose+RoPE: inverse RoPE + inverse transpose.
+/// Input grad: [batch*n_heads, seq, head_dim], output grad: [batch*seq, n_heads*head_dim]
+pub const TRANSPOSE_ROPE_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TransposeRopeParams {
+    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta;
+};
+
+kernel void transpose_rope_backward(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_in [[buffer(1)]],
+    constant TransposeRopeParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.batch * params.seq * params.n_heads * params.head_dim;
+    if (gid >= total) return;
+
+    uint head_dim = params.head_dim;
+    uint seq = params.seq;
+    uint n_heads = params.n_heads;
+
+    // Input grad index: [batch*seq, n_heads*head_dim]
+    uint rem = gid;
+    uint bs = rem / (n_heads * head_dim);
+    uint b = bs / seq;
+    uint s = bs % seq;
+    rem %= n_heads * head_dim;
+    uint h = rem / head_dim;
+    uint d = rem % head_dim;
+
+    // Corresponding output grad index: [batch*n_heads, seq, head_dim]
+    uint out_idx = (b * n_heads + h) * seq * head_dim + s * head_dim + d;
+    float g = grad_out[out_idx];
+
+    // Inverse RoPE: rotate by -angle
+    uint pair = d / 2;
+    float freq = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float angle = float(s + params.offset) * freq;
+    float cos_val;
+    float sin_val = sincos(angle, cos_val);
+
+    uint d_pair = (d % 2 == 0) ? d + 1 : d - 1;
+    uint out_pair = (b * n_heads + h) * seq * head_dim + s * head_dim + d_pair;
+    float g_pair = grad_out[out_pair];
+
+    // Inverse rotation: multiply by rotation matrix transpose
+    if (d % 2 == 0) {
+        grad_in[gid] = g * cos_val + g_pair * sin_val;
+    } else {
+        grad_in[gid] = -g_pair * sin_val + g * cos_val;
+    }
+}
+"#;
+
 /// Gradient masking: zero out entire rows in a [positions, vocab] gradient matrix.
 /// mask[pos] == 0 → zero out grad[pos * vocab .. (pos+1) * vocab].
 /// Used in SFT to mask loss on prompt tokens (only response tokens get gradients).
