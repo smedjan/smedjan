@@ -341,7 +341,9 @@ impl Tensor {
         let out_size = total_m * n;
         let out_buf = self.ctx.alloc_buffer(out_size * 4);
 
-        // FP16 matmul with clamped cast — prevents NaN from half overflow
+        // Pre-cast to FP16 then use FP16 tiled matmul — faster than inline FP32→FP16 cast
+        // because FP16 tiles read 2× less device memory (bandwidth-bound).
+        // The F16_CAST_CACHE avoids redundant casts for weights within a step.
         if batch == 1 {
             let a_f16 = self.cast_to_f16();
             let b_f16 = other.cast_to_f16();
@@ -451,7 +453,6 @@ impl Tensor {
         assert_eq!(k, other.shape[1], "Inner dim mismatch");
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        // FP16 path: cast inputs to half, halves bandwidth
         let a_f16 = self.cast_to_f16();
         let b_f16 = other.cast_to_f16();
         compute::gpu_matmul_trans_b_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
