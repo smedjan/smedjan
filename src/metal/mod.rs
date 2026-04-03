@@ -50,7 +50,8 @@ pub type GpuComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 /// This eliminates the per-kernel commit+wait overhead (~50-80% of wall time).
 struct CommandBatch {
     cmd: Retained<GpuCommandBuffer>,
-    encoder_count: usize,
+    encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    dispatch_count: usize,
 }
 
 thread_local! {
@@ -388,13 +389,11 @@ impl MetalContext {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(cb) = b.take() {
-                if cb.encoder_count > 0 {
+                if cb.dispatch_count > 0 {
+                    cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
                 }
-                // Note: batch is NOT restarted — we'd need &self (the queue) to create
-                // a new command buffer. Since read_buffer is a static method, callers
-                // must call begin_batch() again if they want to continue batching.
             }
         });
     }
@@ -421,34 +420,38 @@ impl MetalContext {
     }
 
     /// Begin a command batch. All subsequent GPU kernel dispatches will be encoded
-    /// into a single command buffer instead of individual commit+wait cycles.
+    /// into a single compute encoder on one command buffer. This amortizes encoder
+    /// creation overhead (~300μs) across all dispatches instead of per-dispatch.
     /// Call `flush_batch()` when you need results.
     pub fn begin_batch(&self) {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
-            // If a batch is already active, flush it first (e.g., auto-flush consumed it partially)
+            // If a batch is already active, flush it first
             if let Some(cb) = b.take() {
-                if cb.encoder_count > 0 {
+                if cb.dispatch_count > 0 {
+                    cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
                 }
             }
             let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
-            *b = Some(CommandBatch { cmd, encoder_count: 0 });
+            let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
+            *b = Some(CommandBatch { cmd, encoder, dispatch_count: 0 });
         });
     }
 
-    /// Flush the current command batch: commit and wait for GPU completion.
+    /// Flush the current command batch: end encoder, commit, and wait for GPU completion.
     /// Returns the number of kernels that were batched.
     pub fn flush_batch(&self) -> usize {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(cb) = b.take() {
-                if cb.encoder_count > 0 {
+                if cb.dispatch_count > 0 {
+                    cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
                 }
-                cb.encoder_count
+                cb.dispatch_count
             } else {
                 0
             }
@@ -462,11 +465,12 @@ impl MetalContext {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(cb) = b.take() {
-                if cb.encoder_count > 0 {
+                if cb.dispatch_count > 0 {
+                    cb.encoder.endEncoding();
                     cb.cmd.commit();
                     // Don't wait — GPU runs while CPU prepares next batch
                 }
-                cb.encoder_count
+                cb.dispatch_count
             } else {
                 0
             }
@@ -503,17 +507,15 @@ impl MetalContext {
         ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(ref mut cb) = *b {
-                // Batched path: encode into the shared command buffer
-                let encoder = cb.cmd.computeCommandEncoder().expect("Failed to create encoder");
-                encoder.setComputePipelineState(pipeline);
-                bind(&encoder);
+                // Batched path: encode into the persistent compute encoder (no encoder create/destroy overhead)
+                cb.encoder.setComputePipelineState(pipeline);
+                bind(&cb.encoder);
                 if use_dispatch_threads {
-                    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+                    cb.encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
                 } else {
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+                    cb.encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
                 }
-                encoder.endEncoding();
-                cb.encoder_count += 1;
+                cb.dispatch_count += 1;
             } else {
                 // Unbatched path: one-off command buffer with sync wait
                 let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");

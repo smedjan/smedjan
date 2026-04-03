@@ -289,9 +289,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         Box::new(move |step| scheduler.get_lr(step))
     };
 
-    // Pre-allocate loss workspace (avoids 33MB+ allocation every step)
+    // Pre-allocate loss workspace (avoids 33MB+ allocation every step).
+    // Skip when using fused-CE — it doesn't use the workspace and the
+    // grad_logits buffer would be batch_seq × vocab × 4 bytes (268MB at batch=64).
     let batch_seq = config.batch_size * config.seq_len;
-    let loss_ws = loss::LossWorkspace::new(ctx, batch_seq, config.model_config.vocab_size as usize);
+    let loss_ws = if !config.fused_ce || config.model_config.n_predict > 0 {
+        Some(loss::LossWorkspace::new(ctx, batch_seq, config.model_config.vocab_size as usize))
+    } else {
+        None
+    };
 
     // EMA (Exponential Moving Average) model for self-distillation
     // The EMA is a running average of weights that's always a better model than the snapshot.
@@ -407,7 +413,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     // FusedLinearCE handles matmul_trans_b internally, so pass [vocab, d_model].
                     // For factored case, fall back to standard CE (fused CE doesn't handle two-step projection yet).
                     let logits = model.apply_lm_head(&hidden);
-                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
+                    if let Some(ref ws) = loss_ws {
+                        loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, ws)
+                    } else {
+                        loss::cross_entropy_loss(ctx, &logits, &targets)
+                    }
                 } else {
                     loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, &targets, 1024)
                 };
@@ -435,8 +445,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                         ctx, &logits, &teacher_logits,
                         config.distill_temperature, config.distill_alpha, &targets,
                     )
+                } else if let Some(ref ws) = loss_ws {
+                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, ws)
                 } else {
-                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, &loss_ws)
+                    loss::cross_entropy_loss(ctx, &logits, &targets)
                 };
 
                 // Z-loss: penalize large logit magnitudes (MoE stability)
