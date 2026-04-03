@@ -630,9 +630,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Async flush caused race condition — checkpoint saves and loss reads saw stale data.
         ctx.flush_batch();
 
-        // Zero gradients + invalidate FP16 weight cache (weights changed by optimizer)
-        autograd::zero_grads();
-        crate::tensor::Tensor::clear_f16_cache();
+        // Recycle gradient buffers to pool + invalidate FP16 weight cache (weights changed by optimizer)
+        autograd::zero_grads_recycle();
+        crate::tensor::Tensor::clear_f16_cache_recycle();
 
         let tokens_this_step = (config.batch_size * effective_seq * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;

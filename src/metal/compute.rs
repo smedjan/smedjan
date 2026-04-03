@@ -1477,8 +1477,8 @@ pub fn gpu_mega_ffn(
     output: &GpuBuffer,
     batch_tokens: u32, d_model: u32, d_ff: u32, eps: f32,
 ) {
-    assert!(d_model <= 256, "mega_ffn requires d_model <= 256 (got {})", d_model);
-    assert!(d_ff <= 1024, "mega_ffn requires d_ff <= 1024 (got {})", d_ff);
+    assert!(d_model <= 2048, "mega_ffn requires d_model <= 2048 (got {})", d_model);
+    assert!(d_ff <= 4096, "mega_ffn requires d_ff <= 4096 (got {})", d_ff);
 
     #[repr(C)]
     struct Params { batch_tokens: u32, d_model: u32, d_ff: u32, eps: f32 }
@@ -1506,7 +1506,7 @@ pub fn gpu_fused_pre_attn(
     batch_tokens: u32, d_model: u32, n_heads: u32, n_kv_heads: u32,
     head_dim: u32, seq_len: u32, rank: u32, eps: f32, rope_theta: f32, kv_offset: u32,
 ) {
-    assert!(d_model <= 256, "fused_pre_attn requires d_model <= 256");
+    assert!(d_model <= 1024, "fused_pre_attn requires d_model <= 1024");
 
     #[repr(C)]
     struct Params {
@@ -1541,8 +1541,8 @@ pub fn gpu_fused_post_attn_ffn(
     batch_tokens: u32, d_model: u32, d_ff: u32,
     n_heads: u32, head_dim: u32, seq_len: u32, rank: u32, eps: f32,
 ) {
-    assert!(d_model <= 256, "fused_post_attn_ffn requires d_model <= 256");
-    assert!(d_ff <= 1024, "fused_post_attn_ffn requires d_ff <= 1024");
+    assert!(d_model <= 1024, "fused_post_attn_ffn requires d_model <= 1024");
+    assert!(d_ff <= 4096, "fused_post_attn_ffn requires d_ff <= 4096");
 
     #[repr(C)]
     struct Params {

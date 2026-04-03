@@ -307,6 +307,16 @@ impl Tensor {
         TERNARY_CACHE.with(|c| c.borrow_mut().clear());
     }
 
+    /// Clear FP16 cache and recycle buffers to the pool instead of dropping.
+    pub fn clear_f16_cache_recycle() {
+        F16_CAST_CACHE.with(|c| {
+            for (_key, buf) in c.borrow_mut().drain() {
+                MetalContext::recycle_buffer(buf);
+            }
+        });
+        TERNARY_CACHE.with(|c| c.borrow_mut().clear());
+    }
+
     /// Matrix multiplication: self @ other
     /// self: [..., M, K], other: [..., K, N] → [..., M, N]
     pub fn matmul(&self, other: &Tensor) -> Tensor {

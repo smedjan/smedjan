@@ -3829,14 +3829,15 @@ kernel void mega_ffn(
     for (uint i = 0; i < simd_groups_per_tg; i++) total_ss += sv[i];
     float inv_rms = rsqrt(total_ss / float(d) + params.eps);
 
-    threadgroup float norm_x_shared[256];
+    // d_model up to 1024 (4KB), d_ff up to 4096 (16KB) — total 20KB < 32KB threadgroup limit
+    threadgroup float norm_x_shared[1024];
     for (uint c = thread_index; c < d; c += threads_per_group) {
         norm_x_shared[c] = x_row[c] * inv_rms * norm_w[c];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Gate + Up + SiLU
-    threadgroup float hidden_shared[1024];
+    threadgroup float hidden_shared[4096];
     for (uint j = thread_index; j < ff; j += threads_per_group) {
         float gate_val = 0.0f, up_val = 0.0f;
         for (uint k = 0; k < d; k++) {
@@ -3890,11 +3891,11 @@ kernel void fused_pre_attn(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float ts = 0.0f; for (uint i = 0; i < ns; i++) ts += sv[i];
     float irms = rsqrt(ts / float(d) + p.eps);
-    threadgroup float nx[256];
+    threadgroup float nx[1024]; // max d_model=1024 (4KB)
     for (uint c = tid; c < d; c += tpg) nx[c] = xr[c] * irms * norm_w[c];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // QKV projection
-    threadgroup float qb[256]; threadgroup float kb[256];
+    // QKV projection — qb/kb up to d_model elements
+    threadgroup float qb[1024]; threadgroup float kb[1024];
     if (p.rank == 0) {
         for (uint i = tid; i < d; i += tpg) { float v=0; for (uint k=0;k<d;k++) v+=nx[k]*W_q[k*d+i]; qb[i]=v; }
         for (uint i = tid; i < kv_dim; i += tpg) { float v=0; for (uint k=0;k<d;k++) v+=nx[k]*W_k[k*kv_dim+i]; kb[i]=v; }
@@ -3969,14 +3970,14 @@ kernel void fused_post_attn_ffn(
     uint d=p.d_model; uint ff=p.d_ff; uint bi=gid/p.seq_len; uint si=gid%p.seq_len;
     device const float* xr = x_res + gid * d;
     // Gather attention output
-    threadgroup float ga[256];
+    threadgroup float ga[1024];
     for (uint i=tid;i<d;i+=tpg){
         uint h=i/p.head_dim,e=i%p.head_dim;
         ga[i]=attn_out[(bi*p.n_heads+h)*p.seq_len*p.head_dim+si*p.head_dim+e];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // W_o projection
-    threadgroup float wo[256];
+    threadgroup float wo[1024];
     if (p.rank==0) {
         for(uint i=tid;i<d;i+=tpg){float v=0;for(uint k=0;k<d;k++)v+=ga[k]*W_o[k*d+i];wo[i]=v;}
     } else {
@@ -3987,7 +3988,7 @@ kernel void fused_post_attn_ffn(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Residual + RMSNorm
-    threadgroup float h[256];
+    threadgroup float h[1024];
     float lss=0;
     for(uint c=tid;c<d;c+=tpg){float hv=xr[c]+wo[c];h[c]=hv;lss+=hv*hv;}
     float ss=simd_sum(lss);
@@ -3999,7 +4000,7 @@ kernel void fused_post_attn_ffn(
     for(uint c=tid;c<d;c+=tpg) ga[c]=h[c]*irms*norm_w[c];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // SwiGLU FFN
-    threadgroup float hid[1024];
+    threadgroup float hid[4096];
     for(uint j=tid;j<ff;j+=tpg){
         float gv=0,uv=0;
         for(uint k=0;k<d;k++){float n=ga[k];gv+=n*W1[k*ff+j];uv+=n*W3[k*ff+j];}
