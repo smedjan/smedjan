@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 3; // v3: added lowrank, bitnet, n_experts, top_k, shared_layers, mup
+const VERSION: u32 = 4; // v4: ReLoRA base weights appended after trainable params when lowrank > 0
 
 /// Save model weights and config to a binary checkpoint file.
 pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::Result<()> {
@@ -21,13 +21,15 @@ pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::R
     // Model config
     write_config(&mut file, &model.config)?;
 
-    // Number of tensors
+    // Number of tensors (trainable params + base params for ReLoRA)
     let params = model.parameters();
-    let n_tensors = params.len() as u32;
+    let base_params = model.base_parameters();
+    let n_tensors = (params.len() + base_params.len()) as u32;
     file.write_all(&n_tensors.to_le_bytes())?;
 
-    // Each tensor: shape + data
-    for (i, param) in params.iter().enumerate() {
+    // Each tensor: shape + data (trainable first, then base weights)
+    let all_params: Vec<&_> = params.iter().chain(base_params.iter()).copied().collect();
+    for (i, param) in all_params.iter().enumerate() {
         // Shape
         let ndims = param.shape.len() as u32;
         file.write_all(&ndims.to_le_bytes())?;
@@ -64,12 +66,14 @@ pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, s
     // Model config
     write_config(&mut file, &model.config)?;
 
-    // Model weights
+    // Model weights (trainable + base for ReLoRA)
     let params = model.parameters();
-    let n_tensors = params.len() as u32;
+    let base_params = model.base_parameters();
+    let all_params: Vec<&_> = params.iter().chain(base_params.iter()).copied().collect();
+    let n_tensors = all_params.len() as u32;
     file.write_all(&n_tensors.to_le_bytes())?;
 
-    for param in &params {
+    for param in &all_params {
         let ndims = param.shape.len() as u32;
         file.write_all(&ndims.to_le_bytes())?;
         for &dim in &param.shape {
@@ -187,7 +191,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version >= 1 && version <= 3, "Unsupported checkpoint version: {} (expected 1-3)", version);
+    assert!(version >= 1 && version <= 4, "Unsupported checkpoint version: {} (expected 1-4)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -209,16 +213,20 @@ pub fn load_checkpoint(
     let n_tensors = u32::from_le_bytes(buf4) as usize;
 
     let params = model.parameters();
+    let base_params = model.base_parameters();
+    let all_params: Vec<&_> = params.iter().chain(base_params.iter()).copied().collect();
+
+    // v3 checkpoints don't include base weights — allow loading with fewer tensors
+    let expected = if version <= 3 { params.len() } else { all_params.len() };
     assert_eq!(
-        params.len(),
-        n_tensors,
+        n_tensors, expected,
         "Checkpoint has {} tensors, model expects {}",
-        n_tensors,
-        params.len()
+        n_tensors, expected
     );
 
-    // Load each tensor
-    for (i, param) in params.iter().enumerate() {
+    // Load each tensor (trainable params first, then base weights for v4+)
+    let load_params = if version <= 3 { &params[..] } else { &all_params[..] };
+    for (i, param) in load_params.iter().enumerate() {
         // Shape
         file.read_exact(&mut buf4)?;
         let ndims = u32::from_le_bytes(buf4) as usize;

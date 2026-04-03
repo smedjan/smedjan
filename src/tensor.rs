@@ -390,6 +390,46 @@ impl Tensor {
         out
     }
 
+    /// Matrix multiply where B (other) is detached — no gradient flows to B.
+    /// Used for ReLoRA frozen base weights: forward uses them, backward skips them.
+    /// Gradients still flow to self (the input activations).
+    pub fn matmul_detached(&self, other: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 2, "matmul_detached expects 2D tensors");
+        assert_eq!(other.shape.len(), 2, "matmul_detached expects 2D tensors");
+        let m = self.shape[0];
+        let k = self.shape[1];
+        let n = other.shape[1];
+        assert_eq!(k, other.shape[0], "inner dimensions must match");
+
+        let out_buf = self.ctx.alloc_buffer(m * n * 4);
+        let a_f16 = self.cast_to_f16();
+        let b_f16 = other.cast_to_f16();
+        compute::gpu_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![m, n],
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+
+        if autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::MatmulDetachedB,
+                inputs: vec![self.id, other.id], // other.id recorded but won't get grad
+                input_buffers: vec![self.buffer.clone(), other.buffer.clone()],
+                output: out_id,
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), other.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+
+        out
+    }
+
     /// Matrix multiply with B transposed: self @ other^T
     /// self: [M, K], other: [N, K] → [M, N]
     pub fn matmul_trans_b(&self, other: &Tensor) -> Tensor {

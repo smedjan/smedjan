@@ -275,10 +275,13 @@ pub struct TransformerBlock {
     pub n_experts: usize,
     pub top_k: usize,
     pub bitnet: bool,
-    // Low-rank FFN decomposition: W = U × V (when lowrank > 0)
-    pub ffn_w1_u: Tensor, pub ffn_w1_v: Tensor, // gate: [d, r] × [r, ff]
-    pub ffn_w2_u: Tensor, pub ffn_w2_v: Tensor, // down: [ff, r] × [r, d]
-    pub ffn_w3_u: Tensor, pub ffn_w3_v: Tensor, // up:   [d, r] × [r, ff]
+    // Low-rank FFN decomposition: W_effective = W_base + U × V (when lowrank > 0)
+    // Base weights are frozen (not in parameters()). Only U/V are trained.
+    // ReLoRA merge: W_base += U @ V, then reinit U/V for rank growth.
+    pub ffn_w1_base: Tensor, pub ffn_w2_base: Tensor, pub ffn_w3_base: Tensor,
+    pub ffn_w1_u: Tensor, pub ffn_w1_v: Tensor, // gate adapter: [d, r] × [r, ff]
+    pub ffn_w2_u: Tensor, pub ffn_w2_v: Tensor, // down adapter: [ff, r] × [r, d]
+    pub ffn_w3_u: Tensor, pub ffn_w3_v: Tensor, // up adapter:   [d, r] × [r, ff]
     pub lowrank: usize,
     pub ln1_weight: Tensor, // [d_model] — attention norm
     pub ln2_weight: Tensor, // [d_model] — ffn norm
@@ -322,25 +325,32 @@ impl TransformerBlock {
         // routing decisions, but NOT for gating weights. Adjusted each step by gamma.
         let router_bias = vec![0.0f32; config.n_experts.max(1)];
 
-        // Low-rank FFN decomposition: W = U × V
+        // Low-rank FFN decomposition: W_effective = W_base + U × V
+        // Base weights: full-rank, frozen (not in parameters(), no optimizer states).
+        // LoRA adapters: small U × V, trained. V initialized to zero so initial delta = 0.
+        // ReLoRA merge: W_base += U @ V, reinit U/V for rank growth.
         let r = config.lowrank;
-        let (w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
+        let (w1_base, w2_base, w3_base, w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
             let u_std = (2.0 / (d + r) as f32).sqrt() * residual_scale;
-            let v_std = (2.0 / (r + ff) as f32).sqrt();
-            let d_std = (2.0 / (ff + r) as f32).sqrt() * residual_scale;
-            let dv_std = (2.0 / (r + d) as f32).sqrt();
+            let d_u_std = (2.0 / (ff + r) as f32).sqrt() * residual_scale;
             (
+                // Base weights: random init (model starts as full-rank)
+                Tensor::randn(ctx, vec![d, ff], ff_std),
+                Tensor::randn(ctx, vec![ff, d], down_std),
+                Tensor::randn(ctx, vec![d, ff], ff_std),
+                // LoRA U: random init (Kaiming-like)
                 Tensor::randn(ctx, vec![d, r], u_std),
-                Tensor::randn(ctx, vec![r, ff], v_std),
-                Tensor::randn(ctx, vec![ff, r], d_std),
-                Tensor::randn(ctx, vec![r, d], dv_std),
+                // LoRA V: zero init (initial delta = U @ 0 = 0, no disturbance to base)
+                Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::randn(ctx, vec![ff, r], d_u_std),
+                Tensor::zeros(ctx, vec![r, d]),
                 Tensor::randn(ctx, vec![d, r], u_std),
-                Tensor::randn(ctx, vec![r, ff], v_std),
+                Tensor::zeros(ctx, vec![r, ff]),
             )
         } else {
             // Placeholders (not used when lowrank=0)
             let z = || Tensor::zeros(ctx, vec![1]);
-            (z(), z(), z(), z(), z(), z())
+            (z(), z(), z(), z(), z(), z(), z(), z(), z())
         };
 
         let mut attn = MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
@@ -351,6 +361,7 @@ impl TransformerBlock {
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+            ffn_w1_base: w1_base, ffn_w2_base: w2_base, ffn_w3_base: w3_base,
             ffn_w1_u: w1u, ffn_w1_v: w1v,
             ffn_w2_u: w2u, ffn_w2_v: w2v,
             ffn_w3_u: w3u, ffn_w3_v: w3v,
@@ -383,18 +394,19 @@ impl TransformerBlock {
         } else { 1.0 };
         let down_std = (2.0 / (ff + d) as f32).sqrt() * rs * depth_scale;
 
-        let (w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
+        let (w1_base, w2_base, w3_base, w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
             let u_std = (2.0 / (d + r) as f32).sqrt() * rs;
-            let v_std = (2.0 / (r + ff) as f32).sqrt() * scale;
-            let d_std = (2.0 / (ff + r) as f32).sqrt() * rs;
-            let dv_std = (2.0 / (r + d) as f32).sqrt() * scale;
+            let d_u_std = (2.0 / (ff + r) as f32).sqrt() * rs;
             (
-                Tensor::randn(ctx, vec![d, r], u_std), Tensor::randn(ctx, vec![r, ff], v_std),
-                Tensor::randn(ctx, vec![ff, r], d_std), Tensor::randn(ctx, vec![r, d], dv_std),
-                Tensor::randn(ctx, vec![d, r], u_std), Tensor::randn(ctx, vec![r, ff], v_std),
+                Tensor::randn(ctx, vec![d, ff], ff_std),
+                Tensor::randn(ctx, vec![ff, d], down_std),
+                Tensor::randn(ctx, vec![d, ff], ff_std),
+                Tensor::randn(ctx, vec![d, r], u_std), Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::randn(ctx, vec![ff, r], d_u_std), Tensor::zeros(ctx, vec![r, d]),
+                Tensor::randn(ctx, vec![d, r], u_std), Tensor::zeros(ctx, vec![r, ff]),
             )
         } else {
-            (z(), z(), z(), z(), z(), z())
+            (z(), z(), z(), z(), z(), z(), z(), z(), z())
         };
 
         let mut attn = MultiHeadAttention::new_scaled(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank, scale);
@@ -405,6 +417,7 @@ impl TransformerBlock {
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+            ffn_w1_base: w1_base, ffn_w2_base: w2_base, ffn_w3_base: w3_base,
             ffn_w1_u: w1u, ffn_w1_v: w1v,
             ffn_w2_u: w2u, ffn_w2_v: w2v,
             ffn_w3_u: w3u, ffn_w3_v: w3v,
@@ -647,8 +660,14 @@ impl TransformerBlock {
 
         // Gate and up projections — separate matmuls (fewer dispatches than fused concat+slice)
         let (gate, up) = if self.lowrank > 0 {
-            let g = x_flat.matmul(&self.ffn_w1_u).matmul(&self.ffn_w1_v);
-            let u = x_flat.matmul(&self.ffn_w3_u).matmul(&self.ffn_w3_v);
+            // ReLoRA: W_effective = W_base + U × V
+            // Base is detached (no grad) — only U/V are trained.
+            let g_base = x_flat.matmul_detached(&self.ffn_w1_base);
+            let g_lora = x_flat.matmul(&self.ffn_w1_u).matmul(&self.ffn_w1_v);
+            let g = g_base.add(&g_lora);
+            let u_base = x_flat.matmul_detached(&self.ffn_w3_base);
+            let u_lora = x_flat.matmul(&self.ffn_w3_u).matmul(&self.ffn_w3_v);
+            let u = u_base.add(&u_lora);
             (g, u)
         } else if self.bitnet {
             (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))
@@ -660,7 +679,9 @@ impl TransformerBlock {
 
         // Down projection
         let out = if self.lowrank > 0 {
-            hidden.matmul(&self.ffn_w2_u).matmul(&self.ffn_w2_v)
+            let d_base = hidden.matmul_detached(&self.ffn_w2_base);
+            let d_lora = hidden.matmul(&self.ffn_w2_u).matmul(&self.ffn_w2_v);
+            d_base.add(&d_lora)
         } else if self.bitnet {
             hidden.ternary_matmul(&self.ffn_w2)
         } else {
@@ -771,6 +792,60 @@ impl TransformerBlock {
             params.push(&self.mod_router);
         }
         params
+    }
+
+    /// Get frozen base weight tensors (for ReLoRA checkpoint save/load).
+    /// Returns empty vec when lowrank=0 (no base weights needed).
+    pub fn base_parameters(&self) -> Vec<&Tensor> {
+        if self.lowrank > 0 {
+            vec![&self.ffn_w1_base, &self.ffn_w2_base, &self.ffn_w3_base]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// ReLoRA merge: W_base += U @ V for all FFN weight pairs, then reinit U/V.
+    /// This accumulates the learned low-rank delta into the base, then gives the
+    /// optimizer a fresh subspace to explore. After K merges at rank r,
+    /// effective rank ≈ K × r. Returns the number of merged parameter pairs.
+    pub fn relora_merge(&self, ctx: &Arc<MetalContext>, reinit_scale: f32) -> usize {
+        if self.lowrank == 0 { return 0; }
+        let r = self.lowrank;
+        let d = self.attn.d_model;
+        let ff = self.ffn_w1_base.shape[1]; // d_ff
+
+        // Merge gate: W1_base += U1 @ V1  ([d,r] @ [r,ff] = [d,ff])
+        let w1_delta = ctx.alloc_buffer(d * ff * 4);
+        compute::gpu_matmul(ctx, &self.ffn_w1_u.buffer, &self.ffn_w1_v.buffer, &w1_delta,
+            d as u32, ff as u32, r as u32);
+        compute::gpu_add_inplace(ctx, &self.ffn_w1_base.buffer, &w1_delta, (d * ff) as u32);
+
+        // Merge down: W2_base += U2 @ V2  ([ff,r] @ [r,d] = [ff,d])
+        let w2_delta = ctx.alloc_buffer(ff * d * 4);
+        compute::gpu_matmul(ctx, &self.ffn_w2_u.buffer, &self.ffn_w2_v.buffer, &w2_delta,
+            ff as u32, d as u32, r as u32);
+        compute::gpu_add_inplace(ctx, &self.ffn_w2_base.buffer, &w2_delta, (ff * d) as u32);
+
+        // Merge up: W3_base += U3 @ V3  ([d,r] @ [r,ff] = [d,ff])
+        let w3_delta = ctx.alloc_buffer(d * ff * 4);
+        compute::gpu_matmul(ctx, &self.ffn_w3_u.buffer, &self.ffn_w3_v.buffer, &w3_delta,
+            d as u32, ff as u32, r as u32);
+        compute::gpu_add_inplace(ctx, &self.ffn_w3_base.buffer, &w3_delta, (d * ff) as u32);
+
+        // Reinit U with small random, V with zeros (standard LoRA init)
+        for param in [&self.ffn_w1_u, &self.ffn_w3_u] {
+            let rand = Tensor::randn(ctx, param.shape.clone(), reinit_scale);
+            compute::gpu_copy(ctx, &rand.buffer, &param.buffer, param.numel() as u32);
+        }
+        let rand = Tensor::randn(ctx, self.ffn_w2_u.shape.clone(), reinit_scale);
+        compute::gpu_copy(ctx, &rand.buffer, &self.ffn_w2_u.buffer, self.ffn_w2_u.numel() as u32);
+
+        // V: zero init (so initial delta after merge = 0)
+        for param in [&self.ffn_w1_v, &self.ffn_w2_v, &self.ffn_w3_v] {
+            compute::gpu_fill(ctx, &param.buffer, param.numel() as u32, 0.0);
+        }
+
+        3 // merged 3 FFN weight pairs
     }
 }
 
@@ -1219,6 +1294,16 @@ impl Transformer {
         }
         for head in &self.mtp_heads { params.push(head); }
         for norm in &self.mtp_norms { params.push(norm); }
+        params
+    }
+
+    /// Get all frozen base weight tensors (for ReLoRA checkpoint save/load).
+    /// These are NOT in parameters() and don't get optimizer states.
+    pub fn base_parameters(&self) -> Vec<&Tensor> {
+        let mut params = Vec::new();
+        for block in &self.blocks {
+            params.extend(block.base_parameters());
+        }
         params
     }
 

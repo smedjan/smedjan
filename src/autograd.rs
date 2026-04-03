@@ -21,6 +21,9 @@ pub type RecomputeFn = Box<dyn Fn(&Arc<MetalContext>) -> Vec<TapeEntry>>;
 #[derive(Debug, Clone)]
 pub enum Op {
     Matmul,
+    /// Matmul where B is detached: C = A @ B, grad flows to A only (not B).
+    /// Used for ReLoRA base weights — frozen weights that participate in forward but not backward.
+    MatmulDetachedB,
     MatmulTransB,
     Add,
     Mul,
@@ -344,6 +347,9 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Op::Matmul => {
                     backward_matmul(ctx, entry, &out_grad);
                 }
+                Op::MatmulDetachedB => {
+                    backward_matmul_detached_b(ctx, entry, &out_grad);
+                }
                 Op::MatmulTransB => {
                     backward_matmul_trans_b(ctx, entry, &out_grad);
                 }
@@ -472,6 +478,25 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retain
     let db_buf = ctx.alloc_buffer(k * n * 4);
     compute::gpu_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_buf, m as u32, k as u32, n as u32);
     accumulate_grad(ctx, entry.inputs[1], &db_buf, k * n);
+}
+
+/// Backward for C = A @ B where B is detached (frozen base weight).
+/// Only computes dA = dC @ B^T. No gradient for B.
+fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+    let a_shape = &entry.shapes[0];
+    let b_shape = &entry.shapes[1];
+    let rank_a = a_shape.len();
+    let rank_b = b_shape.len();
+
+    let m = a_shape[rank_a - 2];
+    let k = a_shape[rank_a - 1];
+    let n = b_shape[rank_b - 1];
+
+    // dA = dC @ B^T : [M, N] @ [N, K] = [M, K]
+    let da_buf = ctx.alloc_buffer(m * k * 4);
+    compute::gpu_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
+    accumulate_grad(ctx, entry.inputs[0], &da_buf, m * k);
+    // No dB — base weight is frozen.
 }
 
 fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
@@ -842,6 +867,7 @@ fn backward_checkpoint(
 
         match &sub_entry.op {
             Op::Matmul => backward_matmul(ctx, &sub_entry, &sub_out_grad),
+            Op::MatmulDetachedB => backward_matmul_detached_b(ctx, &sub_entry, &sub_out_grad),
             Op::MatmulTransB => backward_matmul_trans_b(ctx, &sub_entry, &sub_out_grad),
             Op::Add => backward_add(ctx, &sub_entry, &sub_out_grad),
             Op::Mul => backward_mul(ctx, &sub_entry, &sub_out_grad),

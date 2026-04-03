@@ -1459,13 +1459,16 @@ kernel void rms_norm_backward(
         gi[c] = go[c] * weight[c] * inv_rms - x[c] * correction;
     }
 
-    // grad_weight: atomic accumulate across rows (only for first pass)
-    // We accumulate grad_weight = sum_over_rows(grad_output * x * inv_rms)
-    for (uint c = thread_index; c < cols; c += threads_per_group) {
-        // Use atomic add since multiple rows write to the same weight gradient
-        float gw = go[c] * x[c] * inv_rms;
-        // Atomic float add — supported on Apple GPU family 2+
-        atomic_fetch_add_explicit((device atomic_float*)&grad_weight[c], gw, memory_order_relaxed);
+    // grad_weight: atomic accumulate across rows.
+    // Guard: if dot_sum is NaN/Inf, this row has bad gradients — skip atomic add
+    // to prevent one bad row from poisoning the entire grad_weight vector.
+    // Single per-row check instead of per-element branching (no throughput impact).
+    bool row_ok = !isnan(dot_sum) && !isinf(dot_sum) && !isnan(inv_rms) && !isinf(inv_rms);
+    if (row_ok) {
+        for (uint c = thread_index; c < cols; c += threads_per_group) {
+            float gw = go[c] * x[c] * inv_rms;
+            atomic_fetch_add_explicit((device atomic_float*)&grad_weight[c], gw, memory_order_relaxed);
+        }
     }
 }
 "#;
@@ -1559,6 +1562,10 @@ kernel void embedding_backward(
     for (uint t = thread_index; t < n_tokens; t += threads_per_group) {
         uint token_id = tokens[t];
         float grad_val = grad_output[t * dim + dim_idx];
+
+        // Guard: replace NaN/Inf with 0 to prevent poisoning via atomic add.
+        // Use select() instead of branching for zero pipeline divergence.
+        grad_val = select(grad_val, 0.0f, isnan(grad_val) || isinf(grad_val));
 
         if (token_id == prev_token_id) {
             // Same token as previous iteration — accumulate locally

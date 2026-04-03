@@ -312,6 +312,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let batches_per_epoch = data_loader.batches_per_epoch();
     eprintln!("Dataset: {} tokens, ~{} batches/epoch", data_loader.total_tokens(), batches_per_epoch);
 
+
     // total_tokens initialized from resume state or 0
     let start_time = Instant::now();
 
@@ -613,7 +614,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 compute::gpu_ema_update(ctx, ema_buf, &param.buffer, param.numel() as u32, config.ema_decay);
             }
         }
-        ctx.flush_batch_async();
+        // Sync flush: wait for GPU to finish forward+backward+optimizer before reading any buffers.
+        // Async flush caused race condition — checkpoint saves and loss reads saw stale data.
+        ctx.flush_batch();
 
         // Zero gradients + invalidate FP16 weight cache (weights changed by optimizer)
         autograd::zero_grads();
@@ -695,62 +698,34 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             let _ = writeln!(log_file, "{},{:.6},{:.6e},{:.1},{},{}", step, loss_val, lr, tokens_per_sec, elapsed, total_tokens);
         }
 
-        // ReLoRA: periodically merge lowrank weights and reinitialize for rank growth.
-        // After K merges at rank r, effective rank = K × r. Enables full-rank learning
-        // through sequential low-rank updates. The merge is a no-op for full-rank models.
+        // ReLoRA: periodically merge lowrank adapters into base weights, then reinitialize.
+        // W_base += U @ V, reinit U/V. After K merges at rank r, effective rank ≈ K × r.
         if config.relora_interval > 0 && config.model_config.lowrank > 0
             && step > 0 && step % config.relora_interval == 0
         {
-            // ReLoRA merge: reinitialize lowrank weights with small random values.
-            // The current U @ V contribution is "baked in" to the model's state via
-            // the cumulative effect of gradient updates. Reinitializing U, V gives the
-            // optimizer a fresh subspace to explore. Over K merges, the model has
-            // explored K different rank-r subspaces → effective rank ≈ K × r.
-            //
-            // We reinitialize U, V with small scale to avoid a large jump in the
-            // effective weight (U_new @ V_new ≈ 0 initially, so the model temporarily
-            // "loses" the lowrank contribution but quickly recovers).
             let reinit_scale = 0.01;
-            let mut n_reinit = 0;
+            let mut n_merged = 0;
 
+            ctx.begin_batch();
             for block in &model.blocks {
-                // Reinit attention lowrank pairs
-                if block.attn.attn_rank > 0 {
-                    for param in &[&block.attn.w_q, &block.attn.w_q_v,
-                                   &block.attn.w_k, &block.attn.w_k_v,
-                                   &block.attn.w_v, &block.attn.w_v_v,
-                                   &block.attn.w_o, &block.attn.w_o_v] {
-                        let size = param.numel();
-                        let rand_buf = crate::tensor::Tensor::randn(ctx, param.shape.clone(), reinit_scale);
-                        compute::gpu_copy(ctx, &rand_buf.buffer, &param.buffer, size as u32);
-                        n_reinit += 1;
-                    }
-                }
-                // Reinit FFN lowrank pairs
-                if block.lowrank > 0 {
-                    for param in &[&block.ffn_w1_u, &block.ffn_w1_v,
-                                   &block.ffn_w2_u, &block.ffn_w2_v,
-                                   &block.ffn_w3_u, &block.ffn_w3_v] {
-                        let size = param.numel();
-                        let rand_buf = crate::tensor::Tensor::randn(ctx, param.shape.clone(), reinit_scale);
-                        compute::gpu_copy(ctx, &rand_buf.buffer, &param.buffer, size as u32);
-                        n_reinit += 1;
-                    }
-                }
+                n_merged += block.relora_merge(ctx, reinit_scale);
             }
+            ctx.flush_batch();
 
-            // Reset optimizer momentum for fresh subspace exploration
-            autograd::zero_grads();
-            // Note: this only zeros gradients, not optimizer m/v states.
-            // For full ReLoRA, we'd also zero the m/v entries for reinit'd params.
-            // The optimizer will naturally adapt its momentum over the next few steps.
+            // Reset optimizer momentum/variance for the LoRA params (U, V).
+            // Stale momentum from pre-merge would push the fresh adapters in the wrong direction.
+            optimizer.reset_states_for_params(ctx, &model.parameters());
 
-            eprintln!("[ReLoRA] Step {}: reinitialized {}/{} lowrank params (scale={})",
-                step, n_reinit, model.parameters().len(), reinit_scale);
+            eprintln!("[ReLoRA] Step {}: merged {} weight pairs across {} layers (reinit scale={})",
+                step, n_merged, model.blocks.len(), reinit_scale);
         }
 
         // Checkpointing — save both model-only and full training state for resume
+        // CRITICAL: Wait for GPU to finish the optimizer update before reading param buffers.
+        // flush_batch_async() only commits — doesn't wait. Without this sync, checkpoint
+        // reads stale (pre-optimizer) parameter values, producing corrupt checkpoints.
         if step > 0 && step % config.checkpoint_interval == 0 {
+            ctx.wait_gpu();
             let path = format!("{}/step_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_checkpoint(&path, &model, step)?;
             let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
@@ -786,7 +761,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
     }
 
-    // Final checkpoint
+    // Final checkpoint — wait for GPU before reading weights
+    ctx.wait_gpu();
     let path = format!("{}/final.bin", config.checkpoint_dir);
     checkpoint::save_checkpoint(&path, &model, config.total_steps)?;
     let state_path = format!("{}/state_final.bin", config.checkpoint_dir);

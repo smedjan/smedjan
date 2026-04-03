@@ -99,6 +99,19 @@ impl AdamW {
         }).sum()
     }
 
+    /// Reset m/v states for specific parameters (by tensor ID).
+    /// Used after ReLoRA merge: stale momentum from pre-merge would push fresh adapters
+    /// in the wrong direction.
+    pub fn reset_states_for_params(&self, ctx: &Arc<MetalContext>, params: &[&Tensor]) {
+        let ids: std::collections::HashSet<usize> = params.iter().map(|p| p.id).collect();
+        for ps in &self.params {
+            if ids.contains(&ps.tensor_id) {
+                compute::gpu_fill(ctx, &ps.m, ps.proj_size as u32, 0.0);
+                compute::gpu_fill(ctx, &ps.v, ps.proj_size as u32, 0.0);
+            }
+        }
+    }
+
     /// Perform one optimizer step with the given learning rate (GPU dispatch).
     pub fn step(&mut self, lr: f32) {
         self.step += 1;
