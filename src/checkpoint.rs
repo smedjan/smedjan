@@ -117,7 +117,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version >= 2 && version <= 3, "Unsupported training state version: {}", version);
+    assert!(version >= 2 && version <= 4, "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -135,9 +135,22 @@ pub fn load_training_state(
     file.read_exact(&mut buf4)?;
     let n_tensors = u32::from_le_bytes(buf4) as usize;
     let params = model.parameters();
-    assert_eq!(params.len(), n_tensors);
+    let base_params = model.base_parameters();
 
-    for (i, param) in params.iter().enumerate() {
+    // v4 training states include base params (ReLoRA frozen weights) after trainable params.
+    // v2/v3 states only include trainable params.
+    let expected = if version >= 4 { params.len() + base_params.len() } else { params.len() };
+    assert_eq!(n_tensors, expected,
+        "Training state has {} tensors, model expects {} (version {})",
+        n_tensors, expected, version);
+
+    let all_params: Vec<&_> = if version >= 4 {
+        params.iter().chain(base_params.iter()).copied().collect()
+    } else {
+        params.iter().copied().collect()
+    };
+
+    for (i, param) in all_params.iter().enumerate() {
         file.read_exact(&mut buf4)?;
         let ndims = u32::from_le_bytes(buf4) as usize;
         let mut shape = Vec::with_capacity(ndims);
@@ -156,11 +169,11 @@ pub fn load_training_state(
         }
     }
 
-    // Optimizer state
+    // Optimizer state (only for trainable params, not base params)
     file.read_exact(&mut buf4)?;
     let opt_step = u32::from_le_bytes(buf4);
 
-    let mut opt_states = Vec::with_capacity(n_tensors);
+    let mut opt_states = Vec::with_capacity(params.len());
     for param in &params {
         let size = param.numel();
         let mut m_bytes = vec![0u8; size * 4];
