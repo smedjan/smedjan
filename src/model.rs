@@ -1145,7 +1145,7 @@ impl Transformer {
     /// Forward pass returning hidden states BEFORE the LM head.
     /// Used by FusedLinearCrossEntropy which handles LM head + CE in chunks.
     pub fn forward_hidden(
-        &self, tokens: &[u32], batch: usize, seq_len: usize, _checkpointed: bool,
+        &self, tokens: &[u32], batch: usize, seq_len: usize, checkpointed: bool,
     ) -> Tensor {
         let d = self.config.d_model;
         let n_tokens = batch * seq_len;
@@ -1182,15 +1182,21 @@ impl Transformer {
         } else { embed_tensor };
         let mut h = h_flat.reshape(vec![batch, seq_len, d]);
 
-        let n_layers = self.blocks.len();
-        for (i, block) in self.blocks.iter().enumerate() {
-            if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
-                let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
-                if rand::random::<f32>() < drop_prob { continue; }
+        if checkpointed {
+            for (i, block) in self.blocks.iter().enumerate() {
+                h = block.forward_checkpointed(&h, i);
             }
-            h = block.forward(&h, None);
-            if self.config.fp16_activations && i + 1 < n_layers {
-                h = h.fp16_roundtrip();
+        } else {
+            let n_layers = self.blocks.len();
+            for (i, block) in self.blocks.iter().enumerate() {
+                if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
+                    let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
+                    if rand::random::<f32>() < drop_prob { continue; }
+                }
+                h = block.forward(&h, None);
+                if self.config.fp16_activations && i + 1 < n_layers {
+                    h = h.fp16_roundtrip();
+                }
             }
         }
 
