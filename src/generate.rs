@@ -301,10 +301,9 @@ pub fn generate_streaming<F>(
                 // PERF-5: GPU-side argmax — reads back 4 bytes instead of 128KB
                 gpu_argmax(ctx, &logits.buffer, vocab_size as u32)
             } else {
-                // Temperature scaling on GPU, then read back for CPU sampling
+                // Temperature scaling on GPU, then zero-copy read for CPU sampling
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
-                let logits_data = logits.to_vec();
-                let token_logits = &logits_data[..vocab_size];
+                let token_logits = &logits.as_slice()[..vocab_size];
                 sample_token_prescaled(token_logits, config, &generated)
             };
         }
