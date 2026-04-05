@@ -696,12 +696,13 @@ fn main() {
             };
             eprintln!("Loaded main model at step {}", step);
 
-            let mut config = generate::SamplingConfig::default();
-            config.temperature = temperature;
-            config.top_p = top_p;
-            config.top_k = top_k;
-            config.max_tokens = max_tokens;
-            config.repetition_penalty = repetition_penalty;
+            let config = generate::SamplingConfig {
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repetition_penalty,
+            };
 
             if speculative {
                 let draft_ckpt = draft_checkpoint.expect(
@@ -739,19 +740,17 @@ fn main() {
                     );
                     println!("{}{}", prompt, output);
                 }
+            } else if stream {
+                print!("{}", prompt);
+                generate::generate_streaming(&ctx, &model, &tok, &prompt, &config, |token_str| {
+                    print!("{}", token_str);
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                });
+                println!();
             } else {
-                if stream {
-                    print!("{}", prompt);
-                    generate::generate_streaming(&ctx, &model, &tok, &prompt, &config, |token_str| {
-                        print!("{}", token_str);
-                        use std::io::Write;
-                        std::io::stdout().flush().ok();
-                    });
-                    println!();
-                } else {
-                    let output = generate::generate(&ctx, &model, &tok, &prompt, &config);
-                    println!("{}{}", prompt, output);
-                }
+                let output = generate::generate(&ctx, &model, &tok, &prompt, &config);
+                println!("{}{}", prompt, output);
             }
         }
 
@@ -992,7 +991,7 @@ fn main() {
             let base_params = base_model.parameters();
             for ckpt_path in &checkpoints[1..] {
                 let (other_model, other_step) = checkpoint::load_checkpoint(&ctx, ckpt_path)
-                    .expect(&format!("Failed to load checkpoint: {}", ckpt_path));
+                    .unwrap_or_else(|_| panic!("Failed to load checkpoint: {}", ckpt_path));
                 eprintln!("  + {} (step {})", ckpt_path, other_step);
                 let other_params = other_model.parameters();
                 assert_eq!(base_params.len(), other_params.len(), "Checkpoint param count mismatch");

@@ -643,7 +643,7 @@ fn emit_token<F: FnMut(&str)>(tokenizer: &BpeTokenizer, token: u32, on_token: &m
 }
 
 /// Truncate all KV caches in a layer stack to the given sequence length.
-fn truncate_kv_caches(caches: &mut Vec<KvCache>, target_len: usize) {
+fn truncate_kv_caches(caches: &mut [KvCache], target_len: usize) {
     for cache in caches.iter_mut() {
         if cache.cached_len() > target_len {
             cache.truncate(target_len);

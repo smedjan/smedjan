@@ -347,7 +347,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 let progress = step as f32 / ramp_end as f32;
                 let seq = min_seq as f32 + progress * (config.seq_len - min_seq) as f32;
                 // Round to multiple of 8 for GPU alignment
-                ((seq as usize + 7) / 8 * 8).min(config.seq_len)
+                ((seq as usize).div_ceil(8) * 8).min(config.seq_len)
             } else {
                 config.seq_len
             }
@@ -362,7 +362,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         for _micro_step in 0..grad_accum_steps {
             // Get a micro-batch. With curriculum learning, truncate to effective_seq.
             let (full_inputs, full_targets) = data_loader.next_batch();
-            let (inputs, targets): (Vec<u32>, Vec<u32>) = if effective_seq < config.seq_len {
+
+            // Curriculum: build truncated batch into pre-allocated Vecs.
+            // Non-curriculum: use DataLoader's buffers directly (zero allocation).
+            let curriculum_inputs;
+            let curriculum_targets;
+            let (inputs, targets): (&[u32], &[u32]) = if effective_seq < config.seq_len {
                 let bs = config.batch_size;
                 let mut si = Vec::with_capacity(bs * effective_seq);
                 let mut st = Vec::with_capacity(bs * effective_seq);
@@ -371,9 +376,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     si.extend_from_slice(&full_inputs[start..start + effective_seq]);
                     st.extend_from_slice(&full_targets[start..start + effective_seq]);
                 }
-                (si, st)
+                curriculum_inputs = si;
+                curriculum_targets = st;
+                (&curriculum_inputs, &curriculum_targets)
             } else {
-                (full_inputs.to_vec(), full_targets.to_vec())
+                (full_inputs, full_targets)
             };
 
             // Speculative pretraining: score batch with reference model, skip if easy
@@ -381,8 +388,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 // Run reference forward + loss entirely in no_grad to avoid tape pollution
                 let ref_loss_val = autograd::no_grad(|| {
                     ctx.begin_batch();
-                    let ref_logits = ref_m.forward(&inputs, config.batch_size, effective_seq, None, false);
-                    let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, &targets);
+                    let ref_logits = ref_m.forward(inputs, config.batch_size, effective_seq, None, false);
+                    let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, targets);
                     ctx.flush_batch();
                     let val = ref_loss.to_vec()[0];
                     // Drop all ref-model intermediate buffers before training forward
@@ -405,50 +412,49 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             let (loss_tensor, grad_logits) = if config.fused_ce && n_predict == 0 && config.teacher_checkpoint.is_none() {
                 // FusedLinearCrossEntropy: compute logits+loss in chunks, never materialize full logit tensor.
                 // Saves ~2GB peak memory. Incompatible with MTP and distillation (they need full logits).
-                let hidden = model.forward_hidden(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                let hidden = model.forward_hidden(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
                 // For factored embedding, we need the un-factored embedding for the fused CE.
                 // Use the full vocab embedding (either direct or projected).
-                let embed_for_ce = if model.embed_rank > 0 {
+                if model.embed_rank > 0 {
                     // Factored: need embed_proj @ embedding for the effective [d_model, vocab] weight.
                     // FusedLinearCE handles matmul_trans_b internally, so pass [vocab, d_model].
                     // For factored case, fall back to standard CE (fused CE doesn't handle two-step projection yet).
                     let logits = model.apply_lm_head(&hidden);
                     if let Some(ref ws) = loss_ws {
-                        loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, ws)
+                        loss::cross_entropy_loss_with_workspace(ctx, &logits, targets, ws)
                     } else {
-                        loss::cross_entropy_loss(ctx, &logits, &targets)
+                        loss::cross_entropy_loss(ctx, &logits, targets)
                     }
                 } else {
-                    loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, &targets, 1024)
-                };
-                embed_for_ce
+                    loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, targets, 1024)
+                }
             } else {
                 // Standard path: compute hidden → LM head → CE
                 let (logits, extra_logits, hidden_for_distill) = if n_predict > 0 {
-                    let (l, e) = model.forward_mtp(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    let (l, e) = model.forward_mtp(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
                     (l, e, None)
                 } else if config.ema_decay > 0.0 {
                     // When EMA active: use forward_hidden to get hidden states for self-distillation
-                    let hidden = model.forward_hidden(&inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    let hidden = model.forward_hidden(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
                     let logits = model.apply_lm_head(&hidden);
                     (logits, Vec::new(), Some(hidden))
                 } else {
-                    let l = model.forward(&inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
+                    let l = model.forward(inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
                     (l, Vec::new(), None)
                 };
 
                 let (loss_tensor, grad_logits) = if let Some(ref teacher) = teacher_model {
                     let teacher_logits = autograd::no_grad(|| {
-                        teacher.forward(&inputs, config.batch_size, effective_seq, None, false)
+                        teacher.forward(inputs, config.batch_size, effective_seq, None, false)
                     });
                     loss::distillation_loss(
                         ctx, &logits, &teacher_logits,
-                        config.distill_temperature, config.distill_alpha, &targets,
+                        config.distill_temperature, config.distill_alpha, targets,
                     )
                 } else if let Some(ref ws) = loss_ws {
-                    loss::cross_entropy_loss_with_workspace(ctx, &logits, &targets, ws)
+                    loss::cross_entropy_loss_with_workspace(ctx, &logits, targets, ws)
                 } else {
-                    loss::cross_entropy_loss(ctx, &logits, &targets)
+                    loss::cross_entropy_loss(ctx, &logits, targets)
                 };
 
                 // Z-loss: penalize large logit magnitudes (MoE stability)
@@ -491,7 +497,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                         });
                         // KL distillation: alpha=0.1, temperature=2.0
                         let (distill_loss, distill_grad) = loss::distillation_loss(
-                            ctx, &logits, &teacher_logits, 2.0, 0.1, &targets,
+                            ctx, &logits, &teacher_logits, 2.0, 0.1, targets,
                         );
                         // Add distillation loss to main loss for display
                         compute::gpu_axpy(ctx, &loss_tensor.buffer, &distill_loss.buffer, 1, 0.1);
@@ -816,8 +822,8 @@ fn compute_validation_loss(
         for _ in 0..n_batches {
             let (inputs, targets) = val_loader.next_batch();
             ctx.begin_batch();
-            let logits = model.forward(&inputs, batch_size, seq_len, None, false);
-            let (loss_tensor, _) = loss::cross_entropy_loss(ctx, &logits, &targets);
+            let logits = model.forward(inputs, batch_size, seq_len, None, false);
+            let (loss_tensor, _) = loss::cross_entropy_loss(ctx, &logits, targets);
             ctx.flush_batch();
             let val = loss_tensor.to_vec()[0];
             if val.is_finite() {

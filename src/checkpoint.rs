@@ -9,6 +9,9 @@ use std::sync::Arc;
 const MAGIC: &[u8; 4] = b"AMDL";
 const VERSION: u32 = 4; // v4: ReLoRA base weights appended after trainable params when lowrank > 0
 
+/// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
+pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
+
 /// Save model weights and config to a binary checkpoint file.
 pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
@@ -105,7 +108,7 @@ pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, s
 pub fn load_training_state(
     ctx: &Arc<MetalContext>,
     path: &str,
-) -> std::io::Result<(Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64)> {
+) -> std::io::Result<TrainingState> {
     let mut file = std::fs::File::open(path)?;
     let mut buf4 = [0u8; 4];
     let mut buf8 = [0u8; 8];
@@ -117,7 +120,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version >= 2 && version <= 4, "Unsupported training state version: {}", version);
+    assert!((2..=4).contains(&version), "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -147,7 +150,7 @@ pub fn load_training_state(
     let all_params: Vec<&_> = if version >= 4 {
         params.iter().chain(base_params.iter()).copied().collect()
     } else {
-        params.iter().copied().collect()
+        params.to_vec()
     };
 
     for (i, param) in all_params.iter().enumerate() {
@@ -204,7 +207,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(version >= 1 && version <= 4, "Unsupported checkpoint version: {} (expected 1-4)", version);
+    assert!((1..=4).contains(&version), "Unsupported checkpoint version: {} (expected 1-4)", version);
 
     // Step
     file.read_exact(&mut buf4)?;

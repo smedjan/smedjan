@@ -195,7 +195,7 @@ pub fn fused_linear_cross_entropy(
     let total_loss_buf = ctx.alloc_buffer(4);
     compute::gpu_fill(ctx, &total_loss_buf, 1, 0.0);
 
-    let n_chunks = (n_tokens + chunk_size - 1) / chunk_size;
+    let n_chunks = n_tokens.div_ceil(chunk_size);
 
     for chunk_idx in 0..n_chunks {
         let start = chunk_idx * chunk_size;

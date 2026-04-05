@@ -504,11 +504,11 @@ pub fn minhash_signature(text: &str, num_hashes: usize, shingle_size: usize) -> 
         let shingle: String = chars[i..i + shingle_size].iter().collect();
         let base_hash = fnv_hash(shingle.as_bytes());
 
-        for h in 0..num_hashes {
+        for (h, min_hash) in min_hashes.iter_mut().enumerate().take(num_hashes) {
             // Use different hash functions by XORing with seed
             let hash = base_hash.wrapping_mul(6364136223846793005u64.wrapping_add(h as u64 * 1442695040888963407));
-            if hash < min_hashes[h] {
-                min_hashes[h] = hash;
+            if hash < *min_hash {
+                *min_hash = hash;
             }
         }
     }

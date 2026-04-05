@@ -331,7 +331,7 @@ impl BpeTokenizer {
         // Version
         file.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        assert!(version >= 1 && version <= 2, "Unsupported tokenizer version: {}", version);
+        assert!((1..=2).contains(&version), "Unsupported tokenizer version: {}", version);
 
         // Vocab size
         file.read_exact(&mut buf4)?;

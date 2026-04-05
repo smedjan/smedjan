@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// 256 threads × 2 shared arrays × 4 bytes = 2KB — fits in 32KB threadgroup memory.
 #[inline]
 fn next_power_of_2_clamped(n: u64) -> u64 {
-    let clamped = n.min(256).max(1) as u32;
+    let clamped = n.clamp(1, 256) as u32;
     let p = clamped.next_power_of_two().min(256);
     p as u64
 }
@@ -773,7 +773,7 @@ pub fn gpu_ternary_absmean(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean
 pub fn gpu_ternary_pack(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &GpuBuffer, packed: &GpuBuffer, rows: u32, cols: u32) {
     let rows_buf = params_buffer(ctx, &rows);
     let cols_buf = params_buffer(ctx, &cols);
-    let packed_rows = (rows + 15) / 16;
+    let packed_rows = rows.div_ceil(16);
     let grid = MetalContext::size(cols as u64, packed_rows as u64, 1);
     let tg = MetalContext::size(cols.min(32) as u64, packed_rows.min(32) as u64, 1);
     dispatch_sync!(ctx, "ternary_pack", grid, tg,

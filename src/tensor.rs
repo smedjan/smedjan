@@ -14,10 +14,13 @@ thread_local! {
     static F16_CAST_CACHE: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
 }
 
+/// Cached ternary quantization state: (packed_ternary, absmean).
+type TernaryCacheEntry = (Retained<GpuBuffer>, Retained<GpuBuffer>);
+
 // Thread-local ternary weight cache: avoids requantizing every matmul call.
 // Key: buffer pointer. Value: (packed_ternary, absmean) buffers.
 thread_local! {
-    static TERNARY_CACHE: RefCell<HashMap<usize, (Retained<GpuBuffer>, Retained<GpuBuffer>)>> = RefCell::new(HashMap::new());
+    static TERNARY_CACHE: RefCell<HashMap<usize, TernaryCacheEntry>> = RefCell::new(HashMap::new());
 }
 
 /// A tensor backed by Metal shared memory with automatic differentiation support.
@@ -159,7 +162,7 @@ impl Tensor {
         let n = weight.shape[1];
         assert_eq!(self.shape[1], weight.shape[0], "ternary_matmul K mismatch");
 
-        let packed_rows = (k + 15) / 16;
+        let packed_rows = k.div_ceil(16);
 
         // Check ternary cache (same pattern as FP16 cache)
         let cache_key = weight.buffer.contents().as_ptr() as usize;
