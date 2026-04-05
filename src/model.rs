@@ -1290,13 +1290,20 @@ impl Transformer {
     }
 
     /// Collect all trainable parameters.
+    /// When shared_layers is enabled, only includes the unique block's params once
+    /// (not N duplicates), preventing N× optimizer updates per step.
     pub fn parameters(&self) -> Vec<&Tensor> {
         let mut params = vec![&self.embedding, &self.ln_final_weight];
         if self.embed_rank > 0 {
             params.push(&self.embed_proj);
         }
-        for block in &self.blocks {
-            params.extend(block.parameters());
+        if self.config.shared_layers && !self.blocks.is_empty() {
+            // ALBERT: all blocks share one set of weights — include params once
+            params.extend(self.blocks[0].parameters());
+        } else {
+            for block in &self.blocks {
+                params.extend(block.parameters());
+            }
         }
         for head in &self.mtp_heads { params.push(head); }
         for norm in &self.mtp_norms { params.push(norm); }
@@ -1307,8 +1314,12 @@ impl Transformer {
     /// These are NOT in parameters() and don't get optimizer states.
     pub fn base_parameters(&self) -> Vec<&Tensor> {
         let mut params = Vec::new();
-        for block in &self.blocks {
-            params.extend(block.base_parameters());
+        if self.config.shared_layers && !self.blocks.is_empty() {
+            params.extend(self.blocks[0].base_parameters());
+        } else {
+            for block in &self.blocks {
+                params.extend(block.base_parameters());
+            }
         }
         params
     }
