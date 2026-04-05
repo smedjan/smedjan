@@ -310,14 +310,19 @@ impl Tensor {
         TERNARY_CACHE.with(|c| c.borrow_mut().clear());
     }
 
-    /// Clear FP16 cache and recycle buffers to the pool instead of dropping.
+    /// Clear FP16 and ternary weight caches, recycling buffers to the pool.
     pub fn clear_f16_cache_recycle() {
         F16_CAST_CACHE.with(|c| {
             for (_key, buf) in c.borrow_mut().drain() {
                 MetalContext::recycle_buffer(buf);
             }
         });
-        TERNARY_CACHE.with(|c| c.borrow_mut().clear());
+        TERNARY_CACHE.with(|c| {
+            for (_key, (packed, absmean)) in c.borrow_mut().drain() {
+                MetalContext::recycle_buffer(packed);
+                MetalContext::recycle_buffer(absmean);
+            }
+        });
     }
 
     /// Matrix multiplication: self @ other
