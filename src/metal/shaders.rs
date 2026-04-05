@@ -3444,10 +3444,11 @@ kernel void flash_attention_backward(
             // dQ (thread-local, no race)
             for (uint i = 0; i < d; i++) dq_acc[i] += ds * (float)K_shared[j][i];
 
-            // dK, dV (race between Q rows — acceptable for single-threadgroup-per-bh)
+            // dK, dV — multiple Q threads accumulate to the same K/V position.
+            // Atomic adds prevent data races between threads in the threadgroup.
             for (uint i = 0; i < d; i++) {
-                dK_bh[gk * d + i] += ds * q_row[i];
-                dV_bh[gk * d + i] += p * do_row[i];
+                atomic_fetch_add_explicit((device atomic_float*)&dK_bh[gk * d + i], ds * q_row[i], memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&dV_bh[gk * d + i], p * do_row[i], memory_order_relaxed);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
