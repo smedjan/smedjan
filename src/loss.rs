@@ -245,9 +245,9 @@ pub fn fused_linear_cross_entropy(
             c as u32, d_model as u32, vocab as u32,
         );
 
-        // Add chunk gradient to the full gradient buffer at the right offset
-        // For proper offset-aware add, we'd need a strided add kernel.
-        // Workaround: gpu_buffer_copy with offset to copy grad_h_chunk into grad_hidden
+        // Copy chunk gradient into the full gradient buffer at the right offset.
+        // Chunks are non-overlapping (each covers [start..end) of hidden states),
+        // so copy is correct — each position is written by exactly one chunk.
         compute::gpu_buffer_copy(
             ctx, &grad_h_chunk, &grad_hidden,
             0, h_offset as u32, h_chunk_size as u32,

@@ -37,6 +37,7 @@ fn bind_buffer(encoder: &GpuComputeEncoder, buf: &GpuBuffer, index: usize) {
     unsafe { encoder.setBuffer_offset_atIndex(Some(buf), 0, index); }
 }
 
+
 /// Dispatch helper: encode compute command, set buffers, dispatch threadgroups.
 /// Uses command batching when active (encode-only, no commit/wait).
 /// Falls back to sync dispatch when no batch is active.

@@ -352,110 +352,73 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
                 Some(g) => g,
                 None => continue, // No gradient flows to this op
             };
-
-            match &entry.op {
-                Op::Matmul => {
-                    backward_matmul(ctx, entry, &out_grad);
-                }
-                Op::MatmulDetachedB => {
-                    backward_matmul_detached_b(ctx, entry, &out_grad);
-                }
-                Op::MatmulTransB => {
-                    backward_matmul_trans_b(ctx, entry, &out_grad);
-                }
-                Op::Add => {
-                    backward_add(ctx, entry, &out_grad);
-                }
-                Op::Mul => {
-                    backward_mul(ctx, entry, &out_grad);
-                }
-                Op::Relu => {
-                    let size: usize = entry.shapes[0].iter().product();
-                    let grad_input = ctx.alloc_buffer(size * 4);
-                    compute::gpu_relu_backward(ctx, &entry.input_buffers[0], &out_grad, &grad_input, size as u32);
-                    accumulate_grad(ctx, entry.inputs[0], grad_input, size);
-                }
-                Op::Softmax => {
-                    backward_softmax(ctx, entry, &out_grad);
-                }
-                Op::ScaledCausalSoftmax { scale } => {
-                    backward_scaled_causal_softmax(ctx, entry, &out_grad, *scale);
-                }
-                Op::SliceCols { rows, src_cols, dst_cols, col_offset } => {
-                    backward_slice_cols(ctx, entry, &out_grad, *rows, *src_cols, *dst_cols, *col_offset);
-                }
-                Op::RmsNorm { eps } => {
-                    backward_rms_norm(ctx, entry, &out_grad, *eps);
-                }
-                Op::RmsNormResidual { eps } => {
-                    backward_rms_norm_residual(ctx, entry, &out_grad, *eps);
-                }
-                Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
-                    backward_repeat_kv(ctx, entry, &out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
-                }
-                Op::ScaleRows { rows, cols } => {
-                    backward_scale_rows(ctx, entry, &out_grad, *rows, *cols);
-                }
-                Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
-                    backward_flash_attention(ctx, entry, &out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
-                }
-                Op::Silu => {
-                    backward_silu(ctx, entry, &out_grad);
-                }
-                Op::SiluGate => {
-                    backward_silu_gate(ctx, entry, &out_grad);
-                }
-                Op::Reshape => {
-                    backward_reshape(ctx, entry, &out_grad);
-                }
-                Op::CrossEntropy => {
-                    // Cross-entropy backward is computed in the forward pass (fused).
-                    // The gradient is already stored in the cached buffer.
-                    if let Some(grad_logits) = &entry.cached {
-                        let size: usize = entry.shapes[0].iter().product();
-                        accumulate_grad(ctx, entry.inputs[0], grad_logits.clone(), size);
-                    }
-                }
-                Op::Embedding => {
-                    backward_embedding(ctx, entry, &out_grad);
-                }
-                Op::Scale { factor } => {
-                    backward_scale(ctx, entry, &out_grad, *factor);
-                }
-                Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-                    backward_transpose(ctx, entry, &out_grad, &TransposeParams {
-                        batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
-                    });
-                }
-                Op::Checkpoint { layer_idx } => {
-                    backward_checkpoint(ctx, entry, &out_grad, *layer_idx);
-                }
-                Op::Slice { offset, length, source_size } => {
-                    backward_slice(ctx, entry, &out_grad, *offset, *length, *source_size);
-                }
-                Op::ConcatParts { part_sizes } => {
-                    backward_concat_parts(ctx, entry, &out_grad, part_sizes);
-                }
-                Op::BatchedMatmul => {
-                    backward_batched_matmul(ctx, entry, &out_grad);
-                }
-                Op::BatchedMatmulTransB => {
-                    backward_batched_matmul_trans_b(ctx, entry, &out_grad);
-                }
-                Op::RoPE { seq_len, head_dim, offset, theta } => {
-                    backward_rope(ctx, entry, &out_grad, *seq_len, *head_dim, *offset, *theta);
-                }
-                Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
-                    backward_transpose_rope(ctx, entry, &out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
-                }
-                Op::MegaFfn { eps } => {
-                    backward_mega_ffn(ctx, entry, &out_grad, *eps);
-                }
-            }
+            dispatch_backward_op(ctx, entry, &out_grad);
         }
     }
     // Restore the tape (in case anything needs it later, though typically clear_tape is called)
     TAPE.with(|t| *t.borrow_mut() = tape);
+}
+
+/// Dispatch backward computation for a single tape entry.
+/// Shared by both the main backward pass and gradient-checkpointing sub-tape backward.
+fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+    match &entry.op {
+        Op::Matmul => backward_matmul(ctx, entry, out_grad),
+        Op::MatmulDetachedB => backward_matmul_detached_b(ctx, entry, out_grad),
+        Op::MatmulTransB => backward_matmul_trans_b(ctx, entry, out_grad),
+        Op::Add => backward_add(ctx, entry, out_grad),
+        Op::Mul => backward_mul(ctx, entry, out_grad),
+        Op::Relu => {
+            let size: usize = entry.shapes[0].iter().product();
+            let grad_input = ctx.alloc_buffer(size * 4);
+            compute::gpu_relu_backward(ctx, &entry.input_buffers[0], out_grad, &grad_input, size as u32);
+            accumulate_grad(ctx, entry.inputs[0], grad_input, size);
+        }
+        Op::Softmax => backward_softmax(ctx, entry, out_grad),
+        Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, entry, out_grad, *scale),
+        Op::SliceCols { rows, src_cols, dst_cols, col_offset } => {
+            backward_slice_cols(ctx, entry, out_grad, *rows, *src_cols, *dst_cols, *col_offset);
+        }
+        Op::RmsNorm { eps } => backward_rms_norm(ctx, entry, out_grad, *eps),
+        Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, entry, out_grad, *eps),
+        Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
+            backward_repeat_kv(ctx, entry, out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
+        }
+        Op::ScaleRows { rows, cols } => backward_scale_rows(ctx, entry, out_grad, *rows, *cols),
+        Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
+            backward_flash_attention(ctx, entry, out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
+        }
+        Op::Silu => backward_silu(ctx, entry, out_grad),
+        Op::SiluGate => backward_silu_gate(ctx, entry, out_grad),
+        Op::Reshape => backward_reshape(ctx, entry, out_grad),
+        Op::CrossEntropy => {
+            if let Some(grad_logits) = &entry.cached {
+                let size: usize = entry.shapes[0].iter().product();
+                accumulate_grad(ctx, entry.inputs[0], grad_logits.clone(), size);
+            }
+        }
+        Op::Embedding => backward_embedding(ctx, entry, out_grad),
+        Op::Scale { factor } => backward_scale(ctx, entry, out_grad, *factor),
+        Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
+            backward_transpose(ctx, entry, out_grad, &TransposeParams {
+                batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
+            });
+        }
+        Op::Checkpoint { layer_idx } => backward_checkpoint(ctx, entry, out_grad, *layer_idx),
+        Op::Slice { offset, length, source_size } => {
+            backward_slice(ctx, entry, out_grad, *offset, *length, *source_size);
+        }
+        Op::ConcatParts { part_sizes } => backward_concat_parts(ctx, entry, out_grad, part_sizes),
+        Op::BatchedMatmul => backward_batched_matmul(ctx, entry, out_grad),
+        Op::BatchedMatmulTransB => backward_batched_matmul_trans_b(ctx, entry, out_grad),
+        Op::RoPE { seq_len, head_dim, offset, theta } => {
+            backward_rope(ctx, entry, out_grad, *seq_len, *head_dim, *offset, *theta);
+        }
+        Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
+            backward_transpose_rope(ctx, entry, out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
+        }
+        Op::MegaFfn { eps } => backward_mega_ffn(ctx, entry, out_grad, *eps),
+    }
 }
 
 /// Cast a float buffer to half. Used for FP16 matmul backward (large matrices)
@@ -899,74 +862,7 @@ fn backward_checkpoint(
             Some(g) => g,
             None => continue,
         };
-
-        match &sub_entry.op {
-            Op::Matmul => backward_matmul(ctx, &sub_entry, &sub_out_grad),
-            Op::MatmulDetachedB => backward_matmul_detached_b(ctx, &sub_entry, &sub_out_grad),
-            Op::MatmulTransB => backward_matmul_trans_b(ctx, &sub_entry, &sub_out_grad),
-            Op::Add => backward_add(ctx, &sub_entry, &sub_out_grad),
-            Op::Mul => backward_mul(ctx, &sub_entry, &sub_out_grad),
-            Op::Relu => {
-                let size: usize = sub_entry.shapes[0].iter().product();
-                let gi = ctx.alloc_buffer(size * 4);
-                compute::gpu_relu_backward(ctx, &sub_entry.input_buffers[0], &sub_out_grad, &gi, size as u32);
-                accumulate_grad(ctx, sub_entry.inputs[0], gi, size);
-            }
-            Op::Softmax => backward_softmax(ctx, &sub_entry, &sub_out_grad),
-            Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, &sub_entry, &sub_out_grad, *scale),
-            Op::SliceCols { rows, src_cols, dst_cols, col_offset } => backward_slice_cols(ctx, &sub_entry, &sub_out_grad, *rows, *src_cols, *dst_cols, *col_offset),
-            Op::RmsNorm { eps } => backward_rms_norm(ctx, &sub_entry, &sub_out_grad, *eps),
-            Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, &sub_entry, &sub_out_grad, *eps),
-            Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
-                backward_repeat_kv(ctx, &sub_entry, &sub_out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
-            }
-            Op::ScaleRows { rows, cols } => {
-                backward_scale_rows(ctx, &sub_entry, &sub_out_grad, *rows, *cols);
-            }
-            Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
-                backward_flash_attention(ctx, &sub_entry, &sub_out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
-            }
-            Op::Silu => backward_silu(ctx, &sub_entry, &sub_out_grad),
-            Op::SiluGate => backward_silu_gate(ctx, &sub_entry, &sub_out_grad),
-            Op::Reshape => backward_reshape(ctx, &sub_entry, &sub_out_grad),
-            Op::CrossEntropy => {
-                if let Some(grad_logits) = &sub_entry.cached {
-                    let size: usize = sub_entry.shapes[0].iter().product();
-                    accumulate_grad(ctx, sub_entry.inputs[0], grad_logits.clone(), size);
-                }
-            }
-            Op::Embedding => backward_embedding(ctx, &sub_entry, &sub_out_grad),
-            Op::Scale { factor } => backward_scale(ctx, &sub_entry, &sub_out_grad, *factor),
-            Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-                backward_transpose(ctx, &sub_entry, &sub_out_grad, &TransposeParams {
-                    batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
-                });
-            }
-            Op::Checkpoint { layer_idx: nested_idx } => {
-                backward_checkpoint(ctx, &sub_entry, &sub_out_grad, *nested_idx);
-            }
-            Op::Slice { offset, length, source_size } => {
-                backward_slice(ctx, &sub_entry, &sub_out_grad, *offset, *length, *source_size);
-            }
-            Op::ConcatParts { part_sizes } => {
-                backward_concat_parts(ctx, &sub_entry, &sub_out_grad, part_sizes);
-            }
-            Op::BatchedMatmul => {
-                backward_batched_matmul(ctx, &sub_entry, &sub_out_grad);
-            }
-            Op::BatchedMatmulTransB => {
-                backward_batched_matmul_trans_b(ctx, &sub_entry, &sub_out_grad);
-            }
-            Op::RoPE { seq_len, head_dim, offset, theta } => {
-                backward_rope(ctx, &sub_entry, &sub_out_grad, *seq_len, *head_dim, *offset, *theta);
-            }
-            Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
-                backward_transpose_rope(ctx, &sub_entry, &sub_out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
-            }
-            Op::MegaFfn { eps } => {
-                backward_mega_ffn(ctx, &sub_entry, &sub_out_grad, *eps);
-            }
-        }
+        dispatch_backward_op(ctx, &sub_entry, &sub_out_grad);
     }
 
     // Extract gradient for the checkpoint's input tensor.

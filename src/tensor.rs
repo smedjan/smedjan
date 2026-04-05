@@ -356,27 +356,34 @@ impl Tensor {
             let a_f16 = self.cast_to_f16();
             let b_f16 = other.cast_to_f16();
             compute::gpu_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+        } else if batch_a == batch_b {
+            // Equal batch dims: single-dispatch batched FP16 matmul (1 GPU dispatch for all batches)
+            let a_f16 = self.cast_to_f16();
+            let b_f16 = other.cast_to_f16();
+            compute::gpu_batched_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf,
+                batch as u32, m as u32, n as u32, k as u32);
         } else {
-            // Sequential batch dispatch — each batch element is a separate matmul
-            // All operations stay on GPU — no CPU readback
-            let a_stride = if batch_a == 1 { 0 } else { m * k };
-            let b_stride = if batch_b == 1 { 0 } else { k * n };
-            for b in 0..batch {
-                let a_offset = b * a_stride;
-                let b_offset = b * b_stride;
-                let c_offset = b * m * n;
-
-                let a_sub = self.ctx.alloc_buffer(m * k * 4);
-                compute::gpu_buffer_copy(&self.ctx, &self.buffer, &a_sub, a_offset as u32, 0, (m * k) as u32);
-
-                let b_sub = self.ctx.alloc_buffer(k * n * 4);
-                compute::gpu_buffer_copy(&self.ctx, &other.buffer, &b_sub, b_offset as u32, 0, (k * n) as u32);
-
-                let c_sub = self.ctx.alloc_buffer(m * n * 4);
-                compute::gpu_matmul(&self.ctx, &a_sub, &b_sub, &c_sub, m as u32, n as u32, k as u32);
-
-                compute::gpu_buffer_copy(&self.ctx, &c_sub, &out_buf, 0, c_offset as u32, (m * n) as u32);
-            }
+            // Broadcast: one operand has batch=1. Single-dispatch batched FP32 matmul
+            // with the unbatched operand repeated via gpu_repeat_kv-style expansion.
+            // FP32 path because buffer_copy operates on float offsets.
+            // Expand the broadcast operand to full batch size
+            let (a_full, b_full) = if batch_a == 1 {
+                let expanded = self.ctx.alloc_buffer(batch * m * k * 4);
+                for i in 0..batch {
+                    compute::gpu_buffer_copy(&self.ctx, &self.buffer, &expanded,
+                        0, (i * m * k) as u32, (m * k) as u32);
+                }
+                (expanded, other.buffer.clone())
+            } else {
+                let expanded = self.ctx.alloc_buffer(batch * k * n * 4);
+                for i in 0..batch {
+                    compute::gpu_buffer_copy(&self.ctx, &other.buffer, &expanded,
+                        0, (i * k * n) as u32, (k * n) as u32);
+                }
+                (self.buffer.clone(), expanded)
+            };
+            compute::gpu_batched_matmul(&self.ctx, &a_full, &b_full, &out_buf,
+                batch as u32, m as u32, n as u32, k as u32);
         }
 
         let mut out_shape = self.shape[..rank_a - 2].to_vec();
