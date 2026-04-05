@@ -431,15 +431,21 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         autograd::backward(ctx, loss_tensor.id);
         ctx.flush_batch();
 
-        // Gradient clipping + optimizer step (batched)
+        // Gradient clipping (handles its own batching internally)
         clip_gradients_sft(ctx, &model, config.max_grad_norm);
 
-        // Optimizer step
+        // Optimizer step (batched — one sync for all params instead of per-param)
+        ctx.begin_batch();
         if lr > 1e-10 {
             optimizer.step(lr);
         }
-        optimizer.zero_grad();
         ctx.flush_batch();
+
+        // Clear tape and gradient buffers, recycle to pool
+        autograd::zero_grads_recycle();
+        crate::tensor::Tensor::clear_f16_cache_recycle();
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
 
         let tokens_this_step = (config.batch_size * config.seq_len) as u64;
         total_tokens += tokens_this_step;
