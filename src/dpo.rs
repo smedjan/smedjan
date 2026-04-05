@@ -566,13 +566,17 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         // --- Gradient clipping + optimizer step ---
         clip_gradients_dpo(ctx, &policy_model, config.max_grad_norm);
 
+        ctx.begin_batch();
         if lr > 1e-10 {
             optimizer.step(lr);
         }
-        optimizer.zero_grad();
         ctx.flush_batch();
 
+        // Clear tape, recycle gradient + cache buffers to pool
+        autograd::zero_grads_recycle();
+        crate::tensor::Tensor::clear_f16_cache_recycle();
         autograd::clear_tape();
+        autograd::clear_recompute_registry();
         total_pairs += 1;
 
         // --- Logging ---
