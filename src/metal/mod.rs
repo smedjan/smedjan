@@ -240,9 +240,11 @@ impl MetalContext {
         let size = buf.length();
         BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
-            let list = p.entry(size).or_insert_with(Vec::new);
-            // Cap pool size per bucket to avoid unbounded memory growth
-            if list.len() < 32 {
+            let list = p.entry(size).or_default();
+            // Cap pool size per bucket to avoid unbounded memory growth.
+            // 64 allows gradient-checkpointed backward to find reusable buffers
+            // across layer recomputes (was 32, causing ~63% miss rate).
+            if list.len() < 64 {
                 list.push(buf);
             }
         });

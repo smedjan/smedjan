@@ -881,6 +881,11 @@ fn backward_checkpoint(
     let first_input_id = sub_tape.first().map(|e| e.inputs[0]);
     let input_size: usize = entry.shapes[0].iter().product();
 
+    // Collect sub-tape intermediate tensor IDs for cleanup after backward.
+    // These are output IDs of sub-tape ops — they're ephemeral intermediates
+    // (not model parameters). Cleaning them from GRADS reclaims memory between layers.
+    let sub_intermediate_ids: Vec<usize> = sub_tape.iter().map(|e| e.output).collect();
+
     // Walk the sub-tape in reverse, CONSUMING entries to free GPU buffers incrementally.
     // This is critical: without this, all intermediate buffers stay pinned until the
     // entire sub-tape is processed, causing memory pressure on 16GB devices.
@@ -970,14 +975,18 @@ fn backward_checkpoint(
         }
     }
 
-    // Clean up sub-tape gradients for intermediate tensors to free memory.
-    // We keep gradients for tensor IDs that match the checkpoint entry's inputs
-    // (already accumulated above) and any parameter tensor IDs (which are in the
-    // main GRADS map and were accumulated by the sub-tape backward ops).
-    // The sub-tape intermediate IDs can be dropped.
-    // Note: We don't explicitly clean up here because the sub-tape Vec is dropped
-    // at end of scope, and the GRADS entries for sub-tape intermediates will be
-    // overwritten or cleared when clear_tape() is called at the end of the step.
+    // Clean up sub-tape intermediate gradients. These are ephemeral activations
+    // from the recomputed forward — not model parameter gradients. Removing them
+    // from GRADS frees GPU buffers between checkpoint layers, reducing peak memory
+    // by ~1 layer's worth of intermediates during backward.
+    GRADS.with(|grads| {
+        let mut g = grads.borrow_mut();
+        for id in &sub_intermediate_ids {
+            if let Some(buf) = g.remove(id) {
+                MetalContext::recycle_buffer(buf);
+            }
+        }
+    });
 }
 
 /// Parameters for the transpose backward pass.
