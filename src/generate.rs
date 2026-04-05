@@ -55,18 +55,11 @@ pub fn generate(
         let vocab_size = model.config.vocab_size as usize;
         let greedy = config.temperature < 0.01;
 
-        let mut next_token = if greedy {
-            // PERF-5: For prefill, the logits buffer contains seq_len * vocab_size values.
-            // We need argmax of the last token's logits only, so we read back just that slice.
-            // This is a one-time cost; the hot loop below uses gpu_argmax on single-token logits.
-            let all_logits = logits.to_vec();
-            let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-            sample_token(last_logits, config, &[])
-        } else {
-            let all_logits = logits.to_vec();
-            let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-            sample_token(last_logits, config, &[])
-        };
+        // Sample first token from prefill logits (last position predicts next token).
+        // Zero-copy: as_slice() returns a reference to shared GPU/CPU memory.
+        let all_logits = logits.as_slice();
+        let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
+        let mut next_token = sample_token(last_logits, config, &[]);
 
         let mut generated = Vec::new();
         generated.push(next_token);
