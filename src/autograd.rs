@@ -132,7 +132,8 @@ pub fn record(entry: TapeEntry) {
 /// Clear the tape and all stored gradients.
 pub fn clear_tape() {
     TAPE.with(|tape| {
-        let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
+        // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
+        let entries = std::mem::take(&mut *tape.borrow_mut());
         for entry in entries {
             // Recycle output and cached buffers — these are unique to the tape entry.
             // Input buffers are shared refs to source tensors and MUST NOT be recycled
@@ -162,7 +163,8 @@ pub fn clear_tape_keep_grads() {
     });
 
     TAPE.with(|tape| {
-        let entries = tape.borrow_mut().drain(..).collect::<Vec<_>>();
+        // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
+        let entries = std::mem::take(&mut *tape.borrow_mut());
         for entry in entries {
             // Never recycle Checkpoint output buffers — they're input buffers for
             // the next layer's recompute closure. Recycling them causes the recompute
