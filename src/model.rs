@@ -217,14 +217,28 @@ impl ModelConfig {
     }
 
     /// Memory required for training (weights + gradients + optimizer state) in bytes.
-    /// AdamW needs 3x the weight memory (params + m + v), plus gradients.
+    /// Trainable params need 4 copies (param + grad + m + v). Frozen base weights (ReLoRA) need 1 copy.
     pub fn training_memory_bytes(&self) -> usize {
-        self.param_count() * 4 * 4 // 4 copies (param + grad + m + v) × 4 bytes (f32)
+        let trainable = self.param_count() * 4 * 4; // 4 copies × 4 bytes
+        let frozen = if self.lowrank > 0 {
+            let d = self.d_model;
+            let ff = self.d_ff();
+            let n_unique = if self.shared_layers { 1 } else { self.n_layers };
+            n_unique * 3 * d * ff * 4 // 3 base FFN matrices × f32
+        } else { 0 };
+        trainable + frozen
     }
 
-    /// Memory required for inference (weights only) in bytes.
+    /// Memory required for inference (all weights) in bytes.
     pub fn inference_memory_bytes(&self) -> usize {
-        self.param_count() * 4 // f32
+        let trainable = self.param_count() * 4;
+        let frozen = if self.lowrank > 0 {
+            let d = self.d_model;
+            let ff = self.d_ff();
+            let n_unique = if self.shared_layers { 1 } else { self.n_layers };
+            n_unique * 3 * d * ff * 4
+        } else { 0 };
+        trainable + frozen
     }
 
     /// Print a summary of this config.
