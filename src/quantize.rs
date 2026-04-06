@@ -570,7 +570,17 @@ pub fn export_gguf(
     let mut data_offset: u64 = 0;
     let gguf_type = if quantize_type == "q8_0" { 8u32 } else { 0u32 }; // F32=0, Q8_0=8
 
-    for (param, name) in params.iter().zip(tensor_names.iter()) {
+    // Pre-quantize all tensors if Q8_0 so we know exact sizes for offset calculation
+    let quantized_data: Vec<Option<QuantizedTensor>> = if quantize_type == "q8_0" {
+        params.iter().map(|p| {
+            let data = p.to_vec();
+            Some(quantize(&data, &p.shape, 8, 32))
+        }).collect()
+    } else {
+        params.iter().map(|_| None).collect()
+    };
+
+    for (i, (param, name)) in params.iter().zip(tensor_names.iter()).enumerate() {
         write_gguf_string(&mut file, name)?;
         let ndims = param.shape.len() as u32;
         file.write_all(&ndims.to_le_bytes())?;
@@ -580,7 +590,12 @@ pub fn export_gguf(
         }
         file.write_all(&gguf_type.to_le_bytes())?;
         file.write_all(&data_offset.to_le_bytes())?;
-        data_offset += (param.numel() * 4) as u64; // F32 for now
+        if let Some(ref qt) = quantized_data[i] {
+            // Q8_0: data bytes + scales + zeros
+            data_offset += (qt.data.len() + qt.scales.len() * 4 + qt.zeros.len() * 4) as u64;
+        } else {
+            data_offset += (param.numel() * 4) as u64;
+        }
     }
 
     // Alignment padding to 32 bytes
@@ -591,10 +606,19 @@ pub fn export_gguf(
     }
 
     // Tensor data
-    for param in &params {
-        let data = param.to_vec();
-        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-        file.write_all(&bytes)?;
+    for (i, param) in params.iter().enumerate() {
+        if let Some(ref qt) = quantized_data[i] {
+            // Write quantized data + scales + zeros
+            file.write_all(&qt.data)?;
+            let scale_bytes: Vec<u8> = qt.scales.iter().flat_map(|f| f.to_le_bytes()).collect();
+            file.write_all(&scale_bytes)?;
+            let zero_bytes: Vec<u8> = qt.zeros.iter().flat_map(|f| f.to_le_bytes()).collect();
+            file.write_all(&zero_bytes)?;
+        } else {
+            let data = param.to_vec();
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            file.write_all(&bytes)?;
+        }
     }
 
     let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
@@ -634,8 +658,9 @@ fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
     if config.lowrank > 0 {
         names.push("token_embd_proj.weight".to_string());
     }
-    // Per-layer tensors
-    for i in 0..config.n_layers {
+    // Per-layer tensors — when shared_layers, parameters() returns 1 unique layer
+    let n_unique_layers = if config.shared_layers { 1 } else { config.n_layers };
+    for i in 0..n_unique_layers {
         if config.lowrank > 0 {
             // Low-rank: U and V for each projection
             names.push(format!("blk.{}.attn_q_u.weight", i));
