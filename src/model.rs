@@ -180,35 +180,40 @@ impl ModelConfig {
         Self::custom(vocab_size, 4096, 32, 32, 2.67, 8192)
     }
 
-    /// Count total parameters.
+    /// Count total trainable parameters. When lowrank > 0 (ReLoRA), counts only
+    /// the trainable U/V adapters, not the frozen base weights.
     pub fn param_count(&self) -> usize {
         let d = self.d_model;
         let ff = self.d_ff();
         let v = self.vocab_size as usize;
+        let r = self.lowrank;
 
         // Embedding (shared with lm_head via weight tying)
         let embedding = v * d;
 
-        // Per layer:
-        //   attention Q: d * d, K: d * kv_dim, V: d * kv_dim, O: d * d
-        //   ffn: d * ff + ff * d + d * ff = 3 * d * ff (SwiGLU has 3 weight matrices)
-        //   norms: 2 * d (ln1, ln2)
         let kv_dim = self.kv_dim();
-        let attn_params = d * d + d * kv_dim + d * kv_dim + d * d; // Q + K + V + O
+        let attn_params = if r > 0 {
+            // Low-rank: U[d,r] + V[r,out_dim] for Q, K, V, O
+            (d * r + r * d) + (d * r + r * kv_dim) * 2 + (d * r + r * d)
+        } else {
+            d * d + d * kv_dim + d * kv_dim + d * d
+        };
+
         let ffn_params = if self.n_experts > 1 {
-            self.n_experts * 3 * d * ff + d * self.n_experts // expert weights + router
+            self.n_experts * 3 * d * ff + d * self.n_experts
+        } else if r > 0 {
+            // Low-rank: U[d,r]+V[r,ff] for gate/up, U[ff,r]+V[r,d] for down
+            (d * r + r * ff) * 2 + (ff * r + r * d)
         } else {
             3 * d * ff
         };
+
         let per_layer = attn_params + ffn_params + 2 * d;
-
-        // Final norm
+        let n_unique_layers = if self.shared_layers { 1 } else { self.n_layers };
         let final_norm = d;
-
-        // Multi-token prediction heads: n_predict × (d*d projection + d norm)
         let mtp = self.n_predict * (d * d + d);
 
-        embedding + self.n_layers * per_layer + final_norm + mtp
+        embedding + n_unique_layers * per_layer + final_norm + mtp
     }
 
     /// Memory required for training (weights + gradients + optimizer state) in bytes.
