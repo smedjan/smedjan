@@ -72,10 +72,9 @@ pub fn prepare_dataset(
     let text = std::fs::read_to_string(input_path)?;
     let tokens = tokenizer.encode(&text);
 
+    let byte_data: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
     let mut file = File::create(output_path)?;
-    for &token in &tokens {
-        file.write_all(&token.to_le_bytes())?;
-    }
+    file.write_all(&byte_data)?;
 
     eprintln!(
         "Prepared dataset: {} bytes → {} tokens, saved to {}",

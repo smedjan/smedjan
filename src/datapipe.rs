@@ -352,11 +352,9 @@ pub fn process_source(
         all_tokens.push(crate::tokenizer::EOS_TOKEN); // document separator
     }
 
-    // Write binary shard
-    let mut file = std::fs::File::create(output_path)?;
-    for &token in &all_tokens {
-        file.write_all(&token.to_le_bytes())?;
-    }
+    // Write binary shard (batch write — avoids syscall per token)
+    let byte_data: Vec<u8> = all_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    std::fs::write(output_path, &byte_data)?;
 
     // Write hash
     let hash = sha256_file(output_path)?;
