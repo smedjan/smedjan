@@ -93,6 +93,19 @@ pub fn gpu_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &Gpu
     }
 }
 
+/// Full-FP32 tiled matmul: C = A @ B with no fp16 cast/clamp (precise path). Always the 32×32
+/// tiled kernel (no narrow specialisation). Slower than gpu_matmul but full precision and range.
+pub fn gpu_matmul_fp32(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(64, 1, 1);
+    dispatch_sync!(ctx, "matmul_tiled_fp32", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 /// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
 pub fn gpu_cast_f32_to_f16(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let size_buf = params_buffer(ctx, &size);

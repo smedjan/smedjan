@@ -892,6 +892,44 @@ mod suite {
         });
     }
 
+    /// The opt-in full-fp32 matmul keeps precision AND range that the default fp16-tile matmul loses.
+    #[test]
+    fn matmul_precise_full_fp32_no_clamp() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // 1) Precision: matches a CPU fp32 reference tightly (the fp16 path needs ~1e-2 tolerance).
+            let (m, k, n) = (40usize, 50usize, 48usize);
+            let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29).collect();
+            let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
+            let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
+            let precise = at.matmul_precise(&bt).to_vec();
+            let mut cpu = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0f32;
+                    for kk in 0..k {
+                        s += a[i * k + kk] * b[kk * n + j];
+                    }
+                    cpu[i * n + j] = s;
+                }
+            }
+            let max_rel = precise.iter().zip(&cpu).map(|(p, c)| (p - c).abs() / (1.0 + c.abs())).fold(0.0f32, f32::max);
+            assert!(max_rel < 1e-4, "fp32 matmul precision: max_rel={max_rel} (should be ≪ fp16)");
+
+            // 2) Range: a value above the fp16 max (65504) is preserved; the fp16 path corrupts it.
+            let big = 1.0e5f32;
+            let at2 = Tensor::from_slice(&ctx, &vec![big; 32], vec![1, 32]);
+            let mut bv = vec![0.0f32; 32];
+            bv[0] = 1.0; // selects A[0]
+            let bt2 = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
+            let r = at2.matmul_precise(&bt2).to_vec()[0];
+            assert!((r - big).abs() < big * 1e-3, "fp32 must preserve 1e5: got {r}");
+            let rf16 = at2.matmul(&bt2).to_vec()[0];
+            assert!((rf16 - big).abs() > big * 0.1, "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}");
+        });
+    }
+
     #[test]
     fn tensor_exp_forward_backward() {
         let ctx = test_ctx();

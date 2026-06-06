@@ -105,6 +105,99 @@ kernel void matmul_tiled(
 }
 "#;
 
+/// Full-FP32 tiled matmul: identical tiling to matmul_tiled but the shared-memory tiles are
+/// `float`, not `half`. No fp16 cast and no ±65504 clamp on the inputs, so it keeps full float
+/// precision and range. ~2× the shared-memory bandwidth of the fp16 path (slower), so it is an
+/// opt-in precision path (e.g. logits, large-magnitude matmuls) rather than the default.
+pub const MATMUL_TILED_FP32: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulParams {
+    uint M;
+    uint N;
+    uint K;
+};
+
+#define TILE 32
+#define THREAD_TILE 4
+#define THREADS_PER_GROUP 64
+
+kernel void matmul_tiled_fp32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
+) {
+    uint local_row = thread_index / 8;
+    uint local_col = thread_index % 8;
+
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+
+    // FP32 shared tiles — full precision and range, no clamp.
+    threadgroup float As[TILE][TILE];
+    threadgroup float Bs[TILE][TILE];
+
+    float acc[THREAD_TILE][THREAD_TILE] = {{0.0f}};
+
+    uint M = params.M;
+    uint N = params.N;
+    uint K = params.K;
+
+    for (uint k_block = 0; k_block < K; k_block += TILE) {
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE;
+            uint c = flat % TILE;
+            uint global_r = tile_row + r;
+            uint global_c = k_block + c;
+            As[r][c] = (global_r < M && global_c < K) ? A[global_r * K + global_c] : 0.0f;
+        }
+        for (uint i = 0; i < 16; i++) {
+            uint flat = thread_index * 16 + i;
+            uint r = flat / TILE;
+            uint c = flat % TILE;
+            uint global_r = k_block + r;
+            uint global_c = tile_col + c;
+            Bs[r][c] = (global_r < K && global_c < N) ? B[global_r * N + global_c] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE; k++) {
+            float a_vals[THREAD_TILE];
+            float b_vals[THREAD_TILE];
+            for (uint i = 0; i < THREAD_TILE; i++) {
+                a_vals[i] = As[local_row * THREAD_TILE + i][k];
+            }
+            for (uint j = 0; j < THREAD_TILE; j++) {
+                b_vals[j] = Bs[k][local_col * THREAD_TILE + j];
+            }
+            for (uint i = 0; i < THREAD_TILE; i++) {
+                for (uint j = 0; j < THREAD_TILE; j++) {
+                    acc[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < THREAD_TILE; i++) {
+        for (uint j = 0; j < THREAD_TILE; j++) {
+            uint global_r = tile_row + local_row * THREAD_TILE + i;
+            uint global_c = tile_col + local_col * THREAD_TILE + j;
+            if (global_r < M && global_c < N) {
+                C[global_r * N + global_c] = acc[i][j];
+            }
+        }
+    }
+}
+"#;
+
 /// Narrow matmul for small N (≤32): C = A @ B where A:[M,K], B:[K,N], C:[M,N].
 /// TILE_M=32, TILE_N=16, 32 threads. Each thread computes 4×4 subtile.
 /// Eliminates 50% wasted compute when N=16 with the standard 32-wide tile.
