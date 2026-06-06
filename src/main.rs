@@ -7,6 +7,7 @@ mod datapipe;
 mod dpo;
 mod eval;
 mod generate;
+mod linear_attention;
 mod loss;
 #[cfg(feature = "metal")]
 mod metal;
