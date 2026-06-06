@@ -9,7 +9,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice,
     MTLLibrary, MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -31,6 +31,32 @@ thread_local! {
     static POOL_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (hits, misses)
     // Allocation size log for debugging pool behavior. Enable with enable_alloc_log().
     static ALLOC_SIZE_LOG: RefCell<(bool, HashMap<usize, usize>)> = RefCell::new((false, HashMap::new()));
+    // When > 0, alloc_buffer skips the pool (fresh Metal alloc) and recycle_buffer is a no-op.
+    // Set during gradient-checkpoint recompute so its buffers can't alias the outer backward's
+    // still-referenced pooled buffers.
+    static POOL_BYPASS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII guard that bypasses the buffer pool while alive (used during checkpoint recompute).
+pub struct PoolBypassGuard;
+
+impl PoolBypassGuard {
+    pub fn new() -> Self {
+        POOL_BYPASS.with(|b| b.set(b.get() + 1));
+        PoolBypassGuard
+    }
+}
+
+impl Default for PoolBypassGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PoolBypassGuard {
+    fn drop(&mut self) {
+        POOL_BYPASS.with(|b| b.set(b.get() - 1));
+    }
 }
 
 // Link CoreGraphics — required for MTLCreateSystemDefaultDevice
@@ -215,17 +241,23 @@ impl MetalContext {
             }
         });
 
-        // Try pool first
-        let pooled = BUFFER_POOL.with(|pool| {
-            let mut p = pool.borrow_mut();
-            if let Some(list) = p.get_mut(&size_bytes) {
-                if let Some(buf) = list.pop() {
-                    POOL_STATS.with(|s| s.borrow_mut().0 += 1);
-                    return Some(buf);
-                }
-            }
+        // Try pool first (unless bypassed — e.g. during checkpoint recompute, where reusing a
+        // pooled buffer the outer backward still references would corrupt gradients).
+        let bypass = POOL_BYPASS.with(|b| b.get()) > 0;
+        let pooled = if bypass {
             None
-        });
+        } else {
+            BUFFER_POOL.with(|pool| {
+                let mut p = pool.borrow_mut();
+                if let Some(list) = p.get_mut(&size_bytes) {
+                    if let Some(buf) = list.pop() {
+                        POOL_STATS.with(|s| s.borrow_mut().0 += 1);
+                        return Some(buf);
+                    }
+                }
+                None
+            })
+        };
         let buf = if let Some(buf) = pooled {
             buf
         } else {
@@ -248,6 +280,11 @@ impl MetalContext {
 
     /// Return a buffer to the pool for reuse. Call when a buffer is no longer needed.
     pub fn recycle_buffer(buf: Retained<GpuBuffer>) {
+        // While the pool is bypassed (checkpoint recompute), drop the buffer instead of pooling —
+        // pooling here could hand a still-referenced buffer to a later allocation.
+        if POOL_BYPASS.with(|b| b.get()) > 0 {
+            return;
+        }
         let size = buf.length();
         BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();

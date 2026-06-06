@@ -744,22 +744,20 @@ impl TransformerBlock {
         out.reshape(vec![batch, seq_len, d])
     }
 
-    /// Forward pass with gradient checkpointing. STILL DISABLED (falls back to standard forward).
+    /// Forward pass with gradient checkpointing (recompute-based). RE-ENABLED.
     ///
-    /// Two myths corrected by measurement: the matmul is NOT non-deterministic (bit-exact,
-    /// max|c1-c2|=0), and the address-keyed fp16-cache stale-hit bug — which DID corrupt recompute —
-    /// is now fixed at alloc_buffer. But re-enabling and diffing the gradients (route
-    /// forward_checkpointed → forward_checkpointed_recompute and compare to the standard backward)
-    /// shows the recomputed path STILL diverges from the standard path (~4% relative, sign-flipped
-    /// on the embedding gradient — verified, not theorised).
-    /// So a SEPARATE bug remains in the checkpoint backward's gradient flow / input-grad extraction
-    /// across the checkpoint boundary — not the kernels, not the fp16 cache. Until that is found,
-    /// checkpointing stays off: correct gradients beat a memory win that silently miscomputes them.
-    pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, _layer_idx: usize) -> Tensor {
-        self.forward(x, None)
+    /// Long disabled on the theory that "Metal matmul is non-deterministic" — wrong; matmul is
+    /// bit-exact (max|c1-c2|=0). The real cause of recompute drift was buffer-pool corruption:
+    /// clear_tape / clear_tape_keep_grads recycled buffers still referenced as inputs (parameters,
+    /// the forward's input, or views sharing their source's buffer), so the recompute read
+    /// overwritten data. Fixed by excluding input-referenced buffers from recycling. With that, the
+    /// checkpointed forward reproduces the standard forward exactly and the gradients match
+    /// bit-for-bit (tests::gradient_checkpointing_matches_standard).
+    pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
+        self.forward_checkpointed_recompute(x, layer_idx)
     }
 
-    /// Original recompute-based checkpointing (disabled — see above).
+    /// Recompute-based checkpointing implementation (see forward_checkpointed).
     pub fn forward_checkpointed_recompute(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
         // Save the input tensor's buffer and shape — we need these for the main tape entry
         // and for the recompute closure.

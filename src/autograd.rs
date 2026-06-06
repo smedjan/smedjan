@@ -135,16 +135,31 @@ pub fn record(entry: TapeEntry) {
 
 /// Clear the tape and all stored gradients.
 pub fn clear_tape() {
+    use objc2_metal::MTLBuffer;
     TAPE.with(|tape| {
         // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
         let entries = std::mem::take(&mut *tape.borrow_mut());
+        // Recycle output/cached buffers — but a view op (reshape, etc.) shares its input's buffer
+        // as its OWN output_buffer. Recycling that pools a buffer the source tensor (an activation,
+        // parameter, or the caller's input) still references → the next allocation overwrites live
+        // data: a silent forward-after-clear_tape corruption (the cause of recompute-checkpointing
+        // drift). So skip any output that equals one of the entry's own input buffers, and dedupe
+        // by address so a buffer shared across entries is pooled at most once.
+        let input_addrs: std::collections::HashSet<usize> = entries.iter()
+            .flat_map(|e| e.input_buffers.iter())
+            .map(|b| b.contents().as_ptr() as usize)
+            .collect();
+        let mut recycled = std::collections::HashSet::new();
         for entry in entries {
-            // Recycle output and cached buffers — these are unique to the tape entry.
-            // Input buffers are shared refs to source tensors and MUST NOT be recycled
-            // (model parameters still hold references to them).
-            MetalContext::recycle_buffer(entry.output_buffer);
+            let out_addr = entry.output_buffer.contents().as_ptr() as usize;
+            if !input_addrs.contains(&out_addr) && recycled.insert(out_addr) {
+                MetalContext::recycle_buffer(entry.output_buffer);
+            }
             if let Some(cached) = entry.cached {
-                MetalContext::recycle_buffer(cached);
+                let c_addr = cached.contents().as_ptr() as usize;
+                if !input_addrs.contains(&c_addr) && recycled.insert(c_addr) {
+                    MetalContext::recycle_buffer(cached);
+                }
             }
         }
     });
@@ -169,19 +184,28 @@ pub fn clear_tape_keep_grads() {
     TAPE.with(|tape| {
         // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
         let entries = std::mem::take(&mut *tape.borrow_mut());
+        // Any buffer used as an INPUT (a model parameter, the forward's input, or a view that
+        // shares its source's buffer) is still live and must NOT be recycled — pooling it lets the
+        // next micro-step's forward overwrite live data (silent stale-read corruption). Combined
+        // with grad buffers and checkpoint outputs, and deduped so a shared buffer is pooled once.
+        let input_addrs: std::collections::HashSet<usize> = entries.iter()
+            .flat_map(|e| e.input_buffers.iter())
+            .map(|b| b.contents().as_ptr() as usize)
+            .collect();
+        let mut recycled = std::collections::HashSet::new();
+        let protected = |addr: usize| grad_ptrs.contains(&addr) || input_addrs.contains(&addr);
         for entry in entries {
-            // Never recycle Checkpoint output buffers — they're input buffers for
-            // the next layer's recompute closure. Recycling them causes the recompute
-            // to read garbage data, producing wrong gradients.
+            // Never recycle Checkpoint output buffers — they're input buffers for the next layer's
+            // recompute closure. Recycling them causes the recompute to read garbage data.
             let is_checkpoint = matches!(entry.op, Op::Checkpoint { .. });
 
             let out_ptr = entry.output_buffer.contents().as_ptr() as usize;
-            if !is_checkpoint && !grad_ptrs.contains(&out_ptr) {
+            if !is_checkpoint && !protected(out_ptr) && recycled.insert(out_ptr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
                 let cached_ptr = cached.contents().as_ptr() as usize;
-                if !grad_ptrs.contains(&cached_ptr) {
+                if !protected(cached_ptr) && recycled.insert(cached_ptr) {
                     MetalContext::recycle_buffer(cached);
                 }
             }
@@ -746,6 +770,11 @@ fn backward_checkpoint(
     out_grad: &Retained<GpuBuffer>,
     layer_idx: usize,
 ) {
+    // Bypass the buffer pool for the whole recompute + sub-tape backward: its allocations must not
+    // reuse pooled buffers the outer backward still references (which would silently corrupt
+    // gradients), and its freed buffers must not pollute the pool the outer backward relies on.
+    let _bypass = crate::metal::PoolBypassGuard::new();
+
     // Temporarily remove the recompute fn from the registry so we can call it
     // without holding a RefCell borrow (the fn itself will borrow TAPE via
     // checkpoint_forward). We put it back after calling.
@@ -808,10 +837,13 @@ fn backward_checkpoint(
     // by ~1 layer's worth of intermediates during backward.
     GRADS.with(|grads| {
         let mut g = grads.borrow_mut();
+        // Drop (don't pool) the sub-intermediate gradient buffers. accumulate_grad_shared makes a
+        // sub-intermediate's grad share its buffer with a NON-cleaned grad (e.g. a weight's, via an
+        // add's shared out_grad). Pooling it here would hand a buffer the weight's grad still
+        // references to the next layer's recompute → that weight's gradient gets overwritten
+        // (a non-deterministic ~few-% error). Removing from GRADS lets ARC free it iff truly unused.
         for id in &sub_intermediate_ids {
-            if let Some(buf) = g.remove(id) {
-                MetalContext::recycle_buffer(buf);
-            }
+            g.remove(id);
         }
     });
 }

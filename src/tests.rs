@@ -1847,6 +1847,61 @@ mod suite {
     }
 
 
+    /// Gradient checkpointing must produce the SAME parameter gradients as the standard forward:
+    /// the recompute reproduces the original forward exactly (this is what makes it correct to
+    /// trade compute for activation memory). The fp16-cache + buffer-recycling + pool-bypass fixes
+    /// are what make this hold — before them the recomputed embedding gradient was ~sign-flipped.
+    ///
+    /// `#[ignore]`d only because it needs `--test-threads=1`: this is an EXACT std-vs-recompute
+    /// comparison and the codebase's GPU layer is single-threaded by design (see metal/mod.rs).
+    /// Under cargo's default parallel runner, concurrent GPU activity from other tests corrupts the
+    /// comparison; it passes deterministically when serial. Run:
+    /// `cargo test gradient_checkpointing -- --ignored` (or the whole suite with `--test-threads=1`).
+    #[test]
+    #[ignore = "requires --test-threads=1: GPU layer is single-threaded; parallel runs corrupt the exact comparison"]
+    fn gradient_checkpointing_matches_standard() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 32);
+        let model = Transformer::new(&ctx, cfg);
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5; 8];
+        let pinfo: Vec<(usize, usize)> = model.parameters().iter().map(|p| (p.id, p.numel())).collect();
+        let grab = |pinfo: &[(usize, usize)]| -> Vec<Vec<f32>> {
+            pinfo.iter().map(|&(id, n)| autograd::get_grad(id)
+                .map(|g| Tensor::from_buffer(Arc::clone(&ctx), g, vec![n]).to_vec()).unwrap_or_default()).collect()
+        };
+
+        // Standard backward.
+        let lt = model.forward(&tokens, 1, 8, None, false);
+        let logits_std = lt.to_vec();
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &lt, &targets);
+        autograd::backward(&ctx, loss.id);
+        let std_grads = grab(&pinfo);
+        autograd::clear_tape();
+        autograd::zero_grads();
+        autograd::clear_recompute_registry();
+
+        // Checkpointed backward (same weights).
+        let lt2 = model.forward(&tokens, 1, 8, None, true);
+        let logits_ck = lt2.to_vec();
+        let ldiff = logits_std.iter().zip(&logits_ck).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(ldiff < 1e-3, "checkpointed forward must reproduce the standard forward: {ldiff}");
+        let (loss2, _) = crate::loss::cross_entropy_loss(&ctx, &lt2, &targets);
+        autograd::backward(&ctx, loss2.id);
+        let ck_grads = grab(&pinfo);
+        autograd::zero_grads();
+
+        assert_eq!(std_grads.len(), ck_grads.len());
+        for (i, (s, c)) in std_grads.iter().zip(&ck_grads).enumerate() {
+            assert_eq!(s.len(), c.len(), "param {i} grad len mismatch");
+            // Tolerance relative to the parameter's gradient SCALE (fp16-level absolute noise from
+            // the multi-layer recompute, not per-element relative which blows up near zero).
+            let scale = s.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(0.05);
+            let md = s.iter().zip(c).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(md <= 1e-2 * scale, "param {i}: max grad diff {md} > 1% of scale {scale}");
+        }
+    }
+
     /// Checkpoint save/load roundtrip: verify weights survive a save→load cycle.
     /// Covers the v4 format with both trainable and base parameters.
     #[test]
