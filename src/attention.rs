@@ -15,6 +15,11 @@ pub enum AttnKind {
     /// per-head decay gate (see `crate::ssm`). Reuses the Q/K/V/O projections; adds one small
     /// decay-gate projection `ssm_loga`.
     Ssm,
+    /// RWKV-style time mixing (see `crate::rwkv`): per-channel decayed WKV with a SiLU receptance
+    /// gate (Q projection = receptance). Adds per-channel decay `rwkv_w` and bonus `rwkv_u`.
+    /// Token-shift is omitted on this path (proven in the standalone module); the WKV recurrence
+    /// is the core. Materialised form → short-sequence training (chunked stable form is follow-up).
+    Rwkv,
 }
 
 /// Multi-head attention with rotary positional encoding, KV cache, and
@@ -41,8 +46,10 @@ pub struct MultiHeadAttention {
     pub rope_theta: f32,
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
     pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
-    pub attn_kind: AttnKind,    // Softmax (default), Linear, or Ssm
+    pub attn_kind: AttnKind,    // Softmax (default), Linear, Ssm, or Rwkv
     pub ssm_loga: Tensor,       // [d_model, n_heads] — SSM per-head decay-gate projection (used iff Ssm)
+    pub rwkv_w: Tensor,         // [head_dim] — RWKV per-channel decay (rate = exp(rwkv_w) > 0; used iff Rwkv)
+    pub rwkv_u: Tensor,         // [head_dim] — RWKV per-channel current-token bonus (used iff Rwkv)
 }
 
 /// KV cache for autoregressive inference.
@@ -166,6 +173,8 @@ impl MultiHeadAttention {
             qk_norm_weight: Tensor::ones(ctx, vec![head_dim]), sliding_window: 0,
             attn_kind: AttnKind::Softmax,
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt() * scale),
+            rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
+            rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
         }
     }
 
@@ -213,6 +222,8 @@ impl MultiHeadAttention {
             qk_norm_weight, sliding_window: 0,
             attn_kind: AttnKind::Softmax,
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt()),
+            rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
+            rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
         }
     }
 
@@ -283,10 +294,11 @@ impl MultiHeadAttention {
         // Linear (O(N) kernel) attention and the SSM mixer reuse the expanded, non-strided K/V layout.
         let linear = self.attn_kind == AttnKind::Linear;
         let ssm = self.attn_kind == AttnKind::Ssm;
+        let rwkv = self.attn_kind == AttnKind::Rwkv;
 
         // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
         // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
-        let use_gqa_strided = !linear && !ssm && group_size > 1 && !autograd::is_recording();
+        let use_gqa_strided = !linear && !ssm && !rwkv && group_size > 1 && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
@@ -323,6 +335,16 @@ impl MultiHeadAttention {
             let loga_bh = transpose_bsh_to_bhs(&loga_raw, batch, seq_len, self.n_heads, 1); // [bh, seq, 1]
             let loga = loga_bh.reshape(vec![bh, seq_q_len]).relu().scale(-1.0);
             crate::ssm::ssm(&q, &k_for_attn, &v_for_attn, &loga)
+        } else if rwkv {
+            assert_eq!(
+                seq_q_len, seq_k,
+                "RWKV mixer currently supports full-sequence forward only (seq_q == seq_k)"
+            );
+            // Per-channel WKV with decay rate exp(rwkv_w) > 0 and bonus rwkv_u; SiLU receptance gate
+            // uses the Q projection as the receptance r. (Token-shift omitted on this path.)
+            let actual_w = self.rwkv_w.exp();
+            let wkv_out = crate::rwkv::wkv(&k_for_attn, &v_for_attn, &actual_w, &self.rwkv_u);
+            q.silu().mul(&wkv_out)
         } else if seq_q_len >= 2048 && !use_gqa_strided {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
@@ -415,6 +437,10 @@ impl MultiHeadAttention {
         params.push(&self.qk_norm_weight);
         if self.attn_kind == AttnKind::Ssm {
             params.push(&self.ssm_loga); // trained only for SSM layers
+        }
+        if self.attn_kind == AttnKind::Rwkv {
+            params.push(&self.rwkv_w); // per-channel decay
+            params.push(&self.rwkv_u); // per-channel bonus
         }
         params
     }

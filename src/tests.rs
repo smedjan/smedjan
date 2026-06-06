@@ -2040,6 +2040,45 @@ mod tests {
         std::fs::remove_file(tmp).ok();
     }
 
+    /// The RWKV-style time-mix is usable in the real Transformer: every layer is an RWKV mixer,
+    /// the forward is finite, the per-channel decay (rwkv_w) and bonus (rwkv_u) receive finite
+    /// gradients, and the rwkv flag survives a checkpoint roundtrip.
+    #[test]
+    fn rwkv_model_integrates_and_differentiates() {
+        use crate::attention::AttnKind;
+        let ctx = test_ctx();
+        let mut cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
+        cfg.rwkv = true;
+        let model = Transformer::new(&ctx, cfg);
+        assert_eq!(model.blocks[0].attn.attn_kind, AttnKind::Rwkv);
+        assert_eq!(model.blocks[1].attn.attn_kind, AttnKind::Rwkv);
+
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5; 8];
+        let logits = model.forward(&tokens, 1, 8, None, false);
+        assert_eq!(logits.shape, vec![8, 48]);
+        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "RWKV forward non-finite");
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+        assert!(loss.to_vec()[0].is_finite(), "RWKV loss non-finite");
+        autograd::backward(&ctx, loss.id);
+        for (name, id, shape) in [
+            ("rwkv_w", model.blocks[0].attn.rwkv_w.id, model.blocks[0].attn.rwkv_w.shape.clone()),
+            ("rwkv_u", model.blocks[0].attn.rwkv_u.id, model.blocks[0].attn.rwkv_u.shape.clone()),
+        ] {
+            let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for {name}"));
+            let gv = Tensor::from_buffer(Arc::clone(&ctx), g, shape).to_vec();
+            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on {name}");
+        }
+        autograd::zero_grads();
+
+        let tmp = "/tmp/andreai_rwkv_ckpt.bin";
+        crate::checkpoint::save_checkpoint(tmp, &model, 11).expect("save failed");
+        let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
+        assert!(loaded.config.rwkv, "rwkv flag lost across checkpoint roundtrip");
+        assert_eq!(loaded.blocks[0].attn.attn_kind, AttnKind::Rwkv);
+        std::fs::remove_file(tmp).ok();
+    }
+
     /// Hybrid topology: a model with linear_attn_period=2 alternates softmax and linear-attention
     /// layers, forwards finitely, trains stably, and the schedule survives a checkpoint roundtrip.
     #[test]

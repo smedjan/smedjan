@@ -33,6 +33,7 @@ pub struct ModelConfig {
     pub linear_attn_period: usize, // Hybrid topology: if >0, every Nth layer (idx+1 % N == 0) is linear, the
                                // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
     pub ssm: bool,             // Use the selective state-space (Mamba-2/SSD) mixer in every block.
+    pub rwkv: bool,            // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
 }
 
 impl ModelConfig {
@@ -101,6 +102,7 @@ impl ModelConfig {
             linear_attn: false,
             linear_attn_period: 0,
             ssm: false,
+            rwkv: false,
         }
     }
 
@@ -385,7 +387,9 @@ impl TransformerBlock {
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
             || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
-        if config.ssm {
+        if config.rwkv {
+            attn.attn_kind = crate::attention::AttnKind::Rwkv;
+        } else if config.ssm {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
@@ -450,7 +454,9 @@ impl TransformerBlock {
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
             || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
-        if config.ssm {
+        if config.rwkv {
+            attn.attn_kind = crate::attention::AttnKind::Rwkv;
+        } else if config.ssm {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
