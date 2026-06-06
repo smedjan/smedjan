@@ -94,33 +94,26 @@ pub fn wkv(k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
     assert_eq!(w.shape, vec![hd]);
     assert_eq!(u.shape, vec![hd]);
 
-    // NB: bind every intermediate (especially the .exp() results) to a named local. Inline
-    // temporaries free their GPU buffer at end-of-statement, and a later alloc can recycle it —
-    // which silently aliased exp(u) onto exp(w) when both were inline. Named locals stay live.
     let ek = k.exp(); // exp(k) — RWKV weights values by exp(key)
     let p = ek.mul(v); // P = ek · v
 
     let wmat = broadcast_hd(w, bh, seq); // [bh,seq,hd], = w[d]
     let pos = position_matrix(&k.ctx, bh, seq, hd); // = t
     let posw = pos.mul(&wmat); // t·w[d]
-    let neg_posw = posw.scale(-1.0);
     let g = posw.exp(); // exp(t·w[d])
-    let ginv = neg_posw.exp(); // exp(-t·w[d])
+    let ginv = posw.scale(-1.0).exp(); // exp(-t·w[d])
 
     // S_t[d] = exp(-t·w) · cumsum_i( exp(i·w) P_i )   = Σ_{i≤t} exp(-(t-i)w) P_i
-    let gp = g.mul(&p);
-    let ltri = lower_tri_inclusive(&k.ctx, bh, seq);
-    let cw = ltri.batched_matmul(&gp);
+    let cw = lower_tri_inclusive(&k.ctx, bh, seq).batched_matmul(&g.mul(&p));
     let s = ginv.mul(&cw);
 
-    // wkv_t = exp(w)·(S_t − P_t) + exp(u)·P_t
-    let w_exp = w.exp();
-    let u_exp = u.exp();
-    let expw = broadcast_hd(&w_exp, bh, seq);
-    let expu = broadcast_hd(&u_exp, bh, seq);
-    let neg_p = p.scale(-1.0);
-    let s_minus_p = s.add(&neg_p);
-    let past = expw.mul(&s_minus_p); // exp(w)·(S − P)
+    // wkv_t = exp(w)·(S_t − P_t) + exp(u)·P_t.
+    // The inline exp(w)/exp(u) temporaries are safe now: alloc_buffer invalidates the address-keyed
+    // fp16 cache, so a reused buffer address can't return a stale conversion — the bug this used to
+    // hit (exp(u) reading exp(w)'s cached fp16) is fixed at the allocator.
+    let expw = broadcast_hd(&w.exp(), bh, seq);
+    let expu = broadcast_hd(&u.exp(), bh, seq);
+    let past = expw.mul(&s.add(&p.scale(-1.0))); // exp(w)·(S − P)
     let current = expu.mul(&p); // exp(u)·P
     past.add(&current)
 }

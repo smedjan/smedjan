@@ -864,6 +864,34 @@ mod suite {
         autograd::zero_grads();
     }
 
+    /// Regression for the address-keyed fp16-cache stale-hit bug: when a buffer is freed and a new
+    /// buffer is allocated at the same address, cast_to_f16 (used by the batch==1 matmul) must NOT
+    /// return the previous buffer's cached fp16. alloc_buffer invalidates the cache for the address.
+    #[test]
+    fn f16_cache_invalidated_on_buffer_reuse() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let n = 64usize;
+            let identity: Vec<f32> = (0..n * n).map(|i| if i / n == i % n { 1.0 } else { 0.0 }).collect();
+            let id = Tensor::from_slice(&ctx, &identity, vec![n, n]);
+
+            // A = all 2.0; matmul caches fp16(A) keyed by A's buffer address.
+            let a = Tensor::full(&ctx, vec![n, n], 2.0);
+            let _ = a.matmul(&id).to_vec();
+
+            // Recycle A's buffer, then alloc the same size → reuse A's exact address.
+            MetalContext::recycle_buffer(a.buffer.clone());
+            let reused = ctx.alloc_buffer(n * n * 4);
+            compute::gpu_fill(&ctx, &reused, (n * n) as u32, 3.0);
+            let b = Tensor::from_buffer(Arc::clone(&ctx), reused, vec![n, n]);
+            let rb = b.matmul(&id).to_vec(); // B @ I = B
+
+            // Must reflect the NEW data (3.0), not A's stale cached fp16 (2.0).
+            assert!((rb[0] - 3.0).abs() < 0.05, "stale fp16 cache hit: got {} expected ~3.0", rb[0]);
+            assert!((rb[n * n - 1] - 3.0).abs() < 0.05, "stale fp16 cache hit at end: got {}", rb[n * n - 1]);
+        });
+    }
+
     #[test]
     fn tensor_exp_forward_backward() {
         let ctx = test_ctx();

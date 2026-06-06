@@ -304,6 +304,24 @@ impl Tensor {
         out
     }
 
+    /// Invalidate any cached FP16 / ternary conversion keyed at buffer address `addr`.
+    ///
+    /// The conversion caches are keyed by `buffer.contents()` ptr, which is NOT a stable identity:
+    /// a buffer can be freed and a *different* buffer allocated at the same address within a step
+    /// (the per-step `clear_f16_cache_recycle` only fires after the optimizer). Without this, a
+    /// fresh tensor reusing a freed address would get a stale cache HIT and a matmul would silently
+    /// run on the wrong (previous tensor's) fp16 data. `alloc_buffer` calls this for every buffer it
+    /// hands out, so a freshly-allocated address never carries a stale conversion. (Root cause of
+    /// the RWKV `exp(u)`-reads-`exp(w)` bug and a likely cause of recompute-checkpointing drift.)
+    pub fn invalidate_conversion_cache(addr: usize) {
+        F16_CAST_CACHE.with(|c| {
+            c.borrow_mut().remove(&addr);
+        });
+        TERNARY_CACHE.with(|c| {
+            c.borrow_mut().remove(&addr);
+        });
+    }
+
     /// Clear weight caches. Call after optimizer step when weights change.
     pub fn clear_f16_cache() {
         F16_CAST_CACHE.with(|c| c.borrow_mut().clear());

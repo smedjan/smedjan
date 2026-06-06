@@ -224,16 +224,24 @@ impl MetalContext {
             }
             None
         });
-        if let Some(buf) = pooled {
-            return buf;
-        }
-        POOL_STATS.with(|s| s.borrow_mut().1 += 1);
-        self.device
-            .newBufferWithLength_options(
-                size_bytes,
-                MTLResourceOptions::StorageModeShared,
-            )
-            .expect("Failed to allocate Metal buffer")
+        let buf = if let Some(buf) = pooled {
+            buf
+        } else {
+            POOL_STATS.with(|s| s.borrow_mut().1 += 1);
+            self.device
+                .newBufferWithLength_options(
+                    size_bytes,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("Failed to allocate Metal buffer")
+        };
+        // This buffer's contents are about to be written fresh. Its address may previously have
+        // belonged to a now-freed buffer whose fp16/ternary conversion is still cached (those
+        // caches are keyed by address and only fully cleared after the optimizer step). Drop any
+        // such stale entry so a later cast_to_f16/ternary on this address can't get a false hit.
+        use objc2_metal::MTLBuffer;
+        crate::tensor::Tensor::invalidate_conversion_cache(buf.contents().as_ptr() as usize);
+        buf
     }
 
     /// Return a buffer to the pool for reuse. Call when a buffer is no longer needed.
