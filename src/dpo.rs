@@ -1073,8 +1073,8 @@ mod tests {
         // softmax is uniform: 1/4 for each
         // grad[0][1] = grad_scale * (1 - 0.25) = -0.1 * 0.75 = -0.075
         // grad[0][j!=1] = grad_scale * (0 - 0.25) = -0.1 * (-0.25) = 0.025
-        let g00 = grad[0 * vocab_size + 0]; // j=0, not target
-        let g01 = grad[0 * vocab_size + 1]; // j=1, IS target
+        let g00 = grad[0]; // row 0, j=0, not target
+        let g01 = grad[1]; // row 0, j=1, IS target
         assert!((g01 - (-0.075)).abs() < 1e-5, "Expected -0.075, got {}", g01);
         assert!((g00 - 0.025).abs() < 1e-5, "Expected 0.025, got {}", g00);
 

@@ -469,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14/2.71/etc. are arbitrary test data, not π/e
     fn metal_buffer_alloc_and_readback() {
         let ctx = test_ctx();
 
@@ -707,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is arbitrary test data, not π
     fn quantize_constant_data_roundtrip() {
         // All identical values — scale should be ~0, zero should be the value
         let data = vec![3.14f32; 64];
@@ -1448,6 +1450,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is arbitrary test data, not π
     fn fp16_cast_roundtrip() {
         let ctx = MetalContext::new();
         let data = vec![1.0f32, -2.5, 3.14, 0.0, 1e-3, 65504.0]; // 65504 = max half

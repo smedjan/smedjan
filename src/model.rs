@@ -537,6 +537,7 @@ impl TransformerBlock {
         // Per-token fused kernels: correct but slower than tiled matmul at batch>1
         // due to parallelism loss. Decode path uses KV cache which bypasses here.
         let n_tokens = batch * seq_len;
+        #[allow(clippy::overly_complex_bool_expr)] // `false &&` intentionally disables this path
         let use_fused = false
             && self.n_experts <= 1 && !self.bitnet
             && d <= 256 && self.ffn_w1.shape[1] <= 1024
@@ -1103,6 +1104,7 @@ impl Transformer {
                 // Persistent kernel: 32 co-resident TGs + grid barriers, entire layer in 1 dispatch.
                 // Metal can't guarantee TG co-residency → spin-wait contention.
                 // Ready for AndreOS ring-buffer doorbell dispatch (~10ns/kernel vs Metal's 300μs).
+                #[allow(clippy::overly_complex_bool_expr)] // `false &&` intentionally disables this path
                 let use_persistent = false && !autograd::is_recording()
                     && d <= 256 && self.config.d_ff() <= 1024
                     && self.config.n_experts <= 1 && !self.config.bitnet
