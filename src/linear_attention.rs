@@ -80,13 +80,90 @@ pub fn masked_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     masked.batched_matmul(v) // [bh, seq, hd]
 }
 
-/// Full linear-attention core: masked numerator + RMS-norm over the head dimension.
+/// Strictly-lower-triangular ones matrix `[bh, n, n]`: `L[b,c,c'] = 1` iff `c' < c`.
+/// `L @ X` is the **exclusive** prefix sum of `X` along its first (chunk) axis.
+fn strict_lower_tri(ctx: &Arc<MetalContext>, bh: usize, n: usize) -> Tensor {
+    let mut data = vec![0.0f32; bh * n * n];
+    for c in 0..n {
+        for cp in 0..c {
+            for b in 0..bh {
+                data[(b * n + c) * n + cp] = 1.0;
+            }
+        }
+    }
+    Tensor::from_slice(ctx, &data, vec![bh, n, n])
+}
+
+/// Pick a chunk size that divides `seq`, closest to √seq from above (balances the
+/// O(seq·C) intra cost against the O(seq·hd²/C) inter cost). Falls back to `seq`
+/// (single chunk → exact masked form) when `seq` is prime.
+fn pick_chunk(seq: usize) -> usize {
+    let target = (seq as f64).sqrt() as usize;
+    let target = target.max(1);
+    let mut fallback = seq;
+    for c in 1..=seq {
+        if seq % c == 0 {
+            if c >= target {
+                return c;
+            }
+            fallback = c;
+        }
+    }
+    fallback
+}
+
+/// Causal linear-attention NUMERATOR, **O(N) chunked-parallel** form (un-normalised).
+///
+/// Splits the sequence into `seq/C` chunks and computes, with no `[seq,seq]` matrix and
+/// no sequential Python-style loop:
+///   * intra-chunk: masked `φ(Q_c)φ(K_c)ᵀ V_c` over the small `[C,C]` block (parallel);
+///   * inter-chunk: `φ(Q_c) · S_c`, where `S_c = Σ_{c'<c} φ(K_{c'})ᵀV_{c'}` is the
+///     exclusive prefix sum of chunk summaries, computed as a strictly-lower-triangular
+///     matmul `L·U` over the chunk axis.
+///
+/// Memory is O(seq·C + seq·hd²/C) = O(N) at `C≈hd`, vs O(N²) for the masked form.
+/// Mathematically identical to `masked_reference` (validated by the equivalence test).
+/// Requires `seq % chunk == 0`. `q,k,v: [bh, seq, hd]` → `[bh, seq, hd]`.
+pub fn chunked(q: &Tensor, k: &Tensor, v: &Tensor, chunk: usize) -> Tensor {
+    assert_eq!(q.shape.len(), 3, "linear attention expects [bh, seq, hd]");
+    assert_eq!(q.shape, k.shape, "q and k must share shape");
+    let bh = q.shape[0];
+    let seq = q.shape[1];
+    let hd = q.shape[2];
+    assert!(chunk > 0 && seq % chunk == 0, "seq {seq} must be divisible by chunk {chunk}");
+    let nc = seq / chunk;
+
+    let qf = feature_map(q);
+    let kf = feature_map(k);
+    // Fold chunks into the batch dimension — a pure contiguous reshape ([b][c·C+r] ≡ [b·nc+c][r]).
+    let qfb = qf.reshape(vec![bh * nc, chunk, hd]);
+    let kfb = kf.reshape(vec![bh * nc, chunk, hd]);
+    let vb = v.reshape(vec![bh * nc, chunk, hd]);
+
+    // Intra-chunk, all chunks in parallel: [bh·nc, C, hd].
+    let a = qfb.batched_matmul_trans_b(&kfb); // [bh·nc, C, C]
+    let mask = causal_mask_tensor(&q.ctx, bh * nc, chunk, chunk, 0);
+    let intra = a.mul(&mask).batched_matmul(&vb);
+
+    // Per-chunk summary U_c = φ(K_c)ᵀ V_c, then exclusive prefix sum over chunks via L·U.
+    let u = kfb.batched_matmul_trans_a(&vb); // [bh·nc, hd, hd]
+    let u_flat = u.reshape(vec![bh, nc, hd * hd]);
+    let l = strict_lower_tri(&q.ctx, bh, nc); // [bh, nc, nc]
+    let s = l.batched_matmul(&u_flat).reshape(vec![bh * nc, hd, hd]); // S_c per chunk
+
+    // Inter-chunk: φ(Q_c) · S_c → [bh·nc, C, hd]; add intra; restore [bh, seq, hd].
+    let inter = qfb.batched_matmul(&s);
+    inter.add(&intra).reshape(vec![bh, seq, hd])
+}
+
+/// Full linear-attention core: O(N) chunked numerator + RMS-norm over the head dimension.
 /// The unit weight makes it a pure normalisation (no learned scale → no new parameters),
 /// keeping checkpoints byte-compatible with the existing model.
 /// `q,k,v: [bh, seq, hd]` → `[bh, seq, hd]`.
 pub fn linear_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
-    let num = masked_reference(q, k, v); // [bh, seq, hd]
+    let seq = q.shape[1];
     let hd = q.shape[2];
+    let num = chunked(q, k, v, pick_chunk(seq)); // [bh, seq, hd], O(N) memory
     let unit = Tensor::ones(&q.ctx, vec![hd]);
     num.rms_norm(&unit, 1e-6)
 }
@@ -186,6 +263,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The O(N) chunked-parallel form must equal the O(N²) masked reference exactly
+    /// (up to fp16 matmul tolerance), for every chunk size that divides the sequence —
+    /// including the extremes C=seq (single chunk) and C=1 (pure recurrence).
+    #[test]
+    fn chunked_matches_masked_reference() {
+        let ctx = ctx();
+        let (bh, seq, hd) = (2usize, 12usize, 4usize);
+        let q: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3).collect();
+        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.25).collect();
+        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.5).collect();
+
+        autograd::no_grad(|| {
+            let qt = Tensor::from_slice(&ctx, &q, vec![bh, seq, hd]);
+            let kt = Tensor::from_slice(&ctx, &k, vec![bh, seq, hd]);
+            let vt = Tensor::from_slice(&ctx, &v, vec![bh, seq, hd]);
+            let reference = masked_reference(&qt, &kt, &vt).to_vec();
+            // 12 = 1·12 = 2·6 = 3·4 = 4·3 = 6·2 = 12·1 — exercise several chunkings incl. C=1 and C=seq.
+            for &c in &[1usize, 2, 3, 4, 6, 12] {
+                let got = chunked(&qt, &kt, &vt, c).to_vec();
+                for (idx, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+                    assert!(
+                        (g - r).abs() <= 0.02 * (1.0 + r.abs()),
+                        "chunk={c} idx={idx}: chunked={g} masked={r}"
+                    );
+                }
+            }
+        });
     }
 
     /// Gradients flow end-to-end through the composed core (autograd-for-free check).
