@@ -318,9 +318,7 @@ pub fn distillation_loss(
         &student_logits.buffer,
         &kl_losses_buf,
         &kl_grad_buf,
-        batch as u32,
-        vocab as u32,
-        temperature,
+        compute::KlDims { batch_size: batch as u32, vocab_size: vocab as u32, temperature },
     );
 
     // KL scalar mean

@@ -36,6 +36,13 @@ pub struct ModelConfig {
     pub rwkv: bool,            // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
 }
 
+/// Mixture-of-experts spec for [`ModelConfig::custom_moe`].
+#[derive(Clone, Copy)]
+pub struct MoeSpec {
+    pub n_experts: usize,
+    pub top_k_experts: usize,
+}
+
 impl ModelConfig {
     /// Compute the FFN hidden dimension from d_model and ffn_multiplier.
     /// Rounded to the nearest multiple of 256 for GPU alignment.
@@ -134,16 +141,12 @@ impl ModelConfig {
     }
 
     /// Build a MoE config: multiple expert FFNs, router selects top-K per token.
-    pub fn custom_moe(
-        vocab_size: u32, d_model: usize, n_heads: usize, n_kv_heads: usize,
-        n_layers: usize, ffn_multiplier: f32, max_seq_len: usize,
-        n_experts: usize, top_k_experts: usize,
-    ) -> Self {
-        assert!(n_experts > 0, "n_experts must be > 0");
-        assert!(top_k_experts <= n_experts, "top_k ({}) must be <= n_experts ({})", top_k_experts, n_experts);
-        let mut config = Self::custom_gqa(vocab_size, d_model, n_heads, n_kv_heads, n_layers, ffn_multiplier, max_seq_len);
-        config.n_experts = n_experts;
-        config.top_k_experts = top_k_experts;
+    /// Add a mixture-of-experts spec to a base config (e.g. one from [`Self::custom_gqa`]).
+    pub fn custom_moe(mut config: ModelConfig, moe: MoeSpec) -> Self {
+        assert!(moe.n_experts > 0, "n_experts must be > 0");
+        assert!(moe.top_k_experts <= moe.n_experts, "top_k ({}) must be <= n_experts ({})", moe.top_k_experts, moe.n_experts);
+        config.n_experts = moe.n_experts;
+        config.top_k_experts = moe.top_k_experts;
         config
     }
 
@@ -532,99 +535,6 @@ impl TransformerBlock {
             return result.reshape(vec![batch, seq_len, d]);
         }
 
-        // FULLY-FUSED path: pre-attn (1 dispatch) + attention core (3-5 dispatches) + post-attn+FFN (1 dispatch)
-        // Reduces ~20 dispatches per layer to 5. Only for inference at d≤256.
-        // Per-token fused kernels: correct but slower than tiled matmul at batch>1
-        // due to parallelism loss. Decode path uses KV cache which bypasses here.
-        let n_tokens = batch * seq_len;
-        // Fused pre-attn+FFN path: disabled — per-token fused kernels lose to tiled matmul at
-        // batch>1 (parallelism loss). Named flag (not literal `false &&`) keeps the activation
-        // condition documented without tripping the always-false logic-bug lint.
-        let fused_path_enabled = false;
-        let use_fused = fused_path_enabled
-            && self.n_experts <= 1 && !self.bitnet
-            && d <= 256 && self.ffn_w1.shape[1] <= 1024
-            && n_tokens <= 8
-            && !autograd::is_recording();
-
-        if use_fused {
-            let n_tokens = batch * seq_len;
-            let bh = batch * self.attn.n_heads;
-            let bh_kv = batch * self.attn.n_kv_heads;
-            let hd = self.attn.head_dim;
-            let ff = self.ffn_w1.shape[1];
-            let rank = self.attn.attn_rank as u32;
-            let x_flat = x.reshape(vec![n_tokens, d]);
-
-            // Allocate Q, K, V output buffers in transposed [BH, S, HD] layout
-            let q_buf = x.ctx.alloc_buffer(bh * seq_len * hd * 4);
-            let k_buf = x.ctx.alloc_buffer(bh_kv * seq_len * hd * 4);
-            let v_buf = x.ctx.alloc_buffer(bh_kv * seq_len * hd * 4);
-
-            // 1 dispatch: norm + QKV projection + transpose + RoPE
-            compute::gpu_fused_pre_attn(
-                &x.ctx, &x_flat.buffer, &self.ln1_weight.buffer,
-                &self.attn.w_q.buffer, &self.attn.w_k.buffer, &self.attn.w_v.buffer,
-                &self.attn.w_q_v.buffer, &self.attn.w_k_v.buffer, &self.attn.w_v_v.buffer,
-                &q_buf, &k_buf, &v_buf,
-                n_tokens as u32, d as u32, self.attn.n_heads as u32,
-                self.attn.n_kv_heads as u32, hd as u32, seq_len as u32,
-                rank, self.norm_eps, self.attn.rope_theta, 0,
-            );
-
-            let q = Tensor::from_buffer(Arc::clone(&x.ctx), q_buf, vec![bh, seq_len, hd]);
-            let k = Tensor::from_buffer(Arc::clone(&x.ctx), k_buf, vec![bh_kv, seq_len, hd]);
-            let v = Tensor::from_buffer(Arc::clone(&x.ctx), v_buf, vec![bh_kv, seq_len, hd]);
-
-            // GQA KV expansion if needed
-            let group_size = self.attn.n_heads / self.attn.n_kv_heads;
-            let (k_exp, v_exp) = if group_size > 1 {
-                (
-                    crate::attention::repeat_kv(&k, bh_kv, seq_len, hd, group_size),
-                    crate::attention::repeat_kv(&v, bh_kv, seq_len, hd, group_size),
-                )
-            } else {
-                (k, v)
-            };
-
-            // Attention core: 3-5 dispatches (or 1 with flash)
-            let attn_out = if seq_len >= 2048 {
-                let out_buf = x.ctx.alloc_buffer(bh * seq_len * hd * 4);
-                compute::gpu_flash_attention_forward(
-                    &x.ctx, &q.buffer, &k_exp.buffer, &v_exp.buffer, &out_buf,
-                    bh as u32, seq_len as u32, seq_len as u32, hd as u32, 0,
-                );
-                Tensor::from_buffer(Arc::clone(&x.ctx), out_buf, vec![bh, seq_len, hd])
-            } else {
-                let scale = 1.0 / (hd as f32).sqrt();
-                let scores = q.batched_matmul_trans_b(&k_exp);
-                let scores = scores.scale(scale);
-                let scores = if self.attn.sliding_window > 0 {
-                    scores.causal_mask_window(0, self.attn.sliding_window as u32)
-                } else {
-                    scores.causal_mask(0)
-                };
-                let weights = scores.softmax();
-                weights.batched_matmul(&v_exp)
-            };
-
-            // 1 dispatch: gather-transpose + W_o + residual + norm + SwiGLU FFN + residual
-            let out_buf = x.ctx.alloc_buffer(n_tokens * d * 4);
-            let o_rank = self.attn.attn_rank as u32;
-            compute::gpu_fused_post_attn_ffn(
-                &x.ctx, &x_flat.buffer, &attn_out.buffer, &self.ln2_weight.buffer,
-                &self.attn.w_o.buffer, &self.attn.w_o_v.buffer,
-                &self.ffn_w1.buffer, &self.ffn_w2.buffer, &self.ffn_w3.buffer,
-                &out_buf,
-                n_tokens as u32, d as u32, ff as u32,
-                self.attn.n_heads as u32, hd as u32, seq_len as u32,
-                o_rank, self.norm_eps,
-            );
-
-            return Tensor::from_buffer(Arc::clone(&x.ctx), out_buf, vec![batch, seq_len, d]);
-        }
-
-        // Standard path
         let normed = x.rms_norm(&self.ln1_weight, self.norm_eps);
         let attn_out = self.attn.forward(&normed, kv_cache);
 
@@ -644,8 +554,8 @@ impl TransformerBlock {
             let h_flat = h.reshape(vec![n_tokens, d]);
             compute::gpu_mega_ffn(
                 &x.ctx, &h_flat.buffer, &self.ln2_weight.buffer,
-                &self.ffn_w1.buffer, &self.ffn_w2.buffer, &self.ffn_w3.buffer,
-                &out_buf, n_tokens as u32, d as u32, ff as u32, self.norm_eps,
+                compute::FfnWeights { w1: &self.ffn_w1.buffer, w2: &self.ffn_w2.buffer, w3: &self.ffn_w3.buffer },
+                &out_buf, compute::MegaFfnDims { batch_tokens: n_tokens as u32, d_model: d as u32, d_ff: ff as u32, eps: self.norm_eps },
             );
             return Tensor::from_buffer(Arc::clone(&x.ctx), out_buf, vec![batch, seq_len, d]);
         }
@@ -1107,57 +1017,7 @@ impl Transformer {
                 }
             }
             None => {
-                // Persistent kernel: 32 co-resident TGs + grid barriers, entire layer in 1 dispatch.
-                // Metal can't guarantee TG co-residency → spin-wait contention.
-                // Ready for AndreOS ring-buffer doorbell dispatch (~10ns/kernel vs Metal's 300μs).
-                // Persistent single-dispatch layer kernel: disabled — Metal can't guarantee
-                // threadgroup co-residency, so the grid-barrier spin-waits contend. Named flag
-                // keeps the activation condition documented without the always-false logic-bug lint.
-                let persistent_path_enabled = false;
-                let use_persistent = persistent_path_enabled && !autograd::is_recording()
-                    && d <= 256 && self.config.d_ff() <= 1024
-                    && self.config.n_experts <= 1 && !self.config.bitnet
-                    && self.config.n_kv_heads == self.config.n_heads;
-
-                if use_persistent && !checkpointed {
-                    let rank = self.config.lowrank;
-                    let ff = self.config.d_ff();
-                    let hd = d / self.config.n_heads;
-                    let scratch_size = compute::persistent_layer_scratch_size(
-                        n_tokens, d, rank, ff, self.config.n_heads,
-                        self.config.n_kv_heads, seq_len,
-                    );
-                    let scratch = self.ctx.alloc_buffer(scratch_size);
-                    let barrier_buf = self.ctx.alloc_buffer(4); // single atomic_uint
-
-                    // x_in buffer holds hidden state, modified in-place by each layer
-                    let h_flat = h.reshape(vec![n_tokens, d]);
-                    // Copy to a mutable buffer (persistent_layer writes in-place)
-                    let x_buf = self.ctx.alloc_buffer(n_tokens * d * 4);
-                    compute::gpu_scale_copy(&self.ctx, &h_flat.buffer, &x_buf, (n_tokens * d) as u32, 1.0);
-
-                    for block in &self.blocks {
-                        // Zero barrier counter before each layer
-                        compute::gpu_fill(&self.ctx, &barrier_buf, 1, 0.0);
-                        compute::gpu_persistent_layer(
-                            &self.ctx,
-                            &block.ln1_weight.buffer,
-                            &block.attn.w_q.buffer, &block.attn.w_k.buffer, &block.attn.w_v.buffer,
-                            &block.attn.w_q_v.buffer, &block.attn.w_k_v.buffer, &block.attn.w_v_v.buffer,
-                            &block.attn.w_o.buffer, &block.attn.w_o_v.buffer,
-                            &block.ln2_weight.buffer,
-                            &block.ffn_w1.buffer, &block.ffn_w2.buffer, &block.ffn_w3.buffer,
-                            &block.ffn_w1_v.buffer, &block.ffn_w2_v.buffer, &block.ffn_w3_v.buffer,
-                            &x_buf, &scratch, &barrier_buf,
-                            n_tokens as u32, d as u32, rank as u32, ff as u32,
-                            self.config.n_heads as u32, self.config.n_kv_heads as u32,
-                            hd as u32, seq_len as u32,
-                            self.config.norm_eps, self.config.rope_theta, 0,
-                        );
-                    }
-
-                    h = Tensor::from_buffer(Arc::clone(&self.ctx), x_buf, vec![batch, seq_len, d]);
-                } else if checkpointed {
+                if checkpointed {
                     for (i, block) in self.blocks.iter().enumerate() {
                         h = block.forward_checkpointed(&h, i);
                     }

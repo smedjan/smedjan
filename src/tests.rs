@@ -1564,7 +1564,7 @@ mod suite {
 
         // FP32 reference
         let c_ref = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul(&ctx, &a_buf, &b_buf, &c_ref, 2, 2, 2, 3);
+        compute::gpu_batched_matmul(&ctx, &a_buf, &b_buf, &c_ref, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
         let ref_result = MetalContext::read_buffer(&c_ref, 8);
 
         // FP16 path
@@ -1573,7 +1573,7 @@ mod suite {
         compute::gpu_cast_f32_to_f16(&ctx, &a_buf, &a_f16, a.len() as u32);
         compute::gpu_cast_f32_to_f16(&ctx, &b_buf, &b_f16, b.len() as u32);
         let c_f16 = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul_f16(&ctx, &a_f16, &b_f16, &c_f16, 2, 2, 2, 3);
+        compute::gpu_batched_matmul_f16(&ctx, &a_f16, &b_f16, &c_f16, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
         let f16_result = MetalContext::read_buffer(&c_f16, 8);
 
         for i in 0..8 {
@@ -1583,11 +1583,11 @@ mod suite {
 
         // Also test batched trans_b and trans_a via the FP16 functions
         let c_tb = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul_trans_b_f16(&ctx, &a_f16, &b_f16, &c_tb, 2, 2, 3, 3);
+        compute::gpu_batched_matmul_trans_b_f16(&ctx, &a_f16, &b_f16, &c_tb, compute::BatchedDims { batch: 2, m: 2, n: 3, k: 3 });
         let _ = MetalContext::read_buffer(&c_tb, 8); // just verify no crash
 
         let c_ta = ctx.alloc_buffer(2 * 3 * 2 * 4);
-        compute::gpu_batched_matmul_trans_a_f16(&ctx, &a_f16, &b_f16, &c_ta, 2, 2, 3, 2);
+        compute::gpu_batched_matmul_trans_a_f16(&ctx, &a_f16, &b_f16, &c_ta, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
         let _ = MetalContext::read_buffer(&c_ta, 12); // just verify no crash
     }
 
@@ -1824,8 +1824,8 @@ mod suite {
         let out_buf = ctx.alloc_buffer(n_tokens * d * 4);
         compute::gpu_mega_ffn(
             &ctx, &x.buffer, &norm_w.buffer,
-            &w1.buffer, &w2.buffer, &w3.buffer,
-            &out_buf, n_tokens as u32, d as u32, ff as u32, eps,
+            compute::FfnWeights { w1: &w1.buffer, w2: &w2.buffer, w3: &w3.buffer },
+            &out_buf, compute::MegaFfnDims { batch_tokens: n_tokens as u32, d_model: d as u32, d_ff: ff as u32, eps },
         );
         let mega_out = Tensor::from_buffer(Arc::clone(&ctx), out_buf, vec![n_tokens, d]);
         let mega_vals = mega_out.to_vec();

@@ -336,15 +336,11 @@ pub fn generate_speculative(
 
     generate_speculative_inner(
         ctx,
-        main_model,
-        draft_model,
-        tokenizer,
+        SpecModels { main: main_model, draft: draft_model, tokenizer },
         prompt,
         config,
         draft_tokens,
-        &mut generated,
-        &mut total_accepted,
-        &mut total_drafted,
+        SpecState { generated: &mut generated, total_accepted: &mut total_accepted, total_drafted: &mut total_drafted },
         None::<fn(&str)>,
     );
 
@@ -370,9 +366,7 @@ pub fn generate_speculative(
 /// accepted token as soon as it is confirmed by the main model.
 pub fn generate_speculative_streaming<F>(
     ctx: &Arc<MetalContext>,
-    main_model: &Transformer,
-    draft_model: &Transformer,
-    tokenizer: &BpeTokenizer,
+    models: SpecModels,
     prompt: &str,
     config: &SamplingConfig,
     draft_tokens: usize,
@@ -386,15 +380,11 @@ pub fn generate_speculative_streaming<F>(
 
     generate_speculative_inner(
         ctx,
-        main_model,
-        draft_model,
-        tokenizer,
+        models,
         prompt,
         config,
         draft_tokens,
-        &mut generated,
-        &mut total_accepted,
-        &mut total_drafted,
+        SpecState { generated: &mut generated, total_accepted: &mut total_accepted, total_drafted: &mut total_drafted },
         Some(on_token),
     );
 
@@ -411,21 +401,33 @@ pub fn generate_speculative_streaming<F>(
 
 /// Core speculative decoding loop, shared by both blocking and streaming variants.
 /// When `on_token` is `Some`, streams each accepted token via the callback.
+/// The two models + tokenizer used by speculative decoding.
+pub struct SpecModels<'a> {
+    pub main: &'a Transformer,
+    pub draft: &'a Transformer,
+    pub tokenizer: &'a BpeTokenizer,
+}
+
+/// Mutable accounting threaded through the speculative loop.
+struct SpecState<'a> {
+    generated: &'a mut Vec<u32>,
+    total_accepted: &'a mut usize,
+    total_drafted: &'a mut usize,
+}
+
 fn generate_speculative_inner<F>(
     ctx: &Arc<MetalContext>,
-    main_model: &Transformer,
-    draft_model: &Transformer,
-    tokenizer: &BpeTokenizer,
+    models: SpecModels,
     prompt: &str,
     config: &SamplingConfig,
     draft_tokens: usize,
-    generated: &mut Vec<u32>,
-    total_accepted: &mut usize,
-    total_drafted: &mut usize,
+    state: SpecState,
     mut on_token: Option<F>,
 ) where
     F: FnMut(&str),
 {
+    let SpecModels { main: main_model, draft: draft_model, tokenizer } = models;
+    let SpecState { generated, total_accepted, total_drafted } = state;
     eprintln!(
         "Speculative decoding on {} (draft_tokens={}, temp={}, max_tokens={})",
         ctx.device_name(), draft_tokens, config.temperature, config.max_tokens

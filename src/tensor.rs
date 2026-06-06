@@ -379,7 +379,7 @@ impl Tensor {
             let a_f16 = self.cast_to_f16();
             let b_f16 = other.cast_to_f16();
             compute::gpu_batched_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf,
-                batch as u32, m as u32, n as u32, k as u32);
+                compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 });
         } else {
             // Broadcast: one operand has batch=1. Single-dispatch batched FP32 matmul
             // with the unbatched operand repeated via gpu_repeat_kv-style expansion.
@@ -401,7 +401,7 @@ impl Tensor {
                 (self.buffer.clone(), expanded)
             };
             compute::gpu_batched_matmul(&self.ctx, &a_full, &b_full, &out_buf,
-                batch as u32, m as u32, n as u32, k as u32);
+                compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 });
         }
 
         let mut out_shape = self.shape[..rank_a - 2].to_vec();
@@ -690,7 +690,7 @@ impl Tensor {
         let sum_buf = self.ctx.alloc_buffer(self.numel() * 4); // stores (self + residual)
         compute::gpu_rms_norm_residual(
             &self.ctx, &self.buffer, &residual.buffer, &weight.buffer,
-            &out_buf, &sum_buf, rows as u32, cols as u32, eps,
+            &out_buf, &sum_buf, compute::RmsResDims { rows: rows as u32, cols: cols as u32, eps },
         );
 
         let out_id = autograd::next_id();
@@ -730,7 +730,7 @@ impl Tensor {
         let sum_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_rms_norm_residual(
             &self.ctx, &self.buffer, &residual.buffer, &weight.buffer,
-            &out_buf, &sum_buf, rows as u32, cols as u32, eps,
+            &out_buf, &sum_buf, compute::RmsResDims { rows: rows as u32, cols: cols as u32, eps },
         );
 
         let out_id = autograd::next_id();
@@ -868,7 +868,7 @@ impl Tensor {
         // Out-of-place RoPE: dst = rotate(src, θ) in 1 dispatch (was copy + in-place = 2)
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_rope_copy(&self.ctx, &self.buffer, &out_buf,
-            total_rows as u32, seq_len as u32, head_dim as u32, offset, theta);
+            compute::RopeDims { total_rows: total_rows as u32, seq_len: seq_len as u32, head_dim: head_dim as u32, offset, theta });
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -947,7 +947,7 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         compute::gpu_fused_norm_matmul(
             &self.ctx, &self.buffer, &weight.buffer, &b.buffer, &out_buf,
-            m as u32, n as u32, k as u32, eps,
+            compute::NormMatmulDims { m: m as u32, n: n as u32, k: k as u32, eps },
         );
 
         let out_id = autograd::next_id();
@@ -1111,7 +1111,7 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_scaled_causal_softmax(
             &self.ctx, &self.buffer, &out_buf,
-            total_rows as u32, seq_q as u32, seq_k as u32, scale, kv_offset,
+            compute::SoftmaxDims { total_rows: total_rows as u32, seq_q: seq_q as u32, seq_k: seq_k as u32, scale, kv_offset },
         );
 
         let out_id = autograd::next_id();
@@ -1273,7 +1273,7 @@ impl Tensor {
 
         // Batched matmul. NB: despite "FP32 inputs", the batched_matmul_tiled kernel casts both
         // operands to half in shared memory (like the dense matmul) — results are fp16-precision.
-        compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
+        compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1316,7 +1316,7 @@ impl Tensor {
 
         // Batched matmul trans_b. NB: the kernel casts both operands to half in shared memory —
         // results are fp16-precision, not fp32 (the "FP32 inputs" wording is misleading).
-        compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
+        compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1359,7 +1359,7 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * k * n * 4);
 
-        compute::gpu_batched_matmul_trans_a(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, k as u32, n as u32);
+        compute::gpu_batched_matmul_trans_a(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
 
         let out_id = autograd::next_id();
         let out = Tensor {

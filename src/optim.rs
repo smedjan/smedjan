@@ -391,8 +391,7 @@ impl Sophia {
 
             compute::gpu_sophia_update(
                 &self.ctx, &ps.buffer, &grad, &ps.m, &ps.h,
-                ps.size as u32, lr, self.beta1, self.beta2,
-                self.eps, self.rho, self.weight_decay,
+                ps.size as u32, compute::SophiaParams { lr, beta1: self.beta1, beta2: self.beta2, eps: self.eps, rho: self.rho, weight_decay: self.weight_decay },
             );
         }
     }

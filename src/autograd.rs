@@ -431,7 +431,7 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
         }
         Op::ScaleRows { rows, cols } => backward_scale_rows(ctx, entry, out_grad, *rows, *cols),
         Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
-            backward_flash_attention(ctx, entry, out_grad, *batch_heads, *seq_q, *seq_k, *head_dim, *kv_offset);
+            backward_flash_attention(ctx, entry, out_grad, compute::FlashDims { batch_heads: *batch_heads as u32, seq_q: *seq_q as u32, seq_k: *seq_k as u32, head_dim: *head_dim as u32, kv_offset: *kv_offset });
         }
         Op::Silu => backward_silu(ctx, entry, out_grad),
         Op::SiluGate => backward_silu_gate(ctx, entry, out_grad),
@@ -461,7 +461,7 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
             backward_rope(ctx, entry, out_grad, *seq_len, *head_dim, *offset, *theta);
         }
         Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
-            backward_transpose_rope(ctx, entry, out_grad, *batch, *seq_len, *n_heads, *head_dim, *offset, *theta);
+            backward_transpose_rope(ctx, entry, out_grad, compute::TrRopeDims { batch: *batch as u32, seq: *seq_len as u32, n_heads: *n_heads as u32, head_dim: *head_dim as u32, offset: *offset, theta: *theta });
         }
     }
 }
@@ -739,24 +739,15 @@ fn backward_rope(
     let size: usize = entry.shapes[0].iter().product();
     let total_rows = entry.shapes[0][0] as u32;
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_rope_backward_copy(ctx, out_grad, &grad_input, total_rows, seq_len, head_dim, offset, theta);
+    compute::gpu_rope_backward_copy(ctx, out_grad, &grad_input, compute::RopeDims { total_rows, seq_len, head_dim, offset, theta });
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
 /// Fused transpose+RoPE backward: inverse RoPE + inverse transpose in one dispatch.
-fn backward_transpose_rope(
-    ctx: &Arc<MetalContext>,
-    entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
-    batch: usize, seq_len: usize, n_heads: usize, head_dim: usize,
-    offset: u32, theta: f32,
-) {
-    let size = batch * seq_len * n_heads * head_dim;
+fn backward_transpose_rope(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, d: compute::TrRopeDims) {
+    let size = (d.batch * d.seq * d.n_heads * d.head_dim) as usize;
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_transpose_rope_backward(
-        ctx, out_grad, &grad_input,
-        batch as u32, seq_len as u32, n_heads as u32, head_dim as u32, offset, theta,
-    );
+    compute::gpu_transpose_rope_backward(ctx, out_grad, &grad_input, d);
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
@@ -955,11 +946,11 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     // Batched backward — FP32 (small attention dims, cast overhead not worth it)
     // dA = dC @ B^T : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
 
     // dB = A^T @ dC : [B,K,M] @ [B,M,N] = [B,K,N]
     let db_total = ctx.alloc_buffer(batches * k * n * 4);
-    compute::gpu_batched_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
 
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * k * n);
@@ -979,11 +970,11 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     // Batched backward — FP32
     // dA = dC @ B : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul(ctx, out_grad, &entry.input_buffers[1], &da_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul(ctx, out_grad, &entry.input_buffers[1], &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
 
     // dB = dC^T @ A : [B,N,M] @ [B,M,K] = [B,N,K]
     let db_total = ctx.alloc_buffer(batches * n * k * 4);
-    compute::gpu_batched_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_total, batches as u32, m as u32, n as u32, k as u32);
+    compute::gpu_batched_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
 
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * n * k);
@@ -1003,12 +994,12 @@ fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
 
     // dA = B @ dC^T : a=B[B,M,N], b=dC[B,K,N] → [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_trans_b(ctx, &entry.input_buffers[1], out_grad, &da_total, batches as u32, m as u32, k as u32, n as u32);
+    compute::gpu_batched_matmul_trans_b(ctx, &entry.input_buffers[1], out_grad, &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
 
     // dB = A @ dC : a=A[B,M,K], b=dC[B,K,N] → [B,M,N]
     let db_total = ctx.alloc_buffer(batches * m * n * 4);
-    compute::gpu_batched_matmul(ctx, &entry.input_buffers[0], out_grad, &db_total, batches as u32, m as u32, n as u32, k as u32);
+    compute::gpu_batched_matmul(ctx, &entry.input_buffers[0], out_grad, &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * m * n);
 }
 
@@ -1038,16 +1029,9 @@ fn backward_repeat_kv(
 /// Flash Attention backward: compute dQ, dK, dV using Flash Attention backward kernel.
 /// entry.inputs: [Q_id, K_id, V_id]
 /// entry.cached: O (forward output, for D computation)
-fn backward_flash_attention(
-    ctx: &Arc<MetalContext>,
-    entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>, // dO
-    batch_heads: usize,
-    seq_q: usize,
-    seq_k: usize,
-    head_dim: usize,
-    kv_offset: u32,
-) {
+fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, dims: compute::FlashDims) {
+    let compute::FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset: _ } = dims;
+    let (batch_heads, seq_q, seq_k, head_dim) = (batch_heads as usize, seq_q as usize, seq_k as usize, head_dim as usize);
     let total_q_rows = batch_heads * seq_q;
     let total_k_rows = batch_heads * seq_k;
 
@@ -1070,14 +1054,12 @@ fn backward_flash_attention(
     // Run Flash Attention backward kernel
     compute::gpu_flash_attention_backward(
         ctx,
-        &entry.input_buffers[0], // Q
-        &entry.input_buffers[1], // K
-        &entry.input_buffers[2], // V
-        o_buf,                    // O
-        out_grad,                 // dO
-        &d_buf,                   // D
-        &dq_buf, &dk_buf, &dv_buf,
-        batch_heads as u32, seq_q as u32, seq_k as u32, head_dim as u32, kv_offset,
+        compute::FlashBwdBufs {
+            q: &entry.input_buffers[0], k: &entry.input_buffers[1], v: &entry.input_buffers[2],
+            output: o_buf, d_out: out_grad, d_buf: &d_buf,
+            dq: &dq_buf, dk: &dk_buf, dv: &dv_buf,
+        },
+        dims,
     );
 
     // Accumulate gradients

@@ -39,30 +39,9 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Train a BPE tokenizer from a text corpus
-    Tokenizer {
-        #[arg(long)]
-        input: String,
-        #[arg(long, default_value = "32000")]
-        vocab_size: u32,
-        #[arg(long, default_value = "tokenizer.bin")]
-        output: String,
-    },
-
-    /// Prepare a dataset (tokenize raw text to binary format)
-    Prepare {
-        #[arg(long)]
-        input: String,
-        #[arg(long)]
-        tokenizer: String,
-        #[arg(long, default_value = "dataset.bin")]
-        output: String,
-    },
-
-    /// Train a model
-    Train {
+/// Arguments for the `train` subcommand (boxed in `Commands::Train` to keep the enum small).
+#[derive(clap::Args)]
+struct TrainArgs {
         #[arg(long)]
         dataset: String,
         #[arg(long)]
@@ -200,7 +179,32 @@ enum Commands {
         /// For progressive training: grow a small model, then continue training larger.
         #[arg(long)]
         pretrained: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Train a BPE tokenizer from a text corpus
+    Tokenizer {
+        #[arg(long)]
+        input: String,
+        #[arg(long, default_value = "32000")]
+        vocab_size: u32,
+        #[arg(long, default_value = "tokenizer.bin")]
+        output: String,
     },
+
+    /// Prepare a dataset (tokenize raw text to binary format)
+    Prepare {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        tokenizer: String,
+        #[arg(long, default_value = "dataset.bin")]
+        output: String,
+    },
+
+    /// Train a model
+    Train(Box<TrainArgs>),
 
     /// Show available model sizes and their param counts
     Sizes {
@@ -543,7 +547,8 @@ fn main() {
             eprintln!("Dataset ready: {} tokens", n);
         }
 
-        Commands::Train {
+        Commands::Train(args) => {
+            let TrainArgs {
             dataset,
             tokenizer: tok_path,
             size,
@@ -592,7 +597,7 @@ fn main() {
             fused_ce,
             freeze_fraction,
             pretrained,
-        } => {
+            } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
             let vocab_size = tok.vocab_size();
@@ -614,7 +619,10 @@ fn main() {
                     let kvh = kv_heads.unwrap_or(h);
                     let ms = max_seq.unwrap_or(512);
                     if n_experts > 1 {
-                        model::ModelConfig::custom_moe(vocab_size, d, h, kvh, l, fm, ms, n_experts, top_k_experts)
+                        model::ModelConfig::custom_moe(
+                            model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms),
+                            model::MoeSpec { n_experts, top_k_experts },
+                        )
                     } else {
                         model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
                     }
@@ -729,7 +737,9 @@ fn main() {
                 if stream {
                     print!("{}", prompt);
                     generate::generate_speculative_streaming(
-                        &ctx, &model, &draft_model, &tok, &prompt, &config, draft_tokens,
+                        &ctx,
+                        generate::SpecModels { main: &model, draft: &draft_model, tokenizer: &tok },
+                        &prompt, &config, draft_tokens,
                         |token_str| {
                             print!("{}", token_str);
                             use std::io::Write;

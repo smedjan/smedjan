@@ -350,7 +350,7 @@ impl MultiHeadAttention {
             compute::gpu_flash_attention_forward(
                 &q.ctx,
                 &q.buffer, &k_for_attn.buffer, &v_for_attn.buffer, &attn_out_buf,
-                bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, offset,
+                compute::FlashDims { batch_heads: bh as u32, seq_q: seq_q_len as u32, seq_k: seq_k as u32, head_dim: self.head_dim as u32, kv_offset: offset },
             );
 
             let attn_out_id = autograd::next_id();
@@ -383,7 +383,7 @@ impl MultiHeadAttention {
             let scores_buf = q.ctx.alloc_buffer(bh * seq_q_len * seq_k * 4);
             compute::gpu_batched_matmul_gqa_trans_b(
                 &q.ctx, &q.buffer, &k_for_attn.buffer, &scores_buf,
-                bh as u32, seq_q_len as u32, seq_k as u32, self.head_dim as u32, group_size as u32,
+                compute::BatchedDims { batch: bh as u32, m: seq_q_len as u32, n: seq_k as u32, k: self.head_dim as u32 }, group_size as u32,
             );
             let scores = Tensor::from_buffer(Arc::clone(&q.ctx), scores_buf, vec![bh, seq_q_len, seq_k]);
             let scores = scores.scale(scale);
@@ -396,7 +396,7 @@ impl MultiHeadAttention {
             let attn_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_batched_matmul_gqa(
                 &q.ctx, &weights.buffer, &v_for_attn.buffer, &attn_buf,
-                bh as u32, seq_q_len as u32, self.head_dim as u32, seq_k as u32, group_size as u32,
+                compute::BatchedDims { batch: bh as u32, m: seq_q_len as u32, n: self.head_dim as u32, k: seq_k as u32 }, group_size as u32,
             );
             Tensor::from_buffer(Arc::clone(&q.ctx), attn_buf, vec![bh, seq_q_len, self.head_dim])
         } else {
@@ -465,7 +465,7 @@ fn fused_transpose_rope(
 
     compute::gpu_transpose_rope(
         &t.ctx, &t.buffer, &out_buf,
-        batch as u32, seq_len as u32, n_heads as u32, head_dim as u32, offset, theta,
+        compute::TrRopeDims { batch: batch as u32, seq: seq_len as u32, n_heads: n_heads as u32, head_dim: head_dim as u32, offset, theta },
     );
 
     let out_id = autograd::next_id();
@@ -620,11 +620,11 @@ fn update_kv_cache(
         // Copy new K, V into cache at offset = old_len (single batched dispatch per tensor)
         compute::gpu_strided_batch_copy(
             &k_cache.ctx, &k_new.buffer, &k_cache.buffer,
-            bh as u32, new_len as u32, cache.capacity as u32, old_len as u32, head_dim as u32,
+            compute::StridedCopyDims { bh: bh as u32, src_seq_len: new_len as u32, dst_stride: cache.capacity as u32, dst_offset: old_len as u32, dim: head_dim as u32 },
         );
         compute::gpu_strided_batch_copy(
             &v_cache.ctx, &v_new.buffer, &v_cache.buffer,
-            bh as u32, new_len as u32, cache.capacity as u32, old_len as u32, head_dim as u32,
+            compute::StridedCopyDims { bh: bh as u32, src_seq_len: new_len as u32, dst_stride: cache.capacity as u32, dst_offset: old_len as u32, dim: head_dim as u32 },
         );
 
         cache.len = total_len;
@@ -687,12 +687,12 @@ fn concat_seq(
     // Copy a's data: src [bh, len_a, dim] → dst [bh, total_len, dim] at offset 0
     compute::gpu_strided_batch_copy(
         &a.ctx, &a.buffer, &out_buf,
-        bh as u32, len_a as u32, total_len as u32, 0, dim as u32,
+        compute::StridedCopyDims { bh: bh as u32, src_seq_len: len_a as u32, dst_stride: total_len as u32, dst_offset: 0, dim: dim as u32 },
     );
     // Copy b's data: src [bh, len_b, dim] → dst [bh, total_len, dim] at offset len_a
     compute::gpu_strided_batch_copy(
         &a.ctx, &b.buffer, &out_buf,
-        bh as u32, len_b as u32, total_len as u32, len_a as u32, dim as u32,
+        compute::StridedCopyDims { bh: bh as u32, src_seq_len: len_b as u32, dst_stride: total_len as u32, dst_offset: len_a as u32, dim: dim as u32 },
     );
 
     Tensor::from_buffer(Arc::clone(&a.ctx), out_buf, vec![bh, total_len, dim])

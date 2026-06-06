@@ -203,7 +203,57 @@ pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
 }
 
 /// Batched C[b](f32) = A[b](f16) @ B[b](f16). Single dispatch, FP16 inputs.
-pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+/// Dimensions for a batched matmul dispatch: C[batch, M, N]. K is the contraction dim.
+#[derive(Clone, Copy)]
+pub struct BatchedDims { pub batch: u32, pub m: u32, pub n: u32, pub k: u32 }
+
+/// RoPE-over-flat-rows dims (rope_copy / rope_backward_copy).
+#[derive(Clone, Copy)]
+pub struct RopeDims { pub total_rows: u32, pub seq_len: u32, pub head_dim: u32, pub offset: u32, pub theta: f32 }
+/// Transpose+RoPE dims (transpose_rope / _backward).
+#[derive(Clone, Copy)]
+pub struct TrRopeDims { pub batch: u32, pub seq: u32, pub n_heads: u32, pub head_dim: u32, pub offset: u32, pub theta: f32 }
+/// Flash-attention dims.
+#[derive(Clone, Copy)]
+pub struct FlashDims { pub batch_heads: u32, pub seq_q: u32, pub seq_k: u32, pub head_dim: u32, pub kv_offset: u32 }
+/// Scaled-causal-softmax dims (`window` = u32::MAX means no window).
+#[derive(Clone, Copy)]
+pub struct SoftmaxDims { pub total_rows: u32, pub seq_q: u32, pub seq_k: u32, pub scale: f32, pub kv_offset: u32 }
+/// Lion optimizer hyperparameters.
+#[derive(Clone, Copy)]
+pub struct LionParams { pub lr: f32, pub beta1: f32, pub beta2: f32, pub weight_decay: f32 }
+/// Sophia optimizer hyperparameters.
+#[derive(Clone, Copy)]
+pub struct SophiaParams { pub lr: f32, pub beta1: f32, pub beta2: f32, pub eps: f32, pub rho: f32, pub weight_decay: f32 }
+
+/// Fused residual-add + RMS-norm dims.
+#[derive(Clone, Copy)]
+pub struct RmsResDims { pub rows: u32, pub cols: u32, pub eps: f32 }
+/// Strided batch-copy layout.
+#[derive(Clone, Copy)]
+pub struct StridedCopyDims { pub bh: u32, pub src_seq_len: u32, pub dst_stride: u32, pub dst_offset: u32, pub dim: u32 }
+/// KL-divergence distillation dims.
+#[derive(Clone, Copy)]
+pub struct KlDims { pub batch_size: u32, pub vocab_size: u32, pub temperature: f32 }
+/// Mega-FFN dims.
+#[derive(Clone, Copy)]
+pub struct MegaFfnDims { pub batch_tokens: u32, pub d_model: u32, pub d_ff: u32, pub eps: f32 }
+/// SwiGLU FFN weight matrices.
+#[derive(Clone, Copy)]
+pub struct FfnWeights<'a> { pub w1: &'a GpuBuffer, pub w2: &'a GpuBuffer, pub w3: &'a GpuBuffer }
+/// Fused norm+matmul dims.
+#[derive(Clone, Copy)]
+pub struct NormMatmulDims { pub m: u32, pub n: u32, pub k: u32, pub eps: f32 }
+/// Flash-attention backward buffers.
+#[derive(Clone, Copy)]
+pub struct FlashBwdBufs<'a> {
+    pub q: &'a GpuBuffer, pub k: &'a GpuBuffer, pub v: &'a GpuBuffer,
+    pub output: &'a GpuBuffer, pub d_out: &'a GpuBuffer, pub d_buf: &'a GpuBuffer,
+    pub dq: &'a GpuBuffer, pub dk: &'a GpuBuffer, pub dv: &'a GpuBuffer,
+}
+
+pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
     let params = Params { m, n, k, batch };
@@ -215,7 +265,8 @@ pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuf
 }
 
 /// Batched C[b](f32) = A[b](f16) @ B[b](f16)^T. Single dispatch, FP16 inputs.
-pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
     let params = Params { m, n, k, batch };
@@ -227,7 +278,8 @@ pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b:
 }
 
 /// Batched C[b](f32) = A[b](f16)^T @ B[b](f16). Single dispatch, FP16 inputs.
-pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, k: u32, n: u32) {
+pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, k: u32, n: u32, batch: u32 }
     let params = Params { m, k, n, batch };
@@ -240,7 +292,8 @@ pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b:
 
 /// Batched C[b] = A[b] @ B[b] for all b in [0, batch). Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, K, N], C: [batch, M, N]
-pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
     let params = Params { m, n, k, batch };
@@ -259,7 +312,8 @@ pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
 
 /// Batched C[b] = A[b] @ B[b]^T for all b. Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, N, K], C: [batch, M, N]
-pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, n: u32, k: u32) {
+pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
     let params = Params { m, n, k, batch };
@@ -281,8 +335,9 @@ pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
 /// batch_q = batch * n_heads, batch_kv = batch * n_kv_heads, group_size = n_heads / n_kv_heads
 pub fn gpu_batched_matmul_gqa_trans_b(
     ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
-    batch_q: u32, m: u32, n: u32, k: u32, group_size: u32,
+    d: BatchedDims, group_size: u32,
 ) {
+    let BatchedDims { batch: batch_q, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32, group_size: u32 }
     let params = Params { m, n, k, batch: batch_q, group_size };
@@ -296,8 +351,9 @@ pub fn gpu_batched_matmul_gqa_trans_b(
 /// GQA-aware batched C[b] = A[b] @ B[b/group_size]. Eliminates repeat_kv copy.
 pub fn gpu_batched_matmul_gqa(
     ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
-    batch_q: u32, m: u32, n: u32, k: u32, group_size: u32,
+    d: BatchedDims, group_size: u32,
 ) {
+    let BatchedDims { batch: batch_q, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32, group_size: u32 }
     let params = Params { m, n, k, batch: batch_q, group_size };
@@ -310,7 +366,8 @@ pub fn gpu_batched_matmul_gqa(
 
 /// Batched C[b] = A[b]^T @ B[b] for all b. Single GPU dispatch.
 /// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
-pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, batch: u32, m: u32, k: u32, n: u32) {
+pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
     let params = Params { m, n, k, batch };
@@ -371,15 +428,10 @@ pub fn gpu_rms_norm(
 /// Also stores (input + residual) in sum_out for backward pass.
 pub fn gpu_rms_norm_residual(
     ctx: &Arc<MetalContext>,
-    input: &GpuBuffer,
-    residual: &GpuBuffer,
-    weight: &GpuBuffer,
-    output: &GpuBuffer,
-    sum_out: &GpuBuffer,
-    rows: u32,
-    cols: u32,
-    eps: f32,
+    input: &GpuBuffer, residual: &GpuBuffer, weight: &GpuBuffer,
+    output: &GpuBuffer, sum_out: &GpuBuffer, d: RmsResDims,
 ) {
+    let RmsResDims { rows, cols, eps } = d;
     #[repr(C)]
     struct Params { rows: u32, cols: u32, eps: f32 }
     let params = Params { rows, cols, eps };
@@ -423,10 +475,8 @@ pub fn gpu_rope(
 }
 
 /// Out-of-place RoPE forward: dst = rotate(src, θ). Single dispatch replaces copy + in-place.
-pub fn gpu_rope_copy(
-    ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
-    total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32,
-) {
+pub fn gpu_rope_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims) {
+    let RopeDims { total_rows, seq_len, head_dim, offset, theta } = d;
     #[repr(C)]
     struct Params { seq_len: u32, head_dim: u32, total_rows: u32, offset: u32, theta: f32 }
     let params = Params { seq_len, head_dim, total_rows, offset, theta };
@@ -468,10 +518,8 @@ pub fn gpu_rope_backward(
 }
 
 /// Out-of-place RoPE backward: dst = rotate(src, -θ). Single dispatch replaces copy + in-place.
-pub fn gpu_rope_backward_copy(
-    ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
-    total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32,
-) {
+pub fn gpu_rope_backward_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims) {
+    let RopeDims { total_rows, seq_len, head_dim, offset, theta } = d;
     #[repr(C)]
     struct Params { seq_len: u32, head_dim: u32, total_rows: u32, offset: u32, theta: f32 }
     let params = Params { seq_len, head_dim, total_rows, offset, theta };
@@ -693,10 +741,9 @@ pub fn gpu_embedding_lookup(
 /// Flash Attention Forward: fused Q@K^T → mask → softmax → @V in one kernel.
 /// Q,K,V: [batch_heads, seq, head_dim], O: [batch_heads, seq_q, head_dim]
 pub fn gpu_flash_attention_forward(
-    ctx: &Arc<MetalContext>,
-    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, o: &GpuBuffer,
-    batch_heads: u32, seq_q: u32, seq_k: u32, head_dim: u32, kv_offset: u32,
+    ctx: &Arc<MetalContext>, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, o: &GpuBuffer, d: FlashDims,
 ) {
+    let FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset } = d;
     #[repr(C)]
     struct Params { seq_q: u32, seq_k: u32, head_dim: u32, batch_heads: u32, scale: f32, kv_offset: u32 }
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -731,13 +778,9 @@ pub fn gpu_flash_attn_precompute_d(
 }
 
 /// Flash Attention Backward: compute dQ, dK, dV.
-pub fn gpu_flash_attention_backward(
-    ctx: &Arc<MetalContext>,
-    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer,
-    output: &GpuBuffer, d_out: &GpuBuffer, d_buf: &GpuBuffer,
-    dq: &GpuBuffer, dk: &GpuBuffer, dv: &GpuBuffer,
-    batch_heads: u32, seq_q: u32, seq_k: u32, head_dim: u32, kv_offset: u32,
-) {
+pub fn gpu_flash_attention_backward(ctx: &Arc<MetalContext>, b: FlashBwdBufs, d: FlashDims) {
+    let FlashBwdBufs { q, k, v, output, d_out, d_buf, dq, dk, dv } = b;
+    let FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset } = d;
     #[repr(C)]
     struct Params { seq_q: u32, seq_k: u32, head_dim: u32, batch_heads: u32, scale: f32, kv_offset: u32 }
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -795,7 +838,8 @@ pub fn gpu_ternary_pack(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &
 }
 
 /// Lion optimizer update: simpler than AdamW, 2x less memory (no variance buffer).
-pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, size: u32, lr: f32, beta1: f32, beta2: f32, weight_decay: f32) {
+pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, size: u32, p: LionParams) {
+    let LionParams { lr, beta1, beta2, weight_decay } = p;
     #[repr(C)]
     struct Params { lr: f32, beta1: f32, beta2: f32, weight_decay: f32 }
     let params = Params { lr, beta1, beta2, weight_decay };
@@ -810,7 +854,8 @@ pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuf
 }
 
 /// Sophia optimizer: second-order with diagonal Hessian estimate. 2x faster convergence.
-pub fn gpu_sophia_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, h: &GpuBuffer, size: u32, lr: f32, beta1: f32, beta2: f32, eps: f32, rho: f32, weight_decay: f32) {
+pub fn gpu_sophia_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, h: &GpuBuffer, size: u32, p: SophiaParams) {
+    let SophiaParams { lr, beta1, beta2, eps, rho, weight_decay } = p;
     #[repr(C)]
     struct Params { lr: f32, beta1: f32, beta2: f32, eps: f32, rho: f32, weight_decay: f32 }
     let params = Params { lr, beta1, beta2, eps, rho, weight_decay };
@@ -1329,16 +1374,8 @@ pub fn gpu_gradient_mask(
 /// Batched strided copy: src [bh, src_seq_len, dim] (contiguous) →
 /// dst [bh, dst_stride, dim] at seq offset dst_offset per batch-head.
 /// Single GPU dispatch replaces O(bh) individual buffer_copy calls.
-pub fn gpu_strided_batch_copy(
-    ctx: &Arc<MetalContext>,
-    src: &GpuBuffer,
-    dst: &GpuBuffer,
-    bh: u32,
-    src_seq_len: u32,
-    dst_stride: u32,
-    dst_offset: u32,
-    dim: u32,
-) {
+pub fn gpu_strided_batch_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: StridedCopyDims) {
+    let StridedCopyDims { bh, src_seq_len, dst_stride, dst_offset, dim } = d;
     #[repr(C)]
     struct Params { bh: u32, src_seq_len: u32, dst_stride: u32, dst_offset: u32, dim: u32 }
     let params = Params { bh, src_seq_len, dst_stride, dst_offset, dim };
@@ -1432,14 +1469,10 @@ pub fn gpu_temperature_scale(
 /// grad_student: [batch * vocab] raw gradient w.r.t. student logits: (1/T) * (q - p) / batch
 pub fn gpu_kl_divergence(
     ctx: &Arc<MetalContext>,
-    teacher_logits: &GpuBuffer,
-    student_logits: &GpuBuffer,
-    losses: &GpuBuffer,
-    grad_student: &GpuBuffer,
-    batch_size: u32,
-    vocab_size: u32,
-    temperature: f32,
+    teacher_logits: &GpuBuffer, student_logits: &GpuBuffer, losses: &GpuBuffer, grad_student: &GpuBuffer,
+    d: KlDims,
 ) {
+    let KlDims { batch_size, vocab_size, temperature } = d;
     #[repr(C)]
     struct Params { batch_size: u32, vocab_size: u32, temperature: f32 }
     let params = Params { batch_size, vocab_size, temperature };
@@ -1455,18 +1488,14 @@ pub fn gpu_kl_divergence(
 }
 
 /// Fused scale + causal mask + softmax. Input: [total_rows, seq_k].
-pub fn gpu_scaled_causal_softmax(
-    ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
-    total_rows: u32, seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32,
-) {
-    gpu_scaled_causal_softmax_window(ctx, input, output, total_rows, seq_q, seq_k, scale, kv_offset, 0)
+pub fn gpu_scaled_causal_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims) {
+    let SoftmaxDims { total_rows, seq_q, seq_k, scale, kv_offset } = d;
+    gpu_scaled_causal_softmax_window(ctx, input, output, SoftmaxDims { total_rows, seq_q, seq_k, scale, kv_offset }, 0)
 }
 
 /// Scaled causal softmax with optional sliding window.
-pub fn gpu_scaled_causal_softmax_window(
-    ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer,
-    total_rows: u32, seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32, window: u32,
-) {
+pub fn gpu_scaled_causal_softmax_window(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims, window: u32) {
+    let SoftmaxDims { total_rows, seq_q, seq_k, scale, kv_offset } = d;
     #[repr(C)]
     struct Params { seq_q: u32, seq_k: u32, scale: f32, kv_offset: u32, window: u32 }
     let params = Params { seq_q, seq_k, scale, kv_offset, window };
@@ -1484,12 +1513,10 @@ pub fn gpu_scaled_causal_softmax_window(
 /// For d_model ≤ 256, d_ff ≤ 1024 (fits in threadgroup memory).
 /// Eliminates 5 dispatches + 4 intermediate buffer allocations.
 pub fn gpu_mega_ffn(
-    ctx: &Arc<MetalContext>,
-    x: &GpuBuffer, norm_w: &GpuBuffer,
-    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
-    output: &GpuBuffer,
-    batch_tokens: u32, d_model: u32, d_ff: u32, eps: f32,
+    ctx: &Arc<MetalContext>, x: &GpuBuffer, norm_w: &GpuBuffer, w: FfnWeights, output: &GpuBuffer, d: MegaFfnDims,
 ) {
+    let FfnWeights { w1, w2, w3 } = w;
+    let MegaFfnDims { batch_tokens, d_model, d_ff, eps } = d;
     assert!(d_model <= 2048, "mega_ffn requires d_model <= 2048 (got {})", d_model);
     assert!(d_ff <= 4096, "mega_ffn requires d_ff <= 4096 (got {})", d_ff);
 
@@ -1507,80 +1534,10 @@ pub fn gpu_mega_ffn(
     );
 }
 
-/// Fused pre-attention: RMSNorm + QKV projection + transpose + RoPE in 1 dispatch.
-/// Replaces 9-12 dispatches. Outputs Q/K/V in transposed [BH, S, HD] layout.
-pub fn gpu_fused_pre_attn(
-    ctx: &Arc<MetalContext>,
-    x: &GpuBuffer, norm_w: &GpuBuffer,
-    w_q: &GpuBuffer, w_k: &GpuBuffer, w_v: &GpuBuffer,
-    w_q_v: &GpuBuffer, w_k_v: &GpuBuffer, w_v_v: &GpuBuffer,
-    q_out: &GpuBuffer, k_out: &GpuBuffer, v_out: &GpuBuffer,
-    batch_tokens: u32, d_model: u32, n_heads: u32, n_kv_heads: u32,
-    head_dim: u32, seq_len: u32, rank: u32, eps: f32, rope_theta: f32, kv_offset: u32,
-) {
-    assert!(d_model <= 1024, "fused_pre_attn requires d_model <= 1024");
-
-    #[repr(C)]
-    struct Params {
-        batch_tokens: u32, d_model: u32, n_heads: u32, n_kv_heads: u32,
-        head_dim: u32, seq_len: u32, rank: u32, eps: f32, rope_theta: f32, kv_offset: u32,
-    }
-    let params = Params {
-        batch_tokens, d_model, n_heads, n_kv_heads,
-        head_dim, seq_len, rank, eps, rope_theta, kv_offset,
-    };
-    let params_buf = params_buffer(ctx, &params);
-
-    let grid = MetalContext::size(batch_tokens as u64, 1, 1);
-    let tg = MetalContext::size(256, 1, 1);
-
-    dispatch_sync!(ctx, "fused_pre_attn", grid, tg,
-        0 => x, 1 => norm_w, 2 => w_q, 3 => w_k, 4 => w_v,
-        5 => w_q_v, 6 => w_k_v, 7 => w_v_v,
-        8 => q_out, 9 => k_out, 10 => v_out, 11 => &params_buf
-    );
-}
-
-/// Fused post-attention + FFN: gather-transpose + W_o + residual + norm + SwiGLU + residual.
-/// Replaces 8 dispatches with 1. Outputs final block result.
-pub fn gpu_fused_post_attn_ffn(
-    ctx: &Arc<MetalContext>,
-    x_residual: &GpuBuffer, attn_out: &GpuBuffer, norm_w: &GpuBuffer,
-    w_o: &GpuBuffer, w_o_v: &GpuBuffer,
-    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
-    output: &GpuBuffer,
-    batch_tokens: u32, d_model: u32, d_ff: u32,
-    n_heads: u32, head_dim: u32, seq_len: u32, rank: u32, eps: f32,
-) {
-    assert!(d_model <= 1024, "fused_post_attn_ffn requires d_model <= 1024");
-    assert!(d_ff <= 4096, "fused_post_attn_ffn requires d_ff <= 4096");
-
-    #[repr(C)]
-    struct Params {
-        batch_tokens: u32, d_model: u32, d_ff: u32,
-        n_heads: u32, head_dim: u32, seq_len: u32, rank: u32, eps: f32,
-    }
-    let params = Params { batch_tokens, d_model, d_ff, n_heads, head_dim, seq_len, rank, eps };
-    let params_buf = params_buffer(ctx, &params);
-
-    let grid = MetalContext::size(batch_tokens as u64, 1, 1);
-    let tg = MetalContext::size(256, 1, 1);
-
-    dispatch_sync!(ctx, "fused_post_attn_ffn", grid, tg,
-        0 => x_residual, 1 => attn_out, 2 => norm_w,
-        3 => w_o, 4 => w_o_v, 5 => w1, 6 => w2, 7 => w3,
-        8 => output, 9 => &params_buf
-    );
-}
-
 /// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
 /// Eliminates the intermediate buffer and 1 dispatch (transpose + RoPE → 1 kernel).
-pub fn gpu_transpose_rope(
-    ctx: &Arc<MetalContext>,
-    input: &GpuBuffer,
-    output: &GpuBuffer,
-    batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32,
-) {
+pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: TrRopeDims) {
+    let TrRopeDims { batch, seq, n_heads, head_dim, offset, theta } = d;
     #[repr(C)]
     struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32 }
     let params = Params { batch, seq, n_heads, head_dim, offset, theta };
@@ -1598,12 +1555,8 @@ pub fn gpu_transpose_rope(
 }
 
 /// Backward for fused transpose+RoPE: inverse RoPE + inverse transpose in one dispatch.
-pub fn gpu_transpose_rope_backward(
-    ctx: &Arc<MetalContext>,
-    grad_out: &GpuBuffer,
-    grad_in: &GpuBuffer,
-    batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32,
-) {
+pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer, grad_in: &GpuBuffer, d: TrRopeDims) {
+    let TrRopeDims { batch, seq, n_heads, head_dim, offset, theta } = d;
     #[repr(C)]
     struct Params { batch: u32, seq: u32, n_heads: u32, head_dim: u32, offset: u32, theta: f32 }
     let params = Params { batch, seq, n_heads, head_dim, offset, theta };
@@ -1618,87 +1571,6 @@ pub fn gpu_transpose_rope_backward(
     dispatch_threads_sync!(ctx, "transpose_rope_backward", grid, tg,
         0 => grad_out, 1 => grad_in, 2 => &params_buf
     );
-}
-
-/// Persistent transformer layer: entire layer in ONE dispatch.
-/// 32 co-resident threadgroups with grid-level atomic barriers.
-pub fn gpu_persistent_layer(
-    ctx: &Arc<MetalContext>,
-    ln1_w: &GpuBuffer, w_q: &GpuBuffer, w_k: &GpuBuffer, w_v: &GpuBuffer,
-    w_q_v: &GpuBuffer, w_k_v: &GpuBuffer, w_v_v: &GpuBuffer,
-    w_o: &GpuBuffer, w_o_v: &GpuBuffer,
-    ln2_w: &GpuBuffer,
-    w1: &GpuBuffer, w2: &GpuBuffer, w3: &GpuBuffer,
-    w1_v: &GpuBuffer, w2_v: &GpuBuffer, w3_v: &GpuBuffer,
-    x_in: &GpuBuffer, scratch: &GpuBuffer, barrier: &GpuBuffer,
-    batch_tokens: u32, d_model: u32, rank: u32, d_ff: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, seq_len: u32,
-    eps: f32, rope_theta: f32, kv_offset: u32,
-) {
-    #[repr(C)]
-    struct Params {
-        m: u32, d: u32, r: u32, ff: u32,
-        n_heads: u32, n_kv_heads: u32, head_dim: u32, seq_len: u32,
-        eps: f32, rope_theta: f32, kv_offset: u32,
-    }
-    let params = Params {
-        m: batch_tokens, d: d_model, r: rank, ff: d_ff,
-        n_heads, n_kv_heads, head_dim, seq_len,
-        eps, rope_theta, kv_offset,
-    };
-    let params_buf = params_buffer(ctx, &params);
-
-    // Zero the barrier counter
-    gpu_fill(ctx, barrier, 1, 0.0);
-
-    // 32 co-resident threadgroups × 64 threads = 2048 threads
-    let grid = MetalContext::size(32, 1, 1);
-    let tg = MetalContext::size(64, 1, 1);
-
-    dispatch_sync!(ctx, "persistent_layer", grid, tg,
-        0 => ln1_w, 1 => w_q, 2 => w_k, 3 => w_v,
-        4 => w_q_v, 5 => w_k_v, 6 => w_v_v,
-        7 => w_o, 8 => w_o_v, 9 => ln2_w,
-        10 => w1, 11 => w2, 12 => w3,
-        13 => x_in, 14 => scratch, 15 => barrier,
-        16 => &params_buf, 17 => w1_v, 18 => w2_v, 19 => w3_v
-    );
-}
-
-/// Calculate scratch space needed for persistent_layer in bytes.
-pub fn persistent_layer_scratch_size(
-    batch_tokens: usize, d: usize, r: usize, ff: usize,
-    n_heads: usize, n_kv_heads: usize, seq_len: usize,
-) -> usize {
-    let batch = batch_tokens / seq_len;
-    let bh = batch * n_heads;
-    let bh_kv = batch * n_kv_heads;
-    let hd = d / n_heads;
-    let kv_dim = n_kv_heads * hd;
-    let proj = if r > 0 { r } else { d };
-
-    let mut total = 0usize;
-    total += batch_tokens * d;          // norm_x
-    total += batch_tokens * proj;       // temp_q
-    total += batch_tokens * (if r > 0 { r } else { kv_dim }); // temp_k
-    total += batch_tokens * (if r > 0 { r } else { kv_dim }); // temp_v
-    total += bh * seq_len * hd;         // Q
-    total += bh_kv * seq_len * hd;      // K
-    total += bh_kv * seq_len * hd;      // V
-    total += bh * seq_len * seq_len;    // scores
-    total += bh * seq_len * hd;         // attn_out
-    total += batch_tokens * d;          // aflat
-    total += batch_tokens * proj;       // wo_temp
-    total += batch_tokens * d;          // h
-    total += batch_tokens * d;          // norm2
-    total += batch_tokens * (if r > 0 { r } else { ff }); // gate_temp
-    total += batch_tokens * (if r > 0 { r } else { ff }); // up_temp
-    total += batch_tokens * ff;         // gate
-    total += batch_tokens * ff;         // up
-    total += batch_tokens * ff;         // hidden
-    total += batch_tokens * (if r > 0 { r } else { d }); // down_temp
-    total += batch_tokens * d;          // down
-    total * 4 // float = 4 bytes
 }
 
 /// Pre-compute inv_rms per row: inv_rms[i] = 1/sqrt(mean(A[i]^2) + eps)
@@ -1717,10 +1589,10 @@ pub fn gpu_compute_inv_rms(ctx: &Arc<MetalContext>, input: &GpuBuffer, inv_rms: 
 
 /// Fused RMSNorm + Matmul: C = rms_norm(A, weight, eps) @ B in 2 dispatches.
 /// Eliminates the intermediate [M, K] normalized buffer.
-pub fn gpu_fused_norm_matmul(ctx: &Arc<MetalContext>,
-    a: &GpuBuffer, norm_weight: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer,
-    m: u32, n: u32, k: u32, eps: f32,
+pub fn gpu_fused_norm_matmul(
+    ctx: &Arc<MetalContext>, a: &GpuBuffer, norm_weight: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: NormMatmulDims,
 ) {
+    let NormMatmulDims { m, n, k, eps } = d;
     // Phase 1: compute inv_rms per row
     let inv_rms = ctx.alloc_buffer(m as usize * 4);
     gpu_compute_inv_rms(ctx, a, &inv_rms, m, k, eps);

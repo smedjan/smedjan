@@ -146,9 +146,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let bb16 = ctx.alloc_buffer(8 * 2);
     compute::gpu_cast_f32_to_f16(ctx, &ba, &ba16, 8);
     compute::gpu_cast_f32_to_f16(ctx, &bb, &bb16, 8);
-    compute::gpu_batched_matmul_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
-    compute::gpu_batched_matmul_trans_b_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
-    compute::gpu_batched_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2, 2);
+    compute::gpu_batched_matmul_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
+    compute::gpu_batched_matmul_trans_b_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
+    compute::gpu_batched_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
     // FP16 non-batched matmul backward variant (kept for large-matrix backward path)
     compute::gpu_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2);
     // Utility cast helper (used by FP16 backward when enabled)
@@ -175,13 +175,13 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let g = ctx.buffer_from_slice(&[0.1f32, -0.1]);
     let m = ctx.alloc_buffer(2 * 4);
     compute::gpu_fill(ctx, &m, 2, 0.0);
-    compute::gpu_lion_update(ctx, &p, &g, &m, 2, 0.01, 0.9, 0.99, 0.0);
+    compute::gpu_lion_update(ctx, &p, &g, &m, 2, compute::LionParams { lr: 0.01, beta1: 0.9, beta2: 0.99, weight_decay: 0.0 });
     tested += 1;
 
     // Sophia optimizer
     let h = ctx.alloc_buffer(2 * 4);
     compute::gpu_fill(ctx, &h, 2, 0.0);
-    compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, 0.01, 0.965, 0.99, 1e-4, 1.0, 0.0);
+    compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, compute::SophiaParams { lr: 0.01, beta1: 0.965, beta2: 0.99, eps: 1e-4, rho: 1.0, weight_decay: 0.0 });
     tested += 1;
 
     // LogSumExp + Z-loss
