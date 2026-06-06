@@ -742,10 +742,14 @@ impl TransformerBlock {
     }
 
     /// Forward pass with gradient checkpointing.
-    /// NOTE: Recompute-based checkpointing is DISABLED because Metal GPU matmul is
-    /// non-deterministic (FP16 shared memory rounding varies between kernel invocations).
-    /// Recomputed forward produces different intermediates → wrong gradients → loss diverges.
-    /// Fix requires deterministic kernels (FP32-only shared memory or cached sub-tape approach).
+    /// NOTE: Recompute-based checkpointing is DISABLED. The original rationale ("Metal matmul is
+    /// non-deterministic, FP16 shared-memory rounding varies between invocations") is WRONG —
+    /// matmul and batched_matmul are bit-exact deterministic across repeated invocations (measured:
+    /// max|c1-c2| = 0). The real cause of "recomputed forward produces different intermediates" is
+    /// almost certainly GPU-buffer-pool aliasing on the no_grad recompute path: two live
+    /// intermediates created as inline temporaries can be handed the same recycled buffer (the same
+    /// footgun fixed in crate::rwkv::wkv). Re-enabling checkpointing — a real training-memory win —
+    /// needs that recompute path audited for aliasing, NOT deterministic kernels.
     /// Currently falls back to standard forward (no memory savings, correct gradients).
     pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, _layer_idx: usize) -> Tensor {
         self.forward(x, None)

@@ -1186,7 +1186,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // Batched matmul — uses FP32 inputs (small attention dims don't benefit from FP16 cast overhead)
+        // Batched matmul. NB: despite "FP32 inputs", the batched_matmul_tiled kernel casts both
+        // operands to half in shared memory (like the dense matmul) — results are fp16-precision.
         compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
@@ -1228,7 +1229,8 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
-        // Batched matmul trans_b — uses FP32 inputs (small attention dims)
+        // Batched matmul trans_b. NB: the kernel casts both operands to half in shared memory —
+        // results are fp16-precision, not fp32 (the "FP32 inputs" wording is misleading).
         compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, batches as u32, m as u32, n as u32, k as u32);
 
         let out_id = autograd::next_id();
