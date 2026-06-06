@@ -386,7 +386,7 @@ impl TransformerBlock {
         // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
-            || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
+            || (config.linear_attn_period > 0 && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
         if config.rwkv {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
@@ -453,7 +453,7 @@ impl TransformerBlock {
         // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
-            || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
+            || (config.linear_attn_period > 0 && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
         if config.rwkv {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
@@ -922,7 +922,7 @@ impl Transformer {
         let v = config.vocab_size as usize;
 
         // Embedding — optionally factored: [vocab, rank] × [rank, d] instead of [vocab, d]
-        let embed_rank = config.lowrank.max(0); // reuse lowrank for embedding too
+        let embed_rank = config.lowrank; // reuse lowrank for embedding too
         let (embedding, embed_proj) = if embed_rank > 0 && embed_rank < d {
             let e_std = (1.0 / embed_rank as f32).sqrt();
             let p_std = (1.0 / d as f32).sqrt();
@@ -987,7 +987,7 @@ impl Transformer {
         let d = config.d_model;
         let v = config.vocab_size as usize;
 
-        let embed_rank = config.lowrank.max(0);
+        let embed_rank = config.lowrank;
         let (embedding, embed_proj) = if embed_rank > 0 && embed_rank < d {
             let e_std = (1.0 / embed_rank as f32).sqrt() * scale;
             let p_std = (1.0 / d as f32).sqrt() * scale;

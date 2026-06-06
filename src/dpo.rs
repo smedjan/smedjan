@@ -944,7 +944,7 @@ mod tests {
         // logits[0] = [0, 0, 10, 0] — strongly predicts token 2
         logits[2] = 10.0;
         // logits[1] = [0, 0, 0, 10] — strongly predicts token 3
-        logits[1 * vocab_size + 3] = 10.0;
+        logits[vocab_size + 3] = 10.0;
 
         // tokens = [A, B, C] (len=3), logits = [3, vocab_size]
         // prompt_len = 1: compute log-probs for positions 1 and 2.
@@ -1101,9 +1101,9 @@ mod tests {
         let initial_weights: Vec<f32> = model.parameters()[0].to_vec();
 
         // Create a preference pair
-        let prompt = vec![1u32, 2, 3];
-        let chosen = vec![4u32, 5];
-        let rejected = vec![6u32, 7];
+        let prompt = [1u32, 2, 3];
+        let chosen = [4u32, 5];
+        let rejected = [6u32, 7];
         let prompt_len = prompt.len();
 
         let chosen_input: Vec<u32> = prompt.iter().chain(chosen.iter()).copied().collect();

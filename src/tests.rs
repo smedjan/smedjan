@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)] // file tests.rs containing `mod tests` is the established layout
 mod tests {
     use crate::autograd;
     use crate::datapipe;
@@ -79,7 +80,7 @@ mod tests {
             //       = [38, 44, 50, 56]
             // Row 1: [4*1+5*5+6*9, 4*2+5*6+6*10, 4*3+5*7+6*11, 4*4+5*8+6*12]
             //       = [83, 98, 113, 128]
-            let expected = vec![38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
+            let expected = [38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0];
             for (got, exp) in result.iter().zip(expected.iter()) {
                 assert!(
                     (got - exp).abs() < 1e-3,
@@ -1936,6 +1937,7 @@ mod tests {
     ///   * forward through every layer produces finite logits of the right shape,
     ///   * the backward pass differentiates the linear-attention path (finite grad reaches w_q),
     ///   * training is numerically stable — clipped + warmed-up steps never produce NaN/Inf.
+    ///
     /// (Convergence *quality* of this micro 2-layer weight-tied model is a separate, training-recipe
     /// matter — the softmax baseline destabilises identically at this scale — so it is not asserted
     /// here. The linear-attention math + gradients are proven on the isolated core by the
@@ -2171,7 +2173,7 @@ mod tests {
             .expect("save state failed");
 
         // Load
-        let (loaded_model, opt_states, step, opt_step, tokens) =
+        let (_loaded_model, opt_states, step, _opt_step, tokens) =
             crate::checkpoint::load_training_state(&ctx, tmp_path).expect("load state failed");
         assert_eq!(step, 42);
         assert_eq!(tokens, 100000);

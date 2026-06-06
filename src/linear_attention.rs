@@ -113,7 +113,7 @@ fn pick_chunk(seq: usize) -> usize {
     let target = target.max(1);
     let mut fallback = seq;
     for c in 1..=seq {
-        if seq % c == 0 {
+        if seq.is_multiple_of(c) {
             if c >= target {
                 return c;
             }
@@ -141,7 +141,7 @@ pub fn chunked(q: &Tensor, k: &Tensor, v: &Tensor, chunk: usize) -> Tensor {
     let bh = q.shape[0];
     let seq = q.shape[1];
     let hd = q.shape[2];
-    assert!(chunk > 0 && seq % chunk == 0, "seq {seq} must be divisible by chunk {chunk}");
+    assert!(chunk > 0 && seq.is_multiple_of(chunk), "seq {seq} must be divisible by chunk {chunk}");
     let nc = seq / chunk;
 
     let qf = feature_map(q);

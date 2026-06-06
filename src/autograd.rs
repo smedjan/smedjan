@@ -87,6 +87,7 @@ pub enum Op {
     /// inputs: [x], input_buffers: [x, norm_w, w1, w2, w3]
     /// cached: norm_x (pre-computed normalized input for backward reuse)
     /// shapes[0]: [n_tokens, d], shapes[1]: [d, ff], shapes[2]: [ff, d]
+    #[allow(dead_code)] // recorded only by the currently-disabled fused mega-FFN path
     MegaFfn { eps: f32 },
 }
 
@@ -193,6 +194,7 @@ pub fn clear_tape_keep_grads() {
 
 /// Zero all stored gradient buffers (drop without recycling).
 /// Safe to call even if optimizer is still running async on GPU.
+#[allow(dead_code)] // utility used by tests / available to callers; not on the bin's hot path
 pub fn zero_grads() {
     GRADS.with(|grads| grads.borrow_mut().clear());
 }

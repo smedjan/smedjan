@@ -1,3 +1,10 @@
+// GPU dispatch wrappers (metal/compute.rs) take many buffer/dim args by nature — bundling them
+// into structs per kernel adds noise without value, so the arg-count lint is allowed crate-wide.
+#![allow(clippy::too_many_arguments)]
+// Flat-buffer index loops (e.g. `for i in a..b { x[(i-1)*stride + ..] }`) use the index for offset
+// arithmetic, where a range loop reads clearer than an enumerate()/zip() chain.
+#![allow(clippy::needless_range_loop)]
+
 pub mod api;
 mod attention;
 mod autograd;
@@ -40,6 +47,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap subcommands; boxing the big variant isn't worth it
 enum Commands {
     /// Train a BPE tokenizer from a text corpus
     Tokenizer {
