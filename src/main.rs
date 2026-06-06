@@ -23,6 +23,7 @@ pub mod quantize;
 mod tensor;
 mod tokenizer;
 mod sft;
+mod ssm;
 mod train;
 
 #[cfg(test)]
