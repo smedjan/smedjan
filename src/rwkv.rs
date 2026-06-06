@@ -23,13 +23,13 @@
 //! only for short sequences (the in-kernel exp clamp prevents NaN); the chunked/running-max stable
 //! form is the production follow-up. The recurrence semantics and selectivity are proven here.
 
-#![allow(dead_code)] // wired into the model via the block system; until then the tests exercise it.
 
 use crate::metal::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
 /// One-step causal shift matrix `[bh, seq, seq]`: `Shift[t,i] = 1` iff `i == t-1`.
+#[cfg(test)]
 fn shift_matrix(ctx: &Arc<MetalContext>, bh: usize, seq: usize) -> Tensor {
     let mut data = vec![0.0f32; bh * seq * seq];
     for t in 1..seq {
@@ -76,6 +76,7 @@ fn broadcast_hd(vec_hd: &Tensor, bh: usize, seq: usize) -> Tensor {
 }
 
 /// Token shift: `out_t = x_{t-1}` (with `x_{-1}=0`). `x: [bh, seq, hd]` → `[bh, seq, hd]`.
+#[cfg(test)]
 pub fn token_shift(x: &Tensor) -> Tensor {
     let bh = x.shape[0];
     let seq = x.shape[1];
@@ -128,6 +129,7 @@ pub fn wkv(k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
 /// gate, then an output RMS-norm (eps=1.0, the same well-conditioned norm as the other mixers).
 /// Here r,k,v are already-projected `[bh, seq, hd]` (the block does the shift+projection); this
 /// applies the receptance gate and WKV. `w,u: [hd]`.
+#[cfg(test)]
 pub fn time_mix(r: &Tensor, k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
     let out = wkv(k, v, w, u); // [bh, seq, hd]
     let gated = r.silu().mul(&out); // SiLU receptance gate (sigmoid unavailable; silu is a sound gate)

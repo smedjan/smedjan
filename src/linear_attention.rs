@@ -27,7 +27,6 @@
 //! This avoids needing a GPU division/reciprocal kernel and is a standard stabiliser
 //! for linear-attention / SSM token mixers (cf. RetNet's post-mix GroupNorm).
 
-#![allow(dead_code)] // wired into the model in Stage C; until then only the tests exercise it.
 
 use crate::metal::MetalContext;
 use crate::tensor::Tensor;
@@ -75,6 +74,7 @@ fn causal_mask_tensor(
 
 /// Causal linear-attention **numerator**, masked O(N²) reference form (un-normalised).
 /// `q,k,v: [bh, seq, hd]` → `[bh, seq, hd]`.
+#[cfg(test)]
 pub fn masked_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     assert_eq!(q.shape.len(), 3, "linear attention expects [bh, seq, hd]");
     assert_eq!(q.shape, k.shape, "q and k must share shape");

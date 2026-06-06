@@ -537,8 +537,11 @@ impl TransformerBlock {
         // Per-token fused kernels: correct but slower than tiled matmul at batch>1
         // due to parallelism loss. Decode path uses KV cache which bypasses here.
         let n_tokens = batch * seq_len;
-        #[allow(clippy::overly_complex_bool_expr)] // `false &&` intentionally disables this path
-        let use_fused = false
+        // Fused pre-attn+FFN path: disabled — per-token fused kernels lose to tiled matmul at
+        // batch>1 (parallelism loss). Named flag (not literal `false &&`) keeps the activation
+        // condition documented without tripping the always-false logic-bug lint.
+        let fused_path_enabled = false;
+        let use_fused = fused_path_enabled
             && self.n_experts <= 1 && !self.bitnet
             && d <= 256 && self.ffn_w1.shape[1] <= 1024
             && n_tokens <= 8
@@ -1108,8 +1111,11 @@ impl Transformer {
                 // Persistent kernel: 32 co-resident TGs + grid barriers, entire layer in 1 dispatch.
                 // Metal can't guarantee TG co-residency → spin-wait contention.
                 // Ready for AndreOS ring-buffer doorbell dispatch (~10ns/kernel vs Metal's 300μs).
-                #[allow(clippy::overly_complex_bool_expr)] // `false &&` intentionally disables this path
-                let use_persistent = false && !autograd::is_recording()
+                // Persistent single-dispatch layer kernel: disabled — Metal can't guarantee
+                // threadgroup co-residency, so the grid-barrier spin-waits contend. Named flag
+                // keeps the activation condition documented without the always-false logic-bug lint.
+                let persistent_path_enabled = false;
+                let use_persistent = persistent_path_enabled && !autograd::is_recording()
                     && d <= 256 && self.config.d_ff() <= 1024
                     && self.config.n_experts <= 1 && !self.config.bitnet
                     && self.config.n_kv_heads == self.config.n_heads;

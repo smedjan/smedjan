@@ -24,7 +24,6 @@
 //! (The chunked `O(N)` SSD form — same trans_a state primitive as linear attention, plus a
 //! decay-weighted chunk prefix — is the follow-up optimisation; the recurrence semantics are here.)
 
-#![allow(dead_code)] // wired into the model via the block system; until then the tests exercise it.
 
 use crate::metal::MetalContext;
 use crate::tensor::Tensor;

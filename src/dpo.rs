@@ -240,7 +240,7 @@ fn sequence_log_probs(logits_data: &[f32], vocab_size: usize, tokens: &[u32], pr
 
     let mut total_logp: f32 = 0.0;
 
-    for i in prompt_len..seq_len {
+    for (i, &tok) in tokens.iter().enumerate().take(seq_len).skip(prompt_len) {
         // logits[i-1] predicts token at position i
         let logit_row_start = (i - 1) * vocab_size;
         let logit_row = &logits_data[logit_row_start..logit_row_start + vocab_size];
@@ -249,7 +249,7 @@ fn sequence_log_probs(logits_data: &[f32], vocab_size: usize, tokens: &[u32], pr
         let max_logit = logit_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let log_sum_exp: f32 = logit_row.iter().map(|&x| (x - max_logit).exp()).sum::<f32>().ln();
 
-        let target_token = tokens[i] as usize;
+        let target_token = tok as usize;
         let log_prob = logit_row[target_token] - max_logit - log_sum_exp;
         total_logp += log_prob;
     }
@@ -645,7 +645,7 @@ fn compute_dpo_logit_gradients(
     let seq_len = tokens.len();
     let mut grad = vec![0.0f32; seq_len * vocab_size];
 
-    for i in prompt_len..seq_len {
+    for (i, &tok) in tokens.iter().enumerate().take(seq_len).skip(prompt_len) {
         let logit_row_start = (i - 1) * vocab_size;
         let logit_row = &logits_data[logit_row_start..logit_row_start + vocab_size];
 
@@ -655,7 +655,7 @@ fn compute_dpo_logit_gradients(
         let sum_exp: f32 = exps.iter().sum();
         let inv_sum = 1.0 / sum_exp;
 
-        let target_token = tokens[i] as usize;
+        let target_token = tok as usize;
         let grad_row_start = (i - 1) * vocab_size;
 
         for j in 0..vocab_size {

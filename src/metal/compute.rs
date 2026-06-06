@@ -356,7 +356,6 @@ pub fn gpu_rms_norm(
 
 /// Fused residual add + RMS norm: output = rms_norm(input + residual, weight, eps)
 /// Also stores (input + residual) in sum_out for backward pass.
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_rms_norm_residual(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -1497,7 +1496,6 @@ pub fn gpu_mega_ffn(
 
 /// Fused pre-attention: RMSNorm + QKV projection + transpose + RoPE in 1 dispatch.
 /// Replaces 9-12 dispatches. Outputs Q/K/V in transposed [BH, S, HD] layout.
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_fused_pre_attn(
     ctx: &Arc<MetalContext>,
     x: &GpuBuffer, norm_w: &GpuBuffer,
@@ -1532,7 +1530,6 @@ pub fn gpu_fused_pre_attn(
 
 /// Fused post-attention + FFN: gather-transpose + W_o + residual + norm + SwiGLU + residual.
 /// Replaces 8 dispatches with 1. Outputs final block result.
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_fused_post_attn_ffn(
     ctx: &Arc<MetalContext>,
     x_residual: &GpuBuffer, attn_out: &GpuBuffer, norm_w: &GpuBuffer,
@@ -1612,7 +1609,6 @@ pub fn gpu_transpose_rope_backward(
 
 /// Persistent transformer layer: entire layer in ONE dispatch.
 /// 32 co-resident threadgroups with grid-level atomic barriers.
-#[allow(clippy::too_many_arguments)]
 pub fn gpu_persistent_layer(
     ctx: &Arc<MetalContext>,
     ln1_w: &GpuBuffer, w_q: &GpuBuffer, w_k: &GpuBuffer, w_v: &GpuBuffer,

@@ -536,19 +536,19 @@ fn generate_speculative_inner<F>(
 
             // Phase 3: Compare draft tokens with main model's argmax predictions
             let mut n_accepted = 0usize;
-            for i in 0..n_drafted {
+            for (i, &draft) in draft_candidates.iter().enumerate().take(n_drafted) {
                 // logits[i] is the main model's prediction for position i+1 in verify_seq
                 let logit_offset = i * main_vocab;
                 let position_logits = &all_logits[logit_offset..logit_offset + main_vocab];
                 let main_argmax = argmax(position_logits);
 
-                if main_argmax == draft_candidates[i] {
+                if main_argmax == draft {
                     // Draft token accepted
                     n_accepted += 1;
-                    generated.push(draft_candidates[i]);
-                    emit_token(tokenizer, draft_candidates[i], &mut on_token);
+                    generated.push(draft);
+                    emit_token(tokenizer, draft, &mut on_token);
 
-                    if draft_candidates[i] == EOS_TOKEN {
+                    if draft == EOS_TOKEN {
                         return;
                     }
                 } else {
