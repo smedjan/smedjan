@@ -155,6 +155,7 @@ impl MetalContext {
             ("axpy", shaders::AXPY),
             ("relu", shaders::RELU),
             ("relu_backward", shaders::RELU_BACKWARD),
+            ("exp_fwd", shaders::EXP),
             ("ema_update", shaders::EMA_UPDATE),
             ("logsumexp", shaders::LOGSUMEXP),
             ("concat_cols", shaders::CONCAT_COLS),

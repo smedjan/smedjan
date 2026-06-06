@@ -865,6 +865,26 @@ mod tests {
     }
 
     #[test]
+    fn tensor_exp_forward_backward() {
+        let ctx = test_ctx();
+        let x = Tensor::from_slice(&ctx, &[0.0, 1.0, -1.0, 2.0], vec![4]).with_grad();
+        let y = x.exp();
+        let want = [1.0f32, std::f32::consts::E, 1.0 / std::f32::consts::E, (2.0f32).exp()];
+        for (got, w) in y.to_vec().iter().zip(want) {
+            assert!((got - w).abs() < 1e-3, "exp fwd got {got} want {w}");
+        }
+        // loss = sum(exp(x)) → dL/dx = exp(x)
+        let ones = Tensor::ones(&ctx, vec![4, 1]);
+        let loss = y.reshape(vec![1, 4]).matmul(&ones);
+        autograd::backward(&ctx, loss.id);
+        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(x.id).unwrap(), vec![4]).to_vec();
+        for (got, w) in g.iter().zip(want) {
+            assert!((got - w).abs() < 1e-2, "exp bwd got {got} want {w}");
+        }
+        autograd::zero_grads();
+    }
+
+    #[test]
     fn tensor_slice_flat_and_concat_flat() {
         let ctx = test_ctx();
         autograd::no_grad(|| {

@@ -76,6 +76,8 @@ pub enum Op {
     SliceCols { rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize },
     /// ReLU activation. Backward: grad * (input > 0).
     Relu,
+    /// Elementwise exp. Backward: grad_input = grad_output * output (output = exp(input)).
+    Exp,
     /// Fused scale + causal mask + softmax. Backward: softmax_backward * scale.
     ScaledCausalSoftmax { scale: f32 },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
@@ -376,6 +378,13 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
             let size: usize = entry.shapes[0].iter().product();
             let grad_input = ctx.alloc_buffer(size * 4);
             compute::gpu_relu_backward(ctx, &entry.input_buffers[0], out_grad, &grad_input, size as u32);
+            accumulate_grad(ctx, entry.inputs[0], grad_input, size);
+        }
+        Op::Exp => {
+            // d/dx exp(x) = exp(x) = output;  grad_input = grad_output * output
+            let size: usize = entry.shapes[0].iter().product();
+            let grad_input = ctx.alloc_buffer(size * 4);
+            compute::gpu_mul(ctx, out_grad, &entry.output_buffer, &grad_input, size as u32);
             accumulate_grad(ctx, entry.inputs[0], grad_input, size);
         }
         Op::Softmax => backward_softmax(ctx, entry, out_grad),

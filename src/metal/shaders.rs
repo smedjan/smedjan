@@ -854,6 +854,25 @@ kernel void relu_backward(
 }
 "#;
 
+/// Elementwise exp: output = exp(input). Used by SSM/RWKV selective-decay gates.
+/// Clamped to avoid fp32/fp16 overflow (exp(88)≈1.6e38 ~ fp32 max; cap at 80 for headroom).
+pub const EXP: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ExpParams { uint size; };
+
+kernel void exp_fwd(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ExpParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    output[gid] = exp(min(input[gid], 80.0f));
+}
+"#;
+
 pub const SILU_GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

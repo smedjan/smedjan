@@ -952,6 +952,33 @@ impl Tensor {
         out
     }
 
+    /// Elementwise exp. Backward: d/dx exp(x) = exp(x) = output, so grad_input = grad_output * output.
+    /// Used by SSM/RWKV selective-decay gates. Input is clamped to ≤80 in-kernel for overflow safety.
+    pub fn exp(&self) -> Tensor {
+        let size = self.numel();
+        let out_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_exp(&self.ctx, &self.buffer, &out_buf, size as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id, buffer: out_buf, shape: self.shape.clone(),
+            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+        };
+
+        if self.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Exp,
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), out.shape.clone()],
+                cached: None, // backward reads output_buffer (= exp(x))
+            });
+        }
+        out
+    }
+
     /// Causal mask with sliding window: mask future AND positions beyond window distance.
     pub fn causal_mask_window(&self, offset: u32, window: u32) -> Tensor {
         assert_eq!(self.shape.len(), 3);
