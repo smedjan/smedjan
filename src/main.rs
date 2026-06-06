@@ -19,6 +19,7 @@ mod distill;
 mod gpu;
 mod model;
 mod optim;
+mod rwkv;
 pub mod quantize;
 mod tensor;
 mod tokenizer;
