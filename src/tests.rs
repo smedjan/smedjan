@@ -931,6 +931,30 @@ mod suite {
     }
 
     #[test]
+    fn broadcast_rows_forward_backward() {
+        let ctx = test_ctx();
+        let want = [1.0f32, -2.0, 3.0];
+        let v = Tensor::from_slice(&ctx, &want, vec![3]).with_grad();
+        let out = v.broadcast_rows(4); // [4, 3], each row = [1, -2, 3]
+        assert_eq!(out.shape, vec![4, 3]);
+        let ov = out.to_vec();
+        for r in 0..4 {
+            for c in 0..3 {
+                assert!((ov[r * 3 + c] - want[c]).abs() < 1e-5, "broadcast fwd r{r}c{c}");
+            }
+        }
+        // loss = sum(out) → grad_v[c] = Σ_rows 1 = 4 (the row count).
+        let ones = Tensor::ones(&ctx, vec![12, 1]);
+        let loss = out.reshape(vec![1, 12]).matmul(&ones);
+        autograd::backward(&ctx, loss.id);
+        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(v.id).unwrap(), vec![3]).to_vec();
+        for (c, &gc) in g.iter().enumerate() {
+            assert!((gc - 4.0).abs() < 0.05, "broadcast bwd (column-sum) col {c}: got {gc}");
+        }
+        autograd::zero_grads();
+    }
+
+    #[test]
     fn tensor_exp_forward_backward() {
         let ctx = test_ctx();
         let x = Tensor::from_slice(&ctx, &[0.0, 1.0, -1.0, 2.0], vec![4]).with_grad();

@@ -70,9 +70,8 @@ fn position_matrix(ctx: &Arc<MetalContext>, bh: usize, seq: usize, hd: usize) ->
 /// differentiably, via `ones[bh·seq,1] @ vec[1,hd]`.
 fn broadcast_hd(vec_hd: &Tensor, bh: usize, seq: usize) -> Tensor {
     let hd = vec_hd.shape[0];
-    let ones = Tensor::ones(&vec_hd.ctx, vec![bh * seq, 1]);
-    let row = vec_hd.reshape(vec![1, hd]);
-    ones.matmul(&row).reshape(vec![bh, seq, hd])
+    // Direct broadcast kernel (was ones[bh·seq,1] @ vec[1,hd] — a wasteful K=1 outer-product matmul).
+    vec_hd.broadcast_rows(bh * seq).reshape(vec![bh, seq, hd])
 }
 
 /// Token shift: `out_t = x_{t-1}` (with `x_{-1}=0`). `x: [bh, seq, hd]` → `[bh, seq, hd]`.

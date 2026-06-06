@@ -966,6 +966,26 @@ kernel void exp_fwd(
 }
 "#;
 
+/// Broadcast a `[cols]` vector to `[rows, cols]`: out[r*cols + c] = vec[c]. A direct copy,
+/// avoiding the wasted tiled-matmul machinery of an `ones[rows,1] @ vec[1,cols]` outer product.
+pub const BROADCAST_ROWS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BcastParams { uint rows; uint cols; };
+
+kernel void broadcast_rows(
+    device const float* vec [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant BcastParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = params.rows * params.cols;
+    if (gid >= total) return;
+    out[gid] = vec[gid % params.cols];
+}
+"#;
+
 pub const SILU_GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

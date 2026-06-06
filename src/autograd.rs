@@ -78,6 +78,9 @@ pub enum Op {
     Relu,
     /// Elementwise exp. Backward: grad_input = grad_output * output (output = exp(input)).
     Exp,
+    /// Broadcast a [cols] vector to [rows, cols]. Backward: grad_input = column-sum of grad_output
+    /// (= ones[1,rows] @ grad_output).
+    BroadcastRows { rows: usize, cols: usize },
     /// Fused scale + causal mask + softmax. Backward: softmax_backward * scale.
     ScaledCausalSoftmax { scale: f32 },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
@@ -383,6 +386,14 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
             let grad_input = ctx.alloc_buffer(size * 4);
             compute::gpu_mul(ctx, out_grad, &entry.output_buffer, &grad_input, size as u32);
             accumulate_grad(ctx, entry.inputs[0], grad_input, size);
+        }
+        Op::BroadcastRows { rows, cols } => {
+            // grad_input[1,cols] = ones[1,rows] @ grad_output[rows,cols]  (column-sum over rows)
+            let ones = ctx.alloc_buffer(*rows * 4);
+            compute::gpu_fill(ctx, &ones, *rows as u32, 1.0);
+            let grad_input = ctx.alloc_buffer(*cols * 4);
+            compute::gpu_matmul(ctx, &ones, out_grad, &grad_input, 1, *cols as u32, *rows as u32);
+            accumulate_grad(ctx, entry.inputs[0], grad_input, *cols);
         }
         Op::Softmax => backward_softmax(ctx, entry, out_grad),
         Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, entry, out_grad, *scale),

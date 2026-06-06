@@ -1766,6 +1766,19 @@ pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, 
     dispatch_sync!(ctx, "relu", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
 }
 
+/// Broadcast a `[cols]` vector to `[rows, cols]` (out[r*cols+c] = vec[c]). Direct copy.
+pub fn gpu_broadcast_rows(ctx: &Arc<MetalContext>, vec: &GpuBuffer, out: &GpuBuffer, rows: u32, cols: u32) {
+    #[repr(C)]
+    struct Params { rows: u32, cols: u32 }
+    let params = Params { rows, cols };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (rows * cols) as u64;
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "broadcast_rows", grid, tg, 0 => vec, 1 => out, 2 => &params_buf);
+}
+
 /// Elementwise exp: output = exp(input) (input clamped to ≤80 for overflow safety).
 pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     #[repr(C)]
