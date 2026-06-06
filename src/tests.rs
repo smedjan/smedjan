@@ -919,7 +919,7 @@ mod suite {
 
             // 2) Range: a value above the fp16 max (65504) is preserved; the fp16 path corrupts it.
             let big = 1.0e5f32;
-            let at2 = Tensor::from_slice(&ctx, &vec![big; 32], vec![1, 32]);
+            let at2 = Tensor::from_slice(&ctx, &[big; 32], vec![1, 32]);
             let mut bv = vec![0.0f32; 32];
             bv[0] = 1.0; // selects A[0]
             let bt2 = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
