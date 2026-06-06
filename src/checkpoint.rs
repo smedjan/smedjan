@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 4; // v4: ReLoRA base weights appended after trainable params when lowrank > 0
+const VERSION: u32 = 5; // v5: linear_attn flag in config. v4: ReLoRA base weights appended after trainable params when lowrank > 0
 
 /// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
@@ -120,7 +120,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((2..=4).contains(&version), "Unsupported training state version: {}", version);
+    assert!((2..=5).contains(&version), "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -207,7 +207,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((1..=4).contains(&version), "Unsupported checkpoint version: {} (expected 1-4)", version);
+    assert!((1..=5).contains(&version), "Unsupported checkpoint version: {} (expected 1-5)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -297,6 +297,8 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&(if config.shared_layers { 1u32 } else { 0u32 }).to_le_bytes())?;
     file.write_all(&(config.mup_base_width as u32).to_le_bytes())?;
     file.write_all(&(config.n_predict as u32).to_le_bytes())?;
+    // v5: linear (kernel) attention flag
+    file.write_all(&(if config.linear_attn { 1u32 } else { 0u32 }).to_le_bytes())?;
     Ok(())
 }
 
@@ -356,6 +358,14 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         (0, 1, 1, false, false, 0, 0)  // defaults for v1/v2 checkpoints
     };
 
+    // v5: linear (kernel) attention flag; older checkpoints default to softmax (false).
+    let linear_attn = if version >= 5 {
+        file.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) != 0
+    } else {
+        false
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
@@ -376,5 +386,6 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         stochastic_depth: 0.0,
         sliding_window: 0,
         fp16_activations: false,
+        linear_attn,
     })
 }

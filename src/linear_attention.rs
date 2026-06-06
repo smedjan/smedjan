@@ -33,10 +33,21 @@ use crate::metal::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
-/// Positive feature map φ(x) = relu(x) + 1, built from existing differentiable ops.
+/// Positive, **magnitude-bounded** feature map: φ(x) = rms_norm(relu(x) + 1) over the head dim.
+///
+/// `relu(x)+1` keeps φ strictly positive (a zero row would give a dead output). The RMS-norm
+/// is the stability key: because linear attention here is denominator-free (the numerator is
+/// normalised once at the end, not divided by Σφ(K) per position), an *unbounded* φ lets the
+/// numerator `Σ_{j≤i}(φ(q_i)·φ(k_j))v_j` grow with the input scale and overflow fp16 inside the
+/// GPU matmuls → NaN gradients on unlucky random inits. RMS-normalising φ caps it independent of
+/// input scale (this is exactly QK-norm, which the softmax path also uses), so training is stable.
+/// Built from existing differentiable ops → autograd backward for free.
 fn feature_map(x: &Tensor) -> Tensor {
+    let hd = *x.shape.last().expect("feature_map needs a non-empty shape");
     let ones = Tensor::full(&x.ctx, x.shape.clone(), 1.0);
-    x.relu().add(&ones)
+    let phi = x.relu().add(&ones);
+    let unit = Tensor::ones(&x.ctx, vec![hd]);
+    phi.rms_norm(&unit, 1e-6)
 }
 
 /// Lower-triangular causal mask `[bh, rows, cols]`, replicated across the `bh` batch.
@@ -165,7 +176,11 @@ pub fn linear_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     let hd = q.shape[2];
     let num = chunked(q, k, v, pick_chunk(seq)); // [bh, seq, hd], O(N) memory
     let unit = Tensor::ones(&q.ctx, vec![hd]);
-    num.rms_norm(&unit, 1e-6)
+    // eps=1.0 (not the usual 1e-6): early positions have a near-zero numerator, and a tiny eps
+    // makes 1/rms blow up there → exploding gradients → training divergence. eps=1.0 keeps the
+    // normalisation effective for normal-magnitude numerators while bounding the gradient for
+    // tiny ones (normalise-when-large, pass-through-when-small) → stable training.
+    num.rms_norm(&unit, 1.0)
 }
 
 #[cfg(test)]
@@ -178,18 +193,37 @@ mod tests {
         MetalContext::new()
     }
 
-    /// CPU ground truth for the masked numerator: φ(x)=relu(x)+1, causal sum.
-    /// q,k,v laid out [bh, seq, hd] row-major.
+    /// CPU ground truth for the masked numerator: φ(x)=rms_norm(relu(x)+1) over hd, causal sum.
+    /// q,k,v laid out [bh, seq, hd] row-major. Mirrors the GPU feature_map exactly.
     fn cpu_masked_reference(q: &[f32], k: &[f32], v: &[f32], bh: usize, seq: usize, hd: usize) -> Vec<f32> {
         let phi = |x: f32| x.max(0.0) + 1.0;
+        // φ then RMS-norm over the head dim, per (b, position).
+        let normfeat = |src: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; bh * seq * hd];
+            for p in 0..bh * seq {
+                let base = p * hd;
+                let mut ss = 0.0f32;
+                for d in 0..hd {
+                    let f = phi(src[base + d]);
+                    ss += f * f;
+                }
+                let inv = 1.0 / (ss / hd as f32 + 1e-6).sqrt();
+                for d in 0..hd {
+                    out[base + d] = phi(src[base + d]) * inv;
+                }
+            }
+            out
+        };
+        let qn = normfeat(q);
+        let kn = normfeat(k);
         let mut out = vec![0.0f32; bh * seq * hd];
         for b in 0..bh {
             for i in 0..seq {
                 for j in 0..=i {
-                    // score = φ(qᵢ) · φ(kⱼ)
+                    // score = φ̂(qᵢ) · φ̂(kⱼ)  (φ̂ = RMS-normalised φ)
                     let mut s = 0.0f32;
                     for d in 0..hd {
-                        s += phi(q[(b * seq + i) * hd + d]) * phi(k[(b * seq + j) * hd + d]);
+                        s += qn[(b * seq + i) * hd + d] * kn[(b * seq + j) * hd + d];
                     }
                     for d in 0..hd {
                         out[(b * seq + i) * hd + d] += s * v[(b * seq + j) * hd + d];

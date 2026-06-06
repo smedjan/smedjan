@@ -29,6 +29,7 @@ pub struct ModelConfig {
     pub stochastic_depth: f32, // Layer drop rate: 0.0=off, 0.1=10% max drop rate for deepest layer
     pub sliding_window: usize, // Sliding window attention: 0=full causal, >0=window size. Saves O(n²)→O(n*w) memory.
     pub fp16_activations: bool, // Store inter-layer activations in FP16 during forward. Halves activation memory.
+    pub linear_attn: bool,     // Replace softmax attention with O(N) linear (kernel) attention in every block.
 }
 
 impl ModelConfig {
@@ -94,6 +95,7 @@ impl ModelConfig {
             stochastic_depth: 0.0,
             sliding_window: 0,
             fp16_activations: false,
+            linear_attn: false,
         }
     }
 
@@ -374,6 +376,9 @@ impl TransformerBlock {
 
         let mut attn = MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
         attn.sliding_window = config.sliding_window;
+        if config.linear_attn {
+            attn.attn_kind = crate::attention::AttnKind::Linear;
+        }
 
         Self {
             attn,
@@ -430,6 +435,9 @@ impl TransformerBlock {
 
         let mut attn = MultiHeadAttention::new_scaled(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank, scale);
         attn.sliding_window = config.sliding_window;
+        if config.linear_attn {
+            attn.attn_kind = crate::attention::AttnKind::Linear;
+        }
 
         Self {
             attn,

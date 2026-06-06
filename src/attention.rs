@@ -3,6 +3,16 @@ use crate::metal::{compute, MetalContext};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
+/// Token-mixing kind for the attention block. `Softmax` is standard scaled-dot-product
+/// attention; `Linear` is O(N) softmax-free kernel attention (see `crate::linear_attention`).
+/// Both share the identical Q/K/V/O projections, so switching adds no parameters and keeps
+/// checkpoints byte-compatible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttnKind {
+    Softmax,
+    Linear,
+}
+
 /// Multi-head attention with rotary positional encoding, KV cache, and
 /// Grouped Query Attention (GQA) support.
 ///
@@ -27,6 +37,7 @@ pub struct MultiHeadAttention {
     pub rope_theta: f32,
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
     pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
+    pub attn_kind: AttnKind,    // Softmax (default) or Linear (O(N) kernel attention)
 }
 
 /// KV cache for autoregressive inference.
@@ -148,6 +159,7 @@ impl MultiHeadAttention {
             w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
             attn_rank: rank, n_heads, n_kv_heads, head_dim, d_model, rope_theta,
             qk_norm_weight: Tensor::ones(ctx, vec![head_dim]), sliding_window: 0,
+            attn_kind: AttnKind::Softmax,
         }
     }
 
@@ -193,6 +205,7 @@ impl MultiHeadAttention {
             attn_rank: rank,
             n_heads, n_kv_heads, head_dim, d_model, rope_theta,
             qk_norm_weight, sliding_window: 0,
+            attn_kind: AttnKind::Softmax,
         }
     }
 
@@ -260,9 +273,12 @@ impl MultiHeadAttention {
         let bh = batch * self.n_heads;
         let seq_q_len = q.shape[1];
 
+        // Linear (O(N) kernel) attention reuses the expanded, non-strided K/V layout.
+        let linear = self.attn_kind == AttnKind::Linear;
+
         // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
         // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
-        let use_gqa_strided = group_size > 1 && !autograd::is_recording();
+        let use_gqa_strided = !linear && group_size > 1 && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
@@ -277,9 +293,18 @@ impl MultiHeadAttention {
             (k_full, v_full)
         };
 
-        // Flash Attention for seq_len≥2048 (fused, O(n) memory).
-        // Standard path for seq_len<2048 (tiled matmuls faster at short seq).
-        let attn_cat = if seq_q_len >= 2048 && !use_gqa_strided {
+        // Linear attention: O(N) softmax-free kernel mixing over the full sequence.
+        // Operates on the expanded [bh, seq, hd] Q/K/V (same layout as the standard path).
+        // Decode-with-KV-cache (seq_q != seq_k) needs the recurrent state form — not yet
+        // wired — so linear attention currently runs in the no-cache (training/prefill) path.
+        let attn_cat = if linear {
+            assert_eq!(
+                seq_q_len, seq_k,
+                "linear attention currently supports full-sequence forward only (seq_q == seq_k); \
+                 incremental KV-cache decode needs the recurrent state path"
+            );
+            crate::linear_attention::linear_attention(&q, &k_for_attn, &v_for_attn)
+        } else if seq_q_len >= 2048 && !use_gqa_strided {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
