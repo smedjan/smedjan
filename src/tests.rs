@@ -823,6 +823,48 @@ mod tests {
     }
 
     #[test]
+    fn tensor_batched_matmul_trans_a_forward() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // A: [1, M=3, K=2], B: [1, M=3, N=2] → C = A^T @ B : [1, 2, 2]
+            let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]);
+            let b = Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 3, 2]);
+            let c = a.batched_matmul_trans_a(&b);
+            assert_eq!(c.shape, vec![1, 2, 2]);
+            let r = c.to_vec();
+            // C[k,n] = Σ_m A[m,k] B[m,n] → [[6,8],[8,10]]
+            for (got, want) in r.iter().zip([6.0, 8.0, 8.0, 10.0]) {
+                assert!((got - want).abs() < 1e-2, "got {got} want {want}");
+            }
+        });
+    }
+
+    #[test]
+    fn tensor_batched_matmul_trans_a_backward() {
+        let ctx = test_ctx();
+        let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]).with_grad();
+        let b = Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 3, 2]).with_grad();
+        let c = a.batched_matmul_trans_a(&b); // [1, 2, 2]
+        // loss = sum(C) → dC = ones[2,2]
+        let flat = c.reshape(vec![1, 4]);
+        let ones = Tensor::ones(&ctx, vec![4, 1]);
+        let loss = flat.matmul(&ones); // [1,1]
+        autograd::backward(&ctx, loss.id);
+
+        // dA[m,k] = Σ_n B[m,n]  → [[1,1],[1,1],[2,2]]
+        let ga = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(a.id).unwrap(), vec![1, 3, 2]).to_vec();
+        for (got, want) in ga.iter().zip([1.0, 1.0, 1.0, 1.0, 2.0, 2.0]) {
+            assert!((got - want).abs() < 1e-2, "dA got {got} want {want}");
+        }
+        // dB[m,n] = Σ_k A[m,k]  → [[3,3],[7,7],[11,11]]
+        let gb = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(b.id).unwrap(), vec![1, 3, 2]).to_vec();
+        for (got, want) in gb.iter().zip([3.0, 3.0, 7.0, 7.0, 11.0, 11.0]) {
+            assert!((got - want).abs() < 1e-2, "dB got {got} want {want}");
+        }
+        autograd::zero_grads();
+    }
+
+    #[test]
     fn tensor_slice_flat_and_concat_flat() {
         let ctx = test_ctx();
         autograd::no_grad(|| {

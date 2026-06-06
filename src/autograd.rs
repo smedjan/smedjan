@@ -56,6 +56,10 @@ pub enum Op {
     /// Batched matrix multiply with B transposed: A[b] @ B[b]^T for each batch element.
     /// A: [B, M, K], B: [B, N, K] → C: [B, M, N]
     BatchedMatmulTransB,
+    /// Batched matrix multiply with A transposed: A[b]^T @ B[b] for each batch element.
+    /// A: [B, M, K], B: [B, M, N] → C: [B, K, N] (contracts M).
+    /// dA = B @ dC^T (trans_b), dB = A @ dC (plain) — both existing batched kernels.
+    BatchedMatmulTransA,
     /// Fused SiLU-gate: output = silu(gate) * up
     /// gate and up are the two inputs. Backward: d_gate = d_out * up * silu'(gate), d_up = d_out * silu(gate)
     SiluGate,
@@ -411,6 +415,7 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
         Op::ConcatParts { part_sizes } => backward_concat_parts(ctx, entry, out_grad, part_sizes),
         Op::BatchedMatmul => backward_batched_matmul(ctx, entry, out_grad),
         Op::BatchedMatmulTransB => backward_batched_matmul_trans_b(ctx, entry, out_grad),
+        Op::BatchedMatmulTransA => backward_batched_matmul_trans_a(ctx, entry, out_grad),
         Op::RoPE { seq_len, head_dim, offset, theta } => {
             backward_rope(ctx, entry, out_grad, *seq_len, *head_dim, *offset, *theta);
         }
@@ -1026,6 +1031,29 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
 
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * n * k);
+}
+
+fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+    // C = A^T @ B where A:[B,M,K], B:[B,M,N], C:[B,K,N], dC = out_grad:[B,K,N]
+    // dA = B @ dC^T : [B,M,N] @ [B,N,K] = [B,M,K]   (batched trans_b of B, dC)
+    // dB = A @ dC   : [B,M,K] @ [B,K,N] = [B,M,N]   (batched matmul of A, dC)
+    let a_shape = &entry.shapes[0]; // [B, M, K]
+    let b_shape = &entry.shapes[1]; // [B, M, N]
+
+    let batches = a_shape[0];
+    let m = a_shape[1];
+    let k = a_shape[2];
+    let n = b_shape[2];
+
+    // dA = B @ dC^T : a=B[B,M,N], b=dC[B,K,N] → [B,M,K]
+    let da_total = ctx.alloc_buffer(batches * m * k * 4);
+    compute::gpu_batched_matmul_trans_b(ctx, &entry.input_buffers[1], out_grad, &da_total, batches as u32, m as u32, k as u32, n as u32);
+    accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
+
+    // dB = A @ dC : a=A[B,M,K], b=dC[B,K,N] → [B,M,N]
+    let db_total = ctx.alloc_buffer(batches * m * n * 4);
+    compute::gpu_batched_matmul(ctx, &entry.input_buffers[0], out_grad, &db_total, batches as u32, m as u32, n as u32, k as u32);
+    accumulate_grad(ctx, entry.inputs[1], db_total, batches * m * n);
 }
 
 /// RepeatKv backward: sum group_size gradient blocks back into each KV head.
