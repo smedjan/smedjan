@@ -11,6 +11,10 @@ use std::sync::Arc;
 pub enum AttnKind {
     Softmax,
     Linear,
+    /// Selective state-space (Mamba-2/SSD) mixer: linear attention with an input-dependent
+    /// per-head decay gate (see `crate::ssm`). Reuses the Q/K/V/O projections; adds one small
+    /// decay-gate projection `ssm_loga`.
+    Ssm,
 }
 
 /// Multi-head attention with rotary positional encoding, KV cache, and
@@ -37,7 +41,8 @@ pub struct MultiHeadAttention {
     pub rope_theta: f32,
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
     pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
-    pub attn_kind: AttnKind,    // Softmax (default) or Linear (O(N) kernel attention)
+    pub attn_kind: AttnKind,    // Softmax (default), Linear, or Ssm
+    pub ssm_loga: Tensor,       // [d_model, n_heads] — SSM per-head decay-gate projection (used iff Ssm)
 }
 
 /// KV cache for autoregressive inference.
@@ -160,6 +165,7 @@ impl MultiHeadAttention {
             attn_rank: rank, n_heads, n_kv_heads, head_dim, d_model, rope_theta,
             qk_norm_weight: Tensor::ones(ctx, vec![head_dim]), sliding_window: 0,
             attn_kind: AttnKind::Softmax,
+            ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt() * scale),
         }
     }
 
@@ -206,6 +212,7 @@ impl MultiHeadAttention {
             n_heads, n_kv_heads, head_dim, d_model, rope_theta,
             qk_norm_weight, sliding_window: 0,
             attn_kind: AttnKind::Softmax,
+            ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt()),
         }
     }
 
@@ -273,12 +280,13 @@ impl MultiHeadAttention {
         let bh = batch * self.n_heads;
         let seq_q_len = q.shape[1];
 
-        // Linear (O(N) kernel) attention reuses the expanded, non-strided K/V layout.
+        // Linear (O(N) kernel) attention and the SSM mixer reuse the expanded, non-strided K/V layout.
         let linear = self.attn_kind == AttnKind::Linear;
+        let ssm = self.attn_kind == AttnKind::Ssm;
 
         // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
         // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
-        let use_gqa_strided = !linear && group_size > 1 && !autograd::is_recording();
+        let use_gqa_strided = !linear && !ssm && group_size > 1 && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
@@ -304,6 +312,17 @@ impl MultiHeadAttention {
                  incremental KV-cache decode needs the recurrent state path"
             );
             crate::linear_attention::linear_attention(&q, &k_for_attn, &v_for_attn)
+        } else if ssm {
+            assert_eq!(
+                seq_q_len, seq_k,
+                "SSM mixer currently supports full-sequence forward only (seq_q == seq_k)"
+            );
+            // Per-head, input-dependent log-decay gate: loga = -relu(x @ W_loga) ≤ 0 (decay ∈ (0,1]).
+            // RoPE on Q/K is harmless here — the SSM's positional signal is carried by the decay.
+            let loga_raw = x_flat.matmul(&self.ssm_loga); // [n_tokens, n_heads]
+            let loga_bh = transpose_bsh_to_bhs(&loga_raw, batch, seq_len, self.n_heads, 1); // [bh, seq, 1]
+            let loga = loga_bh.reshape(vec![bh, seq_q_len]).relu().scale(-1.0);
+            crate::ssm::ssm(&q, &k_for_attn, &v_for_attn, &loga)
         } else if seq_q_len >= 2048 && !use_gqa_strided {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
@@ -394,6 +413,9 @@ impl MultiHeadAttention {
             vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o]
         };
         params.push(&self.qk_norm_weight);
+        if self.attn_kind == AttnKind::Ssm {
+            params.push(&self.ssm_loga); // trained only for SSM layers
+        }
         params
     }
 }

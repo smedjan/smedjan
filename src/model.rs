@@ -32,6 +32,7 @@ pub struct ModelConfig {
     pub linear_attn: bool,     // Replace softmax attention with O(N) linear (kernel) attention in EVERY block.
     pub linear_attn_period: usize, // Hybrid topology: if >0, every Nth layer (idx+1 % N == 0) is linear, the
                                // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
+    pub ssm: bool,             // Use the selective state-space (Mamba-2/SSD) mixer in every block.
 }
 
 impl ModelConfig {
@@ -99,6 +100,7 @@ impl ModelConfig {
             fp16_activations: false,
             linear_attn: false,
             linear_attn_period: 0,
+            ssm: false,
         }
     }
 
@@ -383,7 +385,9 @@ impl TransformerBlock {
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
             || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
-        if layer_is_linear {
+        if config.ssm {
+            attn.attn_kind = crate::attention::AttnKind::Ssm;
+        } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
 
@@ -446,7 +450,9 @@ impl TransformerBlock {
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
             || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
-        if layer_is_linear {
+        if config.ssm {
+            attn.attn_kind = crate::attention::AttnKind::Ssm;
+        } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
 

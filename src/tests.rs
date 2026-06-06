@@ -2005,6 +2005,41 @@ mod tests {
         assert!(first.is_finite() && last.is_finite());
     }
 
+    /// The SSM (Mamba-2/SSD) mixer is usable in the real Transformer: every layer is an SSM block,
+    /// the forward is finite, the input-dependent decay gate (ssm_loga) receives a finite gradient,
+    /// and the ssm flag survives a checkpoint roundtrip (reconstructing the SSM mixer).
+    #[test]
+    fn ssm_model_integrates_and_differentiates() {
+        use crate::attention::AttnKind;
+        let ctx = test_ctx();
+        let mut cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
+        cfg.ssm = true;
+        let model = Transformer::new(&ctx, cfg);
+        assert_eq!(model.blocks[0].attn.attn_kind, AttnKind::Ssm);
+        assert_eq!(model.blocks[1].attn.attn_kind, AttnKind::Ssm);
+
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5; 8];
+        let logits = model.forward(&tokens, 1, 8, None, false);
+        assert_eq!(logits.shape, vec![8, 48]);
+        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "SSM forward non-finite");
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+        assert!(loss.to_vec()[0].is_finite(), "SSM loss non-finite");
+        autograd::backward(&ctx, loss.id);
+        // The selective decay gate is differentiated end-to-end.
+        let g = autograd::get_grad(model.blocks[0].attn.ssm_loga.id).expect("no grad for ssm_loga");
+        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.ssm_loga.shape.clone()).to_vec();
+        assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on ssm_loga");
+        autograd::zero_grads();
+
+        let tmp = "/tmp/andreai_ssm_ckpt.bin";
+        crate::checkpoint::save_checkpoint(tmp, &model, 9).expect("save failed");
+        let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
+        assert!(loaded.config.ssm, "ssm flag lost across checkpoint roundtrip");
+        assert_eq!(loaded.blocks[0].attn.attn_kind, AttnKind::Ssm);
+        std::fs::remove_file(tmp).ok();
+    }
+
     /// Hybrid topology: a model with linear_attn_period=2 alternates softmax and linear-attention
     /// layers, forwards finitely, trains stably, and the schedule survives a checkpoint roundtrip.
     #[test]
