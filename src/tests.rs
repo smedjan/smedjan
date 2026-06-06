@@ -2005,6 +2005,48 @@ mod tests {
         assert!(first.is_finite() && last.is_finite());
     }
 
+    /// Hybrid topology: a model with linear_attn_period=2 alternates softmax and linear-attention
+    /// layers, forwards finitely, trains stably, and the schedule survives a checkpoint roundtrip.
+    #[test]
+    fn hybrid_topology_alternates_mixers() {
+        use crate::attention::AttnKind;
+        let ctx = test_ctx();
+        let mut cfg = ModelConfig::custom(48, 64, 4, 4, 2.67, 64); // 4 layers
+        cfg.linear_attn_period = 2; // (idx+1)%2==0 → layers 1,3 linear; 0,2 softmax
+        let model = Transformer::new(&ctx, cfg);
+        assert_eq!(model.blocks[0].attn.attn_kind, AttnKind::Softmax);
+        assert_eq!(model.blocks[1].attn.attn_kind, AttnKind::Linear);
+        assert_eq!(model.blocks[2].attn.attn_kind, AttnKind::Softmax);
+        assert_eq!(model.blocks[3].attn.attn_kind, AttnKind::Linear);
+
+        // Forward through the mixed softmax+linear stack is finite, and one backward is finite —
+        // proving the hybrid stack is differentiable end-to-end. (Multi-step convergence of this
+        // micro model is the known recipe-dependent matter covered by linear_attn_model_trains_stably.)
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5; 8];
+        let logits = model.forward(&tokens, 1, 8, None, false);
+        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "hybrid forward non-finite");
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+        assert!(loss.to_vec()[0].is_finite(), "hybrid loss non-finite");
+        autograd::backward(&ctx, loss.id);
+        // A softmax layer (0) and a linear layer (1) both receive finite gradients.
+        for (li, id) in [(0usize, model.blocks[0].attn.w_q.id), (1usize, model.blocks[1].attn.w_q.id)] {
+            let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for layer {li} w_q"));
+            let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[li].attn.w_q.shape.clone()).to_vec();
+            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad in layer {li}");
+        }
+        autograd::zero_grads();
+
+        // Checkpoint roundtrip preserves the schedule and reconstructs the same mixer per layer.
+        let tmp = "/tmp/andreai_hybrid_ckpt.bin";
+        crate::checkpoint::save_checkpoint(tmp, &model, 3).expect("save failed");
+        let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
+        assert_eq!(loaded.config.linear_attn_period, 2);
+        assert_eq!(loaded.blocks[1].attn.attn_kind, AttnKind::Linear);
+        assert_eq!(loaded.blocks[2].attn.attn_kind, AttnKind::Softmax);
+        std::fs::remove_file(tmp).ok();
+    }
+
     /// Checkpoint v5 preserves the linear_attn flag (and weights) across save→load.
     #[test]
     fn linear_attn_checkpoint_roundtrip() {

@@ -425,6 +425,7 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         bitnet: false,
         lowrank: 0,
         linear_attn: false,
+        linear_attn_period: 0,
     })
 }
 

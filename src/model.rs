@@ -29,7 +29,9 @@ pub struct ModelConfig {
     pub stochastic_depth: f32, // Layer drop rate: 0.0=off, 0.1=10% max drop rate for deepest layer
     pub sliding_window: usize, // Sliding window attention: 0=full causal, >0=window size. Saves O(n²)→O(n*w) memory.
     pub fp16_activations: bool, // Store inter-layer activations in FP16 during forward. Halves activation memory.
-    pub linear_attn: bool,     // Replace softmax attention with O(N) linear (kernel) attention in every block.
+    pub linear_attn: bool,     // Replace softmax attention with O(N) linear (kernel) attention in EVERY block.
+    pub linear_attn_period: usize, // Hybrid topology: if >0, every Nth layer (idx+1 % N == 0) is linear, the
+                               // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
 }
 
 impl ModelConfig {
@@ -96,6 +98,7 @@ impl ModelConfig {
             sliding_window: 0,
             fp16_activations: false,
             linear_attn: false,
+            linear_attn_period: 0,
         }
     }
 
@@ -376,7 +379,11 @@ impl TransformerBlock {
 
         let mut attn = MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
         attn.sliding_window = config.sliding_window;
-        if config.linear_attn {
+        // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
+        // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
+        let layer_is_linear = config.linear_attn
+            || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
+        if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
 
@@ -435,7 +442,11 @@ impl TransformerBlock {
 
         let mut attn = MultiHeadAttention::new_scaled(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank, scale);
         attn.sliding_window = config.sliding_window;
-        if config.linear_attn {
+        // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
+        // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
+        let layer_is_linear = config.linear_attn
+            || (config.linear_attn_period > 0 && (layer_idx + 1) % config.linear_attn_period == 0);
+        if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
 
