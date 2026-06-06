@@ -744,16 +744,17 @@ impl TransformerBlock {
         out.reshape(vec![batch, seq_len, d])
     }
 
-    /// Forward pass with gradient checkpointing.
-    /// NOTE: Recompute-based checkpointing is DISABLED. The original rationale ("Metal matmul is
-    /// non-deterministic, FP16 shared-memory rounding varies between invocations") is WRONG —
-    /// matmul and batched_matmul are bit-exact deterministic across repeated invocations (measured:
-    /// max|c1-c2| = 0). The real cause of "recomputed forward produces different intermediates" is
-    /// almost certainly GPU-buffer-pool aliasing on the no_grad recompute path: two live
-    /// intermediates created as inline temporaries can be handed the same recycled buffer (the same
-    /// footgun fixed in crate::rwkv::wkv). Re-enabling checkpointing — a real training-memory win —
-    /// needs that recompute path audited for aliasing, NOT deterministic kernels.
-    /// Currently falls back to standard forward (no memory savings, correct gradients).
+    /// Forward pass with gradient checkpointing. STILL DISABLED (falls back to standard forward).
+    ///
+    /// Two myths corrected by measurement: the matmul is NOT non-deterministic (bit-exact,
+    /// max|c1-c2|=0), and the address-keyed fp16-cache stale-hit bug — which DID corrupt recompute —
+    /// is now fixed at alloc_buffer. But re-enabling and diffing the gradients (route
+    /// forward_checkpointed → forward_checkpointed_recompute and compare to the standard backward)
+    /// shows the recomputed path STILL diverges from the standard path (~4% relative, sign-flipped
+    /// on the embedding gradient — verified, not theorised).
+    /// So a SEPARATE bug remains in the checkpoint backward's gradient flow / input-grad extraction
+    /// across the checkpoint boundary — not the kernels, not the fp16 cache. Until that is found,
+    /// checkpointing stays off: correct gradients beat a memory win that silently miscomputes them.
     pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, _layer_idx: usize) -> Tensor {
         self.forward(x, None)
     }
