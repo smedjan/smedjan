@@ -236,6 +236,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None => None,
     };
 
+    // The selected optimizer ("muon"/"sophia"/"hybrid"/"adamw-8bit") owns its OWN state buffers
+    // (constructed below). The `optimizer: AdamW` here is only the actual optimizer for the
+    // "adamw"/"adamw-cpu" paths; for the others it must NOT allocate m/v for every parameter — doing
+    // so doubled optimizer memory (e.g. an 8-bit run allocated the fp32 AdamW it never uses on top of
+    // the int8 states, erasing the saving). Give the unused fallback an empty param set → zero m/v.
+    let uses_main_adamw = matches!(config.optimizer_type.as_str(), "adamw" | "adamw-cpu");
+    let empty_refs: Vec<&crate::tensor::Tensor> = Vec::new();
+
     // Initialize model + optimizer (fresh or from resume checkpoint)
     let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) = config.resume_from {
         eprintln!("=== RESUMING from {} ===", resume_path);
@@ -246,8 +254,16 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.config.n_layers, model.config.d_model, model.config.n_heads
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let mut optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
-        optimizer.load_state(&opt_states, opt_step);
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
+        let mut optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        // Only restore AdamW state when the main AdamW is the live optimizer and the checkpoint
+        // actually carries matching state (non-adamw checkpoints save none — see save_training_state).
+        if uses_main_adamw && opt_states.len() == optimizer.params.len() {
+            optimizer.load_state(&opt_states, opt_step);
+        } else if !opt_states.is_empty() {
+            eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
+                opt_states.len(), config.optimizer_type);
+        }
         // Resume from step+1 — the checkpoint was saved AFTER step completed
         let resume_step = step + 1;
         eprintln!("Resuming at step {}/{}, {} tokens, optimizer step {}", resume_step, config.total_steps, tokens, opt_step);
@@ -263,12 +279,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.config.n_layers, model.config.d_model, model.config.n_heads, step
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
+        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
+        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     };
 

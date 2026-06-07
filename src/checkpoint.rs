@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 10; // v10: block-sparse top_k + block_size. v9: MLA latent dim. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const VERSION: u32 = 11; // v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 
 /// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
@@ -87,8 +87,11 @@ pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, s
         file.write_all(&bytes)?;
     }
 
-    // Optimizer state: step, then m and v for each param
+    // Optimizer state: step, optimizer-param count (v11), then m and v for each. The count is 0 when
+    // a non-AdamW optimizer is live (the fallback AdamW carries no state) — so resume reads none and
+    // starts that optimizer's state fresh rather than choking on a size mismatch.
     file.write_all(&optimizer.step.to_le_bytes())?;
+    file.write_all(&(optimizer.params.len() as u32).to_le_bytes())?;
     for ps in &optimizer.params {
         let m_data = MetalContext::read_buffer(&ps.m, ps.size);
         let v_data = MetalContext::read_buffer(&ps.v, ps.size);
@@ -120,7 +123,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((2..=10).contains(&version), "Unsupported training state version: {}", version);
+    assert!((2..=11).contains(&version), "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -176,8 +179,17 @@ pub fn load_training_state(
     file.read_exact(&mut buf4)?;
     let opt_step = u32::from_le_bytes(buf4);
 
-    let mut opt_states = Vec::with_capacity(params.len());
-    for param in &params {
+    // v11+: explicit optimizer-param count (0 when a non-AdamW optimizer was live). Pre-v11 always
+    // wrote one (m,v) per trainable param.
+    let opt_count = if version >= 11 {
+        file.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) as usize
+    } else {
+        params.len()
+    };
+
+    let mut opt_states = Vec::with_capacity(opt_count);
+    for param in params.iter().take(opt_count) {
         let size = param.numel();
         let mut m_bytes = vec![0u8; size * 4];
         let mut v_bytes = vec![0u8; size * 4];
@@ -207,7 +219,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((1..=10).contains(&version), "Unsupported checkpoint version: {} (expected 1-10)", version);
+    assert!((1..=11).contains(&version), "Unsupported checkpoint version: {} (expected 1-11)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
