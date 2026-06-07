@@ -169,7 +169,10 @@ struct TrainArgs {
         /// Route the default fp16 matmul through the hardware simdgroup MMA units (~1.3× faster, bit-identical).
         #[arg(long)]
         simdgroup_matmul: bool,
-        /// Route the default matmul through bf16 (fp32 range, no fp16 ±65504 clamp). Removes an overflow class.
+        /// Route the default matmul through bf16: fp32 RANGE (no fp16 ±65504 clamp) but only ~7-bit
+        /// mantissa (vs fp16's 10). Use ONLY when fp16 overflows (NaN at large activations) — its
+        /// coarser precision DESTABILIZES otherwise (verified: diverged to ~475 on a real run where
+        /// fp16 reached 1.56). For range AND precision use the fp32/simdgroup matmul paths.
         #[arg(long)]
         bf16_matmul: bool,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.

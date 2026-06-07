@@ -180,6 +180,10 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
   (v=g² spans ~1000× per block → small entries → 0 → v̂≈0 → update explodes); store int8 of **√v**
   instead → tracks fp32 to max_diff **4e-4**.
 - **bf16 default-matmul option** (`--bf16-matmul`): fp32 range, no fp16 ±65504 clamp (preserves 1e5).
+  **GROUNDED CORRECTION to §2 #4's "~no cost" claim:** a real 600-step run DIVERGED with bf16
+  (EMA ~475) where fp16 reached 1.56 — bf16's ~7-bit mantissa (vs fp16's 10) adds ~13× matmul error,
+  which destabilizes when the model doesn't actually overflow. So it is an OVERFLOW-MITIGATION tool,
+  NOT a safe default. For range AND precision, use the fp32 matmul or the fp32 `matmul_simdgroup`.
 - **MLA** (`AttnKind::Mla`, `--mla-latent-dim`, `src/mla.rs`): K/V from a shared low-rank latent →
   **16×** KV-cache shrink measured; checkpoint format **v9** persists `mla_latent_dim`.
 - **Sequence packing** (`datapipe::pack_sequences`, `Tensor::causal_doc_mask`): block-diagonal mask;
@@ -189,8 +193,12 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
 - **#5 root-cause the RMSNorm activation collapse itself** (the clamp treats the symptom). Needs
   per-layer activation-norm instrumentation across a real diverging run to find the dead gate /
   zeroed projection.
-- **#6 verify the AdamW hardening + the new opt-in paths (simdgroup/bf16/8-bit/MLA/packing) on a real
-  large-batch multi-hour run** — unit tests prove correctness + boundedness; end-to-end loss/throughput
-  on real data is an operator-run.
+- **#6 verify on real training — SMOKE DONE (600-step tiny on `data/train_v3.bin`), full large-batch
+  multi-hour run still open.** Real-corpus 600-step smokes (uniform ≈ 9.5): plain AdamW → **1.56**,
+  Muon+AdamW hybrid + simdgroup → **1.56** (matches; role-routing + MMA train correctly), 8-bit AdamW →
+  **1.56** (3.9× less optim mem, no quality loss). **bf16-matmul → diverged (~475)** → it's
+  overflow-mitigation only, not a default (see above). MLA (d_c=32, 8× KV-cache shrink) → **1.56**,
+  i.e. no quality loss vs baseline. A real multi-hour large-batch run (loss curves vs baseline,
+  throughput numbers) remains an operator-run.
 - simdgroup beyond 1.29× (double-buffer/larger tiles); MLA decoupled-RoPE keys + KV-cache-compressed
   incremental decode; wiring `pack_sequences` into the training `DataLoader`.
