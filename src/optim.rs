@@ -81,8 +81,13 @@ impl AdamW {
         Self {
             params: param_states,
             beta1: 0.9,
+            // eps floors the update denominator sqrt(v_hat)+eps. With beta2=0.95 (short second-moment
+            // memory) the running variance v collapses fast when gradients momentarily shrink; at the
+            // old eps=1e-8 the denominator then collapsed too, producing huge/oscillating updates that
+            // wandered and (with a degenerate RMSNorm row) diverged. 1e-5 (Llama's value) floors it —
+            // negligible when gradients are healthy (sqrt(v_hat) >> eps), stabilising when they aren't.
             beta2: 0.95,
-            eps: 1e-8,
+            eps: 1e-5,
             weight_decay,
             step: 0,
             galore_rank,
