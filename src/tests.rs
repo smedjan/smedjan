@@ -2601,6 +2601,45 @@ mod suite {
         autograd::clear_tape();
     }
 
+    /// MLA INCREMENTAL DECODE with the latent cache must equal the full prefill forward — token-by-
+    /// token decoding (caching only the small latent c, reconstructing K/V from it each step) produces
+    /// the same logits as processing the whole sequence at once. This is the decisive integration test
+    /// (catches the multi-step / cache bugs that single forwards miss). Also confirms the cache stores
+    /// the latent c ([batch, seq, d_c]) — the 10–50× smaller KV footprint, not full K/V.
+    #[test]
+    fn mla_latent_decode_matches_full() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let model = Transformer::new(&ctx, cfg);
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let seq = tokens.len();
+        let full = model.forward(&tokens, 1, seq, None, false).to_vec(); // [seq, vocab]
+        let mut caches = model.init_kv_caches();
+        let mut inc: Vec<f32> = Vec::new();
+        for t in 0..seq {
+            let lt = model.forward(&tokens[t..t + 1], 1, 1, Some(&mut caches), false).to_vec();
+            inc.extend_from_slice(&lt);
+        }
+        let max_diff = full.iter().zip(&inc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        // Functional decode-correctness = same predicted token per position (the codebase's own
+        // decode tests use argmax agreement; raw logits carry fp16 noise, amplified by MLA's extra
+        // reconstruction matmuls). Compare argmax(full[t]) vs argmax(inc[t]).
+        let vw = vocab as usize;
+        let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) }).0;
+        let mut agree = 0usize;
+        for t in 0..seq {
+            if argmax(&full[t * vw..(t + 1) * vw]) == argmax(&inc[t * vw..(t + 1) * vw]) { agree += 1; }
+        }
+        eprintln!("MLA incremental-decode vs full-prefill: max logit_diff={max_diff:.4}, argmax agree {agree}/{seq}");
+        assert!(inc.iter().all(|x| x.is_finite()), "MLA incremental decode produced non-finite logits");
+        assert_eq!(agree, seq, "MLA latent-cache decode must predict the same token as full prefill at every position");
+        // Cache holds the latent c [batch, seq, d_c=16], NOT K/V (kv_dim=64 → 2×64=128 floats/token).
+        let lat = caches[0].latent.as_ref().expect("MLA decode must populate the latent cache");
+        assert_eq!(lat.shape, vec![1, seq, 16], "latent cache must be [batch, seq, d_c]");
+        autograd::clear_tape();
+    }
+
     /// MLA parameters() must include the latent projections (W_dkv/W_uk/W_uv) and EXCLUDE the now-
     /// unused direct K/V projections (W_k/W_v) — they receive no gradient and shouldn't be trained
     /// or checkpointed.

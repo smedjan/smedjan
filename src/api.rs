@@ -327,6 +327,12 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::set_rmsnorm_clamp(rc);
     tested += 1;
 
+    // Subquadratic block-sparse gather attention (forward) — runs end to end on a tiny tensor.
+    let bsq = crate::tensor::Tensor::zeros(ctx, vec![1, 8, 4]);
+    let bsout = crate::attention::block_sparse_gather_attention(&bsq, &bsq, &bsq, 4, 1);
+    if bsout.shape != vec![1, 8, 4] || bsout.to_vec().iter().any(|x| !x.is_finite()) { passed = false; }
+    tested += 1;
+
     (tested, passed)
 }
 

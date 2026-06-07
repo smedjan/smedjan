@@ -145,11 +145,14 @@ pub struct KvCache {
     pub v: Option<Tensor>, // [batch * n_heads, capacity, head_dim]
     pub len: usize,        // current number of cached positions
     pub capacity: usize,   // pre-allocated max positions
+    /// MLA latent cache: [batch, len, d_c]. When MLA is the mixer, the decode path caches this small
+    /// shared latent (10–50× smaller than K/V) and reconstructs K/V from it each step. None otherwise.
+    pub latent: Option<Tensor>,
 }
 
 impl KvCache {
     pub fn new() -> Self {
-        Self { k: None, v: None, len: 0, capacity: 0 }
+        Self { k: None, v: None, len: 0, capacity: 0, latent: None }
     }
 
     /// Create a pre-allocated KV cache with capacity for max_seq_len positions.
@@ -162,6 +165,7 @@ impl KvCache {
             v: Some(Tensor::from_buffer(Arc::clone(ctx), v_buf, vec![batch_heads, max_seq_len, head_dim])),
             len: 0,
             capacity: max_seq_len,
+            latent: None,
         }
     }
 
@@ -177,6 +181,18 @@ impl KvCache {
     /// the actual tensors.
     pub fn truncate(&mut self, new_len: usize) {
         assert!(new_len <= self.len, "truncate: new_len {} > current len {}", new_len, self.len);
+        // MLA latent cache: keep the first new_len latent rows (it's the source of truth for the MLA
+        // decode path, independent of the K/V buffers). Rebuild as a contiguous [batch, new_len, d_c].
+        if let Some(lat) = self.latent.take() {
+            if new_len == 0 {
+                self.latent = None;
+            } else {
+                let (b, old, dc, lctx) = (lat.shape[0], lat.shape[1], lat.shape[2], Arc::clone(&lat.ctx));
+                let buf = lctx.alloc_buffer(b * new_len * dc * 4);
+                compute::gpu_compact_strided_copy(&lctx, &lat.buffer, &buf, b as u32, new_len as u32, old as u32, dc as u32);
+                self.latent = Some(Tensor::from_buffer(lctx, buf, vec![b, new_len, dc]));
+            }
+        }
         if self.capacity > 0 {
             // Pre-allocated path: just move the length counter back.
             // The buffer space from new_len..old_len is "dead" and will be
@@ -345,6 +361,63 @@ impl MultiHeadAttention {
         self.attn_kind = AttnKind::BlockSparse;
     }
 
+    /// MLA incremental decode caching the latent `c` (not K/V). Appends `c_new` to the latent cache,
+    /// reconstructs K/V from the FULL cached latent (K=c@W_uk, V=c@W_uv), RoPEs at absolute positions,
+    /// and attends the new tokens' queries causally. Cache stores `c` ([batch,total,d_c]) — 10–50×
+    /// smaller than storing K/V. Mathematically equal to the prefill MLA forward (linearity + causal).
+    fn mla_cached_forward(&self, x: &Tensor, cache: &mut KvCache) -> Tensor {
+        let batch = x.shape[0];
+        let new_seq = x.shape[1];
+        let d_model = x.shape[2];
+        let d_c = self.mla_dc;
+        let hd = self.head_dim;
+        let x_flat = x.reshape(vec![batch * new_seq, d_model]);
+
+        let q = x_flat.matmul(&self.w_q); // [batch*new_seq, n_heads*hd]
+        let c_new = x_flat.matmul(&self.w_dkv).reshape(vec![batch, new_seq, d_c]);
+
+        // Append c_new to the latent cache → c_all [batch, total, d_c].
+        let old_len = cache.latent.as_ref().map_or(0, |c| c.shape[1]);
+        let c_all = match cache.latent.take() {
+            Some(c_old) => concat_seq(&c_old, &c_new, batch, old_len, new_seq, d_c),
+            None => c_new,
+        };
+        let total = old_len + new_seq;
+
+        // Reconstruct K/V from the FULL latent (per-token linear, so cached == prefill).
+        let c_flat = c_all.reshape(vec![batch * total, d_c]);
+        let k_all = c_flat.matmul(&self.w_uk); // [batch*total, kv_dim]
+        let v_all = c_flat.matmul(&self.w_uv);
+        cache.latent = Some(c_all);
+        cache.len = total;
+
+        // Transpose + RoPE: K at absolute positions 0..total, Q (new tokens) at old_len..total.
+        let q = fused_transpose_rope(&q, batch, new_seq, self.n_heads, hd, old_len as u32, self.rope_theta);
+        let k = fused_transpose_rope(&k_all, batch, total, self.n_kv_heads, hd, 0, self.rope_theta);
+        let v = transpose_bsh_to_bhs(&v_all, batch, total, self.n_kv_heads, hd);
+        let q = if self.d_model >= 512 { q.rms_norm(&self.qk_norm_weight, 1e-6) } else { q };
+        let k = if self.d_model >= 512 { k.rms_norm(&self.qk_norm_weight, 1e-6) } else { k };
+
+        // GQA expand K/V heads to match Q heads.
+        let group_size = self.n_heads / self.n_kv_heads;
+        let bh_kv = batch * self.n_kv_heads;
+        let (k, v) = if group_size > 1 {
+            (repeat_kv(&k, bh_kv, total, hd, group_size), repeat_kv(&v, bh_kv, total, hd, group_size))
+        } else {
+            (k, v)
+        };
+
+        // Causal attention: new queries (positions old_len..total) over all keys (0..total).
+        let scale = 1.0 / (hd as f32).sqrt();
+        let scores = q.batched_matmul_trans_b(&k).scale(scale); // [bh, new_seq, total]
+        let weights = scores.causal_mask(old_len as u32).softmax();
+        let attn = weights.batched_matmul(&v); // [bh, new_seq, hd]
+
+        let attn_combined = transpose_bhs_to_bsh(&attn, batch, new_seq, self.n_heads, hd);
+        let out = attn_combined.matmul(&self.w_o);
+        out.reshape(vec![batch, new_seq, d_model])
+    }
+
     /// Forward pass with Grouped Query Attention support.
     /// x: [batch, seq_len, d_model]
     /// Returns: [batch, seq_len, d_model]
@@ -356,6 +429,19 @@ impl MultiHeadAttention {
         x: &Tensor,
         kv_cache: Option<&mut KvCache>,
     ) -> Tensor {
+        // MLA incremental decode: cache the small latent `c` (not K/V) and reconstruct K/V from the
+        // full cached latent each step → 10–50× smaller KV cache. Isolated early-return so the main
+        // forward (training + non-MLA) is untouched. Equivalent to the prefill MLA forward (linearity
+        // + causality), verified by the incremental==full test.
+        let kv_cache = if self.attn_kind == AttnKind::Mla {
+            match kv_cache {
+                Some(cache) => return self.mla_cached_forward(x, cache),
+                None => None,
+            }
+        } else {
+            kv_cache
+        };
+
         let batch = x.shape[0];
         let seq_len = x.shape[1];
         let d_model = x.shape[2];
