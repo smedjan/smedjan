@@ -2142,6 +2142,7 @@ struct NormBwdParams {
     uint rows;
     uint cols;
     float eps;
+    float clamp_on; // 1 = bound the degenerate-row backward; 0 = raw (investigation only)
 };
 
 kernel void rms_norm_backward(
@@ -2184,7 +2185,7 @@ kernel void rms_norm_backward(
     // blows the gradient to ~1e8 from a perfectly bounded forward — clip then turns that into a
     // garbage update direction and the optimiser (notably AdamW) stalls/diverges. 1/sqrt(1e-3)
     // floors it; the forward normalization is untouched, so only the degenerate-row backward changes.
-    inv_rms = min(inv_rms, 31.62f);
+    if (params.clamp_on > 0.5f) inv_rms = min(inv_rms, 31.62f);
 
     // Compute dot product — SIMD reduction
     float local_dot = 0.0f;
@@ -2204,7 +2205,7 @@ kernel void rms_norm_backward(
         // compounding across layers — explode the whole gradient (clip then yields a garbage
         // direction and AdamW diverges). Normal grads are O(1-10), so this only clips degenerate
         // spikes, and capping the OUTPUT stops the next layer's incoming grad from compounding.
-        gi[c] = clamp(g, -1.0e3f, 1.0e3f);
+        gi[c] = (params.clamp_on > 0.5f) ? clamp(g, -1.0e3f, 1.0e3f) : g;
     }
 
     // grad_weight: atomic accumulate across rows.

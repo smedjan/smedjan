@@ -2052,6 +2052,47 @@ mod suite {
         autograd::zero_grads();
     }
 
+    /// ROOT-CAUSE + fix for the RMSNorm-backward instability (#5). What this test VERIFIES directly:
+    /// a collapsed activation row makes the backward explode (>1e3) without the clamp and stay bounded
+    /// with it. ANALYZED upstream MECHANISM (the explanation for WHY a row collapses): in the
+    /// weight-tied constant-target overfit, cross-entropy drives down the non-target logits by
+    /// shrinking those tokens' tied embedding rows toward 0; because the same rows are the INPUT
+    /// embeddings, those tokens' input activations go to ~0, so a RMSNorm input row collapses
+    /// (mean_sq → 0). Then inv_rms = 1/√(mean_sq+eps) blows up and the inv_rms³ correction term
+    /// explodes the backward — from a perfectly bounded forward. (At real scale, weight decay on
+    /// rare-token embeddings is the same mechanism.) It is an inherent weight-tying × logit-suppression
+    /// interaction, NOT a kernel bug — so the right fix is to BOUND the degenerate-row backward, which
+    /// is what the clamp does. This test feeds a collapsed row and shows the clamp turns a >1e3
+    /// explosion into a bounded gradient (toggle = `compute::set_rmsnorm_clamp`, investigation-only).
+    #[test]
+    fn rmsnorm_backward_clamp_bounds_collapse() {
+        let ctx = test_ctx();
+        let cols = 64usize;
+        // A collapsed activation row: all tiny → mean_sq ≈ 1e-8 with a near-zero eps.
+        let input = ctx.buffer_from_slice(&vec![1e-4f32; cols]);
+        let weight = ctx.buffer_from_slice(&vec![1.0f32; cols]);
+        // Alternating grad_output: nearly orthogonal to the (uniform) collapsed row, so the inv_rms³
+        // correction term doesn't cancel the inv_rms term — the explosion is exposed, not hidden.
+        let go: Vec<f32> = (0..cols).map(|c| if c % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let grad_output = ctx.buffer_from_slice(&go);
+        let gi = ctx.alloc_buffer(cols * 4);
+        let gw = ctx.alloc_buffer(cols * 4);
+        let p = compute::RmsNormBackwardParams { rows: 1, cols: cols as u32, eps: 1e-10 };
+        let max_abs = |buf: &_| MetalContext::read_buffer(buf, cols).iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+
+        let prev = compute::set_rmsnorm_clamp(false);
+        compute::gpu_rms_norm_backward(&ctx, &input, &weight, &grad_output, &gi, &gw, &p);
+        let unclamped = max_abs(&gi);
+        compute::set_rmsnorm_clamp(true);
+        compute::gpu_rms_norm_backward(&ctx, &input, &weight, &grad_output, &gi, &gw, &p);
+        let clamped = max_abs(&gi);
+        compute::set_rmsnorm_clamp(prev);
+
+        eprintln!("RMSNorm collapsed-row backward: unclamped max|grad|={unclamped:.1}, clamped max|grad|={clamped:.1}");
+        assert!(unclamped > 1.0e3, "collapsed row should explode without the clamp, got {unclamped}");
+        assert!(clamped.is_finite() && clamped <= 1.0e3, "clamp must bound the degenerate backward, got {clamped}");
+    }
+
     /// Investigates the handoff's open question: is beta2=0.999 making loss WORSE a "third subtle
     /// bug", or expected behavior? Conclusion (grounded here): NOT a bug. Under a non-stationary
     /// gradient (a 100× jump), beta2=0.999's slow second-moment memory lags the new gradient scale,

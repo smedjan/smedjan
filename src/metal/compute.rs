@@ -1338,6 +1338,16 @@ pub struct RmsNormBackwardParams {
 }
 
 /// RMS norm backward
+/// The RMSNorm-backward degenerate-row clamp (bounds inv_rms³ + grad on a collapsed activation row).
+/// On by default — it's the fix for the AdamW instability. The toggle exists only to characterize
+/// the explosion it prevents (investigation/tests); leave it on for training.
+static RMSNORM_CLAMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable the RMSNorm-backward clamp. Returns the previous value. Investigation only.
+pub fn set_rmsnorm_clamp(on: bool) -> bool {
+    RMSNORM_CLAMP.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn gpu_rms_norm_backward(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -1352,8 +1362,9 @@ pub fn gpu_rms_norm_backward(
     gpu_fill(ctx, grad_weight, cols, 0.0);
 
     #[repr(C)]
-    struct Params { rows: u32, cols: u32, eps: f32 }
-    let params = Params { rows, cols, eps };
+    struct Params { rows: u32, cols: u32, eps: f32, clamp_on: f32 }
+    let clamp_on = if RMSNORM_CLAMP.load(std::sync::atomic::Ordering::Relaxed) { 1.0 } else { 0.0 };
+    let params = Params { rows, cols, eps, clamp_on };
     let params_buf = params_buffer(ctx, &params);
 
     let threads_per_group = next_power_of_2_clamped(cols as u64);
