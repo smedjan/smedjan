@@ -126,6 +126,7 @@ impl MetalContext {
             ("cross_entropy", shaders::CROSS_ENTROPY),
             ("reduce_sum", shaders::REDUCE_SUM),
             ("adamw_update", shaders::ADAMW_UPDATE),
+            ("adamw_8bit_update", shaders::ADAMW_8BIT_UPDATE),
             ("embedding_lookup", shaders::EMBEDDING_LOOKUP),
             ("causal_mask", shaders::CAUSAL_MASK),
             ("l2_norm", shaders::L2_NORM),

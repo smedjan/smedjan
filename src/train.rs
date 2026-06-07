@@ -301,6 +301,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None
     };
 
+    // Create 8-bit AdamW if selected — block-wise int8 moments, ~4× less optimizer memory.
+    let mut adamw8_opt = if config.optimizer_type == "adamw-8bit" {
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let o = crate::optim::AdamW8bit::new_with_config(ctx, &param_refs, config.weight_decay, config.adamw_hyper());
+        let full = model.parameters().iter().map(|p| p.numel() * 8).sum::<usize>(); // fp32 m+v
+        eprintln!("Using 8-bit AdamW: optimizer memory {:.1}MB (vs {:.1}MB fp32, {:.1}× smaller)",
+            o.memory_bytes() as f32 / 1e6, full as f32 / 1e6, full as f32 / o.memory_bytes().max(1) as f32);
+        Some(o)
+    } else {
+        None
+    };
+
     // Log optimizer info
     if optimizer.galore_rank > 0 {
         eprintln!("GALORE: rank={}, optimizer memory={:.1}MB (vs {:.1}MB full)",
@@ -671,6 +683,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             if let Some(ref mut hybrid) = hybrid_opt {
                 ctx.begin_batch();
                 hybrid.step(lr);
+            } else if let Some(ref mut a8) = adamw8_opt {
+                ctx.begin_batch();
+                a8.step(lr);
             } else if let Some(ref mut muon) = muon_opt {
                 ctx.begin_batch();
                 muon.step(lr);

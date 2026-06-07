@@ -136,8 +136,9 @@ struct TrainArgs {
         /// Speculative threshold: skip if reference loss < this value. Default: 7.0
         #[arg(long, default_value = "7.0")]
         speculative_threshold: f32,
-        /// Optimizer: "adamw", "sophia", "muon", or "hybrid" (Muon for 2-D matrices + AdamW for
-        /// embeddings/head/routers/norms — the canonical Muon recipe). Default: adamw
+        /// Optimizer: "adamw", "sophia", "muon", "hybrid" (Muon for 2-D matrices + AdamW for
+        /// embeddings/head/routers/norms — the canonical Muon recipe), or "adamw-8bit" (block-wise
+        /// int8 moments, ~4× less optimizer memory). Default: adamw
         #[arg(long, default_value = "adamw")]
         optimizer: String,
         /// AdamW first-moment decay (beta1). Default: 0.9

@@ -250,6 +250,123 @@ impl AdamW {
     }
 }
 
+/// 8-bit AdamW: the first/second moments m,v are stored as block-wise int8 (one fp32 absmax scale
+/// per 256-element block) instead of fp32 — ~4× less optimizer memory, the direct lever for fitting
+/// a bigger model on the same RAM ("10× capacity"). The update dequantizes, runs the standard AdamW
+/// math (same hardened eps/no_decay/update_clip as `AdamW`), applies the param step, then requantizes
+/// with fresh per-block scales. Pairs with GaLore (rank) and Muon (no v) for further savings.
+pub struct AdamW8bit {
+    pub params: Vec<Param8State>,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub update_clip: f32,
+    pub weight_decay: f32,
+    pub step: u32,
+    ctx: Arc<MetalContext>,
+}
+
+pub struct Param8State {
+    pub tensor_id: usize,
+    pub buffer: Retained<GpuBuffer>,
+    pub size: usize,
+    pub n_blocks: usize,
+    pub no_decay: bool,
+    pub m_q: Retained<GpuBuffer>,    // int8 of m, `size` bytes
+    pub v_q: Retained<GpuBuffer>,    // int8 of √v (range-compressed), `size` bytes
+    pub m_scale: Retained<GpuBuffer>, // fp32 absmax(|m|)/127 per block, n_blocks entries
+    pub v_scale: Retained<GpuBuffer>, // fp32 absmax(√v)/127 per block, n_blocks entries
+}
+
+impl AdamW8bit {
+    pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
+        Self::new_with_config(ctx, params, weight_decay, AdamWHyper::default())
+    }
+
+    pub fn new_with_config(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, hyper: AdamWHyper) -> Self {
+        let block = compute::ADAM8_BLOCK;
+        let param_states = params.iter().map(|t| {
+            let size = t.numel();
+            let n_blocks = size.div_ceil(block);
+            let m_q = ctx.alloc_buffer(size.max(1));        // 1 byte per int8 element
+            let v_q = ctx.alloc_buffer(size.max(1));
+            let m_scale = ctx.alloc_buffer(n_blocks * 4);   // fp32 per block
+            let v_scale = ctx.alloc_buffer(n_blocks * 4);
+            // Zero all state: int8 0 and fp32 0.0 are both all-zero bytes. Buffers may be pooled
+            // (stale), so this is required.
+            unsafe {
+                std::ptr::write_bytes(m_q.contents().as_ptr() as *mut u8, 0, size.max(1));
+                std::ptr::write_bytes(v_q.contents().as_ptr() as *mut u8, 0, size.max(1));
+                std::ptr::write_bytes(m_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
+                std::ptr::write_bytes(v_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
+            }
+            Param8State {
+                tensor_id: t.id,
+                buffer: t.buffer.clone(),
+                size,
+                n_blocks,
+                no_decay: t.shape.len() <= 1,
+                m_q,
+                v_q,
+                m_scale,
+                v_scale,
+            }
+        }).collect();
+
+        Self {
+            params: param_states,
+            beta1: hyper.beta1,
+            beta2: hyper.beta2,
+            eps: hyper.eps,
+            update_clip: hyper.update_clip,
+            weight_decay,
+            step: 0,
+            ctx: Arc::clone(ctx),
+        }
+    }
+
+    /// Optimizer-state memory: int8 m+v + fp32 block scales. ~4× smaller than fp32 AdamW.
+    pub fn memory_bytes(&self) -> usize {
+        self.params.iter().map(|ps| ps.size * 2 + ps.n_blocks * 4 * 2).sum()
+    }
+
+    pub fn step(&mut self, lr: f32) {
+        self.step += 1;
+        for ps in &self.params {
+            let grad = match autograd::get_grad(ps.tensor_id) {
+                Some(g) => g,
+                None => continue,
+            };
+            compute::gpu_adamw_8bit_update(
+                &self.ctx,
+                &ps.buffer,
+                &grad,
+                &compute::Adam8Buffers {
+                    m_q: &ps.m_q,
+                    v_q: &ps.v_q,
+                    m_scale: &ps.m_scale,
+                    v_scale: &ps.v_scale,
+                },
+                ps.size as u32,
+                &compute::AdamWHyperparams {
+                    lr,
+                    beta1: self.beta1,
+                    beta2: self.beta2,
+                    eps: self.eps,
+                    weight_decay: if ps.no_decay { 0.0 } else { self.weight_decay },
+                    step: self.step,
+                    update_clip: self.update_clip,
+                },
+            );
+        }
+    }
+
+    pub fn zero_grad(&self) {
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+    }
+}
+
 /// Cosine warmup learning rate scheduler with optional warm restarts.
 /// When restart_period > 0, the cosine cycle repeats every restart_period steps
 /// (after warmup), resetting LR to max_lr. This is SGDR (Loshchilov & Hutter, 2017).
@@ -663,6 +780,7 @@ pub enum Optimizer {
     Sophia(Sophia),
     Muon(Muon),
     Hybrid(HybridOptimizer),
+    AdamW8bit(AdamW8bit),
 }
 
 impl Optimizer {
@@ -672,6 +790,7 @@ impl Optimizer {
             Optimizer::Sophia(o) => o.step(lr),
             Optimizer::Muon(o) => o.step(lr),
             Optimizer::Hybrid(o) => o.step(lr),
+            Optimizer::AdamW8bit(o) => o.step(lr),
         }
     }
 
@@ -684,6 +803,7 @@ impl Optimizer {
                 autograd::clear_recompute_registry();
             }
             Optimizer::Hybrid(o) => o.zero_grad(),
+            Optimizer::AdamW8bit(o) => o.zero_grad(),
         }
     }
 
@@ -693,6 +813,7 @@ impl Optimizer {
             Optimizer::Sophia(o) => o.step,
             Optimizer::Muon(o) => o.step,
             Optimizer::Hybrid(o) => o.adamw.step,
+            Optimizer::AdamW8bit(o) => o.step,
         }
     }
 }

@@ -2126,6 +2126,89 @@ mod suite {
         assert!(sg < hand, "simdgroup MMA ({sg:.4}s) should beat hand-rolled f16 ({hand:.4}s)");
     }
 
+    /// 8-bit AdamW must use ~4× less optimizer memory than fp32 AdamW on a real model: the moments
+    /// are int8 (1 byte vs 4) plus a tiny per-256-block fp32 scale.
+    #[test]
+    fn adamw_8bit_memory_is_4x_smaller() {
+        let ctx = test_ctx();
+        let model = Transformer::new(&ctx, ModelConfig::custom(256, 128, 4, 4, 2.67, 128));
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let fp32 = crate::optim::AdamW::new(&ctx, &prefs, 0.0);
+        let q8 = crate::optim::AdamW8bit::new(&ctx, &prefs, 0.0);
+        let ratio = fp32.memory_bytes() as f32 / q8.memory_bytes() as f32;
+        eprintln!("optimizer memory: fp32={} B, 8-bit={} B, ratio={ratio:.2}×",
+            fp32.memory_bytes(), q8.memory_bytes());
+        assert!(ratio > 3.5, "8-bit optimizer should be ~4× smaller, got {ratio:.2}×");
+    }
+
+    /// 8-bit AdamW must follow nearly the SAME trajectory as fp32 AdamW (block-wise int8 quant adds
+    /// only ~1% per-step error). Deterministic: feed an identical fixed gradient to two copies of the
+    /// same parameter for 30 steps; the final weights must agree closely AND both must have moved.
+    #[test]
+    fn adamw_8bit_tracks_fp32() {
+        let ctx = test_ctx();
+        let n = 256usize;
+        let init: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
+        let g: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.1 + 0.01).collect();
+        let w_fp = Tensor::from_slice(&ctx, &init, vec![n]);
+        let w_q = Tensor::from_slice(&ctx, &init, vec![n]);
+        // shape.len()==1 → no_decay; pass wd=0 anyway so the two paths are identical except quant.
+        let mut fp = crate::optim::AdamW::new(&ctx, &[&w_fp], 0.0);
+        let mut q8 = crate::optim::AdamW8bit::new(&ctx, &[&w_q], 0.0);
+        for _ in 0..30 {
+            autograd::zero_grads();
+            let gb = ctx.buffer_from_slice(&g);
+            autograd::accumulate_grad_for_test(&ctx, w_fp.id, &gb, n);
+            fp.step(0.02);
+            autograd::zero_grads();
+            let gb2 = ctx.buffer_from_slice(&g);
+            autograd::accumulate_grad_for_test(&ctx, w_q.id, &gb2, n);
+            q8.step(0.02);
+        }
+        let a = w_fp.to_vec();
+        let b = w_q.to_vec();
+        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let moved = a.iter().zip(&init).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("8-bit vs fp32 after 30 steps: max_diff={max_diff:.5}, fp32 moved={moved:.4}");
+        assert!(moved > 0.1, "fp32 reference must move substantially (sanity), moved={moved}");
+        assert!(max_diff < 0.02, "8-bit AdamW diverged from fp32: max_diff={max_diff}");
+        autograd::zero_grads();
+    }
+
+    /// 8-bit AdamW must keep training BOUNDED end-to-end (the dequant→update→requant kernel must not
+    /// destabilize), via the unified `Optimizer::AdamW8bit` dispatch. Mirrors the fp32 guard
+    /// adamw_training_stays_bounded_no_grad_explosion.
+    #[test]
+    fn adamw_8bit_training_stays_bounded() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
+        let (batch, seq_len) = (8usize, 12usize);
+        let one: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0, 9, 2, 8, 1];
+        let tokens: Vec<u32> = one.iter().cloned().cycle().take(batch * seq_len).collect();
+        let targets: Vec<u32> = vec![5; 8 * 12];
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let mut opt = crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(&ctx, &prefs, 0.0));
+        let mut max_loss = 0.0f32;
+        for step in 0..150 {
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+            let lv = loss.to_vec()[0];
+            assert!(lv.is_finite(), "8-bit AdamW loss non-finite at step {step}");
+            max_loss = max_loss.max(lv);
+            autograd::backward(&ctx, loss.id);
+            autograd::clear_tape_keep_grads();
+            crate::train::clip_gradients(&ctx, &model, 1.0);
+            let lr = 1e-3 * (((step + 1) as f32) / 20.0).min(1.0);
+            opt.step(lr);
+            autograd::zero_grads_recycle();
+        }
+        eprintln!("8-bit AdamW stability: max loss {max_loss:.2}");
+        assert!(max_loss < 30.0, "8-bit AdamW loss blew up (max {max_loss})");
+    }
+
     // =========================================================================
     // Mega-kernel correctness: mega_ffn output must match standard FFN path
     // =========================================================================

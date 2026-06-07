@@ -775,6 +775,65 @@ pub fn gpu_adamw_update(
     );
 }
 
+/// Block size for the 8-bit optimizer (one fp32 absmax scale per BLOCK int8 elements).
+pub const ADAM8_BLOCK: usize = 256;
+
+/// The block-wise-int8 moment buffers for one parameter: m_q/v_q are int8 (`size` bytes each),
+/// m_scale/v_scale are fp32 (ceil(size/256) entries each). Grouped so the update fn stays under the
+/// argument-count lint (the codebase keeps 0 `#[allow]`).
+pub struct Adam8Buffers<'a> {
+    pub m_q: &'a GpuBuffer,
+    pub v_q: &'a GpuBuffer,
+    pub m_scale: &'a GpuBuffer,
+    pub v_scale: &'a GpuBuffer,
+}
+
+/// 8-bit (block-wise int8) AdamW fused update. State buffers are updated in place each step.
+pub fn gpu_adamw_8bit_update(
+    ctx: &Arc<MetalContext>,
+    param: &GpuBuffer,
+    grad: &GpuBuffer,
+    state: &Adam8Buffers,
+    size: u32,
+    hp: &AdamWHyperparams,
+) {
+    let Adam8Buffers { m_q, v_q, m_scale, v_scale } = *state;
+    let AdamWHyperparams { lr, beta1, beta2, eps, weight_decay, step, update_clip } = *hp;
+    #[repr(C)]
+    struct Params {
+        size: u32,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bias_correction1: f32,
+        bias_correction2: f32,
+        update_clip: f32,
+    }
+    let params = Params {
+        size,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        bias_correction1: 1.0 - beta1.powi(step as i32),
+        bias_correction2: 1.0 - beta2.powi(step as i32),
+        update_clip,
+    };
+    let params_buf = params_buffer(ctx, &params);
+
+    let block = ADAM8_BLOCK as u64;
+    let n_blocks = (size as u64).div_ceil(block);
+    let grid = MetalContext::size(n_blocks, 1, 1); // one threadgroup per block
+    let tg = MetalContext::size(block, 1, 1);
+
+    dispatch_sync!(ctx, "adamw_8bit_update", grid, tg,
+        0 => param, 1 => grad, 2 => m_q, 3 => v_q, 4 => m_scale, 5 => v_scale, 6 => &params_buf
+    );
+}
+
 /// Embedding lookup
 pub fn gpu_embedding_lookup(
     ctx: &Arc<MetalContext>,

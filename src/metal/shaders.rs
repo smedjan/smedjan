@@ -1448,6 +1448,88 @@ kernel void adamw_update(
 }
 "#;
 
+/// 8-bit (block-wise int8) AdamW update — bitsandbytes-style. The first/second moments are stored as
+/// int8 with one fp32 absmax scale per block of 256 elements (≈4× less optimizer memory than fp32
+/// m+v). One threadgroup per block: dequant → AdamW math → apply param update → block-reduce the new
+/// absmax → requantize with fresh scales. `m` is signed-linear int8. `v` (≥0) is stored as int8 of
+/// √v, NOT v: within a block v=g² spans a ~1000× dynamic range, so linear-quantizing v underflows
+/// the small entries to 0 → v̂≈0 → the update m̂/ε explodes. √v compresses that range ~31× and is
+/// what the optimizer actually consumes (√v̂). update_clip bounds the step.
+pub const ADAMW_8BIT_UPDATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct Adam8Params {
+    uint size;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bias_correction1;
+    float bias_correction2;
+    float update_clip;
+};
+
+kernel void adamw_8bit_update(
+    device float* param [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    device char* m_q [[buffer(2)]],
+    device char* v_q [[buffer(3)]],
+    device float* m_scale [[buffer(4)]],
+    device float* v_scale [[buffer(5)]],
+    constant Adam8Params& p [[buffer(6)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sm[256];
+    threadgroup float sv[256];
+
+    bool active = gid < p.size;
+    float ms = m_scale[bid];
+    float vs = v_scale[bid];   // scale for √v, not v
+    float g = active ? grad[gid] : 0.0f;
+    float m_old = active ? (float)((int)m_q[gid]) * ms : 0.0f;
+    float sqrt_v_old = active ? (float)((int)v_q[gid]) * vs : 0.0f;
+    float v_old = sqrt_v_old * sqrt_v_old;
+    float m_new = p.beta1 * m_old + (1.0f - p.beta1) * g;
+    float v_new = p.beta2 * v_old + (1.0f - p.beta2) * g * g;
+    float sqrt_v_new = sqrt(v_new);
+
+    if (active) {
+        float m_hat = m_new / p.bias_correction1;
+        float v_hat = v_new / p.bias_correction2;
+        float upd = m_hat / (sqrt(v_hat) + p.eps);
+        if (p.update_clip > 0.0f) upd = clamp(upd, -p.update_clip, p.update_clip);
+        param[gid] = param[gid] * (1.0f - p.lr * p.weight_decay) - p.lr * upd;
+    }
+
+    // Block absmax reduction for requantization (|m| and √v).
+    sm[lid] = active ? fabs(m_new) : 0.0f;
+    sv[lid] = active ? sqrt_v_new : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sm[lid] = max(sm[lid], sm[lid + s]);
+            sv[lid] = max(sv[lid], sv[lid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float new_ms = sm[0] > 0.0f ? sm[0] / 127.0f : 0.0f;
+    float new_vs = sv[0] > 0.0f ? sv[0] / 127.0f : 0.0f;
+    if (lid == 0) {
+        m_scale[bid] = new_ms;
+        v_scale[bid] = new_vs;
+    }
+
+    if (active) {
+        m_q[gid] = new_ms > 0.0f ? (char)round(clamp(m_new / new_ms, -127.0f, 127.0f)) : (char)0;
+        v_q[gid] = new_vs > 0.0f ? (char)round(clamp(sqrt_v_new / new_vs, 0.0f, 127.0f)) : (char)0;
+    }
+}
+"#;
+
 /// Embedding lookup: gather rows from embedding matrix
 /// tokens: [batch * seq_len] as uint, embeddings: [vocab, dim], output: [batch * seq_len, dim]
 pub const EMBEDDING_LOOKUP: &str = r#"
