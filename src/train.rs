@@ -100,6 +100,9 @@ pub struct TrainConfig {
     pub muon_lr_scale: f32,
     /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
     pub adamw_lr_scale: f32,
+    /// Route the default fp16 matmul through the hardware simdgroup MMA units. Bit-identical to the
+    /// hand-rolled fp16 path; measured ~1.3× faster at 1024³ on M3. Default false.
+    pub simdgroup_matmul: bool,
 }
 
 impl TrainConfig {
@@ -160,6 +163,7 @@ impl TrainConfig {
             per_tensor_clip: false,
             muon_lr_scale: 1.0,
             adamw_lr_scale: 1.0,
+            simdgroup_matmul: false,
         }
     }
 }
@@ -181,6 +185,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         config.grad_accum_steps, effective_batch,
     );
     eprintln!("Tokenizer: {}", config.tokenizer_path);
+
+    // Opt-in: route the default fp16 matmul through the hardware simdgroup MMA units (bit-identical,
+    // ~1.3× faster at 1024³ on M3). Process-global switch read inside Tensor::matmul.
+    if config.simdgroup_matmul {
+        compute::set_simdgroup_matmul(true);
+        eprintln!("Matmul: hardware simdgroup MMA fast path enabled");
+    }
 
     // Create checkpoint directory
     std::fs::create_dir_all(&config.checkpoint_dir)?;

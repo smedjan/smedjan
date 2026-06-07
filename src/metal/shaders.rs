@@ -290,6 +290,190 @@ kernel void matmul_tiled_bf16(
 }
 "#;
 
+/// simdgroup_matrix matmul: C = A @ B using the Apple-Silicon hardware matrix units
+/// (`simdgroup_matrix<float,8,8>` + `simdgroup_multiply_accumulate`, Metal 3+, M1→M4). One
+/// threadgroup = one 32-thread simdgroup computes a 32×32 output tile as a 4×4 grid of 8×8 MMA
+/// fragments, looping K in steps of 8. A 32×8 slab of A and an 8×32 slab of B are staged into
+/// threadgroup memory each K-step (cooperative, zero-padded at the M/N/K edges) so the fragment
+/// loads are always in-bounds for non-multiple-of-8 dims; the result fragments are stored back
+/// through threadgroup memory with a bounds-checked cooperative write. This replaces the hand-rolled
+/// scalar-MAC inner loop with the hardware MMA — the single biggest matmul throughput lever here.
+pub const MATMUL_SIMDGROUP: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct MatmulParams {
+    uint M;
+    uint N;
+    uint K;
+};
+
+#define TILE 32
+
+kernel void matmul_simdgroup(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint M = params.M, N = params.N, K = params.K;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+
+    threadgroup float As[TILE * 8];   // 32 rows × 8 cols (row-major)
+    threadgroup float Bs[8 * TILE];   // 8 rows × 32 cols (row-major)
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        // Stage A slab [32×8]: 256 elements, 32 lanes → 8 each, zero-padded at edges.
+        for (uint t = 0; t < 8; t++) {
+            uint idx = lane * 8 + t;       // 0..255
+            uint r = idx >> 3;             // 0..31
+            uint c = idx & 7;              // 0..7
+            uint gr = tile_row + r;
+            uint gc = k0 + c;
+            As[r * 8 + c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        // Stage B slab [8×32]: 256 elements, zero-padded at edges.
+        for (uint t = 0; t < 8; t++) {
+            uint idx = lane * 8 + t;       // 0..255
+            uint r = idx >> 5;             // 0..7
+            uint c = idx & 31;             // 0..31
+            uint gr = k0 + r;
+            uint gc = tile_col + c;
+            Bs[r * TILE + c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 a[4], b[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[i * 8 * 8], 8);     // 8×8, ld=8
+        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], &Bs[j * 8], TILE);      // 8×8, ld=32
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store fragments to the threadgroup tile, then cooperative bounds-checked write to C.
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], &Cs[i * 8 * TILE + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t;          // 0..1023
+        uint r = idx >> 5;                 // 0..31
+        uint c = idx & 31;                 // 0..31
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < M && gc < N) C[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
+/// Half-input simdgroup_matrix matmul: C(fp32) = A(fp16) @ B(fp16) on the hardware MMA units.
+/// The drop-in fast path for the default `matmul` (which pre-casts to fp16 then runs the hand-rolled
+/// `matmul_tiled_f16`): same fp16-input / fp32-output precision, but the inner product runs on the
+/// `simdgroup_half8x8` × `simdgroup_half8x8` → `simdgroup_float8x8` MMA instead of scalar MACs.
+///
+/// 64×64 output tile per threadgroup of 4 simdgroups (128 threads): each simdgroup owns a 32×32
+/// quadrant (4×4 = 16 fragments). A 64×8 slab of A and an 8×64 slab of B are staged to threadgroup
+/// memory per K-step and reused by all 4 quadrants (4× arithmetic intensity vs a 32×32 single-
+/// simdgroup tile, which measured *slower* than the hand-rolled kernel — it was occupancy/
+/// intensity-bound). Edges are zero-padded so the fragment loads stay in-bounds for any M/N/K.
+pub const MATMUL_SIMDGROUP_F16: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct MatmulParams {
+    uint M;
+    uint N;
+    uint K;
+};
+
+#define TILE 64
+
+kernel void matmul_simdgroup_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = params.M, N = params.N, K = params.K;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+    uint q_row = (sgid >> 1) * 32;   // simdgroup's 32×32 quadrant within the 64×64 tile
+    uint q_col = (sgid & 1) * 32;
+
+    threadgroup half As[TILE * 8];   // 64×8
+    threadgroup half Bs[8 * TILE];   // 8×64
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        // Stage A [64×8] and B [8×64]: 512 + 512 elems, 128 lanes → 4 each, zero-padded at edges.
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 3;             // 0..63
+            uint c = idx & 7;              // 0..7
+            uint gr = tile_row + r;
+            uint gc = k0 + c;
+            As[r * 8 + c] = (gr < M && gc < K) ? A[gr * K + gc] : (half)0.0;
+        }
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 6;             // 0..7
+            uint c = idx & 63;             // 0..63
+            uint gr = k0 + r;
+            uint gc = tile_col + c;
+            Bs[r * TILE + c] = (gr < K && gc < N) ? B[gr * N + gc] : (half)0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 a[4], b[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cooperative bounds-checked write: 64×64 = 4096 elems, 128 lanes → 32 each.
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t;          // 0..4095
+        uint r = idx >> 6;                 // 0..63
+        uint c = idx & 63;                 // 0..63
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < M && gc < N) C[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
 /// Narrow matmul for small N (≤32): C = A @ B where A:[M,K], B:[K,N], C:[M,N].
 /// TILE_M=32, TILE_N=16, 32 threads. Each thread computes 4×4 subtile.
 /// Eliminates 50% wasted compute when N=16 with the standard 32-wide tile.

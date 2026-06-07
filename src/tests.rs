@@ -2023,6 +2023,109 @@ mod suite {
         autograd::zero_grads();
     }
 
+    /// The simdgroup_matrix (hardware MMA) matmul must compute the SAME product as the reference
+    /// fp32 tiled kernel — including at M/N/K dims that are not multiples of 8 or 32 (the
+    /// zero-padded edge tiles). Float fragments → fp32 precision, so the only differences are
+    /// floating-point accumulation order; tolerance is tight.
+    #[test]
+    fn matmul_simdgroup_matches_fp32() {
+        let ctx = test_ctx();
+        // (M, K, N): a ragged edge case + a clean aligned case + a tall-skinny case.
+        for &(m, k, n) in &[(33usize, 47usize, 29usize), (64, 64, 64), (96, 16, 40)] {
+            let a = Tensor::randn(&ctx, vec![m, k], 0.5);
+            let b = Tensor::randn(&ctx, vec![k, n], 0.5);
+            let out_sg = ctx.alloc_buffer(m * n * 4);
+            let out_ref = ctx.alloc_buffer(m * n * 4);
+            compute::gpu_matmul_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_fp32(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32);
+            let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
+            let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
+            let mut max_diff = 0.0f32;
+            for i in 0..sg.len() {
+                assert!(sg[i].is_finite(), "simdgroup matmul produced non-finite at {i} for {m}x{k}x{n}");
+                max_diff = max_diff.max((sg[i] - rf[i]).abs());
+            }
+            eprintln!("simdgroup vs fp32 [{m}x{k}x{n}]: max_diff={max_diff:.6}");
+            assert!(max_diff < 1e-3, "simdgroup matmul disagrees with fp32 ({m}x{k}x{n}): max_diff={max_diff}");
+        }
+    }
+
+    /// The half-input simdgroup MMA matmul must match the hand-rolled fp16 tiled matmul on the SAME
+    /// fp16 inputs (both fp16-input / fp32-output; difference is MMA vs scalar accumulation, so the
+    /// tolerance is fp16-scale, not fp32). This is the kernel that backs the opt-in fast path.
+    #[test]
+    fn matmul_simdgroup_f16_matches_f16() {
+        let ctx = test_ctx();
+        for &(m, k, n) in &[(33usize, 47usize, 29usize), (128, 64, 96)] {
+            let a = Tensor::randn(&ctx, vec![m, k], 0.3);
+            let b = Tensor::randn(&ctx, vec![k, n], 0.3);
+            let a16 = a.cast_to_f16();
+            let b16 = b.cast_to_f16();
+            let out_sg = ctx.alloc_buffer(m * n * 4);
+            let out_ref = ctx.alloc_buffer(m * n * 4);
+            compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out_sg, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_f16(&ctx, &a16, &b16, &out_ref, m as u32, n as u32, k as u32);
+            let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
+            let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
+            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            eprintln!("simdgroup_f16 vs f16 [{m}x{k}x{n}]: max_diff={max_diff:.5}");
+            assert!(sg.iter().all(|x| x.is_finite()));
+            assert!(max_diff < 2e-2, "simdgroup_f16 disagrees with f16 ({m}x{k}x{n}): {max_diff}");
+        }
+    }
+
+    /// Toggling the global simdgroup fast path must keep `Tensor::matmul` correct: flag-on and
+    /// flag-off products agree (both fp16 precision). Proves the opt-in wiring routes correctly and
+    /// restores the default afterwards.
+    #[test]
+    fn matmul_simdgroup_flag_routes_correctly() {
+        let ctx = test_ctx();
+        let a = Tensor::randn(&ctx, vec![64, 48], 0.3);
+        let b = Tensor::randn(&ctx, vec![48, 80], 0.3);
+        let prev = compute::set_simdgroup_matmul(false);
+        let off = a.matmul(&b).to_vec();
+        compute::set_simdgroup_matmul(true);
+        assert!(compute::simdgroup_matmul_enabled());
+        let on = a.matmul(&b).to_vec();
+        compute::set_simdgroup_matmul(prev); // restore
+        let max_diff = off.iter().zip(&on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("matmul flag off-vs-on max_diff={max_diff:.5}");
+        assert!(on.iter().all(|x| x.is_finite()));
+        assert!(max_diff < 2e-2, "simdgroup flag path diverged from default matmul: {max_diff}");
+    }
+
+    /// Benchmark (serial, ignored): the hardware simdgroup MMA must be FASTER than the hand-rolled
+    /// fp16 tiled matmul on a large square matmul — grounding the throughput claim rather than
+    /// assuming it. Prints GFLOP/s for both and the speedup. Run:
+    /// `cargo test --release bench_matmul_simdgroup -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture (release)"]
+    fn bench_matmul_simdgroup_vs_handrolled() {
+        use std::time::Instant;
+        let ctx = test_ctx();
+        let s = 1024usize;
+        let a = Tensor::randn(&ctx, vec![s, s], 0.1);
+        let b = Tensor::randn(&ctx, vec![s, s], 0.1);
+        let a16 = a.cast_to_f16();
+        let b16 = b.cast_to_f16();
+        let out = ctx.alloc_buffer(s * s * 4);
+        let flops = 2.0 * (s as f64).powi(3);
+        let iters = 50;
+        // Warmup + time hand-rolled f16.
+        for _ in 0..5 { compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        let t0 = Instant::now();
+        for _ in 0..iters { compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        let hand = t0.elapsed().as_secs_f64() / iters as f64;
+        // Warmup + time simdgroup f16.
+        for _ in 0..5 { compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        let t1 = Instant::now();
+        for _ in 0..iters { compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        let sg = t1.elapsed().as_secs_f64() / iters as f64;
+        eprintln!("matmul {s}^3: hand-rolled f16 = {:.1} GFLOP/s ({:.3} ms), simdgroup f16 = {:.1} GFLOP/s ({:.3} ms), speedup = {:.2}x",
+            flops / hand / 1e9, hand * 1e3, flops / sg / 1e9, sg * 1e3, hand / sg);
+        assert!(sg < hand, "simdgroup MMA ({sg:.4}s) should beat hand-rolled f16 ({hand:.4}s)");
+    }
+
     // =========================================================================
     // Mega-kernel correctness: mega_ffn output must match standard FFN path
     // =========================================================================

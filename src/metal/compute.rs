@@ -119,6 +119,48 @@ pub fn gpu_matmul_bf16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c:
     dispatch_sync!(ctx, "matmul_tiled_bf16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
+/// simdgroup_matrix matmul: C = A @ B on the Apple-Silicon hardware matrix units. Full fp32
+/// precision (float fragments) — numerically matches gpu_matmul_fp32 — but uses the MMA units
+/// instead of the hand-rolled scalar-MAC tiles. 32×32 output tile per 32-thread simdgroup.
+pub fn gpu_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 32u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(32, 1, 1); // one simdgroup
+    dispatch_sync!(ctx, "matmul_simdgroup", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// C(f32) = A(f16) @ B(f16) on the hardware simdgroup MMA units — the fast drop-in for
+/// gpu_matmul_f16. Same fp16-input / fp32-output precision, MMA inner loop instead of scalar MACs.
+pub fn gpu_matmul_simdgroup_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "matmul_simdgroup_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// Global opt-in: when set, the default `Tensor::matmul` routes its f16 inner product through the
+/// hardware simdgroup MMA (`gpu_matmul_simdgroup_f16`) instead of the hand-rolled `gpu_matmul_f16`.
+/// Off by default — identical precision, so this is purely a throughput switch.
+static SIMDGROUP_MATMUL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the simdgroup MMA fast path for the default matmul. Returns the previous value.
+pub fn set_simdgroup_matmul(on: bool) -> bool {
+    SIMDGROUP_MATMUL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the simdgroup MMA fast path is currently enabled for the default matmul.
+pub fn simdgroup_matmul_enabled() -> bool {
+    SIMDGROUP_MATMUL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
 pub fn gpu_cast_f32_to_f16(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let size_buf = params_buffer(ctx, &size);

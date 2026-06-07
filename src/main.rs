@@ -161,6 +161,9 @@ struct TrainArgs {
         /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
         #[arg(long, default_value = "1.0")]
         adamw_lr_scale: f32,
+        /// Route the default fp16 matmul through the hardware simdgroup MMA units (~1.3× faster, bit-identical).
+        #[arg(long)]
+        simdgroup_matmul: bool,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
@@ -660,6 +663,7 @@ fn main() {
             per_tensor_clip,
             muon_lr_scale,
             adamw_lr_scale,
+            simdgroup_matmul,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -751,6 +755,7 @@ fn main() {
             config.per_tensor_clip = per_tensor_clip;
             config.muon_lr_scale = muon_lr_scale;
             config.adamw_lr_scale = adamw_lr_scale;
+            config.simdgroup_matmul = simdgroup_matmul;
 
             train::train(&ctx, &config).expect("Training failed");
         }
