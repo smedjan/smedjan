@@ -109,6 +109,7 @@ impl MetalContext {
         let shader_sources: &[(&str, &str)] = &[
             ("matmul_tiled", shaders::MATMUL_TILED),
             ("matmul_tiled_fp32", shaders::MATMUL_TILED_FP32),
+            ("matmul_tiled_bf16", shaders::MATMUL_TILED_BF16),
             ("matmul_tiled_trans_b", shaders::MATMUL_TILED_TRANS_B),
             ("softmax", shaders::SOFTMAX),
             ("rms_norm", shaders::RMS_NORM),

@@ -472,6 +472,42 @@ impl Tensor {
         out
     }
 
+    /// BF16 2D matmul: C = self @ other with `bfloat` shared tiles — fp32 RANGE (no ±65504 clamp,
+    /// unlike `matmul`'s fp16 path) at ~half the bandwidth of `matmul_precise`, with bf16 mantissa
+    /// precision. The range-safe mixed-precision option. Records Op::Matmul (standard backward).
+    pub fn matmul_bf16(&self, other: &Tensor) -> Tensor {
+        assert_eq!(self.shape.len(), 2, "matmul_bf16 expects 2D tensors");
+        assert_eq!(other.shape.len(), 2, "matmul_bf16 expects 2D tensors");
+        let m = self.shape[0];
+        let k = self.shape[1];
+        assert_eq!(k, other.shape[0], "matmul_bf16 inner dims: {} vs {}", k, other.shape[0]);
+        let n = other.shape[1];
+
+        let out_buf = self.ctx.alloc_buffer(m * n * 4);
+        compute::gpu_matmul_bf16(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![m, n],
+            requires_grad: self.requires_grad || other.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+        if self.requires_grad || other.requires_grad || autograd::is_recording() {
+            autograd::record(TapeEntry {
+                op: Op::Matmul,
+                inputs: vec![self.id, other.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone(), other.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone(), other.shape.clone(), out.shape.clone()],
+                cached: None,
+            });
+        }
+        out
+    }
+
     /// Matrix multiply where B (other) is detached — no gradient flows to B.
     /// Used for ReLoRA frozen base weights: forward uses them, backward skips them.
     /// Gradients still flow to self (the input activations).

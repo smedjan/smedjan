@@ -892,6 +892,44 @@ mod suite {
         });
     }
 
+    /// BF16 matmul: fp32 RANGE (no ±65504 clamp like the fp16 path) at bf16 mantissa precision.
+    #[test]
+    fn matmul_bf16_range_and_precision() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // 1) Range: a value above the fp16 max (65504) is preserved — bf16 has fp32's exponent.
+            let big = 1.0e5f32;
+            let at = Tensor::from_slice(&ctx, &[big; 32], vec![1, 32]);
+            let mut bv = vec![0.0f32; 32];
+            bv[0] = 1.0;
+            let bt = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
+            let r = at.matmul_bf16(&bt).to_vec()[0];
+            assert!((r - big).abs() < big * 0.02, "bf16 must preserve 1e5 (range): got {r}");
+
+            // 2) Precision: matches a CPU fp32 reference to ~bf16 tolerance (not exact).
+            let (m, k, n) = (24usize, 40usize, 24usize);
+            let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29).collect();
+            let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
+            let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
+            let got = at.matmul_bf16(&bt).to_vec();
+            let mut max_rel = 0.0f32;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0f32;
+                    for kk in 0..k {
+                        s += a[i * k + kk] * b[kk * n + j];
+                    }
+                    max_rel = max_rel.max((got[i * n + j] - s).abs() / (1.0 + s.abs()));
+                }
+            }
+            // bf16 has only ~7-8 mantissa bits, so accumulated relative error over k=40 is several %
+            // (here ~6%) — far looser than fp32 but the trade for fp32 range at half the bandwidth.
+            assert!(max_rel < 1e-1, "bf16 matmul should be ~bf16-accurate: max_rel={max_rel}");
+            eprintln!("bf16 matmul: max relative error vs fp32 = {max_rel:.3e}");
+        });
+    }
+
     /// The opt-in full-fp32 matmul keeps precision AND range that the default fp16-tile matmul loses.
     #[test]
     fn matmul_precise_full_fp32_no_clamp() {
