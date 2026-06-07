@@ -35,6 +35,8 @@ pub struct ModelConfig {
     pub ssm: bool,             // Use the selective state-space (Mamba-2/SSD) mixer in every block.
     pub rwkv: bool,            // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
     pub mla_latent_dim: usize, // Multi-head Latent Attention: KV latent dim d_c (0=off). 10-50× KV-cache shrink.
+    pub block_sparse_top_k: usize, // Block-sparse attention: # past blocks attended per query (0=off).
+    pub block_size: usize,     // Block-sparse attention block length (default 64).
 }
 
 /// Mixture-of-experts spec for [`ModelConfig::custom_moe`].
@@ -112,6 +114,8 @@ impl ModelConfig {
             ssm: false,
             rwkv: false,
             mla_latent_dim: 0,
+            block_sparse_top_k: 0,
+            block_size: 64,
         }
     }
 
@@ -398,6 +402,8 @@ impl TransformerBlock {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
         } else if config.mla_latent_dim > 0 {
             attn.enable_mla(ctx, config.mla_latent_dim);
+        } else if config.block_sparse_top_k > 0 {
+            attn.enable_block_sparse(config.block_sparse_top_k, config.block_size);
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
@@ -467,6 +473,8 @@ impl TransformerBlock {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
         } else if config.mla_latent_dim > 0 {
             attn.enable_mla(ctx, config.mla_latent_dim);
+        } else if config.block_sparse_top_k > 0 {
+            attn.enable_block_sparse(config.block_sparse_top_k, config.block_size);
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }

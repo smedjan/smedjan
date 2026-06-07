@@ -27,6 +27,13 @@ pub enum AttnKind {
     /// DeepSeek refinement that keeps RoPE out of the absorbed up-proj — are a documented follow-up;
     /// here RoPE is applied to reconstructed K as usual.) Requires attn_rank == 0.
     Mla,
+    /// Block-sparse attention with learned top-k block routing (MoBA / DeepSeek-NSA family — the
+    /// quality-preserving sparse attention behind subquadratic LLMs). K/V are split into blocks; each
+    /// query attends only to its own block (causally) + the top-k PAST blocks scored by
+    /// query · block-mean-key. Content-based + trainable end-to-end, so it keeps full-attention
+    /// quality at a fraction of the attended positions. Reuses the standard Q/K/V/O projections (no
+    /// new params). Full-sequence forward; uses `block_size` + `block_sparse_top_k`.
+    BlockSparse,
 }
 
 /// Multi-head attention with rotary positional encoding, KV cache, and
@@ -61,6 +68,8 @@ pub struct MultiHeadAttention {
     pub w_dkv: Tensor,          // [d_model, d_c] — MLA KV down-projection (its output is the cacheable latent)
     pub w_uk: Tensor,           // [d_c, kv_dim] — MLA key up-projection
     pub w_uv: Tensor,           // [d_c, kv_dim] — MLA value up-projection
+    pub block_size: usize,      // block-sparse attention block length (used iff BlockSparse)
+    pub block_sparse_top_k: usize, // block-sparse attention: # past blocks attended per query (iff BlockSparse)
 }
 
 /// KV cache for autoregressive inference.
@@ -188,6 +197,8 @@ impl MultiHeadAttention {
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
             mla_dc: 0,
             w_dkv: z(), w_uk: z(), w_uv: z(),
+            block_size: 64,
+            block_sparse_top_k: 0,
         }
     }
 
@@ -239,6 +250,8 @@ impl MultiHeadAttention {
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
             mla_dc: 0,
             w_dkv: z(), w_uk: z(), w_uv: z(),
+            block_size: 64,
+            block_sparse_top_k: 0,
         }
     }
 
@@ -256,6 +269,15 @@ impl MultiHeadAttention {
         self.w_uv = Tensor::randn(ctx, vec![d_c, kv_dim], up_std);
         self.mla_dc = d_c;
         self.attn_kind = AttnKind::Mla;
+    }
+
+    /// Enable block-sparse (MoBA/NSA-style) attention: each query attends to its own block + the
+    /// top-k past blocks. Reuses the existing Q/K/V/O projections (no new params).
+    pub fn enable_block_sparse(&mut self, top_k: usize, block_size: usize) {
+        assert!(top_k > 0 && block_size > 0, "block-sparse needs top_k>0 and block_size>0");
+        self.block_sparse_top_k = top_k;
+        self.block_size = block_size;
+        self.attn_kind = AttnKind::BlockSparse;
     }
 
     /// Forward pass with Grouped Query Attention support.
@@ -333,10 +355,12 @@ impl MultiHeadAttention {
         let linear = self.attn_kind == AttnKind::Linear;
         let ssm = self.attn_kind == AttnKind::Ssm;
         let rwkv = self.attn_kind == AttnKind::Rwkv;
+        let block_sparse = self.attn_kind == AttnKind::BlockSparse;
 
         // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
         // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
-        let use_gqa_strided = !linear && !ssm && !rwkv && group_size > 1 && !autograd::is_recording();
+        // Block-sparse needs the expanded K/V (block-mean + dense scores), so it's excluded too.
+        let use_gqa_strided = !linear && !ssm && !rwkv && !block_sparse && group_size > 1 && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
@@ -383,6 +407,19 @@ impl MultiHeadAttention {
             let actual_w = self.rwkv_w.exp();
             let wkv_out = crate::rwkv::wkv(&k_for_attn, &v_for_attn, &actual_w, &self.rwkv_u);
             q.silu().mul(&wkv_out)
+        } else if block_sparse {
+            assert_eq!(
+                seq_q_len, seq_k,
+                "block-sparse attention is full-sequence forward only (seq_q == seq_k)"
+            );
+            // MoBA/NSA routing: score each K block by query·block-mean-key, keep own block + top-k
+            // past blocks, mask the rest. Block scores drive selection only (not differentiated).
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let block_means = k_for_attn.block_mean_keys(self.block_size); // [bh, nb, hd], no tape
+            let block_scores = q.batched_matmul_trans_b(&block_means);     // [bh, seq, nb]
+            let scores = q.batched_matmul_trans_b(&k_for_attn).scale(scale); // [bh, seq, seq]
+            let masked = scores.block_sparse_mask(&block_scores, self.block_size, self.block_sparse_top_k);
+            masked.softmax().batched_matmul(&v_for_attn)
         } else if seq_q_len >= 2048 && !use_gqa_strided {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(

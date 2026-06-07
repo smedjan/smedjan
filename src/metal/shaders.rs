@@ -1625,6 +1625,72 @@ kernel void causal_doc_mask(
 }
 "#;
 
+/// Block-mean keys for block-sparse attention: average K over each contiguous block of positions.
+/// K:[bh, seq, hd] → out:[bh, nb, hd], out[bh,blk,d] = mean_{i in block blk} K[bh,i,d].
+pub const BLOCK_MEAN_KEYS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BMParams { uint bh; uint seq; uint hd; uint nb; uint block_size; };
+
+kernel void block_mean_keys(
+    device const float* k [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant BMParams& p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint bh = gid.z, blk = gid.y, d = gid.x;
+    if (bh >= p.bh || blk >= p.nb || d >= p.hd) return;
+    uint start = blk * p.block_size;
+    uint end = min(start + p.block_size, p.seq);
+    float s = 0.0f;
+    uint cnt = 0;
+    for (uint i = start; i < end; i++) {
+        s += k[bh * p.seq * p.hd + i * p.hd + d];
+        cnt++;
+    }
+    out[bh * p.nb * p.hd + blk * p.hd + d] = cnt > 0 ? s / (float)cnt : 0.0f;
+}
+"#;
+
+/// Top-k block-sparse attention mask (MoBA / NSA-style routing). Given per-(head,query) block scores
+/// (query · block-mean-key), mask the dense attention scores so each query attends ONLY to: its OWN
+/// block (causally), plus the top-k PAST blocks by block score. Future positions are masked too.
+/// This is the learned, content-based sparse-attention routing that keeps full-attention quality at a
+/// fraction of the attended positions — the core of subquadratic sparse attention. (This variant
+/// masks the dense O(n²) scores — correct + trainable; the true subquadratic SPEEDUP needs a gather
+/// kernel that computes only the selected blocks, a documented follow-up.)
+pub const BLOCK_SPARSE_TOPK_MASK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BSParams { uint bh; uint seq; uint nb; uint block_size; uint top_k; };
+
+kernel void block_sparse_topk_mask(
+    device float* scores [[buffer(0)]],          // [bh, seq, seq], modified in place
+    device const float* block_scores [[buffer(1)]], // [bh, seq, nb]
+    constant BSParams& p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint bh = gid.z, q = gid.y, k = gid.x;
+    if (bh >= p.bh || q >= p.seq || k >= p.seq) return;
+    uint idx = bh * p.seq * p.seq + q * p.seq + k;
+
+    if (k > q) { scores[idx] = -INFINITY; return; } // causal
+    uint qb = q / p.block_size;
+    uint kb = k / p.block_size;
+    if (kb == qb) return; // the query's own block is always attended (causal already applied)
+
+    // Past block kb < qb: selected iff its block score is among the top_k of all past blocks j<qb.
+    float my = block_scores[bh * p.seq * p.nb + q * p.nb + kb];
+    uint better = 0;
+    for (uint j = 0; j < qb; j++) {
+        if (block_scores[bh * p.seq * p.nb + q * p.nb + j] > my) better++;
+    }
+    if (better >= p.top_k) scores[idx] = -INFINITY; // outside the top-k → masked
+}
+"#;
+
 /// Gradient clipping: compute L2 norm of a flat buffer
 pub const L2_NORM: &str = r#"
 #include <metal_stdlib>

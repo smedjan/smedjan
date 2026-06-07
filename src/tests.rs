@@ -1970,6 +1970,107 @@ mod suite {
         assert!(unclipped > 1.0, "unclipped spike update should be large, got {unclipped}");
     }
 
+    /// Block-sparse routing correctness: when top_k ≥ (#past blocks), every causal block is
+    /// selectable, so block-sparse attention must reduce EXACTLY to dense causal attention.
+    #[test]
+    fn block_sparse_matches_dense_when_full() {
+        let ctx = test_ctx();
+        let (hd, seq, bsz) = (8usize, 8usize, 4usize); // nb=2
+        let nb = seq.div_ceil(bsz);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let gen = |salt: usize| -> Vec<f32> {
+            (0..seq * hd).map(|i| (((i * 5 + salt * 11) % 13) as f32 - 6.0) * 0.1).collect()
+        };
+        let q = Tensor::from_slice(&ctx, &gen(1), vec![1, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &gen(2), vec![1, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &gen(3), vec![1, seq, hd]);
+        // Block-sparse with top_k = nb (≥ any query's past-block count) → selects all causal blocks.
+        let bm = k.block_mean_keys(bsz);
+        let bs = q.batched_matmul_trans_b(&bm);
+        let sparse = q.batched_matmul_trans_b(&k).scale(scale)
+            .block_sparse_mask(&bs, bsz, nb).softmax().batched_matmul(&v).to_vec();
+        // Dense causal.
+        let dense = q.batched_matmul_trans_b(&k).scale(scale)
+            .causal_mask(0).softmax().batched_matmul(&v).to_vec();
+        let max_diff = sparse.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("block-sparse (full) vs dense: max_diff={max_diff:.6}");
+        assert!(max_diff < 1e-4, "block-sparse with full top_k must equal dense causal: {max_diff}");
+        autograd::clear_tape();
+    }
+
+    /// Block-sparse selection is content-based + causal: with top_k=1, a query attends to its OWN
+    /// block (causally) + the single highest-scoring PAST block, and masks everything else.
+    #[test]
+    fn block_sparse_selects_top_block() {
+        let ctx = test_ctx();
+        let (seq, bsz, nb) = (12usize, 4usize, 3usize);
+        let scores = Tensor::zeros(&ctx, vec![1, seq, seq]); // 0 = unmasked baseline
+        // Block scores per query position; q=8 (block 2): block0 high, block1 low.
+        let mut bs = vec![0.0f32; seq * nb];
+        for q in 0..seq { bs[q * nb] = 5.0; bs[q * nb + 1] = 1.0; bs[q * nb + 2] = 0.0; }
+        let block_scores = Tensor::from_slice(&ctx, &bs, vec![1, seq, nb]);
+        let m = scores.block_sparse_mask(&block_scores, bsz, 1).to_vec();
+        let at = |q: usize, k: usize| m[q * seq + k];
+        // q=8 (block 2, first position) with top_k=1:
+        //   block 0 (k 0..3) = top-1 past → visible (0.0)
+        //   block 1 (k 4..7) = not selected → -inf
+        //   own block 2: k=8 visible (causal), k=9..11 future → -inf
+        for k in 0..4 { assert_eq!(at(8, k), 0.0, "selected past block must be visible at k={k}"); }
+        for k in 4..8 { assert!(at(8, k).is_infinite(), "unselected block must be masked at k={k}"); }
+        assert_eq!(at(8, 8), 0.0, "own-block causal position must be visible");
+        for k in 9..12 { assert!(at(8, k).is_infinite(), "future must be masked at k={k}"); }
+        autograd::clear_tape();
+    }
+
+    /// End-to-end: a model with `AttnKind::BlockSparse` in every block forwards to finite logits,
+    /// backprops a finite grad into w_q, and trains STABLY (finite + bounded, no blow-up) — the
+    /// MoBA/NSA sparse path works through the real model + backward. Like linear_attn_model_trains_stably,
+    /// convergence *quality* of this micro weight-tied model under aggressive top_k=1 sparsity is a
+    /// training-recipe matter, not asserted here (real-data descent is shown by the training smoke).
+    #[test]
+    fn block_sparse_model_trains_stably() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let cfg = ModelConfig { block_sparse_top_k: 1, block_size: 4, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let model = Transformer::new(&ctx, cfg);
+        assert_eq!(model.blocks[0].attn.attn_kind, crate::attention::AttnKind::BlockSparse);
+        let (batch, seq_len) = (1usize, 16usize);
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 3 % 48) as u32).collect();
+        let targets: Vec<u32> = vec![5; 16];
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let mut opt = crate::optim::Muon::new(&ctx, &prefs, 0.0);
+        let wq_id = model.blocks[0].attn.w_q.id;
+        let (mut first, mut last) = (0.0f32, 0.0f32);
+        for step in 0..40 {
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            if step == 0 {
+                assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
+                assert!(logits.to_vec().iter().all(|x| x.is_finite()), "block-sparse forward non-finite");
+            }
+            let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+            let lv = loss.to_vec()[0];
+            assert!(lv.is_finite(), "block-sparse loss non-finite at step {step}");
+            if step == 0 { first = lv; }
+            last = lv;
+            autograd::backward(&ctx, loss.id);
+            if step == 0 {
+                let g = autograd::get_grad(wq_id).expect("no gradient reached block-sparse w_q");
+                let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone()).to_vec();
+                assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on block-sparse w_q");
+            }
+            autograd::clear_tape_keep_grads();
+            crate::train::clip_gradients(&ctx, &model, 1.0);
+            let lr = 1e-2 * (((step + 1) as f32) / 20.0).min(1.0);
+            opt.step(lr);
+            autograd::zero_grads_recycle();
+        }
+        eprintln!("block-sparse model: loss {first:.3} -> {last:.3}");
+        assert!(last.is_finite() && last < 30.0, "block-sparse training must stay finite + bounded (got {first:.3}->{last:.3})");
+        autograd::clear_tape();
+        autograd::zero_grads();
+    }
+
     /// Investigates the handoff's open question: is beta2=0.999 making loss WORSE a "third subtle
     /// bug", or expected behavior? Conclusion (grounded here): NOT a bug. Under a non-stationary
     /// gradient (a 100× jump), beta2=0.999's slow second-moment memory lags the new gradient scale,

@@ -188,6 +188,16 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
   **16×** KV-cache shrink measured; checkpoint format **v9** persists `mla_latent_dim`.
 - **Sequence packing** (`datapipe::pack_sequences`, `Tensor::causal_doc_mask`): block-diagonal mask;
   packed attention proven **bit-identical** (max_diff 0.0) to per-sequence — zero leakage.
+- **Block-sparse attention** (`AttnKind::BlockSparse`, `--block-sparse-top-k`/`--block-size`,
+  `src/mla.rs` sibling logic in `attention.rs`) — the quality-preserving sparse attention behind
+  subquadratic LLMs (subq.ai / MoBA / DeepSeek-NSA): each query attends to its own block + the top-k
+  PAST blocks scored by query·block-mean-key, content-based + trainable. Reuses Q/K/V/O (no new
+  params); checkpoint v10 persists top_k+block_size. Proven: bit-identical to dense when top_k≥nb
+  (max_diff 0.0), exact top-k+causal selection mask, and on REAL data a genuinely-sparse config
+  (each query attends ~3 of 8 blocks) reaches **EMA 1.56 = the dense baseline** — quality preserved at
+  a fraction of attended positions. NOTE: this masks the dense O(n²) scores (correct + trainable
+  routing); the actual subquadratic SPEEDUP needs a gather kernel that computes only selected blocks
+  (the systems follow-up — the routing/quality core, the hard conceptual part, is done).
 
 **Still genuinely open (need resources beyond unit tests, not code-blocked):**
 - **#5 root-cause the RMSNorm activation collapse itself** (the clamp treats the symptom). Needs

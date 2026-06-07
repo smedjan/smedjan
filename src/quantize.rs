@@ -429,6 +429,8 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         ssm: false,
         rwkv: false,
         mla_latent_dim: 0,
+        block_sparse_top_k: 0,
+        block_size: 64,
     })
 }
 

@@ -122,6 +122,12 @@ struct TrainArgs {
         /// MLA: Multi-head Latent Attention KV latent dim d_c. 0=off. e.g. 64 → 10-50× KV-cache shrink.
         #[arg(long, default_value = "0")]
         mla_latent_dim: usize,
+        /// Block-sparse (MoBA/NSA) attention: # past blocks each query attends. 0=off. e.g. 8.
+        #[arg(long, default_value = "0")]
+        block_sparse_top_k: usize,
+        /// Block-sparse attention block length. Default 64.
+        #[arg(long, default_value = "64")]
+        block_size: usize,
         /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
         #[arg(long, default_value = "0")]
         lowrank: usize,
@@ -648,6 +654,8 @@ fn main() {
             mup_base,
             bitnet,
             mla_latent_dim,
+            block_sparse_top_k,
+            block_size,
             lowrank,
             shared_layers,
             prune_threshold,
@@ -742,6 +750,8 @@ fn main() {
             }
             config.model_config.bitnet = bitnet;
             config.model_config.mla_latent_dim = mla_latent_dim;
+            config.model_config.block_sparse_top_k = block_sparse_top_k;
+            config.model_config.block_size = block_size;
             config.model_config.lowrank = lowrank;
             config.model_config.shared_layers = shared_layers;
             config.prune_threshold = prune_threshold;

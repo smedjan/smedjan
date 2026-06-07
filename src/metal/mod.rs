@@ -130,6 +130,8 @@ impl MetalContext {
             ("embedding_lookup", shaders::EMBEDDING_LOOKUP),
             ("causal_mask", shaders::CAUSAL_MASK),
             ("causal_doc_mask", shaders::CAUSAL_DOC_MASK),
+            ("block_mean_keys", shaders::BLOCK_MEAN_KEYS),
+            ("block_sparse_topk_mask", shaders::BLOCK_SPARSE_TOPK_MASK),
             ("l2_norm", shaders::L2_NORM),
             ("l2_norm_check", shaders::L2_NORM_CHECK),
             ("scale", shaders::SCALE),

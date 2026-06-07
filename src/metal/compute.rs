@@ -1113,6 +1113,48 @@ pub fn gpu_causal_doc_mask(
     );
 }
 
+/// Dimensions for block-mean keys: [bh, seq, hd] → [bh, nb, hd], nb = ceil(seq/block_size).
+#[derive(Clone, Copy)]
+pub struct BlockMeanDims { pub bh: u32, pub seq: u32, pub hd: u32, pub nb: u32, pub block_size: u32 }
+
+/// Block-mean keys for block-sparse attention: K[bh,seq,hd] → out[bh,nb,hd].
+pub fn gpu_block_mean_keys(ctx: &Arc<MetalContext>, k: &GpuBuffer, out: &GpuBuffer, d: BlockMeanDims) {
+    let BlockMeanDims { bh, seq, hd, nb, block_size } = d;
+    #[repr(C)]
+    struct Params { bh: u32, seq: u32, hd: u32, nb: u32, block_size: u32 }
+    let params = Params { bh, seq, hd, nb, block_size };
+    let params_buf = params_buffer(ctx, &params);
+    let total = MetalContext::size(hd as u64, nb as u64, bh as u64);
+    let tg = MetalContext::size(
+        16.min(hd as u64).max(1),
+        4.min(nb as u64).max(1),
+        4.min(bh as u64).max(1),
+    );
+    dispatch_threads_sync!(ctx, "block_mean_keys", total, tg, 0 => k, 1 => out, 2 => &params_buf);
+}
+
+/// Dimensions for the top-k block-sparse mask.
+#[derive(Clone, Copy)]
+pub struct BlockSparseDims { pub bh: u32, pub seq: u32, pub nb: u32, pub block_size: u32, pub top_k: u32 }
+
+/// Top-k block-sparse attention mask: masks dense scores[bh,seq,seq] in place to the own block +
+/// top-k past blocks per query (block_scores[bh,seq,nb]). Includes the causal mask.
+pub fn gpu_block_sparse_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, block_scores: &GpuBuffer, d: BlockSparseDims) {
+    let BlockSparseDims { bh, seq, nb, block_size, top_k } = d;
+    #[repr(C)]
+    struct Params { bh: u32, seq: u32, nb: u32, block_size: u32, top_k: u32 }
+    let params = Params { bh, seq, nb, block_size, top_k };
+    let params_buf = params_buffer(ctx, &params);
+    let total = MetalContext::size(seq as u64, seq as u64, bh as u64);
+    let tg = MetalContext::size(
+        8.min(seq as u64).max(1),
+        8.min(seq as u64).max(1),
+        4.min(bh as u64).max(1),
+    );
+    dispatch_threads_sync!(ctx, "block_sparse_topk_mask", total, tg,
+        0 => scores, 1 => block_scores, 2 => &params_buf);
+}
+
 /// Compute L2 norm. Returns the norm value (includes GPU→CPU readback).
 pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
     let output = ctx.alloc_buffer(std::mem::size_of::<f32>());
