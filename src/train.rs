@@ -341,6 +341,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         None
     };
 
+    // Resume: restore the non-AdamW optimizer's OWN state from the sidecar (the AMDT format only
+    // carries AdamW m/v). Without this, muon/hybrid/8-bit would resume with fresh momentum.
+    if let Some(ref resume_path) = config.resume_from {
+        match checkpoint::load_opt_sidecar(&format!("{resume_path}.opt"))? {
+            Some((ty, ostep, blobs)) if ty == config.optimizer_type => {
+                if let Some(o) = muon_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
+                else if let Some(o) = hybrid_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
+                else if let Some(o) = adamw8_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
+                eprintln!("Restored '{}' optimizer state from sidecar (opt step {})", ty, ostep);
+            }
+            Some((ty, _, _)) => eprintln!("[WARN] sidecar optimizer '{}' != configured '{}' — starting optimizer state fresh", ty, config.optimizer_type),
+            None => {}
+        }
+    }
+
     // Log optimizer info
     if optimizer.galore_rank > 0 {
         eprintln!("GALORE: rank={}, optimizer memory={:.1}MB (vs {:.1}MB full)",
@@ -865,6 +880,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             checkpoint::save_checkpoint(&path, &model, step)?;
             let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
+            save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
 
             // Auto-save best model based on EMA loss
             if ema_loss > 0.0 && ema_loss < best_train_loss {
@@ -902,6 +918,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     checkpoint::save_checkpoint(&path, &model, config.total_steps)?;
     let state_path = format!("{}/state_final.bin", config.checkpoint_dir);
     checkpoint::save_training_state(&state_path, &model, &optimizer, config.total_steps, total_tokens)?;
+    save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
     let total_time = start_time.elapsed().as_secs();
     let total_time_str = if total_time > 3600 {
         format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
@@ -1083,6 +1100,26 @@ fn clip_gradients_per_tensor_fused(ctx: &Arc<MetalContext>, model: &Transformer,
 pub fn clip_gradients_per_tensor(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     ctx.begin_batch();
     clip_gradients_per_tensor_fused(ctx, model, max_norm);
+}
+
+/// Write the active non-AdamW optimizer's resume sidecar (muon/hybrid/8-bit). No-op for AdamW (its
+/// state rides in the AMDT training-state file) and Sophia (no sidecar support yet).
+fn save_opt_sidecar_for(
+    state_path: &str,
+    opt_type: &str,
+    muon: &Option<crate::optim::Muon>,
+    hybrid: &Option<crate::optim::HybridOptimizer>,
+    a8: &Option<crate::optim::AdamW8bit>,
+) -> std::io::Result<()> {
+    let p = format!("{state_path}.opt");
+    if let Some(o) = muon {
+        checkpoint::save_opt_sidecar(&p, opt_type, o.step, &o.save_state_blobs())?;
+    } else if let Some(o) = hybrid {
+        checkpoint::save_opt_sidecar(&p, opt_type, o.adamw.step, &o.save_state_blobs())?;
+    } else if let Some(o) = a8 {
+        checkpoint::save_opt_sidecar(&p, opt_type, o.step, &o.save_state_blobs())?;
+    }
+    Ok(())
 }
 
 /// Standalone clip_gradients — public so SFT/DPO can use the batched implementation.

@@ -2129,6 +2129,65 @@ mod suite {
         autograd::zero_grads();
     }
 
+    /// Optimizer-state persistence for resume: muon / 8-bit / hybrid serialize their own state
+    /// (momentum, int8 moments+scales) to blobs and restore it byte-identically — so resuming a
+    /// non-AdamW run continues with its real optimizer state instead of fresh momentum.
+    #[test]
+    fn optimizer_state_blobs_roundtrip() {
+        let ctx = test_ctx();
+        // Muon: 2-D matrix (Muon path) + a 1-D norm (AdamW-fallback path with v).
+        let w2d = Tensor::randn(&ctx, vec![4, 4], 0.5);
+        let w1d = Tensor::ones(&ctx, vec![4]);
+        let mut muon = crate::optim::Muon::new(&ctx, &[&w2d, &w1d], 0.0);
+        for _ in 0..3 {
+            autograd::zero_grads();
+            let g2 = ctx.buffer_from_slice(&[0.1f32; 16]);
+            let g1 = ctx.buffer_from_slice(&[0.1f32; 4]);
+            autograd::accumulate_grad_for_test(&ctx, w2d.id, &g2, 16);
+            autograd::accumulate_grad_for_test(&ctx, w1d.id, &g1, 4);
+            muon.step(0.01);
+        }
+        let blobs = muon.save_state_blobs();
+        let mut muon2 = crate::optim::Muon::new(&ctx, &[&w2d, &w1d], 0.0);
+        muon2.load_state_blobs(muon.step, &blobs);
+        assert_eq!(muon2.step, muon.step);
+        assert_eq!(muon2.save_state_blobs(), blobs, "Muon state must round-trip byte-identically");
+
+        // 8-bit AdamW: int8 m_q/v_q + fp32 scales.
+        let wq = Tensor::randn(&ctx, vec![300], 0.3);
+        let mut q8 = crate::optim::AdamW8bit::new(&ctx, &[&wq], 0.0);
+        for _ in 0..3 {
+            autograd::zero_grads();
+            let g = ctx.buffer_from_slice(&vec![0.1f32; 300]);
+            autograd::accumulate_grad_for_test(&ctx, wq.id, &g, 300);
+            q8.step(0.01);
+        }
+        let qb = q8.save_state_blobs();
+        let mut q8b = crate::optim::AdamW8bit::new(&ctx, &[&wq], 0.0);
+        q8b.load_state_blobs(q8.step, &qb);
+        assert_eq!(q8b.save_state_blobs(), qb, "8-bit state must round-trip byte-identically");
+
+        // Hybrid: Muon (2-D) + AdamW (embeddings/norms) sub-state.
+        let model = Transformer::new(&ctx, ModelConfig::custom(48, 64, 4, 2, 2.67, 64));
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let force = model.force_adamw_param_ids();
+        let mut hyb = crate::optim::HybridOptimizer::new(&ctx, &prefs, 0.0, &force, crate::optim::AdamWHyper::default());
+        // one real backward so grads exist for all params
+        let toks: Vec<u32> = (0..8).collect();
+        let logits = model.forward(&toks, 1, 8, None, false);
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &[5u32; 8]);
+        autograd::backward(&ctx, loss.id);
+        autograd::clear_tape_keep_grads();
+        hyb.step(0.01);
+        let hb = hyb.save_state_blobs();
+        let mut hyb2 = crate::optim::HybridOptimizer::new(&ctx, &prefs, 0.0, &force, crate::optim::AdamWHyper::default());
+        hyb2.load_state_blobs(hyb.adamw.step, &hb);
+        assert_eq!(hyb2.save_state_blobs(), hb, "Hybrid state must round-trip byte-identically");
+        autograd::clear_tape();
+        autograd::zero_grads();
+    }
+
     /// Per-tensor gradient clipping bounds each tensor independently: an exploded tensor is scaled
     /// to max_norm while a healthy small-grad tensor is left UNTOUCHED — unlike global clipping,
     /// which would shrink the healthy tensor too because the offender inflates the global norm.

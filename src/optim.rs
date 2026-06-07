@@ -6,6 +6,19 @@ use objc2_metal::MTLBuffer;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Read a GPU buffer's first `byte_len` bytes (unified memory — direct, no DMA). Used to serialize
+/// optimizer state (f32 or int8) to a resume sidecar.
+fn buf_bytes(buf: &GpuBuffer, byte_len: usize) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, byte_len).to_vec() }
+}
+
+/// Write bytes into a GPU buffer (unified memory). Caller guarantees `bytes.len()` ≤ buffer size.
+fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len());
+    }
+}
+
 /// Tunable AdamW hyperparameters. Defaults are the hardened values established by the instability
 /// fix: beta2=0.95 (short second-moment memory) with eps=1e-5 (Llama's value) so the update
 /// denominator can't collapse when gradients momentarily shrink. `update_clip` bounds the
@@ -248,6 +261,27 @@ impl AdamW {
         autograd::clear_tape();
         autograd::clear_recompute_registry();
     }
+
+    /// Serialize state for resume: per param, m then v (fp32 bytes). (Sidecar form, parallel to the
+    /// AMDT format's m/v save; used when AdamW is a sub-optimizer of the hybrid.)
+    pub fn save_state_blobs(&self) -> Vec<Vec<u8>> {
+        let mut blobs = Vec::with_capacity(self.params.len() * 2);
+        for ps in &self.params {
+            blobs.push(buf_bytes(&ps.m, ps.proj_size * 4));
+            blobs.push(buf_bytes(&ps.v, ps.proj_size * 4));
+        }
+        blobs
+    }
+
+    /// Restore state from `save_state_blobs` (same order) + the step counter.
+    pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
+        assert_eq!(blobs.len(), self.params.len() * 2, "AdamW state blob count mismatch");
+        self.step = step;
+        for (i, ps) in self.params.iter().enumerate() {
+            buf_set_bytes(&ps.m, &blobs[i * 2]);
+            buf_set_bytes(&ps.v, &blobs[i * 2 + 1]);
+        }
+    }
 }
 
 /// 8-bit AdamW: the first/second moments m,v are stored as block-wise int8 (one fp32 absmax scale
@@ -364,6 +398,30 @@ impl AdamW8bit {
     pub fn zero_grad(&self) {
         autograd::clear_tape();
         autograd::clear_recompute_registry();
+    }
+
+    /// Serialize state for resume: per param, m_q + v_q (int8) then m_scale + v_scale (fp32 bytes).
+    pub fn save_state_blobs(&self) -> Vec<Vec<u8>> {
+        let mut blobs = Vec::with_capacity(self.params.len() * 4);
+        for ps in &self.params {
+            blobs.push(buf_bytes(&ps.m_q, ps.size));
+            blobs.push(buf_bytes(&ps.v_q, ps.size));
+            blobs.push(buf_bytes(&ps.m_scale, ps.n_blocks * 4));
+            blobs.push(buf_bytes(&ps.v_scale, ps.n_blocks * 4));
+        }
+        blobs
+    }
+
+    /// Restore state from `save_state_blobs` (same order) + the step counter.
+    pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
+        assert_eq!(blobs.len(), self.params.len() * 4, "8-bit AdamW state blob count mismatch");
+        self.step = step;
+        for (i, ps) in self.params.iter().enumerate() {
+            buf_set_bytes(&ps.m_q, &blobs[i * 4]);
+            buf_set_bytes(&ps.v_q, &blobs[i * 4 + 1]);
+            buf_set_bytes(&ps.m_scale, &blobs[i * 4 + 2]);
+            buf_set_bytes(&ps.v_scale, &blobs[i * 4 + 3]);
+        }
     }
 }
 
@@ -704,6 +762,34 @@ impl Muon {
             }
         }
     }
+
+    /// Serialize state for resume: per param, the momentum `m` (fp32 bytes), plus the AdamW-fallback
+    /// `v` (fp32 bytes) for the non-2-D params that use it.
+    pub fn save_state_blobs(&self) -> Vec<Vec<u8>> {
+        let mut blobs = Vec::new();
+        for ps in &self.params {
+            blobs.push(buf_bytes(&ps.m, ps.size * 4));
+            if let Some(v) = &ps.v {
+                blobs.push(buf_bytes(v, ps.size * 4));
+            }
+        }
+        blobs
+    }
+
+    /// Restore state from `save_state_blobs` (same order) + the step counter.
+    pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
+        self.step = step;
+        let mut i = 0;
+        for ps in &self.params {
+            buf_set_bytes(&ps.m, &blobs[i]);
+            i += 1;
+            if let Some(v) = &ps.v {
+                buf_set_bytes(v, &blobs[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(i, blobs.len(), "Muon state blob count mismatch");
+    }
 }
 
 /// Muon+AdamW hybrid — the canonical Muon recipe (Keller Jordan et al., Kimi K2, GLM-4.5).
@@ -771,6 +857,23 @@ impl HybridOptimizer {
     /// Number of parameters routed to each sub-optimizer (for logging / tests).
     pub fn split_counts(&self) -> (usize, usize) {
         (self.muon.params.len(), self.adamw.params.len())
+    }
+
+    /// Serialize state for resume: Muon blobs (one m per 2-D matrix) followed by AdamW blobs (m,v per
+    /// embedding/head/norm param). The Muon-portion length is exactly `muon.params.len()` (all hybrid
+    /// Muon params are 2-D, so none carry a fallback `v`), which makes the split unambiguous on load.
+    pub fn save_state_blobs(&self) -> Vec<Vec<u8>> {
+        let mut blobs = self.muon.save_state_blobs();
+        blobs.extend(self.adamw.save_state_blobs());
+        blobs
+    }
+
+    /// Restore state from `save_state_blobs` (same order) + the step counter.
+    pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
+        let muon_n = self.muon.params.len(); // 1 blob (m) per 2-D matrix
+        assert!(blobs.len() >= muon_n, "hybrid state blob count too small");
+        self.muon.load_state_blobs(step, &blobs[..muon_n]);
+        self.adamw.load_state_blobs(step, &blobs[muon_n..]);
     }
 }
 

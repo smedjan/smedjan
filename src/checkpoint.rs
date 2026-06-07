@@ -204,6 +204,56 @@ pub fn load_training_state(
     Ok((model, opt_states, step, opt_step, total_tokens))
 }
 
+/// Save a non-AdamW optimizer's state to a resume sidecar (`<state>.opt`). The main AMDT format
+/// only carries AdamW m/v; muon/hybrid/8-bit state (momentum, int8 moments+scales) goes here so
+/// resume restores it instead of restarting the optimizer fresh. Format: "AOPT" magic, opt_type
+/// (len+utf8), step, n_blobs, then each blob (len + bytes).
+pub fn save_opt_sidecar(path: &str, opt_type: &str, step: u32, blobs: &[Vec<u8>]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(b"AOPT")?;
+    let tb = opt_type.as_bytes();
+    file.write_all(&(tb.len() as u32).to_le_bytes())?;
+    file.write_all(tb)?;
+    file.write_all(&step.to_le_bytes())?;
+    file.write_all(&(blobs.len() as u32).to_le_bytes())?;
+    for b in blobs {
+        file.write_all(&(b.len() as u32).to_le_bytes())?;
+        file.write_all(b)?;
+    }
+    Ok(())
+}
+
+/// Load an optimizer-state sidecar if present. Returns (opt_type, step, blobs), or None if the file
+/// doesn't exist (back-compat: pre-sidecar checkpoints just resume the optimizer fresh).
+pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<(String, u32, Vec<Vec<u8>>)>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut buf4 = [0u8; 4];
+    file.read_exact(&mut buf4)?;
+    assert_eq!(&buf4, b"AOPT", "Not a valid AndreAI optimizer sidecar");
+    file.read_exact(&mut buf4)?;
+    let type_len = u32::from_le_bytes(buf4) as usize;
+    let mut tb = vec![0u8; type_len];
+    file.read_exact(&mut tb)?;
+    let opt_type = String::from_utf8_lossy(&tb).into_owned();
+    file.read_exact(&mut buf4)?;
+    let step = u32::from_le_bytes(buf4);
+    file.read_exact(&mut buf4)?;
+    let n_blobs = u32::from_le_bytes(buf4) as usize;
+    let mut blobs = Vec::with_capacity(n_blobs);
+    for _ in 0..n_blobs {
+        file.read_exact(&mut buf4)?;
+        let len = u32::from_le_bytes(buf4) as usize;
+        let mut b = vec![0u8; len];
+        file.read_exact(&mut b)?;
+        blobs.push(b);
+    }
+    Ok(Some((opt_type, step, blobs)))
+}
+
 /// Load model from a checkpoint file.
 pub fn load_checkpoint(
     ctx: &Arc<MetalContext>,
