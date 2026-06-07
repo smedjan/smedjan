@@ -2625,7 +2625,7 @@ mod suite {
         let ctx = test_ctx();
         let scores = Tensor::zeros(&ctx, vec![1, 4, 4]); // all 0 → unmasked entries stay 0
         let seg = ctx.buffer_from_u32_slice(&[0u32, 0, 1, 1]);
-        let m = scores.causal_doc_mask(&seg).to_vec();
+        let m = scores.causal_doc_mask(&seg, 1).to_vec();
         let at = |q: usize, k: usize| m[q * 4 + k];
         // q=0 (seg0): sees k=0; future k=1,2,3 masked.
         assert_eq!(at(0, 0), 0.0);
@@ -2664,7 +2664,7 @@ mod suite {
         let k = Tensor::from_slice(&ctx, &kd, vec![1, seq, hd]);
         let v = Tensor::from_slice(&ctx, &vd, vec![1, seq, hd]);
         let scores = q.batched_matmul_trans_b(&k).scale(scale);
-        let out_packed = scores.causal_doc_mask(&seg).softmax().batched_matmul(&v).to_vec();
+        let out_packed = scores.causal_doc_mask(&seg, 1).softmax().batched_matmul(&v).to_vec();
 
         // Separate run for segment 0 (its own causal attention).
         let run_seg = |off: usize, len: usize| -> Vec<f32> {

@@ -315,12 +315,17 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     if packed.len() != 1 || packed[0].tokens.len() != 6 || packed[0].tokens[0] != 1 || packed[0].seg_ids[3] != 1 { passed = false; }
     let seg_buf = ctx.buffer_from_u32_slice(&packed[0].seg_ids);
     let scores = crate::tensor::Tensor::zeros(ctx, vec![1, 6, 6]);
-    let masked = scores.causal_doc_mask(&seg_buf).to_vec();
+    let masked = scores.causal_doc_mask(&seg_buf, 1).to_vec();
     // position 3 (segment 1) must NOT see position 0 (segment 0): cross-segment → -inf.
     if masked[3 * 6].is_finite() { passed = false; }
     // position 3 sees position 3 (same segment, causal) → unmasked (0.0).
     if masked[3 * 6 + 3] != 0.0 { passed = false; }
     tested += 2;
+
+    // RMSNorm-backward clamp toggle exists (investigation aid for the activation-collapse fix).
+    let rc = compute::set_rmsnorm_clamp(true);
+    compute::set_rmsnorm_clamp(rc);
+    tested += 1;
 
     (tested, passed)
 }

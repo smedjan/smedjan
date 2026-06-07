@@ -223,9 +223,12 @@ pub fn save_opt_sidecar(path: &str, opt_type: &str, step: u32, blobs: &[Vec<u8>]
     Ok(())
 }
 
+/// Loaded optimizer sidecar: (opt_type, step, state blobs).
+pub type OptSidecar = (String, u32, Vec<Vec<u8>>);
+
 /// Load an optimizer-state sidecar if present. Returns (opt_type, step, blobs), or None if the file
 /// doesn't exist (back-compat: pre-sidecar checkpoints just resume the optimizer fresh).
-pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<(String, u32, Vec<Vec<u8>>)>> {
+pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<OptSidecar>> {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

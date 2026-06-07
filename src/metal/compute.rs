@@ -1122,10 +1122,11 @@ pub fn gpu_causal_doc_mask(
     seg_ids: &GpuBuffer,
     batch_heads: u32,
     seq: u32,
+    n_heads: u32,
 ) {
     #[repr(C)]
-    struct Params { batch_heads: u32, seq: u32 }
-    let params = Params { batch_heads, seq };
+    struct Params { batch_heads: u32, seq: u32, n_heads: u32 }
+    let params = Params { batch_heads, seq, n_heads };
     let params_buf = params_buffer(ctx, &params);
 
     let total = MetalContext::size(seq as u64, seq as u64, batch_heads as u64);

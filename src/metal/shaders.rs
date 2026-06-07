@@ -1743,6 +1743,7 @@ using namespace metal;
 struct DocMaskParams {
     uint batch_heads;
     uint seq;
+    uint n_heads; // seg_ids are per-batch ([batch, seq]); batch index = bh / n_heads
 };
 
 kernel void causal_doc_mask(
@@ -1756,8 +1757,9 @@ kernel void causal_doc_mask(
     uint k = gid.x;
     if (bh >= params.batch_heads || q >= params.seq || k >= params.seq) return;
 
+    uint base = (bh / params.n_heads) * params.seq;
     bool future = k > q;
-    bool cross_segment = seg_ids[q] != seg_ids[k];
+    bool cross_segment = seg_ids[base + q] != seg_ids[base + k];
     if (future || cross_segment) {
         scores[bh * params.seq * params.seq + q * params.seq + k] = -INFINITY;
     }

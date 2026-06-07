@@ -234,9 +234,16 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
 - **MLA absorbed-form incremental decode.** Training + structural part DONE (16× cache shrink, EMA
   1.56). The inference KV-cache-compression at decode (cache the latent; absorb W_uk into W_q; the
   decoupled-RoPE subtlety) is the intricate remaining piece.
-- **Sequence-packing forward integration.** `pack_sequences` + `causal_doc_mask` are DONE+tested; the
-  DataLoader→forward wiring needs either threading `seg_ids` through 64 `forward` call sites or a
-  per-batch global doc-mask — a real refactor for a modest pretraining-quality gain.
+- **Sequence-packing model integration.** The op-level pieces are DONE + verified: `pack_sequences`
+  (greedy first-fit), the per-batch `causal_doc_mask` op (matches dense, bit-identical per-document),
+  and a single forward+backward through a thread-local doc-mask is correct (embedding grad healthy,
+  finite). BUT a full model/train integration (`forward_packed` + thread-local hook + `--pack-sequences`)
+  was ATTEMPTED and REVERTED: multi-step training diverged (flat at uniform → NaN ~step 65) even though
+  each isolated forward/backward is correct. Root cause is a multi-step interaction — the seg buffer's
+  lifetime vs the deferred batched command buffer + buffer-pool recycling + the thread-local clear
+  timing (NOT the masking math, which is verified). Re-attempt with the seg buffer kept alive past
+  `flush_batch` (or threaded explicitly through the forward signature) rather than a thread-local that's
+  cleared before the deferred kernels execute.
 - **#6 full large-batch multi-hour run.** SMOKES DONE — 600-step real-corpus runs: AdamW 1.56,
   hybrid+simdgroup 1.56, 8-bit 1.56, MLA 1.56, block-sparse 1.56; bf16 diverged (→ overflow-only).
   A multi-hour large-batch run (loss curves vs baseline, throughput) is a genuine operator/time

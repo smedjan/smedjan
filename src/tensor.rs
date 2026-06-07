@@ -984,7 +984,7 @@ impl Tensor {
     /// position's segment id. Masks future AND cross-segment positions to -inf, so packed sequences
     /// don't attend across each other. Backward is passthrough (masked → 0 softmax weight → 0 grad),
     /// identical to `causal_mask`.
-    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::metal::GpuBuffer>) -> Tensor {
+    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::metal::GpuBuffer>, n_heads: usize) -> Tensor {
         assert_eq!(self.shape.len(), 3, "causal_doc_mask expects [batch_heads, seq, seq] scores");
         let batch_heads = self.shape[0];
         let seq = self.shape[1];
@@ -992,7 +992,7 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, seg_ids, batch_heads as u32, seq as u32);
+        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, seg_ids, batch_heads as u32, seq as u32, n_heads as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {
