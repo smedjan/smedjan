@@ -1087,6 +1087,32 @@ pub fn gpu_causal_mask_window(
     );
 }
 
+/// Block-diagonal causal mask for sequence packing: mask cross-segment and future positions to
+/// -inf. `seg_ids` is a u32 buffer of length `seq` (one segment id per packed position).
+pub fn gpu_causal_doc_mask(
+    ctx: &Arc<MetalContext>,
+    scores: &GpuBuffer,
+    seg_ids: &GpuBuffer,
+    batch_heads: u32,
+    seq: u32,
+) {
+    #[repr(C)]
+    struct Params { batch_heads: u32, seq: u32 }
+    let params = Params { batch_heads, seq };
+    let params_buf = params_buffer(ctx, &params);
+
+    let total = MetalContext::size(seq as u64, seq as u64, batch_heads as u64);
+    let tg = MetalContext::size(
+        8.min(seq as u64).max(1),
+        8.min(seq as u64).max(1),
+        4.min(batch_heads as u64).max(1),
+    );
+
+    dispatch_threads_sync!(ctx, "causal_doc_mask", total, tg,
+        0 => scores, 1 => seg_ids, 2 => &params_buf
+    );
+}
+
 /// Compute L2 norm. Returns the norm value (includes GPU→CPU readback).
 pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
     let output = ctx.alloc_buffer(std::mem::size_of::<f32>());

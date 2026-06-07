@@ -2338,6 +2338,91 @@ mod suite {
         autograd::zero_grads();
     }
 
+    /// Sequence packing greedily first-fits sequences into fixed rows with per-sequence segment ids
+    /// and a sentinel pad segment. Deterministic layout check.
+    #[test]
+    fn pack_sequences_greedy_layout() {
+        use crate::datapipe::{pack_sequences, PACK_PAD_SEG};
+        // lengths 3,2,4 into max_len 6: row0 = [s0(3)+s1(2)+pad(1)], row1 = [s2(4)+pad(2)].
+        let rows = pack_sequences(&[vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]], 6, 0);
+        assert_eq!(rows.len(), 2, "should pack into 2 rows");
+        assert_eq!(rows[0].tokens, vec![1, 2, 3, 4, 5, 0]);
+        assert_eq!(rows[0].seg_ids, vec![0, 0, 0, 1, 1, PACK_PAD_SEG]);
+        assert_eq!(rows[1].tokens, vec![6, 7, 8, 9, 0, 0]);
+        assert_eq!(rows[1].seg_ids, vec![0, 0, 0, 0, PACK_PAD_SEG, PACK_PAD_SEG]);
+        // Over-long sequence is truncated to max_len.
+        let trunc = pack_sequences(&[vec![1, 2, 3, 4, 5, 6, 7, 8]], 4, 0);
+        assert_eq!(trunc[0].tokens, vec![1, 2, 3, 4]);
+    }
+
+    /// The block-diagonal mask blocks BOTH future and cross-segment positions. With seg=[0,0,1,1],
+    /// a segment-1 query (q=2) must not see segment-0 keys (k=0,1) even though they are in the past.
+    #[test]
+    fn causal_doc_mask_blocks_cross_segment() {
+        let ctx = test_ctx();
+        let scores = Tensor::zeros(&ctx, vec![1, 4, 4]); // all 0 → unmasked entries stay 0
+        let seg = ctx.buffer_from_u32_slice(&[0u32, 0, 1, 1]);
+        let m = scores.causal_doc_mask(&seg).to_vec();
+        let at = |q: usize, k: usize| m[q * 4 + k];
+        // q=0 (seg0): sees k=0; future k=1,2,3 masked.
+        assert_eq!(at(0, 0), 0.0);
+        assert!(at(0, 1).is_infinite() && at(0, 1) < 0.0, "future must be -inf");
+        // q=2 (seg1): k=0,1 are PAST but cross-segment → masked; k=2 same-seg causal → 0; k=3 future.
+        assert!(at(2, 0).is_infinite(), "cross-segment past must be masked");
+        assert!(at(2, 1).is_infinite(), "cross-segment past must be masked");
+        assert_eq!(at(2, 2), 0.0, "same-segment causal must be visible");
+        assert!(at(2, 3).is_infinite(), "future must be masked");
+        // q=3 (seg1): sees k=2,3 (same seg, causal); k=0,1 cross-segment masked.
+        assert_eq!(at(3, 2), 0.0);
+        assert_eq!(at(3, 3), 0.0);
+        assert!(at(3, 0).is_infinite() && at(3, 1).is_infinite());
+    }
+
+    /// THE packing invariant: attention over a PACKED row (two sequences + block-diagonal mask) must
+    /// produce, for each segment, EXACTLY what attention over that sequence ALONE produces — no
+    /// cross-sequence leakage. This is what makes packing a free throughput win instead of a
+    /// correctness hazard.
+    #[test]
+    fn packed_attention_matches_separate() {
+        let ctx = test_ctx();
+        let hd = 8usize;
+        let (l0, l1) = (3usize, 2usize);
+        let seq = l0 + l1; // 5, packed exactly (no pad)
+        let scale = 1.0 / (hd as f32).sqrt();
+        // Deterministic q,k,v for the packed [1, seq, hd].
+        let gen = |salt: usize| -> Vec<f32> {
+            (0..seq * hd).map(|i| (((i * 7 + salt * 13) % 17) as f32 - 8.0) * 0.1).collect()
+        };
+        let (qd, kd, vd) = (gen(1), gen(2), gen(3));
+        let seg = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1]);
+
+        // Packed run: scores → block-diagonal mask → softmax → @v.
+        let q = Tensor::from_slice(&ctx, &qd, vec![1, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &kd, vec![1, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &vd, vec![1, seq, hd]);
+        let scores = q.batched_matmul_trans_b(&k).scale(scale);
+        let out_packed = scores.causal_doc_mask(&seg).softmax().batched_matmul(&v).to_vec();
+
+        // Separate run for segment 0 (its own causal attention).
+        let run_seg = |off: usize, len: usize| -> Vec<f32> {
+            let slice = |d: &[f32]| d[off * hd..(off + len) * hd].to_vec();
+            let q0 = Tensor::from_slice(&ctx, &slice(&qd), vec![1, len, hd]);
+            let k0 = Tensor::from_slice(&ctx, &slice(&kd), vec![1, len, hd]);
+            let v0 = Tensor::from_slice(&ctx, &slice(&vd), vec![1, len, hd]);
+            let s0 = q0.batched_matmul_trans_b(&k0).scale(scale);
+            s0.causal_mask(0).softmax().batched_matmul(&v0).to_vec()
+        };
+        let out0 = run_seg(0, l0);
+        let out1 = run_seg(l0, l1);
+
+        let d0 = out_packed[0..l0 * hd].iter().zip(&out0).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let d1 = out_packed[l0 * hd..seq * hd].iter().zip(&out1).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("packed-vs-separate: seg0 max_diff={d0:.5}, seg1 max_diff={d1:.5}");
+        assert!(d0 < 2e-3, "packed segment 0 leaked / differs from separate: {d0}");
+        assert!(d1 < 2e-3, "packed segment 1 leaked / differs from separate: {d1}");
+        autograd::clear_tape();
+    }
+
     // =========================================================================
     // Mega-kernel correctness: mega_ffn output must match standard FFN path
     // =========================================================================

@@ -282,6 +282,57 @@ fn compute_ngrams(text: &str, n: usize) -> HashSet<u64> {
 }
 
 /// Data mix configuration.
+/// One packed training row: `tokens` and a parallel `seg_ids` (segment id per position).
+/// Feed `seg_ids` to `Tensor::causal_doc_mask` so attention stays within each packed sequence.
+pub struct PackedRow {
+    pub tokens: Vec<u32>,
+    pub seg_ids: Vec<u32>,
+}
+
+/// Sentinel segment id for trailing padding — a segment of its own, so pad positions attend to
+/// nothing real and leak nothing into the packed sequences.
+pub const PACK_PAD_SEG: u32 = u32::MAX;
+
+/// SEQUENCE PACKING (varlen): greedily first-fit variable-length sequences into fixed-length rows of
+/// `max_len`, instead of padding one sequence per row (which wastes compute on pad tokens). Within a
+/// row, segments are numbered 0,1,2,… and the trailing pad uses `PACK_PAD_SEG`. Sequences longer
+/// than `max_len` are truncated. Returns one `PackedRow` per output row.
+pub fn pack_sequences(seqs: &[Vec<u32>], max_len: usize, pad: u32) -> Vec<PackedRow> {
+    assert!(max_len > 0, "max_len must be > 0");
+    let mut rows = Vec::new();
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut seg_ids: Vec<u32> = Vec::new();
+    let mut seg = 0u32;
+
+    let flush = |tokens: &mut Vec<u32>, seg_ids: &mut Vec<u32>, rows: &mut Vec<PackedRow>| {
+        while tokens.len() < max_len {
+            tokens.push(pad);
+            seg_ids.push(PACK_PAD_SEG);
+        }
+        rows.push(PackedRow { tokens: std::mem::take(tokens), seg_ids: std::mem::take(seg_ids) });
+    };
+
+    for seq in seqs {
+        let s: Vec<u32> = seq.iter().take(max_len).copied().collect(); // truncate over-long
+        if s.is_empty() {
+            continue;
+        }
+        if !tokens.is_empty() && tokens.len() + s.len() > max_len {
+            flush(&mut tokens, &mut seg_ids, &mut rows);
+            seg = 0;
+        }
+        for &t in &s {
+            tokens.push(t);
+            seg_ids.push(seg);
+        }
+        seg += 1;
+    }
+    if !tokens.is_empty() {
+        flush(&mut tokens, &mut seg_ids, &mut rows);
+    }
+    rows
+}
+
 pub struct DataMix {
     pub sources: Vec<DataSource>,
 }

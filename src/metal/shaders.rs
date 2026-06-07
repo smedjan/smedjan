@@ -1592,6 +1592,39 @@ kernel void causal_mask(
 }
 "#;
 
+/// Block-diagonal causal mask for SEQUENCE PACKING (varlen). When multiple short sequences are
+/// packed into one row, a token must attend only WITHIN its own segment (and causally). Given a
+/// per-position segment id, mask score[q,k] to -inf when k is in the future (k > q) OR when k and q
+/// are in different segments. Eliminates the padding waste of one-sequence-per-row at the cost of
+/// this segment check. (seq_q == seq_k; no KV-cache offset on the packed training path.)
+pub const CAUSAL_DOC_MASK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct DocMaskParams {
+    uint batch_heads;
+    uint seq;
+};
+
+kernel void causal_doc_mask(
+    device float* scores [[buffer(0)]],
+    device const uint* seg_ids [[buffer(1)]],
+    constant DocMaskParams& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint bh = gid.z;
+    uint q = gid.y;
+    uint k = gid.x;
+    if (bh >= params.batch_heads || q >= params.seq || k >= params.seq) return;
+
+    bool future = k > q;
+    bool cross_segment = seg_ids[q] != seg_ids[k];
+    if (future || cross_segment) {
+        scores[bh * params.seq * params.seq + q * params.seq + k] = -INFINITY;
+    }
+}
+"#;
+
 /// Gradient clipping: compute L2 norm of a flat buffer
 pub const L2_NORM: &str = r#"
 #include <metal_stdlib>

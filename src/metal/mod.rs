@@ -129,6 +129,7 @@ impl MetalContext {
             ("adamw_8bit_update", shaders::ADAMW_8BIT_UPDATE),
             ("embedding_lookup", shaders::EMBEDDING_LOOKUP),
             ("causal_mask", shaders::CAUSAL_MASK),
+            ("causal_doc_mask", shaders::CAUSAL_DOC_MASK),
             ("l2_norm", shaders::L2_NORM),
             ("l2_norm_check", shaders::L2_NORM_CHECK),
             ("scale", shaders::SCALE),

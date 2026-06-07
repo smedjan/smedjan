@@ -979,6 +979,43 @@ impl Tensor {
         out
     }
 
+    /// Block-diagonal causal mask for SEQUENCE PACKING. `self` is attention scores
+    /// `[batch_heads, seq, seq]`; `seg_ids` is a u32 GPU buffer of length `seq` giving each packed
+    /// position's segment id. Masks future AND cross-segment positions to -inf, so packed sequences
+    /// don't attend across each other. Backward is passthrough (masked → 0 softmax weight → 0 grad),
+    /// identical to `causal_mask`.
+    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::metal::GpuBuffer>) -> Tensor {
+        assert_eq!(self.shape.len(), 3, "causal_doc_mask expects [batch_heads, seq, seq] scores");
+        let batch_heads = self.shape[0];
+        let seq = self.shape[1];
+        assert_eq!(self.shape[2], seq, "causal_doc_mask requires seq_q == seq_k (packed training path)");
+
+        let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
+        compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
+        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, seg_ids, batch_heads as u32, seq as u32);
+
+        let out_id = autograd::next_id();
+        let out = Tensor {
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        };
+        if autograd::is_recording() {
+            autograd::record(autograd::TapeEntry {
+                op: Op::Reshape, // passthrough: gradient flows through unchanged
+                inputs: vec![self.id],
+                output: out_id,
+                input_buffers: vec![self.buffer.clone()],
+                output_buffer: out.buffer.clone(),
+                shapes: vec![self.shape.clone()],
+                cached: None,
+            });
+        }
+        out
+    }
+
     /// Fused RMSNorm + Matmul: computes rms_norm(self, weight, eps) @ b in 2 dispatches
     /// instead of 3 (norm + matmul). Eliminates the intermediate normalized buffer.
     /// self: [M, K], weight: [K], b: [K, N] → output: [M, N]
