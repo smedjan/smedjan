@@ -479,6 +479,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
         // Track the last micro-step's loss for logging
         let mut last_loss_tensor: Option<crate::tensor::Tensor> = None;
+        // Persistent loss-readout buffer (NEVER recycled — held for the whole run). The loss scalar is
+        // copied here right after backward, BEFORE clear_tape_keep_grads returns the loss buffer to the
+        // pool. At large batch the pool reuses that buffer within the step, so reading the loss tensor
+        // itself at log time gave garbage (a constant ~1.0) — the model trained fine, only the readout
+        // was wrong. The in-batch copy executes before any reuse, capturing the true loss.
+        let loss_readout = ctx.alloc_buffer(4);
 
         // === Gradient accumulation loop ===
         for _micro_step in 0..grad_accum_steps {
@@ -687,6 +693,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             autograd::backward(ctx, loss_tensor.id);
             // DON'T flush — gradient norm kernels encode into same batch below
 
+            // Capture the loss scalar into the persistent readout buffer NOW — encoded before
+            // clear_tape_keep_grads frees loss_tensor.buffer to the pool, so it executes first in the
+            // batch (correct value) even when later in-batch allocations reuse that buffer.
+            compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);
+
             // Free the tape (activations) but keep accumulated gradients
             autograd::clear_tape_keep_grads();
             autograd::clear_recompute_registry();
@@ -778,7 +789,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)
         if step % config.log_interval == 0 {
             // Read back the last micro-step's loss (scaled). Undo the scale for display.
-            let raw_loss = last_loss_tensor.as_ref().map(|t| t.to_vec()[0]).unwrap_or(0.0);
+            // Read the loss from the persistent readout buffer (the loss tensor's own buffer may have
+            // been recycled+reused within the step). last_loss_tensor stays the "did we step" flag.
+            let raw_loss = if last_loss_tensor.is_some() { MetalContext::read_buffer(&loss_readout, 1)[0] } else { 0.0 };
             let loss_val = if grad_accum_steps > 1 { raw_loss / loss_scale } else { raw_loss };
             if loss_val.is_nan() || loss_val.is_infinite() {
                 eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
