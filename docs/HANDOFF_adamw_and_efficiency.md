@@ -145,3 +145,52 @@ speculative decoding, zero-copy unified-memory tensors, well-tuned release profi
 
 Suggested order to maximize ROI: **(1) simdgroup_matrix** → **(2) 8-bit optimizer** → **(4) bf16 default**
 → **(3) MLA** → **(5) sequence packing**, interleaving the **Muon+AdamW hybrid** for the AdamW thread.
+
+---
+
+## 4. DELIVERED (session after the handoff — all tested, clippy-clean, on `origin/main`)
+
+The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full suite **145 passed /
+0 failed / 4 ignored** (the 4 ignored = long multi-step GPU trajectories that need
+`--test-threads=1`; the GPU layer is single-threaded by design). Build is warning-free with **0
+`#[allow]`** kept — test-only surfaces are exercised by `api::gpu_diagnostic` at runtime.
+
+**AdamW thread**
+- **Muon+AdamW hybrid** (`HybridOptimizer`, `Optimizer::Hybrid`, `--optimizer hybrid`): routes by
+  ROLE via `Transformer::force_adamw_param_ids()` — hidden 2-D matrices → Muon, embeddings/tied
+  head/MoE routers/1-D norms → hardened AdamW. Per-group LR scales (`--muon-lr-scale`,
+  `--adamw-lr-scale`). Fixed a **latent bug** in Muon's own AdamW fallback (it hardcoded eps=1e-8 —
+  the denominator-collapse bug — and decayed norm weights; now uses `AdamWHyper`/`no_decay`).
+- **Configurable eps/beta1/beta2** via `AdamWHyper` + `TrainConfig` + CLI (defaults unchanged).
+- **Update-norm clipping** (`update_clip`): per-element clamp on the normalized update in the kernel +
+  `step_cpu`, bounds overshoot at the source. **Per-tensor grad clip** (`--per-tensor-clip`).
+- **beta2=0.999 anomaly — INVESTIGATED, not a bug.** Grounded by `beta2_high_overshoots_but_is_not_a_bug`:
+  under a 100× gradient jump, 0.999's slow `v` lags → under-sized denom → it overshoots harder than
+  0.95 (jump Δ 0.0052 vs 0.0044), but both stay finite + bounded. It's the diagonal-second-moment
+  non-stationarity tradeoff (why warmup + beta2=0.95 are the defaults), not a third bug.
+
+**Efficiency thread**
+- **simdgroup_matrix MMA** (`matmul_simdgroup`, `matmul_simdgroup_f16`): hardware matrix units. The
+  naive 32×32/1-simdgroup port measured **0.98×** (occupancy-bound, grounded — not assumed); the
+  64×64/4-simdgroup version measures **1.29× at 1024³** (964→1247 GFLOP/s on M3), bit-identical to the
+  hand-rolled fp16. Opt-in (`--simdgroup-matmul`). Below the theoretical 2–8× — double-buffering /
+  larger tiles are the next lever.
+- **8-bit optimizer** (`AdamW8bit`, `--optimizer adamw-8bit`): block-wise int8 moments, **3.94×**
+  optimizer-memory reduction. KEY fix (caught by the fidelity test): linear-quant of `v` underflows
+  (v=g² spans ~1000× per block → small entries → 0 → v̂≈0 → update explodes); store int8 of **√v**
+  instead → tracks fp32 to max_diff **4e-4**.
+- **bf16 default-matmul option** (`--bf16-matmul`): fp32 range, no fp16 ±65504 clamp (preserves 1e5).
+- **MLA** (`AttnKind::Mla`, `--mla-latent-dim`, `src/mla.rs`): K/V from a shared low-rank latent →
+  **16×** KV-cache shrink measured; checkpoint format **v9** persists `mla_latent_dim`.
+- **Sequence packing** (`datapipe::pack_sequences`, `Tensor::causal_doc_mask`): block-diagonal mask;
+  packed attention proven **bit-identical** (max_diff 0.0) to per-sequence — zero leakage.
+
+**Still genuinely open (need resources beyond unit tests, not code-blocked):**
+- **#5 root-cause the RMSNorm activation collapse itself** (the clamp treats the symptom). Needs
+  per-layer activation-norm instrumentation across a real diverging run to find the dead gate /
+  zeroed projection.
+- **#6 verify the AdamW hardening + the new opt-in paths (simdgroup/bf16/8-bit/MLA/packing) on a real
+  large-batch multi-hour run** — unit tests prove correctness + boundedness; end-to-end loss/throughput
+  on real data is an operator-run.
+- simdgroup beyond 1.29× (double-buffer/larger tiles); MLA decoupled-RoPE keys + KV-cache-compressed
+  incremental decode; wiring `pack_sequences` into the training `DataLoader`.

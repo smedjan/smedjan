@@ -1970,6 +1970,63 @@ mod suite {
         assert!(unclipped > 1.0, "unclipped spike update should be large, got {unclipped}");
     }
 
+    /// Investigates the handoff's open question: is beta2=0.999 making loss WORSE a "third subtle
+    /// bug", or expected behavior? Conclusion (grounded here): NOT a bug. Under a non-stationary
+    /// gradient (a 100× jump), beta2=0.999's slow second-moment memory lags the new gradient scale,
+    /// so its denominator √v̂ is under-sized right after the jump → it OVERSHOOTS (larger step) vs
+    /// beta2=0.95, which adapts in a few steps. Both stay finite and bounded — no NaN/explosion, no
+    /// bias-correction bug. The instability is the diagonal-second-moment non-stationarity tradeoff,
+    /// which is exactly why warmup + beta2=0.95 (the hardened default) are used.
+    #[test]
+    fn beta2_high_overshoots_but_is_not_a_bug() {
+        let ctx = test_ctx();
+        let n = 64usize;
+        let run = |beta2: f32| -> (f32, f32, bool) {
+            let w = Tensor::zeros(&ctx, vec![n]);
+            let mut opt = crate::optim::AdamW::new_with_config(
+                &ctx, &[&w], 0.0, 0,
+                crate::optim::AdamWHyper { beta1: 0.9, beta2, eps: 1e-5, update_clip: 0.0 },
+            );
+            let small = ctx.buffer_from_slice(&vec![0.01f32; n]);
+            let big = ctx.buffer_from_slice(&vec![1.0f32; n]); // 100× jump
+            let mut all_finite = true;
+            // 15 small-gradient steps: let v settle to the small scale.
+            for _ in 0..15 {
+                autograd::zero_grads();
+                let g = ctx.buffer_from_slice(&[0.01f32; 64]);
+                autograd::accumulate_grad_for_test(&ctx, w.id, &g, n);
+                opt.step(0.01);
+            }
+            let before_jump = w.to_vec()[0];
+            // The jump step: param movement here reveals the overshoot.
+            autograd::zero_grads();
+            autograd::accumulate_grad_for_test(&ctx, w.id, &big, n);
+            opt.step(0.01);
+            let jump_step = (w.to_vec()[0] - before_jump).abs();
+            // 15 more large-gradient steps.
+            for _ in 0..15 {
+                autograd::zero_grads();
+                let g = ctx.buffer_from_slice(&[1.0f32; 64]);
+                autograd::accumulate_grad_for_test(&ctx, w.id, &g, n);
+                opt.step(0.01);
+                if w.to_vec().iter().any(|x| !x.is_finite()) { all_finite = false; }
+            }
+            let total = w.to_vec()[0].abs();
+            let _ = small;
+            autograd::zero_grads();
+            (jump_step, total, all_finite)
+        };
+        let (jump95, total95, fin95) = run(0.95);
+        let (jump999, total999, fin999) = run(0.999);
+        eprintln!("beta2=0.95:  jump-step Δ={jump95:.5}, total |w|={total95:.4}, finite={fin95}");
+        eprintln!("beta2=0.999: jump-step Δ={jump999:.5}, total |w|={total999:.4}, finite={fin999}");
+        // The key finding: NO bug — both stay finite and bounded across the non-stationary jump.
+        assert!(fin95 && fin999, "AdamW went non-finite — that WOULD be a bug");
+        assert!(total95 < 100.0 && total999 < 100.0, "AdamW must stay bounded (no explosion)");
+        // The mechanism: beta2=0.999 overshoots harder on the jump (lagging v → under-sized denom).
+        assert!(jump999 >= jump95, "beta2=0.999 should overshoot ≥ beta2=0.95 on the gradient jump (jump999={jump999}, jump95={jump95})");
+    }
+
     /// Regression for the latent Muon-fallback bug: the AdamW path for non-2-D params used to
     /// hardcode eps=1e-8 (the denominator-collapse bug fixed elsewhere) and apply weight decay to
     /// norm weights. A 1-D norm at 1.0 with a large weight_decay and ZERO gradient must stay at 1.0
