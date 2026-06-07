@@ -683,6 +683,8 @@ pub struct AdamWHyperparams {
     pub eps: f32,
     pub weight_decay: f32,
     pub step: u32,
+    /// Per-element ceiling on the normalized update |m_hat/(sqrt(v_hat)+eps)|. 0 = disabled.
+    pub update_clip: f32,
 }
 
 /// AdamW fused update.
@@ -695,7 +697,7 @@ pub fn gpu_adamw_update(
     size: u32,
     hp: &AdamWHyperparams,
 ) {
-    let AdamWHyperparams { lr, beta1, beta2, eps, weight_decay, step } = *hp;
+    let AdamWHyperparams { lr, beta1, beta2, eps, weight_decay, step, update_clip } = *hp;
     #[repr(C)]
     struct Params {
         size: u32,
@@ -706,6 +708,7 @@ pub fn gpu_adamw_update(
         weight_decay: f32,
         bias_correction1: f32,
         bias_correction2: f32,
+        update_clip: f32,
     }
     let params = Params {
         size,
@@ -716,6 +719,7 @@ pub fn gpu_adamw_update(
         weight_decay,
         bias_correction1: 1.0 - beta1.powi(step as i32),
         bias_correction2: 1.0 - beta2.powi(step as i32),
+        update_clip,
     };
     let params_buf = params_buffer(ctx, &params);
 

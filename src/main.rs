@@ -136,9 +136,31 @@ struct TrainArgs {
         /// Speculative threshold: skip if reference loss < this value. Default: 7.0
         #[arg(long, default_value = "7.0")]
         speculative_threshold: f32,
-        /// Optimizer: "adamw" or "sophia". Default: adamw
+        /// Optimizer: "adamw", "sophia", "muon", or "hybrid" (Muon for 2-D matrices + AdamW for
+        /// embeddings/head/routers/norms — the canonical Muon recipe). Default: adamw
         #[arg(long, default_value = "adamw")]
         optimizer: String,
+        /// AdamW first-moment decay (beta1). Default: 0.9
+        #[arg(long, default_value = "0.9")]
+        adamw_beta1: f32,
+        /// AdamW second-moment decay (beta2). Default: 0.95 (short memory, pairs with eps=1e-5)
+        #[arg(long, default_value = "0.95")]
+        adamw_beta2: f32,
+        /// AdamW epsilon (update-denominator floor). Default: 1e-5 (the hardened value)
+        #[arg(long, default_value = "0.00001")]
+        adamw_eps: f32,
+        /// Per-element clip on the normalized AdamW update m̂/(√v̂+ε). 0=off. Try 10 to catch spikes.
+        #[arg(long, default_value = "0.0")]
+        update_clip: f32,
+        /// Clip gradients per-tensor (each to max_grad_norm) instead of by global norm.
+        #[arg(long)]
+        per_tensor_clip: bool,
+        /// Hybrid optimizer: LR multiplier for the Muon (hidden-matrix) group. Default 1.0.
+        #[arg(long, default_value = "1.0")]
+        muon_lr_scale: f32,
+        /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
+        #[arg(long, default_value = "1.0")]
+        adamw_lr_scale: f32,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
@@ -631,6 +653,13 @@ fn main() {
             fused_ce,
             freeze_fraction,
             pretrained,
+            adamw_beta1,
+            adamw_beta2,
+            adamw_eps,
+            update_clip,
+            per_tensor_clip,
+            muon_lr_scale,
+            adamw_lr_scale,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -715,6 +744,13 @@ fn main() {
             config.fused_ce = fused_ce;
             config.freeze_fraction = freeze_fraction;
             config.pretrained = pretrained;
+            config.adamw_beta1 = adamw_beta1;
+            config.adamw_beta2 = adamw_beta2;
+            config.adamw_eps = adamw_eps;
+            config.update_clip = update_clip;
+            config.per_tensor_clip = per_tensor_clip;
+            config.muon_lr_scale = muon_lr_scale;
+            config.adamw_lr_scale = adamw_lr_scale;
 
             train::train(&ctx, &config).expect("Training failed");
         }

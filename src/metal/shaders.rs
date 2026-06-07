@@ -1227,6 +1227,7 @@ struct AdamWParams {
     float weight_decay;
     float bias_correction1;  // 1 - beta1^t
     float bias_correction2;  // 1 - beta2^t
+    float update_clip;       // per-element ceiling on |m_hat/(sqrt(v_hat)+eps)|; 0 = disabled
 };
 
 kernel void adamw_update(
@@ -1249,9 +1250,17 @@ kernel void adamw_update(
     float m_hat = m_val / params.bias_correction1;
     float v_hat = v_val / params.bias_correction2;
 
+    // Normalized Adam update. In steady state |update| ~ 1; when v_hat collapses (the
+    // beta2-short-memory instability) it spikes to 1e3+. update_clip bounds it at the source —
+    // more principled than the post-normalization global grad clip, which lets one exploded
+    // component dominate the *direction*. 0 = disabled (exact back-compat).
+    float update = m_hat / (sqrt(v_hat) + params.eps);
+    if (params.update_clip > 0.0f) {
+        update = clamp(update, -params.update_clip, params.update_clip);
+    }
+
     // Weight decay applied to param directly (decoupled), then Adam step
-    param[gid] = param[gid] * (1.0f - params.lr * params.weight_decay)
-                 - params.lr * m_hat / (sqrt(v_hat) + params.eps);
+    param[gid] = param[gid] * (1.0f - params.lr * params.weight_decay) - params.lr * update;
 }
 "#;
 

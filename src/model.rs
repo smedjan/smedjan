@@ -1231,6 +1231,31 @@ impl Transformer {
         params
     }
 
+    /// Tensor IDs that the Muon+AdamW hybrid must route to AdamW even though they are 2-D.
+    /// The canonical Muon recipe (Keller Jordan et al.) orthogonalizes only the *hidden* 2-D weight
+    /// matrices (attention/FFN projections); embeddings, the tied LM head, and MoE routers are
+    /// 2-D in shape but are NOT hidden transforms — orthogonalizing them is the known
+    /// "embedding/head pathology" Muon suffers. Those go to AdamW. (1-D norms/biases are routed to
+    /// AdamW by shape and need no entry here.)
+    pub fn force_adamw_param_ids(&self) -> std::collections::HashSet<usize> {
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(self.embedding.id); // embedding + weight-tied LM head
+        if self.embed_rank > 0 {
+            ids.insert(self.embed_proj.id); // factored-embedding projection
+        }
+        let blocks = if self.config.shared_layers && !self.blocks.is_empty() {
+            &self.blocks[..1]
+        } else {
+            &self.blocks[..]
+        };
+        for b in blocks {
+            if b.n_experts > 1 {
+                ids.insert(b.router_weight.id); // MoE router is a classifier, not a hidden transform
+            }
+        }
+        ids
+    }
+
     /// Get all frozen base weight tensors (for ReLoRA checkpoint save/load).
     /// These are NOT in parameters() and don't get optimizer states.
     pub fn base_parameters(&self) -> Vec<&Tensor> {

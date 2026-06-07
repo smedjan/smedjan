@@ -82,6 +82,36 @@ pub struct TrainConfig {
     /// Load a pretrained model checkpoint (weights only, fresh optimizer).
     /// Used for progressive training: grow a small model, then continue training the larger one.
     pub pretrained: Option<String>,
+    /// AdamW first-moment decay. Default 0.9.
+    pub adamw_beta1: f32,
+    /// AdamW second-moment decay. Default 0.95 (short memory — pairs with eps=1e-5).
+    pub adamw_beta2: f32,
+    /// AdamW epsilon (update-denominator floor). Default 1e-5 (the hardened value).
+    pub adamw_eps: f32,
+    /// Per-element clip on the normalized AdamW update m̂/(√v̂+ε). 0 = disabled (default).
+    /// Bounds overshoot at the source; in healthy training |update|≈1 so a value like 10 never
+    /// triggers but catches denominator-collapse spikes.
+    pub update_clip: f32,
+    /// Clip gradients per-tensor (each tensor to its own max_grad_norm) instead of by global norm.
+    /// A single exploded tensor then can't corrupt the clipped direction of all the others.
+    pub per_tensor_clip: bool,
+    /// Hybrid optimizer: LR multiplier for the Muon (hidden-matrix) group. Default 1.0. The
+    /// canonical recipe drives Muon harder than AdamW (try ~5–60× depending on base lr).
+    pub muon_lr_scale: f32,
+    /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
+    pub adamw_lr_scale: f32,
+}
+
+impl TrainConfig {
+    /// Bundle the AdamW hyperparameters for optimizer construction.
+    pub fn adamw_hyper(&self) -> crate::optim::AdamWHyper {
+        crate::optim::AdamWHyper {
+            beta1: self.adamw_beta1,
+            beta2: self.adamw_beta2,
+            eps: self.adamw_eps,
+            update_clip: self.update_clip,
+        }
+    }
 }
 
 impl TrainConfig {
@@ -123,6 +153,13 @@ impl TrainConfig {
             fused_ce: false,
             freeze_fraction: 0.0,
             pretrained: None,
+            adamw_beta1: 0.9,
+            adamw_beta2: 0.95,
+            adamw_eps: 1e-5,
+            update_clip: 0.0,
+            per_tensor_clip: false,
+            muon_lr_scale: 1.0,
+            adamw_lr_scale: 1.0,
         }
     }
 }
@@ -188,7 +225,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.config.n_layers, model.config.d_model, model.config.n_heads
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let mut optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
+        let mut optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
         optimizer.load_state(&opt_states, opt_step);
         // Resume from step+1 — the checkpoint was saved AFTER step completed
         let resume_step = step + 1;
@@ -205,12 +242,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.config.n_layers, model.config.d_model, model.config.n_heads, step
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
+        let optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let optimizer = AdamW::new_with_galore(ctx, &param_refs, config.weight_decay, config.galore_rank);
+        let optimizer = AdamW::new_with_config(ctx, &param_refs, config.weight_decay, config.galore_rank, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     };
 
@@ -229,7 +266,26 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let n_2d = param_refs.iter().filter(|p| p.shape.len() == 2 && p.shape[0] > 1 && p.shape[1] > 1).count();
         eprintln!("  {}/{} params use Muon (2D), rest use AdamW fallback", n_2d, param_refs.len());
-        Some(crate::optim::Muon::new(ctx, &param_refs, config.weight_decay))
+        let mut m = crate::optim::Muon::new(ctx, &param_refs, config.weight_decay);
+        m.adamw_hyper = config.adamw_hyper();
+        Some(m)
+    } else {
+        None
+    };
+
+    // Create Muon+AdamW hybrid if selected — Muon for hidden 2-D matrices, hardened AdamW for
+    // embeddings/head/routers/norms (the canonical recipe; routes by role, not just by shape).
+    let mut hybrid_opt = if config.optimizer_type == "hybrid" || config.optimizer_type == "muon-adamw" {
+        let param_refs: Vec<&_> = model.parameters().into_iter().collect();
+        let force_adamw = model.force_adamw_param_ids();
+        let mut h = crate::optim::HybridOptimizer::new(
+            ctx, &param_refs, config.weight_decay, &force_adamw, config.adamw_hyper(),
+        );
+        h.set_lr_scales(config.muon_lr_scale, config.adamw_lr_scale);
+        let (n_muon, n_adamw) = h.split_counts();
+        eprintln!("Using Muon+AdamW hybrid: {} matrices on Muon (lr×{}), {} params on AdamW (embeddings/head/routers/norms, lr×{})",
+            n_muon, config.muon_lr_scale, n_adamw, config.adamw_lr_scale);
+        Some(h)
     } else {
         None
     };
@@ -593,11 +649,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
 
         // Gradient clipping: norm computation fused into same batch as backward.
-        clip_gradients_fused(ctx, &model, config.max_grad_norm);
+        if config.per_tensor_clip {
+            clip_gradients_per_tensor_fused(ctx, &model, config.max_grad_norm);
+        } else {
+            clip_gradients_fused(ctx, &model, config.max_grad_norm);
+        }
 
         // Optimizer step: GPU (default) or CPU (Apple Silicon zero-copy)
         if lr > 1e-10 {
-            if let Some(ref mut muon) = muon_opt {
+            if let Some(ref mut hybrid) = hybrid_opt {
+                ctx.begin_batch();
+                hybrid.step(lr);
+            } else if let Some(ref mut muon) = muon_opt {
                 ctx.begin_batch();
                 muon.step(lr);
             } else if let Some(ref mut soph) = sophia_opt {
@@ -895,6 +958,77 @@ fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: 
         }
         ctx.flush_batch();
     }
+}
+
+/// Clip gradients PER-TENSOR by L2 norm (each tensor independently to `max_norm`), instead of by
+/// one global norm. Rationale: under global clipping a single exploded tensor inflates the global
+/// norm and so shrinks *every* tensor's update — corrupting the clipped direction for all the
+/// healthy tensors. Per-tensor clipping bounds the offender alone and leaves the rest untouched.
+/// Fused: expects a command batch already open (from backward); 1 sync for backward+norms.
+fn clip_gradients_per_tensor_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
+    let params = model.parameters();
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+
+    for param in &params {
+        if let Some(grad) = autograd::get_grad(param.id) {
+            let norm_out = ctx.alloc_buffer(std::mem::size_of::<f32>() * 2);
+            compute::gpu_l2_norm_check_into(ctx, &grad, param.numel() as u32, &norm_out);
+            norm_bufs.push(Some((norm_out, param.numel())));
+        } else {
+            norm_bufs.push(None);
+        }
+    }
+    ctx.flush_batch(); // Single flush: backward + norms
+
+    // Decide per-tensor: zero if NaN/Inf, else scale by max_norm/norm when over the cap.
+    let mut nan_count = 0usize;
+    let mut scales: Vec<Option<f32>> = Vec::with_capacity(params.len());
+    for entry in &norm_bufs {
+        match entry {
+            Some((norm_buf, _)) => {
+                let vals = MetalContext::read_buffer(norm_buf, 2);
+                let sum_sq = vals[0];
+                let has_nan = vals[1] > 0.5;
+                if has_nan || !sum_sq.is_finite() {
+                    nan_count += 1;
+                    scales.push(Some(0.0)); // zero this tensor's grad
+                } else {
+                    let norm = sum_sq.sqrt();
+                    if norm > max_norm && norm.is_finite() {
+                        scales.push(Some(max_norm / (norm + 1e-6)));
+                    } else {
+                        scales.push(None); // leave untouched
+                    }
+                }
+            }
+            None => scales.push(None),
+        }
+    }
+    if nan_count > 0 {
+        eprintln!("[WARN] NaN/Inf detected in {} gradient(s) — zeroing affected gradients (per-tensor clip)", nan_count);
+    }
+
+    let any = scales.iter().any(|s| s.is_some());
+    if any {
+        ctx.begin_batch();
+        for (param, scale) in params.iter().zip(scales.iter()) {
+            if let (Some(s), Some(grad)) = (scale, autograd::get_grad(param.id)) {
+                if *s == 0.0 {
+                    compute::gpu_fill(ctx, &grad, param.numel() as u32, 0.0);
+                } else {
+                    compute::gpu_scale(ctx, &grad, param.numel() as u32, *s);
+                }
+            }
+        }
+        ctx.flush_batch();
+    }
+}
+
+/// Standalone per-tensor gradient clip — public for SFT/DPO and tests. Opens the command batch
+/// the fused body expects, then clips each tensor independently to `max_norm`.
+pub fn clip_gradients_per_tensor(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
+    ctx.begin_batch();
+    clip_gradients_per_tensor_fused(ctx, model, max_norm);
 }
 
 /// Standalone clip_gradients — public so SFT/DPO can use the batched implementation.

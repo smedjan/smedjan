@@ -3,7 +3,26 @@ use crate::metal::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
 use objc2::rc::Retained;
 use objc2_metal::MTLBuffer;
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Tunable AdamW hyperparameters. Defaults are the hardened values established by the instability
+/// fix: beta2=0.95 (short second-moment memory) with eps=1e-5 (Llama's value) so the update
+/// denominator can't collapse when gradients momentarily shrink. `update_clip` bounds the
+/// normalized per-element update at the source (0 = disabled).
+#[derive(Clone, Copy, Debug)]
+pub struct AdamWHyper {
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub update_clip: f32,
+}
+
+impl Default for AdamWHyper {
+    fn default() -> Self {
+        Self { beta1: 0.9, beta2: 0.95, eps: 1e-5, update_clip: 0.0 }
+    }
+}
 
 /// AdamW optimizer with decoupled weight decay.
 /// Supports GALORE: gradient low-rank projection for memory savings.
@@ -12,6 +31,8 @@ pub struct AdamW {
     pub beta1: f32,
     pub beta2: f32,
     pub eps: f32,
+    /// Per-element ceiling on the normalized update m_hat/(sqrt(v_hat)+eps); 0 = disabled.
+    pub update_clip: f32,
     pub weight_decay: f32,
     pub step: u32,
     pub galore_rank: usize, // 0 = disabled, >0 = project grads to this rank
@@ -35,6 +56,17 @@ impl AdamW {
     }
 
     pub fn new_with_galore(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, galore_rank: usize) -> Self {
+        Self::new_with_config(ctx, params, weight_decay, galore_rank, AdamWHyper::default())
+    }
+
+    /// Construct AdamW with explicit hyperparameters (betas/eps/update_clip).
+    pub fn new_with_config(
+        ctx: &Arc<MetalContext>,
+        params: &[&Tensor],
+        weight_decay: f32,
+        galore_rank: usize,
+        hyper: AdamWHyper,
+    ) -> Self {
         assert!(
             galore_rank == 0,
             "GALORE (galore_rank={}) is not yet implemented. The current code allocates \
@@ -80,14 +112,16 @@ impl AdamW {
 
         Self {
             params: param_states,
-            beta1: 0.9,
             // eps floors the update denominator sqrt(v_hat)+eps. With beta2=0.95 (short second-moment
             // memory) the running variance v collapses fast when gradients momentarily shrink; at the
             // old eps=1e-8 the denominator then collapsed too, producing huge/oscillating updates that
-            // wandered and (with a degenerate RMSNorm row) diverged. 1e-5 (Llama's value) floors it —
-            // negligible when gradients are healthy (sqrt(v_hat) >> eps), stabilising when they aren't.
-            beta2: 0.95,
-            eps: 1e-5,
+            // wandered and (with a degenerate RMSNorm row) diverged. 1e-5 (Llama's value, the default)
+            // floors it — negligible when gradients are healthy (sqrt(v_hat) >> eps), stabilising when
+            // they aren't. Configurable via AdamWHyper.
+            beta1: hyper.beta1,
+            beta2: hyper.beta2,
+            eps: hyper.eps,
+            update_clip: hyper.update_clip,
             weight_decay,
             step: 0,
             galore_rank,
@@ -142,6 +176,7 @@ impl AdamW {
                     eps: self.eps,
                     weight_decay: if ps.no_decay { 0.0 } else { self.weight_decay },
                     step: self.step,
+                    update_clip: self.update_clip,
                 },
             );
         }
@@ -180,10 +215,13 @@ impl AdamW {
                     let m_hat = m_val / bc1;
                     let v_hat = v_val / bc2;
 
+                    let mut update = m_hat / (v_hat.sqrt() + self.eps);
+                    if self.update_clip > 0.0 {
+                        update = update.clamp(-self.update_clip, self.update_clip);
+                    }
                     let wd = if ps.no_decay { 0.0 } else { self.weight_decay };
                     let p = *param_ptr.add(i);
-                    *param_ptr.add(i) = p * (1.0 - lr * wd)
-                        - lr * m_hat / (v_hat.sqrt() + self.eps);
+                    *param_ptr.add(i) = p * (1.0 - lr * wd) - lr * update;
                 }
             }
         }
@@ -417,6 +455,10 @@ pub struct Muon {
     pub weight_decay: f32,
     pub ns_steps: usize,    // Newton-Schulz iterations (5-7)
     pub step: u32,
+    /// AdamW-fallback hyperparameters for the non-2-D params (norms/biases). eps defaults to the
+    /// hardened 1e-5 — the old hardcoded 1e-8 here was the same denominator-collapse bug that was
+    /// fixed in the standalone AdamW but had been left latent on this fallback path.
+    pub adamw_hyper: AdamWHyper,
     ctx: Arc<MetalContext>,
 }
 
@@ -427,6 +469,7 @@ pub struct MuonState {
     pub shape: Vec<usize>,
     pub m: Retained<GpuBuffer>,    // momentum buffer
     pub is_2d: bool,               // true = Muon update, false = AdamW fallback
+    pub no_decay: bool,            // AdamW fallback: skip weight decay for 1-D norms/biases
     // AdamW fallback state for non-2D params
     pub v: Option<Retained<GpuBuffer>>,
     // Pre-allocated Newton-Schulz workspace (avoids ~100 allocs per 2D param per step)
@@ -459,7 +502,7 @@ impl Muon {
             } else { (None, None, None) };
             MuonState {
                 tensor_id: t.id, buffer: t.buffer.clone(), size,
-                shape: t.shape.clone(), m, is_2d, v,
+                shape: t.shape.clone(), m, is_2d, no_decay: t.shape.len() <= 1, v,
                 ns_x, ns_xxt, ns_xxtx,
             }
         }).collect();
@@ -470,15 +513,13 @@ impl Muon {
             weight_decay,
             ns_steps: 5,
             step: 0,
+            adamw_hyper: AdamWHyper::default(),
             ctx: Arc::clone(ctx),
         }
     }
 
     pub fn step(&mut self, lr: f32) {
         self.step += 1;
-        let beta1_adam = 0.9f32;
-        let beta2_adam = 0.95f32;
-        let eps_adam = 1e-8f32;
 
         for ps in &self.params {
             let grad = autograd::get_grad(ps.tensor_id);
@@ -526,18 +567,93 @@ impl Muon {
                 }
                 compute::gpu_axpy(&self.ctx, &ps.buffer, x_buf, size, -lr);
             } else {
-                // AdamW fallback for 1D params (norms, biases, embeddings)
+                // AdamW fallback for non-2-D params (norms, biases). Uses the hardened eps (1e-5)
+                // and respects no_decay so norm weights aren't decayed toward zero — matching the
+                // standalone AdamW exactly (the old path hardcoded eps=1e-8 + decayed norms).
                 let v_buf = ps.v.as_ref().unwrap();
                 compute::gpu_adamw_update(
                     &self.ctx, &ps.buffer, &grad, &ps.m, v_buf,
                     ps.size as u32,
                     &compute::AdamWHyperparams {
-                        lr, beta1: beta1_adam, beta2: beta2_adam, eps: eps_adam,
-                        weight_decay: self.weight_decay, step: self.step,
+                        lr,
+                        beta1: self.adamw_hyper.beta1,
+                        beta2: self.adamw_hyper.beta2,
+                        eps: self.adamw_hyper.eps,
+                        weight_decay: if ps.no_decay { 0.0 } else { self.weight_decay },
+                        step: self.step,
+                        update_clip: self.adamw_hyper.update_clip,
                     },
                 );
             }
         }
+    }
+}
+
+/// Muon+AdamW hybrid — the canonical Muon recipe (Keller Jordan et al., Kimi K2, GLM-4.5).
+///
+/// Muon's full-batch speed comes from orthogonalizing the *hidden* 2-D weight matrices
+/// (attention/FFN projections) via Newton-Schulz; but applying it to embeddings, the tied LM head,
+/// MoE routers, and 1-D norms/biases is its well-known pathology. The hybrid routes each parameter
+/// by role: true hidden 2-D matrices → Muon, everything else → the hardened AdamW (eps=1e-5,
+/// no_decay for norms). This gets Muon's speed without the embedding/norm degradation, and it is
+/// strictly better than the half-baked AdamW fallback that lived inside `Muon` (which still
+/// orthogonalized embeddings because they are 2-D in shape).
+pub struct HybridOptimizer {
+    pub muon: Muon,   // hidden 2-D weight matrices
+    pub adamw: AdamW, // embeddings, tied head, routers, all 1-D norms/biases
+    /// Per-group LR multipliers on the base lr passed to `step`. The canonical recipe drives the
+    /// orthogonalized Muon group harder than the AdamW group (e.g. Muon ~2e-2, AdamW ~few e-3): the
+    /// AdamW group includes embeddings/the tied head, which oscillate if driven at Muon's LR.
+    pub muon_lr_scale: f32,
+    pub adamw_lr_scale: f32,
+}
+
+impl HybridOptimizer {
+    /// Partition `params` by role. A parameter goes to Muon iff it is a 2-D matrix (both dims > 1)
+    /// AND is not in `force_adamw_ids` (embeddings/head/routers — see
+    /// `Transformer::force_adamw_param_ids`). Everything else (1-D and the forced set) goes to AdamW.
+    pub fn new(
+        ctx: &Arc<MetalContext>,
+        params: &[&Tensor],
+        weight_decay: f32,
+        force_adamw_ids: &HashSet<usize>,
+        hyper: AdamWHyper,
+    ) -> Self {
+        let mut muon_params: Vec<&Tensor> = Vec::new();
+        let mut adamw_params: Vec<&Tensor> = Vec::new();
+        for &t in params {
+            let is_matrix = t.shape.len() == 2 && t.shape[0] > 1 && t.shape[1] > 1;
+            if is_matrix && !force_adamw_ids.contains(&t.id) {
+                muon_params.push(t);
+            } else {
+                adamw_params.push(t);
+            }
+        }
+        let mut muon = Muon::new(ctx, &muon_params, weight_decay);
+        muon.adamw_hyper = hyper; // keep the (unused-here) fallback consistent if a degenerate sneaks in
+        let adamw = AdamW::new_with_config(ctx, &adamw_params, weight_decay, 0, hyper);
+        Self { muon, adamw, muon_lr_scale: 1.0, adamw_lr_scale: 1.0 }
+    }
+
+    /// Set the per-group LR multipliers (Muon group, AdamW group) on the base lr.
+    pub fn set_lr_scales(&mut self, muon: f32, adamw: f32) {
+        self.muon_lr_scale = muon;
+        self.adamw_lr_scale = adamw;
+    }
+
+    pub fn step(&mut self, lr: f32) {
+        self.muon.step(lr * self.muon_lr_scale);
+        self.adamw.step(lr * self.adamw_lr_scale);
+    }
+
+    pub fn zero_grad(&self) {
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+    }
+
+    /// Number of parameters routed to each sub-optimizer (for logging / tests).
+    pub fn split_counts(&self) -> (usize, usize) {
+        (self.muon.params.len(), self.adamw.params.len())
     }
 }
 
@@ -546,6 +662,7 @@ pub enum Optimizer {
     AdamW(AdamW),
     Sophia(Sophia),
     Muon(Muon),
+    Hybrid(HybridOptimizer),
 }
 
 impl Optimizer {
@@ -554,6 +671,7 @@ impl Optimizer {
             Optimizer::AdamW(o) => o.step(lr),
             Optimizer::Sophia(o) => o.step(lr),
             Optimizer::Muon(o) => o.step(lr),
+            Optimizer::Hybrid(o) => o.step(lr),
         }
     }
 
@@ -565,6 +683,7 @@ impl Optimizer {
                 autograd::clear_tape();
                 autograd::clear_recompute_registry();
             }
+            Optimizer::Hybrid(o) => o.zero_grad(),
         }
     }
 
@@ -573,6 +692,7 @@ impl Optimizer {
             Optimizer::AdamW(o) => o.step,
             Optimizer::Sophia(o) => o.step,
             Optimizer::Muon(o) => o.step,
+            Optimizer::Hybrid(o) => o.adamw.step,
         }
     }
 }
