@@ -14,6 +14,8 @@ pub struct SamplingConfig {
     pub top_k: usize,
     pub max_tokens: usize,
     pub repetition_penalty: f32, // >1.0 penalizes repetition, 1.0 = disabled
+    pub min_p: f32,              // keep tokens with p >= min_p * max_p; 0.0 = disabled
+    pub typical_p: f32,          // locally-typical mass to keep; 1.0 = disabled
 }
 
 impl Default for SamplingConfig {
@@ -24,7 +26,59 @@ impl Default for SamplingConfig {
             top_k: 50,
             max_tokens: 256,
             repetition_penalty: 1.2,
+            min_p: 0.0,
+            typical_p: 1.0,
         }
+    }
+}
+
+/// Renormalize a (token, prob) distribution to sum 1 (no-op if the mass is zero).
+fn renorm(probs: &mut [(usize, f32)]) {
+    let sum: f32 = probs.iter().map(|x| x.1).sum();
+    if sum > 0.0 {
+        for p in probs.iter_mut() {
+            p.1 /= sum;
+        }
+    }
+}
+
+/// Apply min-p and locally-typical filtering to a normalized (token, prob) distribution, in place.
+///
+/// * **min-p** keeps tokens with `p >= min_p * max_p` — a relative floor that adapts to how peaked
+///   the distribution is (unlike top-p's fixed cumulative mass). `0.0` disables it.
+/// * **locally-typical** (Meister et al. 2022) keeps the smallest set of tokens whose surprisal
+///   `−ln p` is closest to the distribution entropy `H`, until their mass reaches `typical_p` —
+///   trimming both the over-confident head and the long tail. `1.0` disables it.
+pub fn filter_min_p_typical(probs: &mut Vec<(usize, f32)>, min_p: f32, typical_p: f32) {
+    if probs.is_empty() {
+        return;
+    }
+    if min_p > 0.0 {
+        let max_p = probs.iter().map(|x| x.1).fold(0.0f32, f32::max);
+        let thresh = min_p * max_p;
+        probs.retain(|&(_, p)| p >= thresh);
+        renorm(probs);
+    }
+    if typical_p < 1.0 && probs.len() > 1 {
+        let h: f32 = -probs.iter().map(|&(_, p)| if p > 0.0 { p * p.ln() } else { 0.0 }).sum::<f32>();
+        let mut ranked = probs.clone();
+        ranked.sort_by(|a, b| {
+            let da = ((-a.1.ln()) - h).abs();
+            let db = ((-b.1.ln()) - h).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cumulative = 0.0;
+        let mut cutoff = ranked.len();
+        for (k, &(_, p)) in ranked.iter().enumerate() {
+            cumulative += p;
+            if cumulative >= typical_p {
+                cutoff = k + 1;
+                break;
+            }
+        }
+        ranked.truncate(cutoff);
+        *probs = ranked;
+        renorm(probs);
     }
 }
 
@@ -160,6 +214,8 @@ fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[
         }
     }
 
+    filter_min_p_typical(&mut probs, config.min_p, config.typical_p);
+
     // Sample from distribution
     let r: f32 = rng.gen();
     let mut cumulative = 0.0;
@@ -236,6 +292,8 @@ fn sample_token(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u
             p.1 /= sum;
         }
     }
+
+    filter_min_p_typical(&mut probs, config.min_p, config.typical_p);
 
     // Sample from the distribution
     let r: f32 = rng.gen();

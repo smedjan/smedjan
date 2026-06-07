@@ -212,6 +212,20 @@ enum Commands {
         vocab_size: u32,
     },
 
+    /// Compute perplexity (exp mean NLL) of a model over a text string or file
+    Perplexity {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        tokenizer: String,
+        /// Text to score (overridden by --file when set)
+        #[arg(long, default_value = "")]
+        text: String,
+        /// Read scoring text from a file instead of --text
+        #[arg(long)]
+        file: Option<String>,
+    },
+
     /// Generate text from a trained model
     Generate {
         #[arg(long)]
@@ -231,6 +245,12 @@ enum Commands {
         /// Repetition penalty (>1.0 penalizes, 1.0 = disabled)
         #[arg(long, default_value = "1.2")]
         repetition_penalty: f32,
+        /// Min-p sampling: keep tokens with p >= min_p * max_p (0.0 = disabled)
+        #[arg(long, default_value = "0.0")]
+        min_p: f32,
+        /// Locally-typical sampling: mass to keep (1.0 = disabled)
+        #[arg(long, default_value = "1.0")]
+        typical_p: f32,
         #[arg(long, default_value = "false")]
         stream: bool,
         /// Enable speculative decoding with a smaller draft model
@@ -694,6 +714,8 @@ fn main() {
             top_p,
             top_k,
             repetition_penalty,
+            min_p,
+            typical_p,
             stream,
             speculative,
             draft_checkpoint,
@@ -713,6 +735,8 @@ fn main() {
                 top_k,
                 max_tokens,
                 repetition_penalty,
+                min_p,
+                typical_p,
             };
 
             if speculative {
@@ -822,6 +846,23 @@ fn main() {
             }
             println!();
             println!("Or use --size custom with --dim --layers --heads --kv-heads --ffn-mult --max-seq for any arbitrary config.");
+        }
+
+        Commands::Perplexity { checkpoint, tokenizer, text, file } => {
+            let tok = tokenizer::BpeTokenizer::load(&tokenizer).expect("Failed to load tokenizer");
+            let (model, step) = if checkpoint.ends_with(".qbin") {
+                quantize::load_quantized(&ctx, &checkpoint).expect("Failed to load quantized checkpoint")
+            } else {
+                checkpoint::load_checkpoint(&ctx, &checkpoint).expect("Failed to load checkpoint")
+            };
+            let corpus = match file {
+                Some(f) => String::from_utf8_lossy(&std::fs::read(&f).expect("Failed to read --file")).into_owned(),
+                None => text,
+            };
+            let tokens = tok.encode(&corpus);
+            assert!(tokens.len() >= 2, "need >= 2 tokens to score perplexity (got {})", tokens.len());
+            let ppl = eval::perplexity(&ctx, &model, &tokens);
+            println!("Perplexity: {:.3} over {} tokens (model step {})", ppl, tokens.len(), step);
         }
 
         Commands::Process {

@@ -1999,6 +1999,45 @@ mod suite {
             (best final loss {best:.3}) — training is broken, not just slow");
     }
 
+    /// Perplexity = exp(mean per-token NLL). A fresh, ~uniform model over `vocab` tokens scores
+    /// ≈ `vocab` — sanity-checks the metric is wired (finite, ≥ 1, vocab-scale).
+    #[test]
+    fn perplexity_metric_is_vocab_scale() {
+        let ctx = test_ctx();
+        let vocab = 32u32;
+        let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0, 9, 2, 8, 1];
+        let ppl = crate::eval::perplexity(&ctx, &model, &tokens);
+        eprintln!("fresh-model perplexity = {ppl:.2} (vocab={vocab})");
+        assert!(ppl.is_finite() && ppl >= 1.0, "perplexity must be finite and >= 1: {ppl}");
+        assert!(ppl <= vocab as f32 * 8.0, "fresh-model perplexity implausibly high: {ppl}");
+    }
+
+    /// min-p (relative floor) and locally-typical filtering trim a known distribution correctly.
+    #[test]
+    fn sampling_min_p_and_typical_filtering() {
+        use crate::generate::filter_min_p_typical;
+        // min_p = 0.3, max_p = 0.5 → threshold 0.15; token 3 (0.05) dropped, rest renormalized.
+        let mut probs = vec![(0usize, 0.5f32), (1, 0.3), (2, 0.15), (3, 0.05)];
+        filter_min_p_typical(&mut probs, 0.3, 1.0);
+        assert!(probs.iter().all(|&(i, _)| i != 3), "min-p must drop the sub-threshold token");
+        assert_eq!(probs.len(), 3);
+        let sum: f32 = probs.iter().map(|x| x.1).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "min-p must renormalize, sum={sum}");
+
+        // typical_p keeps the lowest-surprisal-vs-entropy mass (here the 0.7+0.2 head) and renorms.
+        let mut p2 = vec![(0usize, 0.7f32), (1, 0.2), (2, 0.07), (3, 0.03)];
+        filter_min_p_typical(&mut p2, 0.0, 0.9);
+        assert!(p2.len() < 4 && !p2.is_empty(), "typical must trim the set: {}", p2.len());
+        let s2: f32 = p2.iter().map(|x| x.1).sum();
+        assert!((s2 - 1.0).abs() < 1e-5, "typical must renormalize, sum={s2}");
+
+        // both disabled → unchanged
+        let mut p3 = vec![(0usize, 0.6f32), (1, 0.4)];
+        filter_min_p_typical(&mut p3, 0.0, 1.0);
+        assert_eq!(p3.len(), 2);
+    }
+
     /// End-to-end integration of linear (O(N) kernel) attention in the real Transformer:
     ///   * forward through every layer produces finite logits of the right shape,
     ///   * the backward pass differentiates the linear-attention path (finite grad reaches w_q),

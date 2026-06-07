@@ -114,6 +114,23 @@ fn is_exact_match(generated: &str, expected: &str) -> bool {
     gen_first_line == exp_trimmed
 }
 
+/// Perplexity over a token sequence: `exp(mean per-token NLL)` of predicting `tok[i+1]` from
+/// `tok[..=i]`. The standard intrinsic language-modeling quality metric (lower is better; a model
+/// uniform over `V` tokens scores `V`), complementing the string exact/partial-match metrics which
+/// only measure task completion. Runs a single no-grad forward pass.
+pub fn perplexity(ctx: &Arc<MetalContext>, model: &Transformer, tokens: &[u32]) -> f32 {
+    assert!(tokens.len() >= 2, "perplexity needs at least 2 tokens");
+    let seq_len = tokens.len() - 1;
+    let inputs = &tokens[..seq_len];
+    let targets = &tokens[1..];
+    let mean_nll = crate::autograd::no_grad(|| {
+        let logits = model.forward(inputs, 1, seq_len, None, false);
+        let (loss, _) = crate::loss::cross_entropy_loss(ctx, &logits, targets);
+        loss.to_vec()[0]
+    });
+    mean_nll.exp()
+}
+
 /// Run evaluation on a set of examples.
 pub fn evaluate(
     ctx: &Arc<MetalContext>,
@@ -127,6 +144,8 @@ pub fn evaluate(
         top_k: 10,
         max_tokens: 64,
         repetition_penalty: 1.2,
+        min_p: 0.0,
+        typical_p: 1.0,
     };
 
     let mut outputs = Vec::with_capacity(examples.len());
