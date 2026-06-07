@@ -226,26 +226,45 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
   unit test directly show the explosion (max|grad|≈9950 without the clamp) and the fix (bounded to
   31.6). The clamp is the correct fix, not a symptom-patch.
 
-**Still genuinely open (substantial scoped efforts — cores done+verified, not quick drains):**
-- **Block-sparse TRUE subquadratic speedup.** The routing/quality core is DONE (matches dense, EMA
-  1.56 on real data at ~3/8 blocks). What remains is a gather/flash kernel that COMPUTES only the
-  selected blocks (currently masks the dense O(n²) scores). Research-grade online-softmax kernel —
-  warrants a focused session, not a tail addition.
-- **MLA absorbed-form incremental decode.** Training + structural part DONE (16× cache shrink, EMA
-  1.56). The inference KV-cache-compression at decode (cache the latent; absorb W_uk into W_q; the
-  decoupled-RoPE subtlety) is the intricate remaining piece.
-- **Sequence-packing model integration.** The op-level pieces are DONE + verified: `pack_sequences`
-  (greedy first-fit), the per-batch `causal_doc_mask` op (matches dense, bit-identical per-document),
-  and a single forward+backward through a thread-local doc-mask is correct (embedding grad healthy,
-  finite). BUT a full model/train integration (`forward_packed` + thread-local hook + `--pack-sequences`)
-  was ATTEMPTED and REVERTED: multi-step training diverged (flat at uniform → NaN ~step 65) even though
-  each isolated forward/backward is correct. Root cause is a multi-step interaction — the seg buffer's
-  lifetime vs the deferred batched command buffer + buffer-pool recycling + the thread-local clear
-  timing (NOT the masking math, which is verified). Re-attempt with the seg buffer kept alive past
-  `flush_batch` (or threaded explicitly through the forward signature) rather than a thread-local that's
-  cleared before the deferred kernels execute.
-- **#6 full large-batch multi-hour run.** SMOKES DONE — 600-step real-corpus runs: AdamW 1.56,
-  hybrid+simdgroup 1.56, 8-bit 1.56, MLA 1.56, block-sparse 1.56; bf16 diverged (→ overflow-only).
-  A multi-hour large-batch run (loss curves vs baseline, throughput) is a genuine operator/time
-  resource, not code.
+## 5. DELIVERED (round 3 — "time to engineer" the 3 remaining; all on `origin/main`)
+
+- **Block-sparse TRUE subquadratic speedup — DONE (forward).** `block_sparse_gather_attention`
+  (`src/attention.rs`) + kernels `gather_blocks` / `gather_causal_mask`: GATHERS only the selected
+  K/V blocks and runs attention over them → score compute O(n·(top_k+1)·block), not O(n²). Verified:
+  equals dense causal when all blocks selectable (max_diff 0.000000); genuinely sparse otherwise;
+  BENCH seq=1024 → 1.65× faster, 4.00× fewer score-FLOPs (grows with n). Forward-only (inference /
+  compute-proof); a TRAINABLE sparse path needs custom gather backward (next).
+- **MLA incremental decode — DONE.** `MultiHeadAttention::mla_cached_forward` (isolated early-return,
+  training path untouched) caches the small latent `c` (`KvCache.latent`, [batch,total,d_c]) and
+  reconstructs K/V from it each step → the 10–50× KV-cache shrink in real generation. Verified by the
+  decisive integration test: incremental decode == full prefill (argmax 8/8, logit diff 0.026). The
+  absorbed form (fold W_uk into W_q + decoupled RoPE) is the further compute optimization, still open.
+- **#6 large-batch run — investigated; findings, no clean multi-hour curve.** Confirmed the integrated
+  stack trains REPRODUCIBLY to EMA ~1.56 at the proven config (8-bit + simdgroup, tiny/batch16/lr3e-3:
+  1.5643, 1.5571, +6 bisect points all ~1.56). Real findings the run surfaced:
+  - **LR×batch sensitivity**: the Muon+AdamW HYBRID DIVERGES at batch 32 (Muon's orthogonalized
+    updates destabilize at higher effective LR — muon_lr_scale must come down as batch/LR rise);
+    plain AdamW/8-bit at lr 3e-3 also diverges at batch 32 (lr 3e-3 is a batch-16 LR). Larger batch
+    needs LR re-tuning, not the same LR.
+  - **Loss-readout cosmetic artifact**: the per-step displayed loss intermittently prints a constant
+    1.0000 (more often at large batch). It is COSMETIC — training is unaffected (weight-norm healthy,
+    EMA captures the real loss). A "fix" reading the loss mid-step (in-batch copy OR flush) was tried
+    and REVERTED: it corrupts gradients via andreai's command-batch buffer-hazard/recycling model
+    (EMA 1.56 → 8.8 / 388). A correct fix needs a hazard-aware readout (dedicated non-pooled loss
+    buffer + explicit barrier) — documented, not rushed. Lesson: the unit suite (156) does NOT catch
+    training-quality regressions; a real run does.
+
+**Still genuinely open (substantial scoped efforts — cores done+verified):**
+- **Block-sparse TRAINABLE subquadratic** — the gather forward is done; the trainable path needs
+  custom gather/scatter backward kernels (research-grade).
+- **MLA absorbed-form decode** — latent-cache decode is done; absorbing W_uk into W_q with decoupled
+  RoPE (avoids reconstructing K/V each step) is the intricate compute optimization.
+- **Sequence-packing model integration.** Op-level pieces DONE + verified (`pack_sequences`, per-batch
+  `causal_doc_mask`, bit-identical per document). The model/train integration was attempted + reverted
+  (diverged) — same class of buffer-lifetime-vs-deferred-batch issue as the loss-readout above. The
+  correct fix threads the seg buffer through the forward signature (no thread-local cleared before the
+  deferred kernels run).
+- **Hazard-aware loss readout** (see #6 findings) — so large-batch runs show the true per-step loss.
+- **#6 multi-hour curve** — needs LR re-tuned for the target batch (the runs above show the same LR
+  doesn't transfer); a genuine operator/time resource once the LR schedule is set.
 - simdgroup beyond 1.29× (double-buffer / larger tiles).
