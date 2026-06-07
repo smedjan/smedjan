@@ -1666,6 +1666,12 @@ kernel void rms_norm_backward(
     float mean_sq = total_ss / float(cols);
     float rms = sqrt(mean_sq + params.eps);
     float inv_rms = 1.0f / rms;
+    // Bound inv_rms so the inv_rms^3 correction term below can't explode when an activation row
+    // collapses (mean_sq -> 0). With eps=1e-5, inv_rms maxes at ~316 and inv_rms^3 at ~3e7, which
+    // blows the gradient to ~1e8 from a perfectly bounded forward — clip then turns that into a
+    // garbage update direction and the optimiser (notably AdamW) stalls/diverges. 1/sqrt(1e-3)
+    // floors it; the forward normalization is untouched, so only the degenerate-row backward changes.
+    inv_rms = min(inv_rms, 31.62f);
 
     // Compute dot product — SIMD reduction
     float local_dot = 0.0f;
@@ -1680,7 +1686,12 @@ kernel void rms_norm_backward(
     // grad_input = (grad_output * weight * inv_rms) - (input * dot_sum * inv_rms^3 / cols)
     float correction = dot_sum * inv_rms * inv_rms * inv_rms / float(cols);
     for (uint c = thread_index; c < cols; c += threads_per_group) {
-        gi[c] = go[c] * weight[c] * inv_rms - x[c] * correction;
+        float g = go[c] * weight[c] * inv_rms - x[c] * correction;
+        // Cap the per-element grad. A collapsed activation row would otherwise blow this up and —
+        // compounding across layers — explode the whole gradient (clip then yields a garbage
+        // direction and AdamW diverges). Normal grads are O(1-10), so this only clips degenerate
+        // spikes, and capping the OUTPUT stops the next layer's incoming grad from compounding.
+        gi[c] = clamp(g, -1.0e3f, 1.0e3f);
     }
 
     // grad_weight: atomic accumulate across rows.

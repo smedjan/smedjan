@@ -1993,6 +1993,42 @@ mod suite {
         std::fs::remove_file(tmp_path).ok();
     }
 
+    /// REGRESSION (AdamW stability): RMSNorm's backward has an `inv_rms^3` term. When an activation
+    /// row collapses (mean_sq -> 0) it exploded the gradient to ~1e8 from a perfectly bounded
+    /// forward; clip then turned that into a garbage direction and AdamW's loss blew up to ~1e5.
+    /// inv_rms is now clamped in the backward. This guards that AdamW on a tiny full-batch keeps the
+    /// GRADIENT NORM and loss BOUNDED — it need not converge here (Muon does, see the convergence
+    /// test; AdamW's sign-like updates just oscillate on full-batch), but it must NOT explode.
+    #[test]
+    fn adamw_training_stays_bounded_no_grad_explosion() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
+        let (batch, seq_len) = (8usize, 12usize);
+        let one: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0, 9, 2, 8, 1];
+        let tokens: Vec<u32> = one.iter().cloned().cycle().take(batch * seq_len).collect();
+        let targets: Vec<u32> = vec![5; 8 * 12];
+        let params = model.parameters();
+        let param_refs: Vec<&Tensor> = params.to_vec();
+        let mut opt = crate::optim::AdamW::new(&ctx, &param_refs, 0.0);
+        let mut max_loss = 0.0f32;
+        for step in 0..150 {
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+            let lv = loss.to_vec()[0];
+            assert!(lv.is_finite(), "loss non-finite at step {step}");
+            max_loss = max_loss.max(lv);
+            autograd::backward(&ctx, loss.id);
+            autograd::clear_tape_keep_grads();
+            crate::train::clip_gradients(&ctx, &model, 1.0);
+            let lr = 1e-3 * (((step + 1) as f32) / 20.0).min(1.0);
+            opt.step(lr);
+            autograd::zero_grads_recycle();
+        }
+        eprintln!("AdamW stability: max loss {max_loss:.2}");
+        assert!(max_loss < 30.0, "AdamW loss blew up (max {max_loss}) — the RMSNorm-backward instability regressed");
+    }
+
     /// END-TO-END CONVERGENCE: the full forward → cross-entropy → backward → clip → optimizer loop
     /// must actually REDUCE loss to near-zero, not merely stay finite. This is the "can it learn at
     /// all" smoke test — without it, a silent bug in the backward or optimizer wiring would pass
