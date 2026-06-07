@@ -2003,6 +2003,71 @@ mod suite {
         autograd::clear_tape();
     }
 
+    /// SUBQUADRATIC block-sparse gather: when top_k+1 ≥ nb (every causal block is selectable), the
+    /// gather-based attention must reduce EXACTLY to dense causal attention. Proves the gather +
+    /// compact-attention + causal mask are correct.
+    #[test]
+    fn block_sparse_gather_matches_dense_when_full() {
+        let ctx = test_ctx();
+        let (bh, seq, hd, block) = (2usize, 16usize, 8usize, 4usize); // nb=4
+        let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1).collect::<Vec<f32>>();
+        let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+        // top_k=3 → k_sel=4=nb → all causal blocks selected → dense causal attention.
+        let gathered = crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3).to_vec();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
+        let max_diff = gathered.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("gather(full) vs dense causal: max_diff={max_diff:.6}");
+        assert!(gathered.iter().all(|x| x.is_finite()));
+        assert!(max_diff < 1e-4, "gather with full top_k must equal dense causal: {max_diff}");
+        autograd::clear_tape();
+    }
+
+    /// Genuinely sparse gather (top_k=1): finite output that DIFFERS from dense (most past blocks
+    /// dropped) — confirms the routing actually restricts attention, not silently attending all.
+    #[test]
+    fn block_sparse_gather_is_sparse() {
+        let ctx = test_ctx();
+        let (bh, seq, hd, block) = (1usize, 32usize, 8usize, 4usize); // nb=8
+        let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 3 + s * 5) % 19) as f32 - 9.0) * 0.1).collect::<Vec<f32>>();
+        let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+        let sparse = crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 1).to_vec(); // own + 1 past of up to 7
+        let scale = 1.0 / (hd as f32).sqrt();
+        let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
+        let max_diff = sparse.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("gather(top_k=1) vs dense: max_diff={max_diff:.4} (expect >0 — genuinely sparse)");
+        assert!(sparse.iter().all(|x| x.is_finite()), "sparse gather must be finite");
+        assert!(max_diff > 1e-3, "top_k=1 must differ from dense (it drops most blocks): {max_diff}");
+    }
+
+    /// Benchmark (ignored): the gather path's score compute is O(n·(top_k+1)·block) vs dense O(n²) —
+    /// must be FASTER at long sequence. Grounds the subquadratic claim. Run with --ignored --nocapture.
+    #[test]
+    #[ignore = "benchmark: run with --ignored --nocapture (release)"]
+    fn bench_block_sparse_gather_subquadratic() {
+        use std::time::Instant;
+        let ctx = test_ctx();
+        let (bh, seq, hd, block, top_k) = (8usize, 1024usize, 64usize, 64usize, 3usize); // nb=16, k_sel=4
+        let r = |s: usize| Tensor::randn(&ctx, vec![bh, seq, hd], 0.1 + s as f32 * 0.0);
+        let (q, k, v) = (r(1), r(2), r(3));
+        let scale = 1.0 / (hd as f32).sqrt();
+        let dense = || { let s = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax(); s.batched_matmul(&v); };
+        let sparse = || { crate::attention::block_sparse_gather_attention(&q, &k, &v, block, top_k); };
+        for _ in 0..3 { dense(); sparse(); }
+        let iters = 20;
+        let t0 = Instant::now(); for _ in 0..iters { dense(); } let td = t0.elapsed().as_secs_f64() / iters as f64;
+        let t1 = Instant::now(); for _ in 0..iters { sparse(); } let ts = t1.elapsed().as_secs_f64() / iters as f64;
+        let dense_flops = 2.0 * (bh * seq * seq * hd) as f64; // Q@K^T scores
+        let sparse_flops = 2.0 * (bh * seq * (top_k + 1) * block * hd) as f64;
+        eprintln!("block-sparse gather seq={seq} block={block} top_k={top_k}: dense {td:.4}s, sparse {ts:.4}s, speedup {:.2}x; score-FLOPs {:.0}M vs {:.0}M ({:.2}× fewer)",
+            td / ts, dense_flops / 1e6, sparse_flops / 1e6, dense_flops / sparse_flops);
+        assert!(ts < td, "gather block-sparse ({ts:.4}s) should beat dense ({td:.4}s) at seq={seq}");
+    }
+
     /// End-to-end: a model with `AttnKind::BlockSparse` in every block forwards to finite logits,
     /// backprops a finite grad into w_q, and trains STABLY (finite + bounded, no blow-up) — the
     /// MoBA/NSA sparse path works through the real model + backward. Like linear_attn_model_trains_stably,

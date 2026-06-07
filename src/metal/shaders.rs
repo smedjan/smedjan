@@ -1832,6 +1832,80 @@ kernel void block_sparse_topk_mask(
 }
 "#;
 
+/// Gather selected K/V blocks for SUBQUADRATIC block-sparse attention. For each (head, query-block)
+/// pair `bnq = bh*nb + qb`, copy its `K_SEL` selected key/value blocks (indices in `sel`) into a
+/// compact buffer so attention computes ONLY over the selected positions (vs masking the full O(n²)
+/// scores). Sentinel `sel >= nb` → zero-filled (a padding block, later fully masked).
+/// src: [bh, seq, hd]; sel: [bh*nb*K_SEL] u32; out: [bh*nb, K_SEL*block, hd].
+pub const GATHER_BLOCKS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GatherParams { uint bh; uint nb; uint seq; uint hd; uint block; uint k_sel; };
+
+kernel void gather_blocks(
+    device const float* src [[buffer(0)]],
+    device const uint* sel [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant GatherParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint sel_w = p.k_sel * p.block;           // gathered keys per query-block
+    uint total = p.bh * p.nb * sel_w * p.hd;
+    if (gid >= total) return;
+    uint d = gid % p.hd;
+    uint rem = gid / p.hd;
+    uint pos = rem % sel_w;                    // 0..k_sel*block
+    uint bnq = rem / sel_w;                    // bh_idx*nb + qb
+    uint slot = pos / p.block;
+    uint w = pos % p.block;
+    uint bh_idx = bnq / p.nb;
+    uint block_idx = sel[bnq * p.k_sel + slot];
+    if (block_idx >= p.nb) { out[gid] = 0.0f; return; } // sentinel → padding
+    uint src_row = block_idx * p.block + w;
+    if (src_row >= p.seq) { out[gid] = 0.0f; return; }
+    out[gid] = src[bh_idx * p.seq * p.hd + src_row * p.hd + d];
+}
+"#;
+
+/// Causal mask for the gathered block-sparse scores. scores: [bh*nb, block, K_SEL*block]. For query
+/// row `r` of query-block `qb` (global pos qb*block+r) and gathered key column `slot*block+w`
+/// (global pos sel[slot]*block+w), keep iff the key is real (slot in range) and causal
+/// (key_global <= query_global); else -inf.
+pub const GATHER_CAUSAL_MASK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GMaskParams { uint bh_nb; uint nb; uint block; uint k_sel; };
+
+kernel void gather_causal_mask(
+    device float* scores [[buffer(0)]],
+    device const uint* sel [[buffer(1)]],
+    constant GMaskParams& p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint bnq = gid.z;                          // bh_idx*nb + qb
+    uint r = gid.y;                            // query row within block
+    uint c = gid.x;                            // gathered key column
+    uint sel_w = p.k_sel * p.block;
+    if (bnq >= p.bh_nb || r >= p.block || c >= sel_w) return;
+    uint qb = bnq % p.nb;
+    uint q_global = qb * p.block + r;
+    uint slot = c / p.block;
+    uint w = c % p.block;
+    uint block_idx = sel[bnq * p.k_sel + slot];
+    uint idx = bnq * p.block * sel_w + r * sel_w + c;
+    bool masked;
+    if (block_idx >= p.nb) {
+        masked = true;                         // padding slot
+    } else {
+        uint k_global = block_idx * p.block + w;
+        masked = k_global > q_global;          // causal
+    }
+    if (masked) scores[idx] = -INFINITY;
+}
+"#;
+
 /// Gradient clipping: compute L2 norm of a flat buffer
 pub const L2_NORM: &str = r#"
 #include <metal_stdlib>

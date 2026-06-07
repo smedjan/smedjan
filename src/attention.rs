@@ -36,6 +36,71 @@ pub enum AttnKind {
     BlockSparse,
 }
 
+/// SUBQUADRATIC block-sparse attention (forward / inference). Unlike `AttnKind::BlockSparse` (which
+/// masks the full O(n²) scores — correct + trainable, but no compute saving), this GATHERS only the
+/// selected key/value blocks and runs attention over them, so the score compute is
+/// O(n · (top_k+1) · block) instead of O(n²) — the genuine subquadratic speedup. Per-query-block
+/// routing: each query block attends its own block + the top_k past blocks by block-mean-query ·
+/// block-mean-key. Forward-only (no tape) — for inference; a trainable version needs custom gather
+/// backward (documented follow-up). q/k/v: [bh, seq, hd] (expanded), seq % block == 0. Returns
+/// [bh, seq, hd].
+pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: usize, top_k: usize) -> Tensor {
+    assert_eq!(q.shape.len(), 3, "block_sparse_gather expects [bh, seq, hd]");
+    let (bh, seq, hd) = (q.shape[0], q.shape[1], q.shape[2]);
+    assert_eq!(seq % block, 0, "block_sparse_gather requires seq % block == 0");
+    let nb = seq / block;
+    let k_sel = (top_k + 1).min(nb); // own block + up to top_k past; capped at nb
+    let ctx = Arc::clone(&q.ctx);
+
+    autograd::no_grad(|| {
+        // Block means (per query/key block), then block-block scores for selection.
+        let mean_q = q.block_mean_keys(block); // [bh, nb, hd]
+        let mean_k = k.block_mean_keys(block);
+        let block_scores = mean_q.batched_matmul_trans_b(&mean_k).to_vec(); // [bh, nb, nb]
+
+        // CPU top-k selection per (head, query-block): slot 0 = own block, then top_k past blocks by
+        // score; remaining slots = sentinel (nb) → padding (zero-gathered, fully masked).
+        let mut sel = vec![nb as u32; bh * nb * k_sel];
+        for bh_i in 0..bh {
+            for qb in 0..nb {
+                let base = (bh_i * nb + qb) * k_sel;
+                sel[base] = qb as u32; // own block
+                if qb > 0 && top_k > 0 {
+                    let srow = (bh_i * nb + qb) * nb;
+                    let mut past: Vec<(usize, f32)> = (0..qb).map(|kb| (kb, block_scores[srow + kb])).collect();
+                    past.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for (i, &(kb, _)) in past.iter().take(top_k).enumerate() {
+                        sel[base + 1 + i] = kb as u32;
+                    }
+                }
+            }
+        }
+        let sel_buf = ctx.buffer_from_u32_slice(&sel);
+
+        // Gather the selected K/V blocks into compact [bh*nb, k_sel*block, hd] buffers.
+        let dims = compute::GatherDims {
+            bh: bh as u32, nb: nb as u32, seq: seq as u32, hd: hd as u32,
+            block: block as u32, k_sel: k_sel as u32,
+        };
+        let sel_w = k_sel * block;
+        let ksel_buf = ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
+        let vsel_buf = ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
+        compute::gpu_gather_blocks(&ctx, &k.buffer, &sel_buf, &ksel_buf, dims);
+        compute::gpu_gather_blocks(&ctx, &v.buffer, &sel_buf, &vsel_buf, dims);
+        let k_sel_t = Tensor::from_buffer(Arc::clone(&ctx), ksel_buf, vec![bh * nb, sel_w, hd]);
+        let v_sel_t = Tensor::from_buffer(Arc::clone(&ctx), vsel_buf, vec![bh * nb, sel_w, hd]);
+
+        // Attention over the gathered blocks: [bh*nb, block, hd] @ [bh*nb, sel_w, hd]^T.
+        let q_bnq = q.reshape(vec![bh * nb, block, hd]);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let scores = q_bnq.batched_matmul_trans_b(&k_sel_t).scale(scale); // [bh*nb, block, sel_w]
+        compute::gpu_gather_causal_mask(&ctx, &scores.buffer, &sel_buf, (bh * nb) as u32, nb as u32, block as u32, k_sel as u32);
+        let weights = scores.softmax();
+        let out = weights.batched_matmul(&v_sel_t); // [bh*nb, block, hd]
+        out.reshape(vec![bh, seq, hd])
+    })
+}
+
 /// Multi-head attention with rotary positional encoding, KV cache, and
 /// Grouped Query Attention (GQA) support.
 ///

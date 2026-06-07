@@ -1183,6 +1183,36 @@ pub fn gpu_block_sparse_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, block_
         0 => scores, 1 => block_scores, 2 => &params_buf);
 }
 
+/// Dimensions for block gather (subquadratic block-sparse attention).
+#[derive(Clone, Copy)]
+pub struct GatherDims { pub bh: u32, pub nb: u32, pub seq: u32, pub hd: u32, pub block: u32, pub k_sel: u32 }
+
+/// Gather selected K/V blocks into a compact [bh*nb, k_sel*block, hd] buffer per query-block.
+pub fn gpu_gather_blocks(ctx: &Arc<MetalContext>, src: &GpuBuffer, sel: &GpuBuffer, out: &GpuBuffer, d: GatherDims) {
+    let GatherDims { bh, nb, seq, hd, block, k_sel } = d;
+    #[repr(C)]
+    struct Params { bh: u32, nb: u32, seq: u32, hd: u32, block: u32, k_sel: u32 }
+    let params = Params { bh, nb, seq, hd, block, k_sel };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (bh * nb * k_sel * block * hd) as u64;
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "gather_blocks", grid, tg, 0 => src, 1 => sel, 2 => out, 3 => &params_buf);
+}
+
+/// Causal mask for gathered block-sparse scores [bh*nb, block, k_sel*block] (uses selection indices).
+pub fn gpu_gather_causal_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, sel: &GpuBuffer, bh_nb: u32, nb: u32, block: u32, k_sel: u32) {
+    #[repr(C)]
+    struct Params { bh_nb: u32, nb: u32, block: u32, k_sel: u32 }
+    let params = Params { bh_nb, nb, block, k_sel };
+    let params_buf = params_buffer(ctx, &params);
+    let sel_w = (k_sel * block) as u64;
+    let total = MetalContext::size(sel_w, block as u64, bh_nb as u64);
+    let tg = MetalContext::size(8.min(sel_w).max(1), 8.min(block as u64).max(1), 4.min(bh_nb as u64).max(1));
+    dispatch_threads_sync!(ctx, "gather_causal_mask", total, tg, 0 => scores, 1 => sel, 2 => &params_buf);
+}
+
 /// Compute L2 norm. Returns the norm value (includes GPU→CPU readback).
 pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
     let output = ctx.alloc_buffer(std::mem::size_of::<f32>());
