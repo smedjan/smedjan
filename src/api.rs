@@ -277,6 +277,39 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     if (norm_async - 5.0).abs() > 0.01 { passed = false; }
     tested += 2;
 
+    // simdgroup_matrix (hardware MMA) fp32 matmul: must match the identity selection.
+    let sg_c = ctx.alloc_buffer(4 * 4);
+    compute::gpu_matmul_simdgroup(ctx, &a, &b, &sg_c, 2, 2, 2); // a @ I == a
+    let sg_vals = MetalContext::read_buffer(&sg_c, 4);
+    if (sg_vals[0] - 1.0).abs() > 0.01 || (sg_vals[3] - 4.0).abs() > 0.01 { passed = false; }
+    tested += 1;
+
+    // Hybrid (Muon+AdamW) and 8-bit AdamW optimizer enum variants + MLA cache-footprint helper.
+    let tiny2 = crate::tensor::Tensor::zeros(ctx, vec![2, 2]);
+    let tiny2_refs: Vec<&crate::tensor::Tensor> = vec![&tiny2];
+    let mut hybrid = crate::optim::Optimizer::Hybrid(crate::optim::HybridOptimizer::new(
+        ctx, &tiny2_refs, 0.0, &std::collections::HashSet::new(), crate::optim::AdamWHyper::default()));
+    hybrid.step(0.0);
+    let mut q8 = crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(ctx, &tiny2_refs, 0.0));
+    q8.step(0.0);
+    let (_std_kv, _mla_kv, shrink) = crate::mla::cache_footprint(1024, 64); // 2*1024/64 = 32×
+    if shrink < 8.0 { passed = false; }
+    tested += 3;
+
+    // MLA-enabled attention forward + per-tensor gradient clip (exercises the MLA path at runtime).
+    let mla_cfg = crate::model::ModelConfig { mla_latent_dim: 16, ..crate::model::ModelConfig::custom(32, 64, 4, 2, 2.67, 32) };
+    let mla_model = crate::model::Transformer::new(ctx, mla_cfg);
+    let mla_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 0];
+    let mla_logits = mla_model.forward(&mla_tokens, 1, 8, None, false);
+    if mla_logits.to_vec().iter().any(|x| !x.is_finite()) { passed = false; }
+    let (mla_loss, _) = crate::loss::cross_entropy_loss(ctx, &mla_logits, &[5u32; 8]);
+    crate::autograd::backward(ctx, mla_loss.id);
+    crate::autograd::clear_tape_keep_grads();
+    crate::train::clip_gradients_per_tensor(ctx, &mla_model, 1.0);
+    crate::autograd::zero_grads_recycle();
+    crate::autograd::clear_tape();
+    tested += 2;
+
     (tested, passed)
 }
 

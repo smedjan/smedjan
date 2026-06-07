@@ -20,6 +20,13 @@ pub enum AttnKind {
     /// Token-shift is omitted on this path (proven in the standalone module); the WKV recurrence
     /// is the core. Materialised form → short-sequence training (chunked stable form is follow-up).
     Rwkv,
+    /// Multi-head Latent Attention (DeepSeek-V2/V3): K and V are reconstructed from a shared low-rank
+    /// latent `c = x @ W_dkv` (dim d_c ≪ kv_dim) via up-projections `W_uk`, `W_uv`. The latent `c` is
+    /// what an MLA KV cache stores → 10–50× cache shrink. Attention itself is standard softmax over
+    /// the reconstructed K/V; the W_q/W_o projections are unchanged. (Decoupled-RoPE keys — the
+    /// DeepSeek refinement that keeps RoPE out of the absorbed up-proj — are a documented follow-up;
+    /// here RoPE is applied to reconstructed K as usual.) Requires attn_rank == 0.
+    Mla,
 }
 
 /// Multi-head attention with rotary positional encoding, KV cache, and
@@ -50,6 +57,10 @@ pub struct MultiHeadAttention {
     pub ssm_loga: Tensor,       // [d_model, n_heads] — SSM per-head decay-gate projection (used iff Ssm)
     pub rwkv_w: Tensor,         // [head_dim] — RWKV per-channel decay (rate = exp(rwkv_w) > 0; used iff Rwkv)
     pub rwkv_u: Tensor,         // [head_dim] — RWKV per-channel current-token bonus (used iff Rwkv)
+    pub mla_dc: usize,          // MLA latent dim d_c (0 = MLA off); used iff Mla
+    pub w_dkv: Tensor,          // [d_model, d_c] — MLA KV down-projection (its output is the cacheable latent)
+    pub w_uk: Tensor,           // [d_c, kv_dim] — MLA key up-projection
+    pub w_uv: Tensor,           // [d_c, kv_dim] — MLA value up-projection
 }
 
 /// KV cache for autoregressive inference.
@@ -175,6 +186,8 @@ impl MultiHeadAttention {
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt() * scale),
             rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
+            mla_dc: 0,
+            w_dkv: z(), w_uk: z(), w_uv: z(),
         }
     }
 
@@ -224,7 +237,25 @@ impl MultiHeadAttention {
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt()),
             rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
+            mla_dc: 0,
+            w_dkv: z(), w_uk: z(), w_uv: z(),
         }
+    }
+
+    /// Enable Multi-head Latent Attention with latent dim `d_c`. Allocates the KV down-projection
+    /// and the K/V up-projections, and switches the mixer to `AttnKind::Mla`. Requires attn_rank==0
+    /// (MLA replaces the K/V projections; combining with low-rank Q/V is unsupported here).
+    pub fn enable_mla(&mut self, ctx: &Arc<MetalContext>, d_c: usize) {
+        assert!(d_c > 0, "MLA latent dim must be > 0");
+        assert_eq!(self.attn_rank, 0, "MLA requires attn_rank == 0 (low-rank Q/V is unsupported with MLA)");
+        let kv_dim = self.head_dim * self.n_kv_heads;
+        let down_std = (2.0 / (self.d_model + d_c) as f32).sqrt();
+        let up_std = (2.0 / (d_c + kv_dim) as f32).sqrt();
+        self.w_dkv = Tensor::randn(ctx, vec![self.d_model, d_c], down_std);
+        self.w_uk = Tensor::randn(ctx, vec![d_c, kv_dim], up_std);
+        self.w_uv = Tensor::randn(ctx, vec![d_c, kv_dim], up_std);
+        self.mla_dc = d_c;
+        self.attn_kind = AttnKind::Mla;
     }
 
     /// Forward pass with Grouped Query Attention support.
@@ -247,7 +278,14 @@ impl MultiHeadAttention {
         let x_flat = x.reshape(vec![batch * seq_len, d_model]);
 
         // Project Q, K, V — separate matmuls (fewer dispatches than fused concat+slice)
-        let (q, k, v) = if self.attn_rank > 0 {
+        let (q, k, v) = if self.attn_kind == AttnKind::Mla {
+            // MLA: K,V reconstructed from a shared low-rank latent c = x @ W_dkv (the cacheable
+            // compression). Q/O unchanged. K,V keep the standard [n_tokens, kv_dim] shape, so the
+            // rest of the pipeline (transpose, RoPE, GQA, softmax) is identical.
+            let q = x_flat.matmul(&self.w_q);
+            let (_c, k, v) = crate::mla::mla_kv(&x_flat, &self.w_dkv, &self.w_uk, &self.w_uv);
+            (q, k, v)
+        } else if self.attn_rank > 0 {
             (
                 x_flat.matmul(&self.w_q).matmul(&self.w_q_v),
                 x_flat.matmul(&self.w_k).matmul(&self.w_k_v),
@@ -428,6 +466,14 @@ impl MultiHeadAttention {
 
     /// Collect all trainable parameters.
     pub fn parameters(&self) -> Vec<&Tensor> {
+        if self.attn_kind == AttnKind::Mla {
+            // MLA: Q/O projections + QK-norm + the latent down/up projections. The direct w_k/w_v
+            // are unused (K,V come from the latent), so they are NOT trained or checkpointed.
+            return vec![
+                &self.w_q, &self.w_o, &self.qk_norm_weight,
+                &self.w_dkv, &self.w_uk, &self.w_uv,
+            ];
+        }
         let mut params = if self.attn_rank > 0 {
             vec![&self.w_q, &self.w_q_v, &self.w_k, &self.w_k_v,
                  &self.w_v, &self.w_v_v, &self.w_o, &self.w_o_v]

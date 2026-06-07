@@ -2247,6 +2247,97 @@ mod suite {
         assert!(max_loss < 30.0, "8-bit AdamW loss blew up (max {max_loss})");
     }
 
+    /// MLA core: K,V are reconstructed from a shared low-rank latent c=x@W_dkv whose dim d_c is far
+    /// smaller than kv_dim — so an MLA KV cache (storing c) is much smaller than caching K,V. Shapes
+    /// must be right, the reconstruction differentiable, and the cache shrink large.
+    #[test]
+    fn mla_kv_compresses_and_reconstructs() {
+        let ctx = test_ctx();
+        let (n_tokens, d_model, kv_dim, d_c) = (16usize, 128usize, 128usize, 16usize);
+        let x = Tensor::randn(&ctx, vec![n_tokens, d_model], 0.3);
+        let w_dkv = Tensor::randn(&ctx, vec![d_model, d_c], 0.1);
+        let w_uk = Tensor::randn(&ctx, vec![d_c, kv_dim], 0.1);
+        let w_uv = Tensor::randn(&ctx, vec![d_c, kv_dim], 0.1);
+        let (c, k, v) = crate::mla::mla_kv(&x, &w_dkv, &w_uk, &w_uv);
+        assert_eq!(c.shape, vec![n_tokens, d_c], "latent shape");
+        assert_eq!(k.shape, vec![n_tokens, kv_dim], "reconstructed K shape");
+        assert_eq!(v.shape, vec![n_tokens, kv_dim], "reconstructed V shape");
+        // K must equal c @ w_uk numerically (sanity that mla_kv really up-projects the latent).
+        let k_ref = c.matmul(&w_uk).to_vec();
+        let k_got = k.to_vec();
+        let max_diff = k_ref.iter().zip(&k_got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "K must be c@W_uk: max_diff={max_diff}");
+        let (std_kv, mla_kv, shrink) = crate::mla::cache_footprint(kv_dim, d_c);
+        eprintln!("MLA cache/token: standard={std_kv} floats, MLA={mla_kv} floats, shrink={shrink:.0}×");
+        assert!(shrink >= 8.0, "MLA cache must be ≥8× smaller, got {shrink:.1}×");
+        autograd::clear_tape();
+    }
+
+    /// MLA parameters() must include the latent projections (W_dkv/W_uk/W_uv) and EXCLUDE the now-
+    /// unused direct K/V projections (W_k/W_v) — they receive no gradient and shouldn't be trained
+    /// or checkpointed.
+    #[test]
+    fn mla_parameters_route_through_latent() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(48, 64, 4, 4, 2.67, 64) };
+        let model = Transformer::new(&ctx, cfg);
+        let attn = &model.blocks[0].attn;
+        assert_eq!(attn.attn_kind, crate::attention::AttnKind::Mla);
+        let ids: std::collections::HashSet<usize> = attn.parameters().iter().map(|p| p.id).collect();
+        assert!(ids.contains(&attn.w_dkv.id), "W_dkv must be a trained param");
+        assert!(ids.contains(&attn.w_uk.id) && ids.contains(&attn.w_uv.id), "W_uk/W_uv must be trained");
+        assert!(!ids.contains(&attn.w_k.id) && !ids.contains(&attn.w_v.id),
+            "MLA must NOT train the unused direct K/V projections");
+    }
+
+    /// End-to-end MLA integration: a model with `AttnKind::Mla` in every block must forward to finite
+    /// logits, backprop a finite gradient into the latent down-projection W_dkv, and train stably
+    /// (clipped, warmed-up Muon steps never go non-finite). Mirrors linear_attn_model_trains_stably.
+    #[test]
+    fn mla_model_trains_stably() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let model = Transformer::new(&ctx, cfg);
+        let (batch, seq_len) = (1usize, 8usize);
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5; 8];
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let mut opt = crate::optim::Muon::new(&ctx, &prefs, 0.0);
+        let w_dkv_id = model.blocks[0].attn.w_dkv.id;
+        let mut first = 0.0f32;
+        let mut last = 0.0f32;
+        for step in 0..40 {
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            if step == 0 {
+                let lg = logits.to_vec();
+                assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
+                assert!(lg.iter().all(|x| x.is_finite()), "MLA forward produced non-finite logits");
+            }
+            let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+            let lv = loss.to_vec()[0];
+            assert!(lv.is_finite(), "MLA loss non-finite at step {step}: {lv}");
+            if step == 0 { first = lv; }
+            last = lv;
+            autograd::backward(&ctx, loss.id);
+            if step == 0 {
+                let g = autograd::get_grad(w_dkv_id).expect("no gradient reached the MLA W_dkv latent projection");
+                let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_dkv.shape.clone()).to_vec();
+                assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on MLA W_dkv");
+            }
+            autograd::clear_tape_keep_grads();
+            crate::train::clip_gradients(&ctx, &model, 1.0);
+            let lr = 1e-2 * (((step + 1) as f32) / 20.0).min(1.0);
+            opt.step(lr);
+            autograd::zero_grads_recycle();
+        }
+        eprintln!("MLA model: loss {first:.3} -> {last:.3}");
+        assert!(last.is_finite(), "MLA training went non-finite");
+        autograd::clear_tape();
+        autograd::zero_grads();
+    }
+
     // =========================================================================
     // Mega-kernel correctness: mega_ffn output must match standard FFN path
     // =========================================================================

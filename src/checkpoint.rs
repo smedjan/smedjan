@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 8; // v8: rwkv mixer flag. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const VERSION: u32 = 9; // v9: MLA latent dim. v8: rwkv mixer flag. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 
 /// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
@@ -120,7 +120,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((2..=8).contains(&version), "Unsupported training state version: {}", version);
+    assert!((2..=9).contains(&version), "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -207,7 +207,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((1..=8).contains(&version), "Unsupported checkpoint version: {} (expected 1-8)", version);
+    assert!((1..=9).contains(&version), "Unsupported checkpoint version: {} (expected 1-9)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -305,6 +305,8 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     file.write_all(&(if config.ssm { 1u32 } else { 0u32 }).to_le_bytes())?;
     // v8: RWKV mixer flag
     file.write_all(&(if config.rwkv { 1u32 } else { 0u32 }).to_le_bytes())?;
+    // v9: MLA latent dim (0 = off)
+    file.write_all(&(config.mla_latent_dim as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -396,6 +398,14 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         false
     };
 
+    // v9: MLA latent dim; older checkpoints default to 0 (off).
+    let mla_latent_dim = if version >= 9 {
+        file.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) as usize
+    } else {
+        0
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
@@ -420,5 +430,6 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         linear_attn_period,
         ssm,
         rwkv,
+        mla_latent_dim,
     })
 }

@@ -9,6 +9,7 @@ mod eval;
 mod generate;
 mod linear_attention;
 mod loss;
+mod mla;
 #[cfg(feature = "metal")]
 mod metal;
 #[cfg(feature = "cuda")]
@@ -118,6 +119,9 @@ struct TrainArgs {
         /// BitNet: use ternary weights in FFN (no float multiply). Default: false
         #[arg(long)]
         bitnet: bool,
+        /// MLA: Multi-head Latent Attention KV latent dim d_c. 0=off. e.g. 64 → 10-50× KV-cache shrink.
+        #[arg(long, default_value = "0")]
+        mla_latent_dim: usize,
         /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
         #[arg(long, default_value = "0")]
         lowrank: usize,
@@ -640,6 +644,7 @@ fn main() {
             lr_restart,
             mup_base,
             bitnet,
+            mla_latent_dim,
             lowrank,
             shared_layers,
             prune_threshold,
@@ -733,6 +738,7 @@ fn main() {
                 config.model_config.mup_base_width = mup_base;
             }
             config.model_config.bitnet = bitnet;
+            config.model_config.mla_latent_dim = mla_latent_dim;
             config.model_config.lowrank = lowrank;
             config.model_config.shared_layers = shared_layers;
             config.prune_threshold = prune_threshold;

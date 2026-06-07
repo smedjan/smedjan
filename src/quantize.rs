@@ -428,6 +428,7 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
         linear_attn_period: 0,
         ssm: false,
         rwkv: false,
+        mla_latent_dim: 0,
     })
 }
 

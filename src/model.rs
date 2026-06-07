@@ -34,6 +34,7 @@ pub struct ModelConfig {
                                // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
     pub ssm: bool,             // Use the selective state-space (Mamba-2/SSD) mixer in every block.
     pub rwkv: bool,            // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
+    pub mla_latent_dim: usize, // Multi-head Latent Attention: KV latent dim d_c (0=off). 10-50× KV-cache shrink.
 }
 
 /// Mixture-of-experts spec for [`ModelConfig::custom_moe`].
@@ -110,6 +111,7 @@ impl ModelConfig {
             linear_attn_period: 0,
             ssm: false,
             rwkv: false,
+            mla_latent_dim: 0,
         }
     }
 
@@ -394,6 +396,8 @@ impl TransformerBlock {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
+        } else if config.mla_latent_dim > 0 {
+            attn.enable_mla(ctx, config.mla_latent_dim);
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
@@ -461,6 +465,8 @@ impl TransformerBlock {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
             attn.attn_kind = crate::attention::AttnKind::Ssm;
+        } else if config.mla_latent_dim > 0 {
+            attn.enable_mla(ctx, config.mla_latent_dim);
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
