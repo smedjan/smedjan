@@ -213,20 +213,32 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
   (4 ignored → 3). Convergence is proven by the deterministic routing test + the real-data smoke
   (1.56). The remaining 3 ignored are legit: exact-comparison gradient-checkpointing, the manual
   simdgroup benchmark, and a pre-existing fp16-nondeterminism matmul check.
-- **Known follow-up (not a bug):** non-AdamW optimizer *state* (muon/hybrid/8-bit momentum) isn't
-  persisted across resume — the model + step restore correctly, the optimizer restarts fresh (same as
-  muon/sophia always did). Per-optimizer state serialization is the follow-up if exact resume matters.
+**Follow-ups DRAINED (review round 2):**
+- **Optimizer-state persistence across resume [DONE].** Muon/hybrid/8-bit now serialize their own
+  state (momentum, int8 moments + scales) to a `<state>.opt` sidecar and restore it; resume continues
+  with real optimizer state instead of fresh momentum. Byte-identical round-trip test + CLI
+  train→resume verified ("Restored 'muon' optimizer state…"). `checkpoint::{save,load}_opt_sidecar`.
+- **Batched simdgroup MMA [DONE].** The simdgroup fast path now covers the batched attention matmuls
+  (Q@K^T, weights@V), not just batch==1 projections — `batched_matmul_simdgroup{,_trans_b}`, routed
+  under `--simdgroup-matmul`. Bit-identical to the default batched matmul (max_diff 0.0).
+- **#5 RMSNorm collapse root-cause [DONE].** Mechanism analyzed (weight-tying × logit-suppression
+  drives embedding rows→0 → collapsed input row → inv_rms³ explosion); `set_rmsnorm_clamp` toggle +
+  unit test directly show the explosion (max|grad|≈9950 without the clamp) and the fix (bounded to
+  31.6). The clamp is the correct fix, not a symptom-patch.
 
-**Still genuinely open (need resources beyond unit tests, not code-blocked):**
-- **#5 root-cause the RMSNorm activation collapse itself** (the clamp treats the symptom). Needs
-  per-layer activation-norm instrumentation across a real diverging run to find the dead gate /
-  zeroed projection.
-- **#6 verify on real training — SMOKE DONE (600-step tiny on `data/train_v3.bin`), full large-batch
-  multi-hour run still open.** Real-corpus 600-step smokes (uniform ≈ 9.5): plain AdamW → **1.56**,
-  Muon+AdamW hybrid + simdgroup → **1.56** (matches; role-routing + MMA train correctly), 8-bit AdamW →
-  **1.56** (3.9× less optim mem, no quality loss). **bf16-matmul → diverged (~475)** → it's
-  overflow-mitigation only, not a default (see above). MLA (d_c=32, 8× KV-cache shrink) → **1.56**,
-  i.e. no quality loss vs baseline. A real multi-hour large-batch run (loss curves vs baseline,
-  throughput numbers) remains an operator-run.
-- simdgroup beyond 1.29× (double-buffer/larger tiles); MLA decoupled-RoPE keys + KV-cache-compressed
-  incremental decode; wiring `pack_sequences` into the training `DataLoader`.
+**Still genuinely open (substantial scoped efforts — cores done+verified, not quick drains):**
+- **Block-sparse TRUE subquadratic speedup.** The routing/quality core is DONE (matches dense, EMA
+  1.56 on real data at ~3/8 blocks). What remains is a gather/flash kernel that COMPUTES only the
+  selected blocks (currently masks the dense O(n²) scores). Research-grade online-softmax kernel —
+  warrants a focused session, not a tail addition.
+- **MLA absorbed-form incremental decode.** Training + structural part DONE (16× cache shrink, EMA
+  1.56). The inference KV-cache-compression at decode (cache the latent; absorb W_uk into W_q; the
+  decoupled-RoPE subtlety) is the intricate remaining piece.
+- **Sequence-packing forward integration.** `pack_sequences` + `causal_doc_mask` are DONE+tested; the
+  DataLoader→forward wiring needs either threading `seg_ids` through 64 `forward` call sites or a
+  per-batch global doc-mask — a real refactor for a modest pretraining-quality gain.
+- **#6 full large-batch multi-hour run.** SMOKES DONE — 600-step real-corpus runs: AdamW 1.56,
+  hybrid+simdgroup 1.56, 8-bit 1.56, MLA 1.56, block-sparse 1.56; bf16 diverged (→ overflow-only).
+  A multi-hour large-batch run (loss curves vs baseline, throughput) is a genuine operator/time
+  resource, not code.
+- simdgroup beyond 1.29× (double-buffer / larger tiles).
