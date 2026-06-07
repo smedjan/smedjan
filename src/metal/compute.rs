@@ -380,6 +380,33 @@ pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     );
 }
 
+/// Batched matmul on the hardware simdgroup MMA units (fp32 in/out, half fragments). 64×64 tile /
+/// 4 simdgroups per (tile, batch). Same precision as gpu_batched_matmul.
+pub fn gpu_batched_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "batched_matmul_simdgroup", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// Batched simdgroup matmul with B transposed: C[b] = A[b] @ B[b]^T.
+pub fn gpu_batched_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32, batch: u32 }
+    let params = Params { m, n, k, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(128, 1, 1);
+    dispatch_sync!(ctx, "batched_matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 /// Batched C[b] = A[b] @ B[b]^T for all b. Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, N, K], C: [batch, M, N]
 pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {

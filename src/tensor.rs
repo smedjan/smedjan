@@ -1409,7 +1409,12 @@ impl Tensor {
 
         // Batched matmul. NB: despite "FP32 inputs", the batched_matmul_tiled kernel casts both
         // operands to half in shared memory (like the dense matmul) — results are fp16-precision.
-        compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
+        let bd = compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 };
+        if compute::simdgroup_matmul_enabled() {
+            compute::gpu_batched_matmul_simdgroup(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+        } else {
+            compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+        }
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1452,7 +1457,12 @@ impl Tensor {
 
         // Batched matmul trans_b. NB: the kernel casts both operands to half in shared memory —
         // results are fp16-precision, not fp32 (the "FP32 inputs" wording is misleading).
-        compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
+        let bd = compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 };
+        if compute::simdgroup_matmul_enabled() {
+            compute::gpu_batched_matmul_trans_b_simdgroup(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+        } else {
+            compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+        }
 
         let out_id = autograd::next_id();
         let out = Tensor {

@@ -2251,6 +2251,30 @@ mod suite {
         });
     }
 
+    /// The batched simdgroup MMA path (attention matmuls) must match the default batched matmul on
+    /// the same inputs — for both plain and trans_b, at non-multiple-of-64 dims (edge tiles). Proves
+    /// the simdgroup fast path extends correctly beyond the batch==1 projections.
+    #[test]
+    fn batched_simdgroup_matches_default() {
+        let ctx = test_ctx();
+        let a = Tensor::randn(&ctx, vec![3, 40, 48], 0.3);
+        let b = Tensor::randn(&ctx, vec![3, 48, 56], 0.3);
+        let bt = Tensor::randn(&ctx, vec![3, 56, 48], 0.3); // for trans_b: [batch, n, k]
+        let prev = compute::set_simdgroup_matmul(false);
+        let mm_off = a.batched_matmul(&b).to_vec();
+        let tb_off = a.batched_matmul_trans_b(&bt).to_vec();
+        compute::set_simdgroup_matmul(true);
+        let mm_on = a.batched_matmul(&b).to_vec();
+        let tb_on = a.batched_matmul_trans_b(&bt).to_vec();
+        compute::set_simdgroup_matmul(prev);
+        let d_mm = mm_off.iter().zip(&mm_on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let d_tb = tb_off.iter().zip(&tb_on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("batched simdgroup: matmul max_diff={d_mm:.5}, trans_b max_diff={d_tb:.5}");
+        assert!(mm_on.iter().all(|x| x.is_finite()) && tb_on.iter().all(|x| x.is_finite()));
+        assert!(d_mm < 2e-2, "batched simdgroup matmul mismatch: {d_mm}");
+        assert!(d_tb < 2e-2, "batched simdgroup trans_b mismatch: {d_tb}");
+    }
+
     /// Toggling the global simdgroup fast path must keep `Tensor::matmul` correct: flag-on and
     /// flag-off products agree (both fp16 precision). Proves the opt-in wiring routes correctly and
     /// restores the default afterwards.

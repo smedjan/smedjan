@@ -474,6 +474,145 @@ kernel void matmul_simdgroup_f16(
 }
 "#;
 
+/// Batched simdgroup-matrix matmul: C[b] = A[b] @ B[b] on the hardware MMA units (extends the
+/// simdgroup fast path beyond the batch==1 projections to the batched attention matmuls). fp32 in /
+/// fp32 out, half MMA fragments (same precision as batched_matmul_tiled). 64×64 tile / 4 simdgroups,
+/// batch in grid.z. A[b]:[M,K], B[b]:[K,N], C[b]:[M,N].
+pub const BATCHED_MATMUL_SIMDGROUP: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct BatchedMatmulParams { uint M; uint N; uint K; uint batch; };
+#define TILE 64
+
+kernel void batched_matmul_simdgroup(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant BatchedMatmulParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint b = group_id.z;
+    if (b >= params.batch) return;
+    uint M = params.M, N = params.N, K = params.K;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+    uint q_row = (sgid >> 1) * 32;
+    uint q_col = (sgid & 1) * 32;
+    device const float* A_b = A + b * M * K;
+    device const float* B_b = B + b * K * N;
+    device float* C_b = C + b * M * N;
+
+    threadgroup half As[TILE * 8];
+    threadgroup half Bs[8 * TILE];
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+        acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t; uint r = idx >> 3; uint c = idx & 7;
+            uint gr = tile_row + r, gc = k0 + c;
+            As[r * 8 + c] = (gr < M && gc < K) ? (half)A_b[gr * K + gc] : (half)0.0;
+        }
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t; uint r = idx >> 6; uint c = idx & 63;
+            uint gr = k0 + r, gc = tile_col + c;
+            Bs[r * TILE + c] = (gr < K && gc < N) ? (half)B_b[gr * N + gc] : (half)0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_half8x8 a[4], bb[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(bb[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+            simdgroup_multiply_accumulate(acc[i][j], a[i], bb[j], acc[i][j]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+        simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t; uint r = idx >> 6; uint c = idx & 63;
+        uint gr = tile_row + r, gc = tile_col + c;
+        if (gr < M && gc < N) C_b[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
+/// Batched simdgroup matmul with B transposed: C[b] = A[b] @ B[b]^T. A[b]:[M,K], B[b]:[N,K],
+/// C[b]:[M,N]. Same MMA tiling; B is staged with transposed indexing (Bs[kk][nn] = B[nn][k0+kk]).
+pub const BATCHED_MATMUL_SIMDGROUP_TRANS_B: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct BatchedMatmulParams { uint M; uint N; uint K; uint batch; };
+#define TILE 64
+
+kernel void batched_matmul_simdgroup_trans_b(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant BatchedMatmulParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint b = group_id.z;
+    if (b >= params.batch) return;
+    uint M = params.M, N = params.N, K = params.K;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+    uint q_row = (sgid >> 1) * 32;
+    uint q_col = (sgid & 1) * 32;
+    device const float* A_b = A + b * M * K;
+    device const float* B_b = B + b * N * K; // B is [N, K]
+    device float* C_b = C + b * M * N;
+
+    threadgroup half As[TILE * 8];
+    threadgroup half Bs[8 * TILE];
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+        acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t; uint r = idx >> 3; uint c = idx & 7;
+            uint gr = tile_row + r, gc = k0 + c;
+            As[r * 8 + c] = (gr < M && gc < K) ? (half)A_b[gr * K + gc] : (half)0.0;
+        }
+        // Stage B^T: Bs[kk][nn] = B[tile_col+nn][k0+kk]  (B is [N,K])
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t; uint kk = idx >> 6; uint nn = idx & 63;
+            uint gn = tile_col + nn, gk = k0 + kk;
+            Bs[kk * TILE + nn] = (gn < N && gk < K) ? (half)B_b[gn * K + gk] : (half)0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_half8x8 a[4], bb[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(bb[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+            simdgroup_multiply_accumulate(acc[i][j], a[i], bb[j], acc[i][j]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++)
+        simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t; uint r = idx >> 6; uint c = idx & 63;
+        uint gr = tile_row + r, gc = tile_col + c;
+        if (gr < M && gc < N) C_b[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
 /// Narrow matmul for small N (≤32): C = A @ B where A:[M,K], B:[K,N], C:[M,N].
 /// TILE_M=32, TILE_N=16, 32 threads. Each thread computes 4×4 subtile.
 /// Eliminates 50% wasted compute when N=16 with the standard 32-wide tile.
