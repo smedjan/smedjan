@@ -355,6 +355,24 @@ mod suite {
         assert_eq!(SPECIAL_TOKENS, 3, "SPECIAL_TOKENS count should be 3");
     }
 
+    /// Importing a GPT-2 / HF `merges.txt` reproduces its merge rules exactly (byte-level BPE).
+    #[test]
+    fn import_gpt2_merges_reproduces_rules() {
+        // Printable ASCII maps to itself in GPT-2's byte map, so these lines mean: a+b→ab, ab+a→aba.
+        let merges = "#version: 0.2\na b\nab a\n";
+        let tok = BpeTokenizer::import_gpt2_merges(merges);
+        // base = 3 special + 256 bytes; +2 merges = 261 tokens.
+        assert_eq!(tok.inverse_vocab.len(), 261);
+        assert_eq!(tok.merges.len(), 2);
+        // The merges apply during encoding.
+        assert_eq!(tok.encode("ab").len(), 1, "a+b merge should collapse to one token");
+        assert_eq!(tok.encode("aba").len(), 1, "ab+a merge should collapse to one token");
+        assert_eq!(tok.encode("ba").len(), 2, "no b+a merge is defined");
+        // Decode roundtrips through the imported vocab.
+        assert_eq!(tok.decode(&tok.encode("aba")), "aba");
+        assert_eq!(tok.decode(&tok.encode("ab")), "ab");
+    }
+
     #[test]
     fn tokenizer_vocab_size_after_training() {
         let corpus = b"abcabcabcabc def def def ghi ghi jkl";

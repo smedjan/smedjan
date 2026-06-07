@@ -19,6 +19,29 @@ pub struct BpeTokenizer {
     pub merge_priority: HashMap<(u32, u32), usize>,
 }
 
+/// GPT-2's reversible byte→unicode map: bytes in the printable ranges map to themselves, the rest
+/// to code points 256+n. Returns (byte, char) pairs — used to decode `merges.txt` token strings
+/// (which live in this char space) back to their raw bytes.
+fn gpt2_byte_to_unicode() -> Vec<(u8, char)> {
+    let mut bs: Vec<u32> = Vec::new();
+    for (lo, hi) in [(b'!' as u32, b'~' as u32), (0xA1u32, 0xACu32), (0xAEu32, 0xFFu32)] {
+        bs.extend(lo..=hi);
+    }
+    let mut cs: Vec<u32> = bs.clone();
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    bs.iter()
+        .zip(cs.iter())
+        .map(|(&b, &c)| (b as u8, char::from_u32(c).expect("valid code point")))
+        .collect()
+}
+
 impl BpeTokenizer {
     /// Train a BPE tokenizer from a corpus.
     pub fn train(corpus: &[u8], vocab_size: u32) -> Self {
@@ -111,6 +134,66 @@ impl BpeTokenizer {
             merges,
             merge_priority,
         }
+    }
+
+    /// Import a byte-level BPE from a GPT-2 / HuggingFace `merges.txt` (priority-ordered "A B" lines
+    /// in GPT-2's byte-to-unicode char space). The merge RULES are reproduced exactly, so encoding
+    /// matches the source tokenizer; IDs follow this harness's convention (3 special + 256 bytes +
+    /// merges) rather than the source's, which is what a freshly-trained model needs. No vocab.json
+    /// required — the vocab is rebuilt from the byte base by applying the merges in order.
+    pub fn import_gpt2_merges(merges_text: &str) -> Self {
+        let char2byte: HashMap<char, u8> =
+            gpt2_byte_to_unicode().into_iter().map(|(b, c)| (c, b)).collect();
+        // Decode a GPT-2 char-space token to its raw bytes (None if it contains an unmapped char).
+        let decode = |s: &str| -> Option<Vec<u8>> { s.chars().map(|c| char2byte.get(&c).copied()).collect() };
+
+        let mut inverse_vocab: Vec<Vec<u8>> = Vec::new();
+        let mut vocab: HashMap<Vec<u8>, u32> = HashMap::new();
+        // 3 special tokens (ids 0..3), then the 256 single bytes (id = byte + 3), matching `train`.
+        for special in [&b"<|pad|>"[..], &b"<|bos|>"[..], &b"<|eos|>"[..]] {
+            let id = inverse_vocab.len() as u32;
+            vocab.insert(special.to_vec(), id);
+            inverse_vocab.push(special.to_vec());
+        }
+        for b in 0u32..256 {
+            let bytes = vec![b as u8];
+            let id = inverse_vocab.len() as u32;
+            vocab.insert(bytes.clone(), id);
+            inverse_vocab.push(bytes);
+        }
+
+        let mut merges: Vec<(u32, u32, u32)> = Vec::new();
+        let mut merge_priority: HashMap<(u32, u32), usize> = HashMap::new();
+        for line in merges_text.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with("#version") {
+                continue;
+            }
+            let mut it = line.splitn(2, ' ');
+            let (a, b) = match (it.next(), it.next()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let (a_bytes, b_bytes) = match (decode(a), decode(b)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let (a_id, b_id) = match (vocab.get(&a_bytes), vocab.get(&b_bytes)) {
+                (Some(&a), Some(&b)) => (a, b),
+                _ => continue, // merge references a token not yet built — skip (malformed file)
+            };
+            let mut merged = a_bytes;
+            merged.extend_from_slice(&b_bytes);
+            if vocab.contains_key(&merged) {
+                continue; // duplicate merge target
+            }
+            let merged_id = inverse_vocab.len() as u32;
+            merge_priority.insert((a_id, b_id), merges.len());
+            merges.push((a_id, b_id, merged_id));
+            vocab.insert(merged.clone(), merged_id);
+            inverse_vocab.push(merged);
+        }
+        BpeTokenizer { vocab, inverse_vocab, merges, merge_priority }
     }
 
     /// Encode text to token IDs.

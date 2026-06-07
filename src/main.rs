@@ -226,6 +226,16 @@ enum Commands {
         file: Option<String>,
     },
 
+    /// Import a GPT-2 / HuggingFace merges.txt as a byte-level BPE tokenizer and save it
+    ImportBpe {
+        /// Path to a GPT-2/HF merges.txt
+        #[arg(long)]
+        merges: String,
+        /// Output tokenizer path
+        #[arg(long)]
+        output: String,
+    },
+
     /// Generate text from a trained model
     Generate {
         #[arg(long)]
@@ -863,6 +873,18 @@ fn main() {
             assert!(tokens.len() >= 2, "need >= 2 tokens to score perplexity (got {})", tokens.len());
             let ppl = eval::perplexity(&ctx, &model, &tokens);
             println!("Perplexity: {:.3} over {} tokens (model step {})", ppl, tokens.len(), step);
+        }
+
+        Commands::ImportBpe { merges, output } => {
+            let text = std::fs::read_to_string(&merges).expect("Failed to read merges file");
+            let tok = tokenizer::BpeTokenizer::import_gpt2_merges(&text);
+            tok.save(&output).expect("Failed to save tokenizer");
+            println!(
+                "Imported {} merges → {} tokens, saved to {}",
+                tok.merges.len(),
+                tok.inverse_vocab.len(),
+                output
+            );
         }
 
         Commands::Process {
