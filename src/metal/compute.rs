@@ -161,6 +161,21 @@ pub fn simdgroup_matmul_enabled() -> bool {
     SIMDGROUP_MATMUL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Global opt-in: when set (and simdgroup is off), the default `Tensor::matmul` runs its fp32
+/// operands through the bf16 tiled kernel — fp32 *range* (no ±65504 clamp) at fp16-ish bandwidth,
+/// removing the fp16-overflow instability class. Off by default.
+static BF16_MATMUL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the bf16 default-matmul path. Returns the previous value.
+pub fn set_bf16_matmul(on: bool) -> bool {
+    BF16_MATMUL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the bf16 default-matmul path is currently enabled.
+pub fn bf16_matmul_enabled() -> bool {
+    BF16_MATMUL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
 pub fn gpu_cast_f32_to_f16(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let size_buf = params_buffer(ctx, &size);

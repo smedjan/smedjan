@@ -2074,6 +2074,44 @@ mod suite {
         }
     }
 
+    /// The bf16 default-matmul flag gives `Tensor::matmul` fp32 RANGE: a value above the fp16 max
+    /// (65504) is preserved, where the default fp16 path overflows/clamps it. And for normal-range
+    /// values bf16-on agrees with the fp16 default to bf16 precision. Restores the default after.
+    #[test]
+    fn matmul_bf16_flag_preserves_range() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            // Range: A[0]=1e5 selected by a one-hot B. fp16 path corrupts it; bf16 preserves it.
+            let big = 1.0e5f32;
+            let a = Tensor::from_slice(&ctx, &[big; 32], vec![1, 32]);
+            let mut bv = vec![0.0f32; 32];
+            bv[0] = 1.0;
+            let b = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
+
+            let prev = compute::set_bf16_matmul(false);
+            let r_f16 = a.matmul(&b).to_vec()[0];
+            compute::set_bf16_matmul(true);
+            assert!(compute::bf16_matmul_enabled());
+            let r_bf16 = a.matmul(&b).to_vec()[0];
+            compute::set_bf16_matmul(prev); // restore
+
+            eprintln!("matmul 1e5: fp16={r_f16}, bf16={r_bf16}");
+            assert!((r_bf16 - big).abs() < big * 5e-3, "bf16 must preserve 1e5: got {r_bf16}");
+            assert!((r_f16 - big).abs() > big * 0.1, "fp16 path should corrupt 1e5 (overflow/clamp): got {r_f16}");
+
+            // Normal range: bf16-on vs fp16 default agree to bf16 precision.
+            let x = Tensor::randn(&ctx, vec![48, 40], 0.4);
+            let y = Tensor::randn(&ctx, vec![40, 56], 0.4);
+            let off = x.matmul(&y).to_vec();
+            compute::set_bf16_matmul(true);
+            let on = x.matmul(&y).to_vec();
+            compute::set_bf16_matmul(false);
+            let max_rel = off.iter().zip(&on).map(|(p, q)| (p - q).abs() / (1.0 + p.abs())).fold(0.0f32, f32::max);
+            eprintln!("bf16 vs fp16 normal-range max_rel={max_rel:.4}");
+            assert!(on.iter().all(|v| v.is_finite()) && max_rel < 0.05, "bf16 normal-range mismatch: {max_rel}");
+        });
+    }
+
     /// Toggling the global simdgroup fast path must keep `Tensor::matmul` correct: flag-on and
     /// flag-off products agree (both fp16 precision). Proves the opt-in wiring routes correctly and
     /// restores the default afterwards.

@@ -165,6 +165,9 @@ struct TrainArgs {
         /// Route the default fp16 matmul through the hardware simdgroup MMA units (~1.3× faster, bit-identical).
         #[arg(long)]
         simdgroup_matmul: bool,
+        /// Route the default matmul through bf16 (fp32 range, no fp16 ±65504 clamp). Removes an overflow class.
+        #[arg(long)]
+        bf16_matmul: bool,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
@@ -665,6 +668,7 @@ fn main() {
             muon_lr_scale,
             adamw_lr_scale,
             simdgroup_matmul,
+            bf16_matmul,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -757,6 +761,7 @@ fn main() {
             config.muon_lr_scale = muon_lr_scale;
             config.adamw_lr_scale = adamw_lr_scale;
             config.simdgroup_matmul = simdgroup_matmul;
+            config.bf16_matmul = bf16_matmul;
 
             train::train(&ctx, &config).expect("Training failed");
         }

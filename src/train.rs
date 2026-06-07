@@ -103,6 +103,10 @@ pub struct TrainConfig {
     /// Route the default fp16 matmul through the hardware simdgroup MMA units. Bit-identical to the
     /// hand-rolled fp16 path; measured ~1.3× faster at 1024³ on M3. Default false.
     pub simdgroup_matmul: bool,
+    /// Route the default matmul through the bf16 kernel — fp32 range (no ±65504 clamp) instead of the
+    /// fp16 path that overflows large magnitudes. Removes an fp16-overflow instability class. Default
+    /// false. (simdgroup_matmul takes precedence if both are set.)
+    pub bf16_matmul: bool,
 }
 
 impl TrainConfig {
@@ -164,6 +168,7 @@ impl TrainConfig {
             muon_lr_scale: 1.0,
             adamw_lr_scale: 1.0,
             simdgroup_matmul: false,
+            bf16_matmul: false,
         }
     }
 }
@@ -191,6 +196,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     if config.simdgroup_matmul {
         compute::set_simdgroup_matmul(true);
         eprintln!("Matmul: hardware simdgroup MMA fast path enabled");
+    } else if config.bf16_matmul {
+        compute::set_bf16_matmul(true);
+        eprintln!("Matmul: bf16 path enabled (fp32 range, no fp16 ±65504 clamp)");
     }
 
     // Create checkpoint directory
