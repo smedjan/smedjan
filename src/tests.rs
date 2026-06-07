@@ -1993,12 +1993,13 @@ mod suite {
         std::fs::remove_file(tmp_path).ok();
     }
 
-    /// REGRESSION (AdamW stability): RMSNorm's backward has an `inv_rms^3` term. When an activation
-    /// row collapses (mean_sq -> 0) it exploded the gradient to ~1e8 from a perfectly bounded
-    /// forward; clip then turned that into a garbage direction and AdamW's loss blew up to ~1e5.
-    /// inv_rms is now clamped in the backward. This guards that AdamW on a tiny full-batch keeps the
-    /// GRADIENT NORM and loss BOUNDED — it need not converge here (Muon does, see the convergence
-    /// test; AdamW's sign-like updates just oscillate on full-batch), but it must NOT explode.
+    /// REGRESSION (AdamW stability): two fixes stop AdamW blowing up on a tiny full-batch.
+    /// (1) RMSNorm's backward has an `inv_rms^3` term that, when an activation row collapses
+    /// (mean_sq -> 0), exploded the gradient to ~1e8 from a bounded forward — now clamped in the
+    /// backward. (2) eps was 1e-8, too small for beta2=0.95, so the update denominator collapsed —
+    /// now 1e-5. With both, AdamW keeps the loss BOUNDED (it also descends, but that's slow and noisy
+    /// so we only assert bounded here; the convergence test proves learning with Muon). It must not
+    /// regress to the ~1e5 blow-up.
     #[test]
     fn adamw_training_stays_bounded_no_grad_explosion() {
         let ctx = test_ctx();
@@ -2035,11 +2036,13 @@ mod suite {
     /// every other training test (which assert finiteness only). A capable Transformer is trained to
     /// predict a constant target (guaranteed-learnable) over a small batch; the loss must collapse.
     ///
-    /// Uses MUON: while finding this test I confirmed the loop learns, but also that AdamW is
-    /// unstable in this tiny full-batch regime (loss wanders ~uniform and gradients transiently
-    /// explode ~1e1→1e6, blowing up the run), whereas Muon descends cleanly (≈3.5 → <0.1). That
-    /// AdamW micro-batch instability is a separate, real issue tracked outside this smoke test; here
-    /// we assert the harness CAN converge, using its stable optimizer.
+    /// Uses MUON because it converges fastest here. Building this test also surfaced — and led to
+    /// fixing — two real bugs that used to make AdamW oscillate/diverge on this regime: a RMSNorm
+    /// backward that exploded (inv_rms^3) on a collapsed activation row, and an AdamW eps (1e-8) too
+    /// small for beta2=0.95, which let the update denominator collapse. Both are fixed, so AdamW is
+    /// now stable and descends below uniform too — it's just still SLOWER than Muon on a full-batch
+    /// overfit (the inherent diagonal-vs-matrix preconditioning gap, not a bug), so the fast smoke
+    /// test stays on Muon. See adamw_training_stays_bounded_no_grad_explosion for the AdamW guard.
     #[test]
     fn model_converges_overfitting_fixed_batch() {
         let ctx = test_ctx();
