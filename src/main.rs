@@ -272,6 +272,10 @@ enum Commands {
         /// Number of speculative tokens per verification step
         #[arg(long, default_value = "8")]
         draft_tokens: usize,
+        /// Batch mode: read prompts (one per line, equal token length) from this file and decode
+        /// them together through one batched KV cache. Overrides --prompt when set.
+        #[arg(long)]
+        batch_file: Option<String>,
     },
 
     /// Show model info from a checkpoint
@@ -730,6 +734,7 @@ fn main() {
             speculative,
             draft_checkpoint,
             draft_tokens,
+            batch_file,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             let (model, step) = if ckpt_path.ends_with(".qbin") {
@@ -749,7 +754,14 @@ fn main() {
                 typical_p,
             };
 
-            if speculative {
+            if let Some(bf) = batch_file {
+                let text = std::fs::read_to_string(&bf).expect("Failed to read --batch-file");
+                let prompts: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let outs = generate::generate_batch(&ctx, &model, &tok, &prompts, &config);
+                for (p, o) in prompts.iter().zip(&outs) {
+                    println!("[{}] => {}", p, o);
+                }
+            } else if speculative {
                 let draft_ckpt = draft_checkpoint.expect(
                     "--draft-checkpoint is required when --speculative is set"
                 );
