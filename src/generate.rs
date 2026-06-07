@@ -151,6 +151,103 @@ pub fn generate(
     })
 }
 
+/// Batched generation: decode `prompts.len()` continuations together through one batched KV cache,
+/// for throughput (one forward over the whole batch per step instead of N separate forwards).
+/// Requires the prompts to encode to the SAME length — variable lengths need padding masks /
+/// continuous batching, a separate larger feature. Returns one decoded string per prompt.
+pub fn generate_batch(
+    ctx: &Arc<MetalContext>,
+    model: &Transformer,
+    tokenizer: &BpeTokenizer,
+    prompts: &[&str],
+    config: &SamplingConfig,
+) -> Vec<String> {
+    assert!(!prompts.is_empty(), "generate_batch needs at least one prompt");
+    autograd::no_grad(|| {
+        let b = prompts.len();
+        let encoded: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let mut t = vec![BOS_TOKEN];
+                t.extend(tokenizer.encode(p));
+                t
+            })
+            .collect();
+        let len = encoded[0].len();
+        assert!(
+            encoded.iter().all(|e| e.len() == len),
+            "generate_batch requires equal token-length prompts (got {:?})",
+            encoded.iter().map(|e| e.len()).collect::<Vec<_>>()
+        );
+
+        let vocab = model.config.vocab_size as usize;
+        let greedy = config.temperature < 0.01;
+        let argmax = |slice: &[f32]| -> u32 {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in slice.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    best = i;
+                }
+            }
+            best as u32
+        };
+
+        let mut kv = model.init_kv_caches_preallocated(b);
+
+        // Prefill the whole batch [b, len] in one forward.
+        let flat: Vec<u32> = encoded.iter().flatten().copied().collect();
+        ctx.begin_batch();
+        let logits = model.forward(&flat, b, len, Some(&mut kv), false);
+        ctx.flush_batch();
+        let all = logits.as_slice(); // [b * len, vocab]
+
+        let mut seqs: Vec<Vec<u32>> = vec![Vec::new(); b];
+        let mut cur: Vec<u32> = Vec::with_capacity(b);
+        let mut done = vec![false; b];
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let lp = &all[(i * len + len - 1) * vocab..(i * len + len) * vocab];
+            let t = if greedy { argmax(lp) } else { sample_token(lp, config, &[]) };
+            seq.push(t);
+            cur.push(t);
+            if t == EOS_TOKEN {
+                done[i] = true;
+            }
+        }
+
+        // Decode the batch in lockstep: one token per sequence per step.
+        for _ in 1..config.max_tokens {
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            ctx.begin_batch();
+            let logits = model.forward(&cur, b, 1, Some(&mut kv), false);
+            ctx.flush_batch();
+            let all = logits.as_slice(); // [b, vocab]
+            for i in 0..b {
+                if done[i] {
+                    continue;
+                }
+                let lp = &all[i * vocab..(i + 1) * vocab];
+                let t = if greedy { argmax(lp) } else { sample_token(lp, config, &seqs[i]) };
+                cur[i] = t;
+                seqs[i].push(t);
+                if t == EOS_TOKEN {
+                    done[i] = true;
+                }
+            }
+        }
+
+        seqs.into_iter()
+            .map(|s| {
+                let s: Vec<u32> = s.into_iter().take_while(|&t| t != EOS_TOKEN).collect();
+                tokenizer.decode(&s)
+            })
+            .collect()
+    })
+}
+
 /// Sample a token from pre-scaled logits (temperature already applied on GPU).
 /// Uses repetition penalty, top-k, top-p filtering and softmax sampling.
 fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u32 {

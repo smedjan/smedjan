@@ -2094,6 +2094,26 @@ mod suite {
         assert_eq!(p3.len(), 2);
     }
 
+    /// Batched generation decodes N sequences through one batched KV cache. Identical prompts must
+    /// yield identical continuations (the batch dimension is handled correctly), and B-identical
+    /// batched greedy must match single-sequence greedy.
+    #[test]
+    fn batched_generation_is_self_consistent() {
+        let ctx = test_ctx();
+        let vocab = 280u32;
+        let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
+        let tok = BpeTokenizer::train(b"the quick brown fox jumps over the lazy dog. ", vocab);
+        let cfg = crate::generate::SamplingConfig { temperature: 0.0, max_tokens: 12, ..Default::default() };
+        let outs = crate::generate::generate_batch(
+            &ctx, &model, &tok, &["the quick", "the quick", "the quick"], &cfg,
+        );
+        assert_eq!(outs.len(), 3);
+        assert_eq!(outs[0], outs[1], "identical prompts must give identical batched outputs");
+        assert_eq!(outs[1], outs[2]);
+        let single = crate::generate::generate(&ctx, &model, &tok, "the quick", &cfg);
+        assert_eq!(outs[0], single, "batched (B-identical) greedy must match single-seq greedy");
+    }
+
     /// End-to-end integration of linear (O(N) kernel) attention in the real Transformer:
     ///   * forward through every layer produces finite logits of the right shape,
     ///   * the backward pass differentiates the linear-attention path (finite grad reaches w_q),
