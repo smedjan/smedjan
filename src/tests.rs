@@ -3000,9 +3000,12 @@ mod suite {
         let targets: Vec<u32> = vec![5; 8 * 12]; // constant target — the loop MUST be able to fit it
 
         // The init is unseeded (Tensor::randn → thread_rng), so the convergence RATE varies between
-        // inits (some collapse to <0.1 in ~150 steps, a few descend much slower). Retry a few fresh
-        // inits and pass as soon as one collapses: a genuinely broken backward/optimizer fails ALL
-        // attempts, while mere init-slowness can't make the test flaky.
+        // inits. Retry a few fresh inits and pass as soon as one collapses: a genuinely broken
+        // backward/optimizer fails ALL attempts, while mere init-slowness can't make the test flaky.
+        // NB: peak lr is 5e-3, not 1e-2 — at 1e-2 Muon diverged (loss climbing) on the large majority
+        // of random inits here, so ALL 5 retries failed ~2/3 of the time (a real flaky test, unrelated
+        // to backward correctness). 5e-3 over 500 steps descends smoothly to <0.5 on essentially every
+        // init; a broken backward still can't fit the constant target and fails all attempts.
         let mut best = f32::INFINITY;
         let mut converged = false;
         for attempt in 0..5 {
@@ -3011,7 +3014,7 @@ mod suite {
             let param_refs: Vec<&Tensor> = params.to_vec();
             let mut opt = crate::optim::Muon::new(&ctx, &param_refs, 0.0);
             let (mut first, mut last) = (f32::NAN, f32::NAN);
-            for step in 0..250 {
+            for step in 0..500 {
                 let logits = model.forward(&tokens, batch, seq_len, None, false);
                 let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
                 let lv = loss.to_vec()[0];
@@ -3023,7 +3026,7 @@ mod suite {
                 autograd::backward(&ctx, loss.id);
                 autograd::clear_tape_keep_grads();
                 crate::train::clip_gradients(&ctx, &model, 1.0);
-                let lr = 1e-2 * (((step + 1) as f32) / 30.0).min(1.0); // warmup 30 steps
+                let lr = 5e-3 * (((step + 1) as f32) / 30.0).min(1.0); // warmup 30 steps
                 opt.step(lr);
                 autograd::zero_grads_recycle();
             }
@@ -3080,24 +3083,187 @@ mod suite {
         assert_eq!(p3.len(), 2);
     }
 
-    /// Batched generation decodes N sequences through one batched KV cache. Identical prompts must
-    /// yield identical continuations (the batch dimension is handled correctly), and B-identical
-    /// batched greedy must match single-sequence greedy.
+    /// Batched generation decodes N sequences through one batched KV cache. The batch dimension must
+    /// be wired correctly and the cached decode must reproduce the equivalent full forward. We assert
+    /// this at the **logit level**, not by bit-exact string equality of a greedy rollout: an untrained
+    /// random model collapses to a near-tied tail where any sub-ULP difference flips the argmax, so a
+    /// string compare is the wrong instrument.
+    ///
+    /// Regression guard for the `transpose_rope` dispatch bug: that wrapper computed a *threadgroup*
+    /// count but dispatched it through `dispatchThreads` (which reads the grid as a *thread* count),
+    /// so it launched only `ceil(total/256)` threads and left the rest of the RoPE'd Q/K as stale pool
+    /// memory. At `seq_len==1` decode that is one thread — so the new token's K (and batch index 0 /
+    /// every single-sequence generation) was garbage that varied run-to-run with pool contents. The
+    /// two checks below pin it: (1) B identical lanes must be **bit-identical** (a lane reading stale
+    /// memory diverges by whole units); (2) the cached decode must match a no-cache full forward over
+    /// `[prompt, t0]` within fp16 cross-kernel noise.
     #[test]
     fn batched_generation_is_self_consistent() {
         let ctx = test_ctx();
         let vocab = 280u32;
+        let v = vocab as usize;
         let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
         let tok = BpeTokenizer::train(b"the quick brown fox jumps over the lazy dog. ", vocab);
-        let cfg = crate::generate::SamplingConfig { temperature: 0.0, max_tokens: 12, ..Default::default() };
-        let outs = crate::generate::generate_batch(
-            &ctx, &model, &tok, &["the quick", "the quick", "the quick"], &cfg,
-        );
-        assert_eq!(outs.len(), 3);
-        assert_eq!(outs[0], outs[1], "identical prompts must give identical batched outputs");
-        assert_eq!(outs[1], outs[2]);
-        let single = crate::generate::generate(&ctx, &model, &tok, "the quick", &cfg);
-        assert_eq!(outs[0], single, "batched (B-identical) greedy must match single-seq greedy");
+
+        // Identical lanes run identical, deterministic (tiled, fixed-order) kernels → bit-identical.
+        // LANE_TOL is a hair above 0 to tolerate any future benign reduction-order change while still
+        // catching the stale-memory bug (which diverges by ~0.5+). CROSS_TOL covers the genuine fp16
+        // noise between two different kernel paths (cached decode vs full forward, batch vs batch-1).
+        const LANE_TOL: f32 = 1e-3;
+        const CROSS_TOL: f32 = 0.05;
+        let max_abs_diff = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        let argmax = |s: &[f32]| {
+            s.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            }).0
+        };
+
+        // Build a B-identical prefill batch exactly as generate_batch does (BOS + encoded prompt).
+        let b = 3usize;
+        let mut ids = vec![BOS_TOKEN];
+        ids.extend(tok.encode("the quick"));
+        let len = ids.len();
+        let flat: Vec<u32> = (0..b).flat_map(|_| ids.iter().copied()).collect();
+
+        autograd::no_grad(|| {
+            // ---- Stage A: batched prefill vs single-sequence prefill (no KV cache → pure forward). ----
+            ctx.begin_batch();
+            let batched = model.forward(&flat, b, len, None, false);
+            ctx.flush_batch();
+            let batched = batched.to_vec(); // [b * len, vocab]
+
+            ctx.begin_batch();
+            let single = model.forward(&ids, 1, len, None, false);
+            ctx.flush_batch();
+            let single = single.to_vec(); // [len, vocab]
+
+            // Last-position logits per lane (the row generation samples from).
+            let lane = |i: usize| &batched[(i * len + len - 1) * v..(i * len + len) * v];
+            let single_last = &single[(len - 1) * v..len * v];
+
+            assert!(max_abs_diff(lane(0), lane(1)) < LANE_TOL, "identical prefill lanes diverged");
+            assert!(max_abs_diff(lane(1), lane(2)) < LANE_TOL, "identical prefill lanes diverged");
+            assert!(max_abs_diff(lane(0), single_last) < CROSS_TOL, "batched prefill ≠ single-seq");
+
+            // Decisive first token: well-separated argmax → identical everywhere.
+            let t0 = argmax(lane(0));
+            assert_eq!(t0, argmax(lane(1)), "lanes disagree on the first token");
+            assert_eq!(t0, argmax(lane(2)));
+            assert_eq!(t0, argmax(single_last), "batched first token ≠ single-seq greedy");
+
+            // ---- Stage B: one batched preallocated-KV-cache decode step vs a no-cache full forward. ----
+            let mut kv_b = model.init_kv_caches_preallocated(b);
+            ctx.begin_batch();
+            let _ = model.forward(&flat, b, len, Some(&mut kv_b), false); // prefill → populate cache
+            ctx.flush_batch();
+            let step_in = vec![t0 as u32; b];
+            ctx.begin_batch();
+            let dec_b = model.forward(&step_in, b, 1, Some(&mut kv_b), false); // [b, vocab]
+            ctx.flush_batch();
+            let dec_b = dec_b.to_vec();
+
+            // Ground truth: full forward over [prompt, t0], last position per lane (what decode emits).
+            let mut ids2 = ids.clone();
+            ids2.push(t0 as u32);
+            let len2 = ids2.len();
+            let flat2: Vec<u32> = (0..b).flat_map(|_| ids2.iter().copied()).collect();
+            ctx.begin_batch();
+            let gt = model.forward(&flat2, b, len2, None, false);
+            ctx.flush_batch();
+            let gt = gt.to_vec();
+            let glane = |i: usize| &gt[(i * len2 + len2 - 1) * v..(i * len2 + len2) * v];
+            let dl = |i: usize| &dec_b[i * v..(i + 1) * v];
+
+            assert!(max_abs_diff(dl(0), dl(1)) < LANE_TOL, "identical decode lanes diverged");
+            assert!(max_abs_diff(dl(1), dl(2)) < LANE_TOL, "identical decode lanes diverged");
+            // Every lane's cached decode must reproduce the no-cache ground truth.
+            for i in 0..b {
+                let c = max_abs_diff(dl(i), glane(i));
+                assert!(c < CROSS_TOL, "cached decode lane {i} ≠ no-cache ground truth: {c}");
+            }
+        });
+    }
+
+    /// Finite-difference check of the fused transpose+RoPE kernel and its backward, exercised directly
+    /// (not through the model). This is the unit-level guard for the dispatch bug fixed alongside the
+    /// batched-decode test: `gpu_transpose_rope` / `_backward` computed a threadgroup count but
+    /// dispatched it as a thread count, so they wrote only `ceil(total/256)` of their output and left
+    /// the rest stale. Here the forward must reproduce hand-computed RoPE at every element, and the
+    /// backward gradient must match central finite differences of `L = Σ(rope(in) · G)` — both of which
+    /// fail loudly if any output element is left unwritten.
+    #[test]
+    fn transpose_rope_forward_and_backward_match_finite_diff() {
+        let ctx = test_ctx();
+        let (batch, seq, n_heads, head_dim) = (2usize, 3usize, 2usize, 4usize);
+        let offset = 1u32;
+        let theta = 10000.0f32;
+        let bh = batch * n_heads;
+        let in_len = batch * seq * n_heads * head_dim; // input [batch*seq, n_heads*head_dim]
+        let out_len = bh * seq * head_dim; // output [bh, seq, head_dim]
+        let dims = compute::TrRopeDims {
+            batch: batch as u32, seq: seq as u32, n_heads: n_heads as u32,
+            head_dim: head_dim as u32, offset, theta,
+        };
+
+        // Deterministic pseudo-random inputs (no thread_rng → reproducible).
+        let inp: Vec<f32> = (0..in_len).map(|i| ((i * 37 + 11) % 23) as f32 * 0.1 - 1.1).collect();
+        let grad_out: Vec<f32> = (0..out_len).map(|i| ((i * 19 + 5) % 17) as f32 * 0.1 - 0.8).collect();
+
+        let forward = |data: &[f32]| -> Vec<f32> {
+            let in_buf = ctx.buffer_from_slice(data);
+            let out_buf = ctx.alloc_buffer(out_len * 4);
+            compute::gpu_transpose_rope(&ctx, &in_buf, &out_buf, dims);
+            ctx.wait_gpu();
+            MetalContext::read_buffer(&out_buf, out_len)
+        };
+
+        // (1) Forward correctness: compare against a hand-written RoPE over the whole tensor.
+        let out = forward(&inp);
+        let nh_hd = n_heads * head_dim;
+        let mut max_fwd_err = 0.0f32;
+        for b in 0..batch {
+            for h in 0..n_heads {
+                for s in 0..seq {
+                    for d in 0..head_dim {
+                        let val = inp[(b * seq + s) * nh_hd + h * head_dim + d];
+                        let dp = if d % 2 == 0 { d + 1 } else { d - 1 };
+                        let val_pair = inp[(b * seq + s) * nh_hd + h * head_dim + dp];
+                        let pair = (d / 2) as f32;
+                        let freq = 1.0 / theta.powf(2.0 * pair / head_dim as f32);
+                        let angle = (s as f32 + offset as f32) * freq;
+                        let (sin, cos) = angle.sin_cos();
+                        let expect = if d % 2 == 0 { val * cos - val_pair * sin } else { val_pair * sin + val * cos };
+                        let got = out[((b * n_heads + h) * seq + s) * head_dim + d];
+                        max_fwd_err = max_fwd_err.max((expect - got).abs());
+                    }
+                }
+            }
+        }
+        assert!(max_fwd_err < 1e-4, "transpose_rope forward mismatch vs hand-computed RoPE: {max_fwd_err} \
+            (a too-small dispatch leaves output elements stale → large error)");
+
+        // (2) Backward vs central finite differences of L = Σ(rope(in)·grad_out).
+        let grad_buf = {
+            let go = ctx.buffer_from_slice(&grad_out);
+            let gi = ctx.alloc_buffer(in_len * 4);
+            compute::gpu_transpose_rope_backward(&ctx, &go, &gi, dims);
+            ctx.wait_gpu();
+            MetalContext::read_buffer(&gi, in_len)
+        };
+        let loss = |data: &[f32]| -> f32 { forward(data).iter().zip(&grad_out).map(|(o, g)| o * g).sum() };
+        let eps = 1e-2f32;
+        let mut max_grad_err = 0.0f32;
+        for &i in &[0usize, 1, 5, 7, 13, 23, in_len - 1] {
+            let mut up = inp.clone();
+            up[i] += eps;
+            let mut dn = inp.clone();
+            dn[i] -= eps;
+            let fd = (loss(&up) - loss(&dn)) / (2.0 * eps);
+            max_grad_err = max_grad_err.max((fd - grad_buf[i]).abs());
+        }
+        assert!(max_grad_err < 1e-2, "transpose_rope backward disagrees with finite differences: {max_grad_err}");
     }
 
     /// End-to-end integration of linear (O(N) kernel) attention in the real Transformer:

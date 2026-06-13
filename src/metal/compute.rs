@@ -146,34 +146,41 @@ pub fn gpu_matmul_simdgroup_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuB
     dispatch_sync!(ctx, "matmul_simdgroup_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Global opt-in: when set, the default `Tensor::matmul` routes its f16 inner product through the
-/// hardware simdgroup MMA (`gpu_matmul_simdgroup_f16`) instead of the hand-rolled `gpu_matmul_f16`.
-/// Off by default — identical precision, so this is purely a throughput switch.
-static SIMDGROUP_MATMUL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// These matmul-path switches are THREAD-LOCAL, not process-global. Compute is single-threaded
+// (the training loop / generation / CLI all set the flag and run every dispatch on one thread —
+// there is no worker-thread pool in src/), so thread-local matches production exactly. The reason it
+// must NOT be a global atomic: `cargo test` runs tests on parallel threads, and a test that opts into
+// bf16/simdgroup would otherwise leak the flag into a concurrently-running numeric test — e.g.
+// model_converges picking up bf16 mid-training (which diverges, per train.rs's own warning). Thread
+// scoping isolates each test's choice.
+thread_local! {
+    // SIMDGROUP_MATMUL — opt-in: route the default `Tensor::matmul` f16 inner product through the
+    // hardware simdgroup MMA (`gpu_matmul_simdgroup_f16`) instead of `gpu_matmul_f16`. Identical
+    // precision — throughput switch. Off by default.
+    static SIMDGROUP_MATMUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // BF16_MATMUL — opt-in: when set (and simdgroup is off), run the default matmul's fp32 operands
+    // through the bf16 tiled kernel — fp32 *range* (no ±65504 clamp) at fp16-ish bandwidth. Off by default.
+    static BF16_MATMUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Enable/disable the simdgroup MMA fast path for the default matmul. Returns the previous value.
+/// Enable/disable the simdgroup MMA fast path for the default matmul (this thread). Returns previous.
 pub fn set_simdgroup_matmul(on: bool) -> bool {
-    SIMDGROUP_MATMUL.swap(on, std::sync::atomic::Ordering::Relaxed)
+    SIMDGROUP_MATMUL.with(|c| c.replace(on))
 }
 
-/// Whether the simdgroup MMA fast path is currently enabled for the default matmul.
+/// Whether the simdgroup MMA fast path is enabled for the default matmul on this thread.
 pub fn simdgroup_matmul_enabled() -> bool {
-    SIMDGROUP_MATMUL.load(std::sync::atomic::Ordering::Relaxed)
+    SIMDGROUP_MATMUL.with(|c| c.get())
 }
 
-/// Global opt-in: when set (and simdgroup is off), the default `Tensor::matmul` runs its fp32
-/// operands through the bf16 tiled kernel — fp32 *range* (no ±65504 clamp) at fp16-ish bandwidth,
-/// removing the fp16-overflow instability class. Off by default.
-static BF16_MATMUL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Enable/disable the bf16 default-matmul path. Returns the previous value.
+/// Enable/disable the bf16 default-matmul path (this thread). Returns the previous value.
 pub fn set_bf16_matmul(on: bool) -> bool {
-    BF16_MATMUL.swap(on, std::sync::atomic::Ordering::Relaxed)
+    BF16_MATMUL.with(|c| c.replace(on))
 }
 
-/// Whether the bf16 default-matmul path is currently enabled.
+/// Whether the bf16 default-matmul path is enabled on this thread.
 pub fn bf16_matmul_enabled() -> bool {
-    BF16_MATMUL.load(std::sync::atomic::Ordering::Relaxed)
+    BF16_MATMUL.with(|c| c.get())
 }
 
 /// Cast float32 buffer to float16. Output buffer must be size * 2 bytes.
@@ -1368,15 +1375,19 @@ pub struct RmsNormBackwardParams {
     pub eps: f32,
 }
 
-/// RMS norm backward
-/// The RMSNorm-backward degenerate-row clamp (bounds inv_rms³ + grad on a collapsed activation row).
-/// On by default — it's the fix for the AdamW instability. The toggle exists only to characterize
-/// the explosion it prevents (investigation/tests); leave it on for training.
-static RMSNORM_CLAMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+// RMS norm backward.
+// The RMSNorm-backward degenerate-row clamp (bounds inv_rms³ + grad on a collapsed activation row).
+// On by default — it's the fix for the AdamW instability. The toggle exists only to characterize
+// the explosion it prevents (investigation/tests); leave it on for training. Thread-local (not a
+// global atomic) for the same reason as the matmul-path flags above: an investigation test that
+// disables it must not strip the clamp from a numeric test running concurrently under `cargo test`.
+thread_local! {
+    static RMSNORM_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 
-/// Enable/disable the RMSNorm-backward clamp. Returns the previous value. Investigation only.
+/// Enable/disable the RMSNorm-backward clamp on this thread. Returns the previous value. Investigation only.
 pub fn set_rmsnorm_clamp(on: bool) -> bool {
-    RMSNORM_CLAMP.swap(on, std::sync::atomic::Ordering::Relaxed)
+    RMSNORM_CLAMP.with(|c| c.replace(on))
 }
 
 pub fn gpu_rms_norm_backward(
@@ -1394,7 +1405,7 @@ pub fn gpu_rms_norm_backward(
 
     #[repr(C)]
     struct Params { rows: u32, cols: u32, eps: f32, clamp_on: f32 }
-    let clamp_on = if RMSNORM_CLAMP.load(std::sync::atomic::Ordering::Relaxed) { 1.0 } else { 0.0 };
+    let clamp_on = if RMSNORM_CLAMP.with(|c| c.get()) { 1.0 } else { 0.0 };
     let params = Params { rows, cols, eps, clamp_on };
     let params_buf = params_buffer(ctx, &params);
 
@@ -1819,7 +1830,11 @@ pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &G
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
-    dispatch_threads_sync!(ctx, "transpose_rope", grid, tg,
+    // `grid` is the number of THREADGROUPS, so dispatch via dispatchThreadgroups (dispatch_sync!),
+    // NOT dispatchThreads (which reads `grid` as a total thread count and would launch only
+    // `ceil(total/256)` threads — leaving most of the output as stale pool memory; at seq_len=1
+    // decode that is `groups==1`, so only one element is written and the cached K is garbage).
+    dispatch_sync!(ctx, "transpose_rope", grid, tg,
         0 => input, 1 => output, 2 => &params_buf
     );
 }
@@ -1838,7 +1853,11 @@ pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer
     let grid = MetalContext::size(groups, 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
 
-    dispatch_threads_sync!(ctx, "transpose_rope_backward", grid, tg,
+    // `grid` is the number of THREADGROUPS — dispatch via dispatchThreadgroups (dispatch_sync!), not
+    // dispatchThreads. The old dispatch_threads_sync! launched only `ceil(total/256)` threads, so the
+    // RoPE gradient was written for at most the first 256·groups/total fraction of grad_in and left
+    // the rest stale — silently corrupting Q/K gradients (worst at short sequences).
+    dispatch_sync!(ctx, "transpose_rope_backward", grid, tg,
         0 => grad_out, 1 => grad_in, 2 => &params_buf
     );
 }
