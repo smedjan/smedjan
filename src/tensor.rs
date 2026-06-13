@@ -184,22 +184,24 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         compute::gpu_ternary_matmul(&self.ctx, &self.buffer, &packed_buf, &out_buf, m as u32, n as u32, k as u32);
 
-        // Scale output by absmean per column: out[i][j] *= absmean[j]
-        // This restores the magnitude lost by ternary quantization
-        let out_tensor = Tensor::from_buffer(Arc::clone(&self.ctx), out_buf, vec![m, n]);
-        let absmean_tensor = Tensor::from_buffer(Arc::clone(&self.ctx), absmean_buf, vec![n]);
-        // Broadcast scale: use scale_rows with transposed logic
-        // For column scaling, we'd need a scale_cols op. Approximate with mean scale for now.
-        // Read first absmean value as approximate global scale
-        // (proper per-column scaling needs a scale_cols kernel — future optimization)
-        let absmean_data = MetalContext::read_buffer(&absmean_tensor.buffer, n.min(1));
-        let mean_scale = if !absmean_data.is_empty() && absmean_data[0] > 0.0 { absmean_data[0] } else { 1.0 };
-        let out_scaled = out_tensor.scale(mean_scale);
+        // Scale output by absmean PER COLUMN: out[i][j] *= absmean[j]. This restores the magnitude
+        // lost by ternary quantization. Each output column j comes from weight column j, which has
+        // its own absmean[j]; the previous code scaled the WHOLE output by absmean[0] (a single
+        // scalar), which is only correct when every column shares a scale — otherwise every column
+        // but the first gets the wrong magnitude. Fixed via broadcast_rows (tile absmean[n] across m
+        // rows) + elementwise mul. This also removes a per-matmul read_buffer that was force-flushing
+        // the command batch mid-forward.
+        let scale_full = self.ctx.alloc_buffer(m * n * 4);
+        compute::gpu_broadcast_rows(&self.ctx, &absmean_buf, &scale_full, m as u32, n as u32);
+        let scaled_buf = self.ctx.alloc_buffer(m * n * 4);
+        compute::gpu_mul(&self.ctx, &out_buf, &scale_full, &scaled_buf, (m * n) as u32);
+        let out_scaled = Tensor::from_buffer(Arc::clone(&self.ctx), scaled_buf, vec![m, n]);
 
-        // STE: the scale() call above already records Op::Scale on the tape.
-        // For backward, gradients flow through scale → out_tensor.
-        // out_tensor was created from from_buffer (not on tape), but the matmul
-        // backward is handled by recording the STE matmul entry:
+        // STE: the per-column scaling above uses raw compute kernels (not recorded on the tape).
+        // The backward treats the whole ternary matmul as a regular matmul against the FULL-PRECISION
+        // weight (input_buffers below), so the forward quantization/scaling never enters the gradient
+        // — this is the Straight-Through Estimator. We record exactly one entry for out_scaled.id: even
+        // when no_grad is active we keep this when is_recording(), matching the prior behavior.
         if self.requires_grad || weight.requires_grad || autograd::is_recording() {
             autograd::record(autograd::TapeEntry {
                 op: autograd::Op::Matmul, // STE: backward treats ternary as regular matmul

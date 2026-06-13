@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 11; // v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const VERSION: u32 = 12; // v12: sliding_window (windowed attention is forward-affecting — was silently lost on load). v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 
 /// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
@@ -52,6 +52,65 @@ pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::R
 
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
     eprintln!("Checkpoint saved: {} ({:.1} MB, step {})", path, size_mb, step);
+    Ok(())
+}
+
+/// Save a checkpoint whose TRAINABLE weights come from the EMA buffers (the exponential moving
+/// average maintained during training) instead of the live snapshot. The EMA is typically a better
+/// model than the final step (BYOL / self-distillation result — "the EMA is always a better model
+/// than the current snapshot"), so it's worth keeping rather than discarding. Format is byte-identical
+/// to `save_checkpoint`, so it loads through the normal `load_checkpoint` path.
+///
+/// `ema_buffers` must be parallel to `model.parameters()` (same order/count — that's how the train
+/// loop builds them). Frozen ReLoRA base params (which EMA does not track) are written from the model
+/// as-is, since the EMA of a frozen weight is the weight itself.
+pub fn save_checkpoint_ema(
+    path: &str,
+    model: &Transformer,
+    ema_buffers: &[objc2::rc::Retained<crate::metal::GpuBuffer>],
+    step: u32,
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+
+    file.write_all(MAGIC)?;
+    file.write_all(&VERSION.to_le_bytes())?;
+    file.write_all(&step.to_le_bytes())?;
+    write_config(&mut file, &model.config)?;
+
+    let params = model.parameters();
+    let base_params = model.base_parameters();
+    assert_eq!(
+        ema_buffers.len(), params.len(),
+        "save_checkpoint_ema: {} EMA buffers but {} trainable params", ema_buffers.len(), params.len()
+    );
+    let n_tensors = (params.len() + base_params.len()) as u32;
+    file.write_all(&n_tensors.to_le_bytes())?;
+
+    // Trainable tensors: shape from the param, DATA from the parallel EMA buffer.
+    for (i, param) in params.iter().enumerate() {
+        let ndims = param.shape.len() as u32;
+        file.write_all(&ndims.to_le_bytes())?;
+        for &dim in &param.shape {
+            file.write_all(&(dim as u32).to_le_bytes())?;
+        }
+        let data = MetalContext::read_buffer(&ema_buffers[i], param.numel());
+        let byte_data: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&byte_data)?;
+    }
+    // Frozen base (ReLoRA) tensors: written from the model — EMA doesn't track them.
+    for param in base_params.iter() {
+        let ndims = param.shape.len() as u32;
+        file.write_all(&ndims.to_le_bytes())?;
+        for &dim in &param.shape {
+            file.write_all(&(dim as u32).to_le_bytes())?;
+        }
+        let data = param.to_vec();
+        let byte_data: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        file.write_all(&byte_data)?;
+    }
+
+    let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
+    eprintln!("EMA checkpoint saved: {} ({:.1} MB, step {})", path, size_mb, step);
     Ok(())
 }
 
@@ -123,7 +182,7 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((2..=11).contains(&version), "Unsupported training state version: {}", version);
+    assert!((2..=12).contains(&version), "Unsupported training state version: {}", version);
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -272,7 +331,7 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((1..=11).contains(&version), "Unsupported checkpoint version: {} (expected 1-11)", version);
+    assert!((1..=12).contains(&version), "Unsupported checkpoint version: {} (expected 1-12)", version);
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -375,6 +434,10 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     // v10: block-sparse attention top_k + block_size
     file.write_all(&(config.block_sparse_top_k as u32).to_le_bytes())?;
     file.write_all(&(config.block_size as u32).to_le_bytes())?;
+    // v12: sliding-window size (0 = full causal). Forward-affecting — a windowed-trained model must
+    // not silently load as full-causal. (stochastic_depth/fp16_activations are intentionally NOT
+    // persisted: they're train-time-only knobs that should default off at inference/resume.)
+    file.write_all(&(config.sliding_window as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -485,6 +548,14 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         (0, 64)
     };
 
+    // v12: sliding-window size; older checkpoints default to 0 (full causal).
+    let sliding_window = if version >= 12 {
+        file.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) as usize
+    } else {
+        0
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
@@ -503,7 +574,7 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         lowrank,
         n_predict,
         stochastic_depth: 0.0,
-        sliding_window: 0,
+        sliding_window,
         fp16_activations: false,
         linear_attn,
         linear_attn_period,

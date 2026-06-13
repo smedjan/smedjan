@@ -104,7 +104,7 @@ pub fn quantize(data: &[f32], shape: &[usize], bits: u8, group_size: usize) -> Q
                 group_size,
             }
         }
-        _ => unreachable!(),
+        _ => panic!("Unsupported quantization bits: {} (only 4 and 8 supported)", bits),
     }
 }
 

@@ -1982,6 +1982,33 @@ pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
     dispatch_sync!(ctx, "scale_copy", grid, tg, 0 => src, 1 => dst, 2 => &params_buf);
 }
 
+/// Muon Frobenius normalization: x = m / (‖m‖_F + eps), in a single dispatch with no CPU readback.
+/// Single-threadgroup sum-of-squares reduction (≤256 threads, grid-stride) then per-element rsqrt
+/// scale — same launch shape as gpu_reduce_sum. Guarantees σ_max ≤ 1 < √3 so the cubic Newton-Schulz
+/// in Muon::step always converges (replaces the unbounded 1/√max(rows,cols) heuristic).
+pub fn gpu_muon_frob_normalize(ctx: &Arc<MetalContext>, m: &GpuBuffer, x: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let grid = MetalContext::size(1, 1, 1);
+    let tg = MetalContext::size(next_power_of_2_clamped(size as u64), 1, 1);
+    dispatch_sync!(ctx, "muon_frob_normalize", grid, tg, 0 => m, 1 => x, 2 => &params_buf);
+}
+
+/// NorMuon per-neuron scale: out[i] = 1/(sqrt(v[i]·bias_correction) + eps), elementwise over [size].
+pub fn gpu_inv_sqrt_bc(ctx: &Arc<MetalContext>, v: &GpuBuffer, out: &GpuBuffer, size: u32, bias_correction: f32, eps: f32) {
+    #[repr(C)]
+    struct Params { size: u32, bias_correction: f32, eps: f32 }
+    let params = Params { size, bias_correction, eps };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let groups = (size as u64).div_ceil(tpg);
+    let grid = MetalContext::size(groups, 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "inv_sqrt_bc", grid, tg, 0 => v, 1 => out, 2 => &params_buf);
+}
+
 /// Column-wise copy: src[rows, src_cols] → dst[rows, dst_cols] at col_offset.
 pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer,
     rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)

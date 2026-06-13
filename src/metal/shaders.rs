@@ -2034,6 +2034,74 @@ kernel void scale_copy(
 }
 "#;
 
+/// Muon Frobenius normalization: x = m / (‖m‖_F + eps).
+/// Single-threadgroup sum-of-squares reduction (grid-stride, ≤256 threads — mirrors reduce_sum),
+/// then a per-element scale by rsqrt(ssq + eps). Done in ONE dispatch with no CPU readback, so it
+/// can't force-flush the command batch (the buffer-hazard class). This guarantees the largest
+/// singular value of the normalized matrix ≤ 1 < √3, so the cubic Newton-Schulz that follows always
+/// converges; the previous 1/√max(rows,cols) heuristic did NOT bound the spectral norm, so at larger
+/// momentum magnitude (bigger batch / higher effective LR) σ_max could exceed √3 and the iteration
+/// diverged cubically — the suspected root cause of the batch-32 Muon/hybrid divergence.
+pub const MUON_FROB_NORMALIZE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NormParams { uint size; };
+
+kernel void muon_frob_normalize(
+    device const float* m [[buffer(0)]],
+    device float* x [[buffer(1)]],
+    constant NormParams& params [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    threadgroup float shared[256];
+    float local = 0.0f;
+    for (uint i = tid; i < params.size; i += tpg) {
+        float v = m[i];
+        local += v * v;
+    }
+    shared[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tpg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // shared[0] now holds the total Σ m_i² (stable after the final barrier). All threads read it
+    // (read-only, no further shared writes), so no extra barrier is needed before the scale loop.
+    float inv = rsqrt(shared[0] + 1e-14f);
+    for (uint i = tid; i < params.size; i += tpg) {
+        x[i] = m[i] * inv;
+    }
+}
+"#;
+
+/// NorMuon per-neuron normalization factor: out[i] = 1 / (sqrt(v[i] * bias_correction) + eps).
+/// `v` is the per-row running second moment; `bias_correction` = 1/(1-beta2^t). Elementwise over the
+/// [rows] vector. Feeds scale_rows to normalize the orthogonalized update per output neuron.
+pub const INV_SQRT_BC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct InvSqrtParams { uint size; float bias_correction; float eps; };
+
+kernel void inv_sqrt_bc(
+    device const float* v [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant InvSqrtParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < params.size) {
+        float vhat = v[gid] * params.bias_correction;
+        out[gid] = 1.0f / (sqrt(vhat) + params.eps);
+    }
+}
+"#;
+
 /// Fill buffer with a constant value
 /// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j])))
 /// Numerically stable: output[i] = max + log(sum(exp(x - max)))

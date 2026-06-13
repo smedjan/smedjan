@@ -146,6 +146,7 @@ pub fn evaluate(
         repetition_penalty: 1.2,
         min_p: 0.0,
         typical_p: 1.0,
+        no_repeat_ngram_size: 0,
     };
 
     let mut outputs = Vec::with_capacity(examples.len());

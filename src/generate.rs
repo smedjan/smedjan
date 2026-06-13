@@ -16,6 +16,7 @@ pub struct SamplingConfig {
     pub repetition_penalty: f32, // >1.0 penalizes repetition, 1.0 = disabled
     pub min_p: f32,              // keep tokens with p >= min_p * max_p; 0.0 = disabled
     pub typical_p: f32,          // locally-typical mass to keep; 1.0 = disabled
+    pub no_repeat_ngram_size: usize, // hard-ban any token completing an n-gram already generated; 0 = off
 }
 
 impl Default for SamplingConfig {
@@ -28,8 +29,27 @@ impl Default for SamplingConfig {
             repetition_penalty: 1.2,
             min_p: 0.0,
             typical_p: 1.0,
+            no_repeat_ngram_size: 0,
         }
     }
+}
+
+/// Tokens whose selection would complete an n-gram that already appears in `generated`
+/// (HuggingFace `no_repeat_ngram_size`). The last `n-1` generated tokens form the prefix; every
+/// place that prefix occurred in the history contributes the token that followed it as banned.
+/// `n == 0` or history shorter than `n` → nothing banned. Pure CPU, O(len·n).
+fn no_repeat_ngram_banned(generated: &[u32], n: usize) -> Vec<usize> {
+    if n == 0 || generated.len() < n {
+        return Vec::new();
+    }
+    let prefix = &generated[generated.len() - (n - 1)..]; // last n-1 tokens (empty when n==1)
+    let mut banned = Vec::new();
+    for i in 0..=generated.len() - n {
+        if &generated[i..i + (n - 1)] == prefix {
+            banned.push(generated[i + (n - 1)] as usize);
+        }
+    }
+    banned
 }
 
 /// Renormalize a (token, prob) distribution to sum 1 (no-op if the mass is zero).
@@ -268,6 +288,15 @@ fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[
         }
     }
 
+    // no-repeat-ngram: hard-ban tokens that would repeat an already-seen n-gram (-inf → prob 0).
+    if config.no_repeat_ngram_size > 0 {
+        for idx in no_repeat_ngram_banned(generated, config.no_repeat_ngram_size) {
+            if idx < penalized.len() {
+                penalized[idx] = f32::NEG_INFINITY;
+            }
+        }
+    }
+
     let mut scaled: Vec<(usize, f32)> = penalized
         .iter()
         .enumerate()
@@ -341,6 +370,16 @@ fn sample_token(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u
                 } else {
                     penalized[idx] *= config.repetition_penalty;
                 }
+            }
+        }
+    }
+
+    // no-repeat-ngram: hard-ban tokens that would repeat an already-seen n-gram (-inf survives the
+    // temperature division below and yields prob 0 after softmax).
+    if config.no_repeat_ngram_size > 0 {
+        for idx in no_repeat_ngram_banned(generated, config.no_repeat_ngram_size) {
+            if idx < penalized.len() {
+                penalized[idx] = f32::NEG_INFINITY;
             }
         }
     }
@@ -811,4 +850,43 @@ fn argmax(logits: &[f32]) -> u32 {
         }
     }
     best_idx
+}
+
+#[cfg(test)]
+mod ngram_tests {
+    use super::no_repeat_ngram_banned;
+
+    #[test]
+    fn disabled_and_short_history_ban_nothing() {
+        assert!(no_repeat_ngram_banned(&[1, 2, 3], 0).is_empty()); // n=0 → off
+        assert!(no_repeat_ngram_banned(&[1, 2], 3).is_empty());    // history shorter than n
+    }
+
+    #[test]
+    fn bans_token_that_would_repeat_a_trigram() {
+        // history: [a b c a b]; last n-1 = [a b]; the earlier "a b" was followed by c → ban c.
+        let banned = no_repeat_ngram_banned(&[10, 20, 30, 10, 20], 3);
+        assert_eq!(banned, vec![30]);
+    }
+
+    #[test]
+    fn no_ban_when_prefix_never_recurs() {
+        // last bigram [20 30] never appeared before → nothing banned.
+        assert!(no_repeat_ngram_banned(&[10, 20, 30], 3).is_empty());
+    }
+
+    #[test]
+    fn n_equals_one_bans_every_seen_token() {
+        let mut banned = no_repeat_ngram_banned(&[5, 7, 5], 1);
+        banned.sort_unstable();
+        assert_eq!(banned, vec![5, 5, 7]); // every position contributes its own token
+    }
+
+    #[test]
+    fn multiple_recurrences_ban_all_followers() {
+        // history [a b x a b y a b]; prefix [a b] occurred before at →x and →y.
+        let mut banned = no_repeat_ngram_banned(&[1, 2, 8, 1, 2, 9, 1, 2], 3);
+        banned.sort_unstable();
+        assert_eq!(banned, vec![8, 9]);
+    }
 }

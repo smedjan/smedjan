@@ -634,6 +634,14 @@ pub struct Muon {
     /// hardened 1e-5 — the old hardcoded 1e-8 here was the same denominator-collapse bug that was
     /// fixed in the standalone AdamW but had been left latent on this fallback path.
     pub adamw_hyper: AdamWHyper,
+    /// NorMuon: when true, normalize the orthogonalized update per-neuron (per output row) by a
+    /// running second moment — adds Adam-like per-neuron adaptivity on top of orthogonalization
+    /// (arXiv NorMuon, ~+11% over Muon). Off by default = plain Muon. The per-row moment is held in
+    /// `MuonState::ns_vrow` (in-memory only; re-warms after a resume — it's a fast beta2=0.95 EMA, so
+    /// not persisting it costs only a few steps and keeps the optimizer state-blob format unchanged).
+    pub normalized: bool,
+    pub norm_beta2: f32,
+    pub norm_eps: f32,
     ctx: Arc<MetalContext>,
 }
 
@@ -651,6 +659,9 @@ pub struct MuonState {
     pub ns_x: Option<Retained<GpuBuffer>>,    // [rows, cols] — working copy
     pub ns_xxt: Option<Retained<GpuBuffer>>,  // [rows, rows] — X @ X^T
     pub ns_xxtx: Option<Retained<GpuBuffer>>, // [rows, cols] — (X @ X^T) @ X
+    // NorMuon per-row state (only Some for 2-D params): the running second moment and a scratch buffer.
+    pub ns_vrow: Option<Retained<GpuBuffer>>,  // [rows] — EMA of per-row mean-square of the orthogonal update
+    pub ns_rowss: Option<Retained<GpuBuffer>>, // [rows] — scratch (per-row sum-of-squares, then the scale)
 }
 
 impl Muon {
@@ -665,20 +676,24 @@ impl Muon {
                 compute::gpu_fill(ctx, &v_buf, size as u32, 0.0);
                 Some(v_buf)
             } else { None };
-            // Pre-allocate NS workspace for 2D params
-            let (ns_x, ns_xxt, ns_xxtx) = if is_2d {
+            // Pre-allocate NS workspace for 2D params (+ NorMuon per-row buffers, used only when enabled).
+            let (ns_x, ns_xxt, ns_xxtx, ns_vrow, ns_rowss) = if is_2d {
                 let rows = t.shape[0];
                 let cols = t.shape[1];
+                let vrow = ctx.alloc_buffer(rows * 4);
+                compute::gpu_fill(ctx, &vrow, rows as u32, 0.0); // second moment starts at 0
                 (
                     Some(ctx.alloc_buffer(rows * cols * 4)),
                     Some(ctx.alloc_buffer(rows * rows * 4)),
                     Some(ctx.alloc_buffer(rows * cols * 4)),
+                    Some(vrow),
+                    Some(ctx.alloc_buffer(rows * 4)),
                 )
-            } else { (None, None, None) };
+            } else { (None, None, None, None, None) };
             MuonState {
                 tensor_id: t.id, buffer: t.buffer.clone(), size,
                 shape: t.shape.clone(), m, is_2d, no_decay: t.shape.len() <= 1, v,
-                ns_x, ns_xxt, ns_xxtx,
+                ns_x, ns_xxt, ns_xxtx, ns_vrow, ns_rowss,
             }
         }).collect();
 
@@ -689,8 +704,21 @@ impl Muon {
             ns_steps: 5,
             step: 0,
             adamw_hyper: AdamWHyper::default(),
+            normalized: false,
+            norm_beta2: 0.95,
+            norm_eps: 1e-8,
             ctx: Arc::clone(ctx),
         }
+    }
+
+    /// Enable NorMuon: neuron-wise (per-row) second-moment normalization of the orthogonalized update
+    /// (~+11% over Muon). Off by default. `beta2` is the per-row second-moment EMA decay (try 0.95),
+    /// `eps` floors the denominator (try 1e-8). Applies to every 2-D param; the per-row state lives in
+    /// `ns_vrow` (already allocated in `new`).
+    pub fn set_normalization(&mut self, beta2: f32, eps: f32) {
+        self.normalized = true;
+        self.norm_beta2 = beta2;
+        self.norm_eps = eps;
     }
 
     pub fn step(&mut self, lr: f32) {
@@ -709,17 +737,25 @@ impl Muon {
                 // Update momentum: m = beta * m + (1-beta) * grad
                 compute::gpu_ema_update(&self.ctx, &ps.m, &grad, size, self.beta);
 
-                // Newton-Schulz orthogonalization of momentum M [rows, cols]
-                // Normalize M to unit spectral norm first (approximate: scale by 1/sqrt(rows*cols))
-                let norm_scale = 1.0 / ((rows as f32).max(cols as f32)).sqrt();
+                // Newton-Schulz orthogonalization of momentum M [rows, cols].
+                // Normalize M by its FROBENIUS norm first: X = M / (‖M‖_F + eps). This guarantees
+                // σ_max(X) ≤ ‖X‖_2 ≤ ‖X‖_F = 1 < √3, the convergence radius of the cubic NS map
+                // g(σ)=1.5σ−0.5σ³. The previous 1/√max(rows,cols) scale was a dimension heuristic that
+                // did NOT bound the spectral norm, so at larger momentum magnitude (bigger batch /
+                // higher effective LR) σ_max could exceed √3 and the iteration diverged cubically —
+                // the suspected cause of the batch-32 Muon/hybrid divergence (#6). Orthogonalization
+                // is scale-free, so when NS already converged (small batch) the update is unchanged;
+                // only the divergent regime is fixed. NOTE: a partially-converged NS (small ns_steps)
+                // is mildly scale-sensitive, so re-check --muon-lr-scale after this change.
+                // Done on-GPU in one dispatch (no CPU readback → no command-batch flush/hazard).
 
                 // Pre-allocated workspace — no buffer allocations per step
                 let x_buf = ps.ns_x.as_ref().unwrap();
                 let xxt_buf = ps.ns_xxt.as_ref().unwrap();
                 let xxtx_buf = ps.ns_xxtx.as_ref().unwrap();
 
-                // X = M * norm_scale (working copy into pre-allocated buffer)
-                compute::gpu_scale_copy(&self.ctx, &ps.m, x_buf, size, norm_scale);
+                // X = M / (‖M‖_F + eps) into the pre-allocated working buffer.
+                compute::gpu_muon_frob_normalize(&self.ctx, &ps.m, x_buf, size);
 
                 // Newton-Schulz: X = 1.5*X - 0.5*(X@X^T)@X (5 iterations)
                 let a = 1.5f32;
@@ -733,6 +769,25 @@ impl Muon {
                     // X = a*X + b*(X@X^T@X) — fused with axpy: scale X, then axpy
                     compute::gpu_scale(&self.ctx, x_buf, size, a);
                     compute::gpu_axpy(&self.ctx, x_buf, xxtx_buf, size, b);
+                }
+
+                // NorMuon: per-neuron (per output row) normalization of the orthogonalized update X.
+                // Adds Adam-like per-neuron adaptivity on top of Muon's orthogonalization (~+11% over
+                // Muon). Off by default (plain Muon). Reuses existing kernels — no new optimizer state
+                // on disk (ns_vrow is in-memory, re-warms after resume).
+                if self.normalized {
+                    let vrow = ps.ns_vrow.as_ref().unwrap();   // [rows] running second moment
+                    let rowss = ps.ns_rowss.as_ref().unwrap(); // [rows] scratch
+                    // r[i] = mean_j X[i,j]^2  (per-row mean-square of the orthogonal update)
+                    compute::gpu_row_dot_reduce(&self.ctx, x_buf, x_buf, rowss, rows, cols);
+                    compute::gpu_scale(&self.ctx, rowss, rows, 1.0 / cols as f32);
+                    // v[i] = beta2*v[i] + (1-beta2)*r[i]
+                    compute::gpu_ema_update(&self.ctx, vrow, rowss, rows, self.norm_beta2);
+                    // scale[i] = 1 / (sqrt(v[i] / (1 - beta2^t)) + eps)  — bias-corrected; written into rowss
+                    let bias_correction = 1.0 / (1.0 - self.norm_beta2.powi(self.step as i32));
+                    compute::gpu_inv_sqrt_bc(&self.ctx, vrow, rowss, rows, bias_correction, self.norm_eps);
+                    // X[i,j] *= scale[i]  (in-place: each thread reads+writes its own element)
+                    compute::gpu_scale_rows(&self.ctx, x_buf, rowss, x_buf, rows, cols);
                 }
 
                 // Apply: theta = theta * (1 - lr * wd) - lr * X

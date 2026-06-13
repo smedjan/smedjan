@@ -137,7 +137,9 @@ struct TrainArgs {
         /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
         #[arg(long, default_value = "0.0")]
         prune_threshold: f32,
-        /// GALORE: gradient low-rank projection rank. 0=disabled. Saves optimizer memory.
+        /// GALORE: gradient low-rank projection rank. 0=disabled. NOT YET IMPLEMENTED — any value > 0
+        /// panics at optimizer construction (the projection path is a stub). Use Muon (no v-state) or
+        /// --optimizer adamw-8bit for the optimizer-memory win instead. See docs followup handoff §6.
         #[arg(long, default_value = "0")]
         galore_rank: usize,
         /// Speculative pretraining: reference model checkpoint. Skip batches it already knows.
@@ -181,6 +183,15 @@ struct TrainArgs {
         /// fp16 reached 1.56). For range AND precision use the fp32/simdgroup matmul paths.
         #[arg(long)]
         bf16_matmul: bool,
+        /// Batch-size LR transfer reference batch. 0=off (use --lr as-is). When set, --lr is the LR tuned
+        /// at THIS batch size and is scaled to the actual --batch-size by the √batch rule. Orthogonal to
+        /// μP. For Muon, drop --muon-lr-scale as batch rises instead (see #6).
+        #[arg(long, default_value = "0")]
+        lr_ref_batch: usize,
+        /// NorMuon: per-neuron (per-row) second-moment normalization of the Muon/hybrid orthogonalized
+        /// update (~+11% over Muon). Only affects --optimizer muon / hybrid. Default false.
+        #[arg(long)]
+        normuon: bool,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
@@ -303,6 +314,10 @@ enum Commands {
         /// Locally-typical sampling: mass to keep (1.0 = disabled)
         #[arg(long, default_value = "1.0")]
         typical_p: f32,
+        /// No-repeat-ngram: hard-ban any token completing an n-gram already generated (0 = off, 3 = good
+        /// default for assistants — stops degenerate loops that repetition-penalty alone misses).
+        #[arg(long, default_value = "0")]
+        no_repeat_ngram_size: usize,
         #[arg(long, default_value = "false")]
         stream: bool,
         /// Enable speculative decoding with a smaller draft model
@@ -685,6 +700,8 @@ fn main() {
             adamw_lr_scale,
             simdgroup_matmul,
             bf16_matmul,
+            lr_ref_batch,
+            normuon,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -781,6 +798,8 @@ fn main() {
             config.adamw_lr_scale = adamw_lr_scale;
             config.simdgroup_matmul = simdgroup_matmul;
             config.bf16_matmul = bf16_matmul;
+            config.lr_ref_batch = lr_ref_batch;
+            config.normuon = normuon;
 
             train::train(&ctx, &config).expect("Training failed");
         }
@@ -796,6 +815,7 @@ fn main() {
             repetition_penalty,
             min_p,
             typical_p,
+            no_repeat_ngram_size,
             stream,
             speculative,
             draft_checkpoint,
@@ -818,6 +838,7 @@ fn main() {
                 repetition_penalty,
                 min_p,
                 typical_p,
+                no_repeat_ngram_size,
             };
 
             if let Some(bf) = batch_file {

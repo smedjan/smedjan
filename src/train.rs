@@ -108,6 +108,17 @@ pub struct TrainConfig {
     /// activations; otherwise its precision loss destabilizes training (verified on a real run:
     /// diverged where fp16 converged). Default false. (simdgroup_matmul takes precedence if both set.)
     pub bf16_matmul: bool,
+    /// Batch-size LR transfer. 0 = disabled (max_lr used as-is). When > 0, max_lr is interpreted as the
+    /// LR tuned at THIS reference batch size, and the effective LR is scaled to the actual batch_size by
+    /// the square-root rule (LR ∝ √batch — the standard Adam-family heuristic). Orthogonal to μP (which
+    /// transfers across model WIDTH). See #6: a batch-16 LR diverged at batch 32, so larger batches need
+    /// LR re-tuning rather than the same LR. NOTE for Muon: orthogonalized updates have a batch-independent
+    /// magnitude and may need the OPPOSITE direction — drop --muon-lr-scale as batch rises. Verify the
+    /// direction on a real run (the loss readout is now correct at large batch, so it's observable).
+    pub lr_ref_batch: usize,
+    /// NorMuon: per-neuron (per-row) second-moment normalization of the Muon/​hybrid orthogonalized
+    /// update (~+11% over Muon). Only affects `--optimizer muon` / `hybrid`. Default false = plain Muon.
+    pub normuon: bool,
 }
 
 impl TrainConfig {
@@ -170,6 +181,8 @@ impl TrainConfig {
             adamw_lr_scale: 1.0,
             simdgroup_matmul: false,
             bf16_matmul: false,
+            lr_ref_batch: 0,
+            normuon: false,
         }
     }
 }
@@ -307,6 +320,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         eprintln!("  {}/{} params use Muon (2D), rest use AdamW fallback", n_2d, param_refs.len());
         let mut m = crate::optim::Muon::new(ctx, &param_refs, config.weight_decay);
         m.adamw_hyper = config.adamw_hyper();
+        if config.normuon {
+            m.set_normalization(0.95, 1e-8);
+            eprintln!("  NorMuon: per-neuron second-moment normalization ON");
+        }
         Some(m)
     } else {
         None
@@ -321,6 +338,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             ctx, &param_refs, config.weight_decay, &force_adamw, config.adamw_hyper(),
         );
         h.set_lr_scales(config.muon_lr_scale, config.adamw_lr_scale);
+        if config.normuon {
+            h.muon.set_normalization(0.95, 1e-8);
+            eprintln!("  NorMuon: per-neuron second-moment normalization ON (Muon group)");
+        }
         let (n_muon, n_adamw) = h.split_counts();
         eprintln!("Using Muon+AdamW hybrid: {} matrices on Muon (lr×{}), {} params on AdamW (embeddings/head/routers/norms, lr×{})",
             n_muon, config.muon_lr_scale, n_adamw, config.adamw_lr_scale);
@@ -364,12 +385,23 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             model.parameters().iter().map(|p| p.numel() * 8).sum::<usize>() as f32 / 1e6);
     }
 
-    // μP: scale learning rate by base_width / d_model
+    // μP: scale learning rate by base_width / d_model (WIDTH transfer).
     let mup_scale = config.model_config.mup_lr_scale();
-    let effective_lr = config.max_lr * mup_scale;
+    // Batch-size LR transfer (orthogonal to μP). When lr_ref_batch > 0, max_lr is the LR tuned at that
+    // reference batch and is scaled to the actual batch by the √batch rule. Disabled (=1.0) by default.
+    let batch_scale = if config.lr_ref_batch > 0 {
+        (config.batch_size as f32 / config.lr_ref_batch as f32).sqrt()
+    } else {
+        1.0
+    };
+    let effective_lr = config.max_lr * mup_scale * batch_scale;
+    eprintln!(
+        "LR: max_lr={:.2e} × μP({:.3}) × batch√({:.3}) = effective {:.2e}  [batch={}, ref_batch={}]",
+        config.max_lr, mup_scale, batch_scale, effective_lr, config.batch_size, config.lr_ref_batch
+    );
     if mup_scale < 1.0 {
-        eprintln!("μP enabled: base_width={}, LR scaled {:.4} → {:.4}",
-            config.model_config.mup_base_width, config.max_lr, effective_lr);
+        eprintln!("μP enabled: base_width={}, width-LR scale {:.4}",
+            config.model_config.mup_base_width, mup_scale);
     }
 
     // Learning rate scheduler — multiple options from research
@@ -455,6 +487,20 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut best_train_loss = f32::INFINITY;
     let mut prev_loss = 0.0f32; // for gradient noise estimation
     let loss_scale = 1.0 / grad_accum_steps as f32;
+
+    // Persistent, UNPOOLED loss-readout buffer (allocated once, never recycled, never aliases a live
+    // buffer). The loss scalar is copied here right after backward — BEFORE clear_tape_keep_grads
+    // returns the loss buffer to the pool — so the copy executes first in the command batch and
+    // captures the true value even when later in-batch allocations reuse that buffer.
+    //
+    // ROOT CAUSE (the reason 7255b2b was reverted in 48c4e05): that earlier fix used
+    // `ctx.alloc_buffer(4)` for the readout, i.e. a POOLED 4-byte buffer. At large batch the pool
+    // handed back a 4-byte buffer that was still logically live (a gradient-norm / clip scalar
+    // encoded earlier in the same uncommitted command batch); the gpu_copy below then clobbered it
+    // → corrupted gradient clipping → divergence (EMA 1.56 → 388). The bug was never the copy — it
+    // was pulling the destination FROM the pool. `buffer_from_slice` does a direct (unpooled) Metal
+    // allocation that is never recycled and never handed to any other tensor, so it cannot alias.
+    let loss_readout = ctx.buffer_from_slice(&[0.0f32]);
 
     for step in start_step..config.total_steps {
         let step_start = Instant::now();
@@ -687,6 +733,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             autograd::backward(ctx, loss_tensor.id);
             // DON'T flush — gradient norm kernels encode into same batch below
 
+            // Capture the loss scalar into the persistent (unpooled) readout buffer NOW — encoded
+            // before clear_tape_keep_grads returns loss_tensor.buffer to the pool, so it runs first
+            // in the command batch and captures the true value even if that buffer is later reused
+            // in-step. Reads the (possibly grad_accum-scaled) loss; the log site undoes the scale.
+            compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);
+
             // Free the tape (activations) but keep accumulated gradients
             autograd::clear_tape_keep_grads();
             autograd::clear_recompute_registry();
@@ -778,7 +830,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)
         if step % config.log_interval == 0 {
             // Read back the last micro-step's loss (scaled). Undo the scale for display.
-            let raw_loss = last_loss_tensor.as_ref().map(|t| t.to_vec()[0]).unwrap_or(0.0);
+            // Read from the persistent UNPOOLED readout buffer — loss_tensor.buffer may have been
+            // recycled+reused within the step (the large-batch "constant 1.0" artifact). The copy
+            // above captured the true value before any reuse. last_loss_tensor is now only the
+            // "did we take a step this iteration" flag.
+            let raw_loss = if last_loss_tensor.is_some() {
+                MetalContext::read_buffer(&loss_readout, 1)[0]
+            } else {
+                0.0
+            };
             let loss_val = if grad_accum_steps > 1 { raw_loss / loss_scale } else { raw_loss };
             if loss_val.is_nan() || loss_val.is_infinite() {
                 eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
@@ -882,6 +942,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
             save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
 
+            // EMA export: the moving-average weights are usually a better model than the live snapshot
+            // (self-distillation result). Save them alongside so they aren't discarded. Loads via the
+            // normal load_checkpoint path.
+            if !ema_buffers.is_empty() {
+                let ema_path = format!("{}/ema_{}.bin", config.checkpoint_dir, step);
+                checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, step)?;
+            }
+
             // Auto-save best model based on EMA loss
             if ema_loss > 0.0 && ema_loss < best_train_loss {
                 best_train_loss = ema_loss;
@@ -919,6 +987,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let state_path = format!("{}/state_final.bin", config.checkpoint_dir);
     checkpoint::save_training_state(&state_path, &model, &optimizer, config.total_steps, total_tokens)?;
     save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
+    if !ema_buffers.is_empty() {
+        let ema_path = format!("{}/ema_final.bin", config.checkpoint_dir);
+        checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, config.total_steps)?;
+        eprintln!("  EMA model saved to ema_final.bin (often better than final.bin — compare with `andreai perplexity`)");
+    }
     let total_time = start_time.elapsed().as_secs();
     let total_time_str = if total_time > 3600 {
         format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
