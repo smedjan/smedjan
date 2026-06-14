@@ -144,12 +144,22 @@ pub fn clear_tape() {
     TAPE.with(|tape| {
         // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
         let entries = std::mem::take(&mut *tape.borrow_mut());
-        // Recycle output/cached buffers — but a view op (reshape, etc.) shares its input's buffer
-        // as its OWN output_buffer. Recycling that pools a buffer the source tensor (an activation,
-        // parameter, or the caller's input) still references → the next allocation overwrites live
-        // data: a silent forward-after-clear_tape corruption (the cause of recompute-checkpointing
-        // drift). So skip any output that equals one of the entry's own input buffers, and dedupe
-        // by address so a buffer shared across entries is pooled at most once.
+        // Recycle output/cached buffers post-flush. A *view* op (reshape, etc.) sets its output_buffer
+        // to one of its OWN input buffers; that shared address must never be pooled — a live source
+        // tensor / parameter / the caller still holds it → next allocation overwrites live data: the
+        // forward-after-clear_tape corruption behind recompute-checkpointing drift. But a *fresh*
+        // activation output that merely flows into a later op as that op's input IS safe to pool once
+        // the whole (already-flushed) tape is dropped — and it is the bulk of per-step allocations
+        // (the old whole-tape input-union guard skipped these too → ~4% pool reuse). Parameters are
+        // never an op's output_buffer, so the output loop can never pool a weight. So: protect only
+        // self-aliased (view) output addrs; pool every other output. `cached` (softmax probs, reduction
+        // sums — never a param) keeps the conservative whole-tape-input guard.
+        let alias_addrs: std::collections::HashSet<usize> = entries.iter()
+            .filter_map(|e| {
+                let out = e.output_buffer.contents().as_ptr() as usize;
+                e.input_buffers.iter().any(|b| b.contents().as_ptr() as usize == out).then_some(out)
+            })
+            .collect();
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
             .flat_map(|e| e.input_buffers.iter())
             .map(|b| b.contents().as_ptr() as usize)
@@ -157,7 +167,7 @@ pub fn clear_tape() {
         let mut recycled = std::collections::HashSet::new();
         for entry in entries {
             let out_addr = entry.output_buffer.contents().as_ptr() as usize;
-            if !input_addrs.contains(&out_addr) && recycled.insert(out_addr) {
+            if !alias_addrs.contains(&out_addr) && recycled.insert(out_addr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
