@@ -2795,6 +2795,47 @@ mod suite {
         autograd::clear_tape();
     }
 
+    /// Model-level seq-packing: the per-document mask threaded through the FULL Transformer via
+    /// forward_seg must isolate packed sequences — changing one document must not change another's
+    /// logits. Differential design (no dependence on cross-config fp reproducibility): docB sits at
+    /// the same positions in both rows, so under the mask its logits are independent of docA.
+    #[test]
+    fn seq_packing_isolates_documents_through_model() {
+        let ctx = test_ctx();
+        let vocab = 16u32;
+        let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
+        let seq = 7usize;
+        // Row = docA (3 tok) + docB (4 tok); seg id per position.
+        let seg_buf = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1, 1, 1]);
+        let docb = [3usize, 4, 5, 6]; // docB positions in the row
+
+        let docb_logits = |toks: &[u32], seg: Option<&objc2::rc::Retained<crate::metal::GpuBuffer>>| -> Vec<f32> {
+            autograd::clear_tape();
+            autograd::zero_grads();
+            let out = model.forward_seg(toks, 1, seq, None, false, seg).to_vec(); // [seq, vocab]
+            autograd::clear_tape();
+            let vc = vocab as usize;
+            docb.iter().flat_map(|&p| out[p * vc..(p + 1) * vc].to_vec()).collect::<Vec<f32>>()
+        };
+        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+
+        let row1 = [1u32, 2, 3, 4, 5, 6, 7]; // docA=[1,2,3]
+        let row2 = [9u32, 8, 2, 4, 5, 6, 7]; // docA'=[9,8,2] — different; docB=[4,5,6,7] unchanged
+
+        // (1) Masked: docB logits must NOT move when docA changes (zero cross-document leakage).
+        let masked = max_diff(&docb_logits(&row1, Some(&seg_buf)), &docb_logits(&row2, Some(&seg_buf)));
+        assert!(masked < 2e-3, "seq-packing leaked: docB logits changed with docA under the per-doc mask (max diff {masked})");
+
+        // (2) Negative control: WITHOUT the mask, docB attends across the row, so changing docA DOES
+        // move docB's logits — proving the mask is what isolates them (the test isn't vacuous).
+        let unmasked = max_diff(&docb_logits(&row1, None), &docb_logits(&row2, None));
+        assert!(unmasked > 1e-2, "negative control failed: docB logits unchanged without the mask (max diff {unmasked}) — test can't detect leakage");
+
+        eprintln!("seq-packing isolation: masked diff={masked:.5} (want ~0), unmasked diff={unmasked:.5} (want >0)");
+        autograd::clear_tape();
+        autograd::zero_grads();
+    }
+
     // =========================================================================
     // Mega-kernel correctness: mega_ffn output must match standard FFN path
     // =========================================================================

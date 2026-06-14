@@ -1,6 +1,7 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::metal::{compute, MetalContext};
+use crate::metal::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
+use objc2::rc::Retained;
 use std::sync::Arc;
 
 /// Token-mixing kind for the attention block. `Softmax` is standard scaled-dot-product
@@ -424,11 +425,32 @@ impl MultiHeadAttention {
     ///
     /// When n_kv_heads < n_heads, K and V are projected to kv_dim = head_dim * n_kv_heads,
     /// then expanded via repeat_kv to match n_heads before attention computation.
-    pub fn forward(
+    /// Thin wrapper: standard forward with no sequence packing.
+    pub fn forward(&self, x: &Tensor, kv_cache: Option<&mut KvCache>) -> Tensor {
+        self.forward_seg(x, kv_cache, None)
+    }
+
+    /// Forward with optional packed-sequence segment ids. When `seg_ids` is Some, the standard dense
+    /// softmax path applies a causal + per-document mask so attention stays within each packed
+    /// sequence. seg_ids is honored only on the standard MHA/GQA path (training/prefill, offset 0).
+    /// The caller owns the seg buffer for the whole step — threaded by reference, NOT a thread-local
+    /// (the cleared-thread-local-before-deferred-batch hazard reverted the first attempt; see
+    /// HANDOFF_buffer_hazard_and_followups.md §2). Special mixers (MLA/linear/SSM/RWKV/block-sparse)
+    /// keep their own masking and ignore it.
+    pub fn forward_seg(
         &self,
         x: &Tensor,
         kv_cache: Option<&mut KvCache>,
+        seg_ids: Option<&Retained<GpuBuffer>>,
     ) -> Tensor {
+        debug_assert!(
+            seg_ids.is_none()
+                || !matches!(
+                    self.attn_kind,
+                    AttnKind::Linear | AttnKind::Ssm | AttnKind::Rwkv | AttnKind::BlockSparse | AttnKind::Mla
+                ),
+            "seq-packing (seg_ids) is only honored on the standard MHA/GQA dense path"
+        );
         // MLA incremental decode: cache the small latent `c` (not K/V) and reconstruct K/V from the
         // full cached latent each step → 10–50× smaller KV cache. Isolated early-return so the main
         // forward (training + non-MLA) is untouched. Equivalent to the prefill MLA forward (linearity
@@ -571,7 +593,7 @@ impl MultiHeadAttention {
             let scores = q.batched_matmul_trans_b(&k_for_attn).scale(scale); // [bh, seq, seq]
             let masked = scores.block_sparse_mask(&block_scores, self.block_size, self.block_sparse_top_k);
             masked.softmax().batched_matmul(&v_for_attn)
-        } else if seq_q_len >= 2048 && !use_gqa_strided {
+        } else if seq_q_len >= 2048 && !use_gqa_strided && seg_ids.is_none() {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
@@ -629,7 +651,12 @@ impl MultiHeadAttention {
             // Fused scale+mask+softmax: 1 dispatch instead of 3
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores = q.batched_matmul_trans_b(&k_for_attn);
-            let weights = if self.sliding_window > 0 {
+            let weights = if let Some(seg) = seg_ids {
+                // Packed varlen (training/prefill, offset 0): causal + per-document mask keeps
+                // attention inside each packed sequence. Falls back here (not the fused kernel)
+                // because the doc mask needs the explicit [bh, seq, seq] scores.
+                scores.scale(scale).causal_doc_mask(seg, self.n_heads).softmax()
+            } else if self.sliding_window > 0 {
                 // Windowed attention can't use fused kernel — fall back to separate ops
                 let scores = scores.scale(scale);
                 let scores = scores.causal_mask_window(offset, self.sliding_window as u32);

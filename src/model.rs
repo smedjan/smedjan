@@ -509,7 +509,18 @@ impl TransformerBlock {
     /// With Mixture of Depths (mod_capacity > 0): scores each token via a small router.
     /// Tokens with low scores get residual passthrough only. This saves 30-50% compute
     /// by skipping expensive attention+FFN for "easy" tokens.
+    /// Thin wrapper: block forward with no sequence packing.
     pub fn forward(&self, x: &Tensor, kv_cache: Option<&mut KvCache>) -> Tensor {
+        self.forward_seg(x, kv_cache, None)
+    }
+
+    /// Block forward with optional packed-sequence segment ids (threaded to attention).
+    pub fn forward_seg(
+        &self,
+        x: &Tensor,
+        kv_cache: Option<&mut KvCache>,
+        seg_ids: Option<&Retained<GpuBuffer>>,
+    ) -> Tensor {
         let batch = x.shape[0];
         let seq_len = x.shape[1];
         let d = x.shape[2];
@@ -530,7 +541,7 @@ impl TransformerBlock {
 
             // Full block computation
             let normed = x.rms_norm(&self.ln1_weight, self.norm_eps);
-            let attn_out = self.attn.forward(&normed, kv_cache);
+            let attn_out = self.attn.forward_seg(&normed, kv_cache, seg_ids);
             let (normed2, h) = attn_out.rms_norm_residual_with_sum(x, &self.ln2_weight, self.norm_eps);
             let ffn_out = if self.n_experts > 1 {
                 self.moe_ffn(&normed2, batch, seq_len, d)
@@ -550,7 +561,7 @@ impl TransformerBlock {
         }
 
         let normed = x.rms_norm(&self.ln1_weight, self.norm_eps);
-        let attn_out = self.attn.forward(&normed, kv_cache);
+        let attn_out = self.attn.forward_seg(&normed, kv_cache, seg_ids);
 
         // MEGA-KERNEL: fuse norm + FFN + residual into single dispatch for d≤256.
         // Per-token threadgroups lose to tiled matmul at large token counts.
@@ -678,11 +689,24 @@ impl TransformerBlock {
     /// checkpointed forward reproduces the standard forward exactly and the gradients match
     /// bit-for-bit (tests::gradient_checkpointing_matches_standard).
     pub fn forward_checkpointed(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
-        self.forward_checkpointed_recompute(x, layer_idx)
+        self.forward_checkpointed_seg(x, layer_idx, None)
+    }
+
+    /// Checkpointed block forward with optional packed-sequence segment ids.
+    pub fn forward_checkpointed_seg(
+        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&Retained<GpuBuffer>>,
+    ) -> Tensor {
+        self.forward_checkpointed_recompute_seg(x, layer_idx, seg_ids)
     }
 
     /// Recompute-based checkpointing implementation (see forward_checkpointed).
     pub fn forward_checkpointed_recompute(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
+        self.forward_checkpointed_recompute_seg(x, layer_idx, None)
+    }
+
+    pub fn forward_checkpointed_recompute_seg(
+        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&Retained<GpuBuffer>>,
+    ) -> Tensor {
         // Save the input tensor's buffer and shape — we need these for the main tape entry
         // and for the recompute closure.
         let input_id = x.id;
@@ -692,7 +716,7 @@ impl TransformerBlock {
 
         // Run the forward pass on a temporary sub-tape (discarded after capturing output)
         let (output, _sub_tape) = autograd::checkpoint_forward(|| {
-            self.forward(x, None)
+            self.forward_seg(x, None, seg_ids)
         });
 
         // Record a single checkpoint op on the main tape
@@ -719,6 +743,9 @@ impl TransformerBlock {
         let block = Arc::clone(self);
         let recompute_input_buffer = input_buffer;
         let recompute_input_shape = input_shape;
+        // Clone the seg buffer (refcount bump) so it outlives the deferred recompute — never a
+        // thread-local that could be cleared before the recompute's mask dispatches run (§2).
+        let seg_owned: Option<Retained<GpuBuffer>> = seg_ids.cloned();
 
         autograd::register_recompute(layer_idx, Box::new(move |recompute_ctx: &Arc<MetalContext>| {
             // Reconstruct the input tensor from the saved buffer
@@ -732,7 +759,7 @@ impl TransformerBlock {
 
             // Run forward on a fresh sub-tape and return it
             let (_recomputed_output, sub_tape) = autograd::checkpoint_forward(|| {
-                block.forward(&recompute_input, None)
+                block.forward_seg(&recompute_input, None, seg_owned.as_ref())
             });
 
             sub_tape
@@ -966,6 +993,7 @@ impl Transformer {
     /// (only stores block inputs, recomputes intermediates during backward).
     /// Checkpointing is ignored when kv_caches are provided (inference mode).
     /// Returns logits: [batch * seq_len, vocab_size]
+    /// Thin wrapper: full forward with no sequence packing.
     pub fn forward(
         &self,
         tokens: &[u32],
@@ -973,6 +1001,21 @@ impl Transformer {
         seq_len: usize,
         kv_caches: Option<&mut Vec<KvCache>>,
         checkpointed: bool,
+    ) -> Tensor {
+        self.forward_seg(tokens, batch, seq_len, kv_caches, checkpointed, None)
+    }
+
+    /// Full forward with optional packed-sequence segment ids (per position; threaded to every
+    /// block's attention). Only the no-cache (training/prefill) path honors it; the seg buffer is
+    /// caller-owned for the whole step.
+    pub fn forward_seg(
+        &self,
+        tokens: &[u32],
+        batch: usize,
+        seq_len: usize,
+        kv_caches: Option<&mut Vec<KvCache>>,
+        checkpointed: bool,
+        seg_ids: Option<&Retained<GpuBuffer>>,
     ) -> Tensor {
         let d = self.config.d_model;
         let v = self.config.vocab_size as usize;
@@ -1033,7 +1076,7 @@ impl Transformer {
             None => {
                 if checkpointed {
                     for (i, block) in self.blocks.iter().enumerate() {
-                        h = block.forward_checkpointed(&h, i);
+                        h = block.forward_checkpointed_seg(&h, i, seg_ids);
                     }
                 } else {
                     let n_layers = self.blocks.len();
@@ -1045,7 +1088,7 @@ impl Transformer {
                                 continue;
                             }
                         }
-                        h = block.forward(&h, None);
+                        h = block.forward_seg(&h, None, seg_ids);
 
                         if self.config.fp16_activations && i + 1 < n_layers {
                             h = h.fp16_roundtrip();
