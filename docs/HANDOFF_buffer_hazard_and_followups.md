@@ -23,9 +23,22 @@ Fix: allocate the readout buffer **once, outside the pool**, via `ctx.buffer_fro
 — a direct (unpooled) Metal allocation that is never recycled and never handed to any other tensor,
 so it cannot alias anything. Three edits:
 - declare `let loss_readout = ctx.buffer_from_slice(&[0.0f32]);` once before the `for step` loop;
-- `compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);` right after `backward`, before
-  `clear_tape_keep_grads` (so it executes first in the batch);
+- `compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);` **BEFORE `autograd::backward`**;
 - read the log-time loss from `loss_readout` instead of `last_loss_tensor.to_vec()`.
+
+> **Correction (verified on M3, 2026-06-13).** An unpooled *destination* is necessary but NOT
+> sufficient. The earlier wording placed the copy *after* `backward` ("so it executes first") — that is
+> wrong: encoded dispatches run in **encoding order**, so a copy encoded after `backward` runs after it.
+> The hazard is on the **source**: `backward` recycles 4-byte pooled buffers for its own scalars
+> (including the `dL/dL = 1.0` seed) and re-hands `loss_tensor.buffer` to one of them, overwriting it
+> before the post-backward copy executes. The result is the displayed loss reading **exactly `1.0`**
+> (the seed) once the pool warms up — masking the *true* loss entirely (the model is actually training
+> fine; only the readout, and the "EMA ~1.56" derived from it, were garbage). The "1.0" is therefore a
+> **readout artifact, not divergence** — confirmed by capturing logits + `loss_tensor` behind an extra
+> flush, which read a correct, descending ~9.x. Moving the copy to *before* `backward` captures the
+> true value while `loss_tensor.buffer` is still live. With the honest readout, a tiny model on
+> `train_v3.bin` descends 9.5 → 9.08 over 2000 steps (perplexity 7572 → 4574); too-hot configs
+> (seq256/lr3e-3) now visibly *climb* the loss instead of hiding behind a constant 1.0.
 
 Why this is the general lesson (the **buffer-hazard root cause**, task #1): the thread-local buffer
 pool reissues a buffer the instant it is recycled, but `dispatch_kernel` only *encodes* into the

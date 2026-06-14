@@ -729,15 +729,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
             }
 
+            // Capture the loss scalar into the persistent (unpooled) readout buffer BEFORE backward.
+            // backward() recycles 4-byte pooled buffers for its own scalars (including the dL/dL=1.0
+            // seed) and can re-hand loss_tensor.buffer to one of them; since those kernels are encoded
+            // — and so execute — before any copy placed *after* backward, a post-backward copy reads
+            // the overwritten value (the classic "displayed loss == 1.0" = the backward seed). Encoding
+            // the copy here, before backward, captures the true loss while loss_tensor.buffer is still
+            // live. Destination is the unpooled loss_readout so it can't itself be aliased.
+            compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);
+
             // Backward pass in the SAME command batch as forward — one fewer GPU sync
             autograd::backward(ctx, loss_tensor.id);
             // DON'T flush — gradient norm kernels encode into same batch below
-
-            // Capture the loss scalar into the persistent (unpooled) readout buffer NOW — encoded
-            // before clear_tape_keep_grads returns loss_tensor.buffer to the pool, so it runs first
-            // in the command batch and captures the true value even if that buffer is later reused
-            // in-step. Reads the (possibly grad_accum-scaled) loss; the log site undoes the scale.
-            compute::gpu_copy(ctx, &loss_tensor.buffer, &loss_readout, 1);
 
             // Free the tape (activations) but keep accumulated gradients
             autograd::clear_tape_keep_grads();
