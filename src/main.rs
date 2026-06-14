@@ -574,6 +574,9 @@ enum Commands {
         /// Number of timed iterations
         #[arg(long, default_value = "20")]
         iters: usize,
+        /// Route matmuls through the hardware simdgroup MMA units (bit-identical; measures the fast path).
+        #[arg(long)]
+        simdgroup_matmul: bool,
     },
 }
 
@@ -1261,7 +1264,7 @@ fn main() {
         }
 
         Commands::Bench {
-            size, batch_size, seq_len, lowrank, warmup, iters,
+            size, batch_size, seq_len, lowrank, warmup, iters, simdgroup_matmul,
         } => {
             use std::time::Instant;
 
@@ -1289,6 +1292,10 @@ fn main() {
                 batch_size, seq_len, batch_size * seq_len);
             eprintln!("Fused kernels: {}", if fused_eligible { "ACTIVE (inference)" } else { "disabled" });
             eprintln!("Warmup: {}, Timed iters: {}", warmup, iters);
+            if simdgroup_matmul {
+                metal::compute::set_simdgroup_matmul(true);
+            }
+            eprintln!("Matmul path: {}", if simdgroup_matmul { "hardware simdgroup MMA" } else { "scalar-MAC tiled (default)" });
             eprintln!();
 
             let model = model::Transformer::new(&ctx, config.clone());
