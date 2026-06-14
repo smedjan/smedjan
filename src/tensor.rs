@@ -992,7 +992,7 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, seg_ids, batch_heads as u32, seq as u32, n_heads as u32);
+        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, &crate::gpu::buf_as_u32(seg_ids), batch_heads as u32, seq as u32, n_heads as u32);
 
         let out_id = autograd::next_id();
         let out = Tensor {

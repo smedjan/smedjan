@@ -107,7 +107,7 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
 /// Gather selected source blocks into a compact [bh*nb, k_sel*block, hd] tensor, recording an
 /// `Op::GatherBlocks` tape entry (when recording) so the backward scatter-adds gradients back to
 /// `src`. `sel_buf` is the fixed routing permutation (computed non-differentiably by the caller).
-fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::Buf, dims: compute::GatherDims) -> Tensor {
+fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::BufU32, dims: compute::GatherDims) -> Tensor {
     let (bh, nb, hd, block, k_sel) = (
         dims.bh as usize, dims.nb as usize, dims.hd as usize, dims.block as usize, dims.k_sel as usize,
     );
@@ -125,7 +125,7 @@ fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::Buf, dims: compute
             input_buffers: vec![src.buffer.clone()],
             output_buffer: out.buffer.clone(),
             shapes: vec![src.shape.clone()],
-            cached: Some(sel_buf.clone()),
+            cached: Some(crate::gpu::u32_to_buf(sel_buf.clone())),
         });
     }
     out

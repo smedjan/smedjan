@@ -229,10 +229,7 @@ pub fn load_training_state(
         let n_elements: usize = shape.iter().product();
         let mut byte_data = vec![0u8; n_elements * 4];
         file.read_exact(&mut byte_data)?;
-        unsafe {
-            let ptr = param.buffer.contents().as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(byte_data.as_ptr(), ptr, byte_data.len());
-        }
+        crate::gpu::buf_write_bytes(&param.buffer, &byte_data);
     }
 
     // Optimizer state (only for trainable params, not base params)
@@ -389,10 +386,7 @@ pub fn load_checkpoint(
         file.read_exact(&mut byte_data)?;
 
         // Write directly to the Metal buffer (unified memory, zero-copy)
-        unsafe {
-            let ptr = param.buffer.contents().as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(byte_data.as_ptr(), ptr, byte_data.len());
-        }
+        crate::gpu::buf_write_bytes(&param.buffer, &byte_data);
 
         if i % 10 == 0 {
             eprintln!("  loaded tensor {}/{}", i + 1, n_tensors);

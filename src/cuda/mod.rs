@@ -39,6 +39,30 @@ pub fn buf_len_bytes(b: &Buf) -> usize {
     (**b).len() * 4
 }
 
+/// Write host bytes into a device buffer (htod). Mirrors Metal's unified-memory write; bytes are
+/// reinterpreted as f32 then synchronously copied into the live device allocation.
+#[inline]
+pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
+    let n = bytes.len() / 4;
+    let mut f = vec![0f32; n];
+    for i in 0..n {
+        f[i] = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+    }
+    unsafe { cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f).expect("htod buf_write_bytes"); }
+}
+
+/// Reinterpret a u32 buffer handle as a Buf (f32) for storage in the untyped tape Vec<Buf>.
+/// CudaSlice<u32> and CudaSlice<f32> have identical layout (device ptr + len, both 4-byte elems);
+/// the tape only holds it to hand back to embedding_backward, which reinterprets it back as u32.
+pub fn u32_to_buf(b: BufU32) -> Buf {
+    unsafe { std::mem::transmute::<Arc<CudaSlice<u32>>, Arc<CudaSlice<f32>>>(b) }
+}
+
+/// Inverse of `u32_to_buf`: view a tape-stored Buf as the u32 buffer it really is.
+pub fn buf_as_u32(b: &Buf) -> BufU32 {
+    unsafe { std::mem::transmute::<Arc<CudaSlice<f32>>, Arc<CudaSlice<u32>>>(b.clone()) }
+}
+
 /// CUDA context: device handle, pre-compiled kernels, buffer pool.
 /// Named MetalContext for source compatibility with the rest of the codebase.
 pub struct MetalContext {
@@ -52,8 +76,14 @@ impl MetalContext {
     pub fn new() -> Arc<Self> {
         let device = CudaDevice::new(0).expect("Failed to initialize CUDA device");
 
-        // Load all PTX kernels
-        let ptx = cudarc::nvrtc::compile_ptx(kernels::ALL_KERNELS)
+        // Compile all kernels to PTX. nvrtc needs the toolkit include dir for <cuda_fp16.h> etc.;
+        // derive it from CUDA_PATH (set at build/run time) with a sane fallback.
+        let cuda_inc = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".into()) + "/include";
+        let opts = cudarc::nvrtc::CompileOptions {
+            include_paths: vec![cuda_inc],
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(kernels::ALL_KERNELS, opts)
             .expect("Failed to compile CUDA kernels");
         device.load_ptx(ptx, "andreai", &kernels::KERNEL_NAMES)
             .expect("Failed to load CUDA kernels");
@@ -78,6 +108,11 @@ impl MetalContext {
     pub fn buffer_from_u32_slice(&self, data: &[u32]) -> BufU32 {
         Arc::new(self.device.htod_sync_copy(data)
             .expect("Failed to copy u32 to device"))
+    }
+
+    /// Allocate a zeroed u32 device buffer of `count` elements.
+    pub fn alloc_buffer_u32(&self, count: usize) -> BufU32 {
+        Arc::new(self.device.alloc_zeros::<u32>(count).expect("Failed to allocate u32 CUDA buffer"))
     }
 
     /// Read f32 data from device buffer.
@@ -132,6 +167,17 @@ impl MetalContext {
     /// Read a device buffer into a host slice (dtoh). Mirrors Metal's read_buffer_into.
     pub fn read_buffer_into(buf: &CudaSlice<f32>, dst: &mut [f32]) {
         buf.device().dtoh_sync_copy_into(buf, dst).expect("dtoh_sync_copy_into");
+    }
+
+    /// Block until all queued GPU work finishes. CUDA copies here are already synchronous; sync anyway.
+    pub fn wait_gpu(&self) {
+        self.device.synchronize().ok();
+    }
+
+    /// Metal returns a zero-copy host view of unified memory; CUDA device memory has no host slice.
+    /// Callers on CUDA must use `to_vec()` / `read_buffer` instead. Stubbed to keep the API surface.
+    pub fn buffer_as_slice(_buf: &CudaSlice<f32>, _n: usize) -> &'static [f32] {
+        unimplemented!("cuda: buffer_as_slice has no zero-copy host view — use to_vec()/read_buffer")
     }
 
     // Command batching — CUDA uses streams, no explicit batching needed.

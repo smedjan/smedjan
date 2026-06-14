@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 /// Pre-allocated buffers for loss computation — avoids 33MB+ allocation every step.
 pub struct LossWorkspace {
-    pub targets_buf: crate::gpu::Buf,   // [batch * seq_len] u32
+    pub targets_buf: crate::gpu::BufU32,   // [batch * seq_len] u32
     pub losses_buf: crate::gpu::Buf,    // [batch * seq_len] f32
     pub grad_logits_buf: crate::gpu::Buf, // [batch * seq_len, vocab] f32
     pub scalar_buf: crate::gpu::Buf,    // [1] f32
@@ -14,7 +14,7 @@ pub struct LossWorkspace {
 impl LossWorkspace {
     pub fn new(ctx: &Arc<MetalContext>, batch_seq: usize, vocab: usize) -> Self {
         Self {
-            targets_buf: ctx.alloc_buffer(batch_seq * 4),
+            targets_buf: ctx.alloc_buffer_u32(batch_seq),
             losses_buf: ctx.alloc_buffer(batch_seq * 4),
             grad_logits_buf: ctx.alloc_buffer(batch_seq * vocab * 4),
             scalar_buf: ctx.alloc_buffer(4),

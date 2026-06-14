@@ -269,6 +269,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Only restore AdamW state when the main AdamW is the live optimizer and the checkpoint
         // actually carries matching state (non-adamw checkpoints save none — see save_training_state).
         if uses_main_adamw && opt_states.len() == optimizer.params.len() {
+            #[cfg(feature = "metal")]
             optimizer.load_state(&opt_states, opt_step);
         } else if !opt_states.is_empty() {
             eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
@@ -782,7 +783,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             } else if config.optimizer_type == "adamw-cpu" {
                 // CPU optimizer: runs on unified memory while GPU can start next forward.
                 // Apple Silicon advantage: zero-copy, ~same speed as GPU for small param counts.
+                #[cfg(feature = "metal")]
                 optimizer.step_cpu(lr);
+                #[cfg(not(feature = "metal"))]
+                optimizer.step(lr);
                 ctx.begin_batch(); // start a dummy batch for the flush below
             } else {
                 ctx.begin_batch();

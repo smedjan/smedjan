@@ -155,6 +155,20 @@ pub fn buf_len_bytes(b: &Buf) -> usize {
     b.length()
 }
 
+/// Write host bytes into a buffer (unified memory; zero-copy). Replaces inline `.contents()`
+/// memcpy in checkpoint/quantize so CUDA can substitute an htod copy.
+#[inline]
+pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
+    use objc2_metal::MTLBuffer;
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len()); }
+}
+
+/// On Metal, buffers are untyped so the u32/f32 handles are the same — identity conversions.
+#[inline]
+pub fn u32_to_buf(b: BufU32) -> Buf { b }
+#[inline]
+pub fn buf_as_u32(b: &Buf) -> BufU32 { b.clone() }
+
 /// Active command batch for kernel fusion. Accumulates multiple kernel dispatches
 /// into a single command buffer, then commits and waits once.
 /// This eliminates the per-kernel commit+wait overhead (~50-80% of wall time).
@@ -532,6 +546,11 @@ impl MetalContext {
     }
 
     /// Allocate a buffer and initialize with u32 data.
+    /// Allocate a zeroed u32 buffer of `count` elements (untyped on Metal → reuse alloc_buffer).
+    pub fn alloc_buffer_u32(&self, count: usize) -> Buf {
+        self.alloc_buffer(count * 4)
+    }
+
     pub fn buffer_from_u32_slice(&self, data: &[u32]) -> Retained<GpuBuffer> {
         let byte_len = std::mem::size_of_val(data);
         let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();

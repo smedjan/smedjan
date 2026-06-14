@@ -8,11 +8,29 @@ use std::sync::Arc;
 
 /// Read a GPU buffer's first `byte_len` bytes (unified memory — direct, no DMA). Used to serialize
 /// optimizer state (f32 or int8) to a resume sidecar.
+#[cfg(feature = "metal")]
 fn buf_bytes(buf: &GpuBuffer, byte_len: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, byte_len).to_vec() }
 }
+// CUDA: device memory has no host pointer — dtoh the f32 slice and reinterpret as bytes.
+#[cfg(not(feature = "metal"))]
+fn buf_bytes(buf: &GpuBuffer, byte_len: usize) -> Vec<u8> {
+    let v = crate::gpu::MetalContext::read_buffer(buf, byte_len / 4);
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
 
 /// Write bytes into a GPU buffer (unified memory). Caller guarantees `bytes.len()` ≤ buffer size.
+#[cfg(not(feature = "metal"))]
+fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
+    let n = bytes.len() / 4;
+    let mut f = vec![0f32; n];
+    for i in 0..n {
+        f[i] = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+    }
+    use cudarc::driver::DevicePtr;
+    unsafe { cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f).expect("htod buf_set_bytes"); }
+}
+#[cfg(feature = "metal")]
 fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len());
@@ -167,6 +185,7 @@ impl AdamW {
     /// On Apple Silicon, CPU and GPU share physical memory — no copy needed.
     /// The CPU update runs while the GPU can start the next forward pass.
     /// This hides optimizer latency behind GPU compute.
+    #[cfg(feature = "metal")]
     pub fn step_cpu(&mut self, lr: f32) {
         #[cfg(feature = "metal")]
         use objc2_metal::MTLBuffer;
@@ -210,6 +229,7 @@ impl AdamW {
     }
 
     /// Load optimizer state from checkpoint data. Sets m, v buffers and step counter.
+    #[cfg(feature = "metal")]
     pub fn load_state(&mut self, states: &[(Vec<f32>, Vec<f32>)], opt_step: u32) {
         assert_eq!(states.len(), self.params.len(), "Optimizer state count mismatch");
         self.step = opt_step;
@@ -297,6 +317,8 @@ impl AdamW8bit {
             let v_scale = ctx.alloc_buffer(n_blocks * 4);
             // Zero all state: int8 0 and fp32 0.0 are both all-zero bytes. Buffers may be pooled
             // (stale), so this is required.
+            // Metal: pooled buffers may be stale → must zero. CUDA: alloc_zeros already zeroes.
+            #[cfg(feature = "metal")]
             unsafe {
                 std::ptr::write_bytes(m_q.contents().as_ptr() as *mut u8, 0, size.max(1));
                 std::ptr::write_bytes(v_q.contents().as_ptr() as *mut u8, 0, size.max(1));

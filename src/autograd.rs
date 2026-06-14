@@ -722,7 +722,7 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &cra
     let grad_embeddings = ctx.alloc_buffer(vocab * dim * 4);
     compute::gpu_embedding_backward(
         ctx,
-        &entry.input_buffers[0], // tokens
+        &crate::gpu::buf_as_u32(&entry.input_buffers[0]), // tokens (reinterpret tape-stored Buf as u32)
         out_grad,
         &grad_embeddings,
         n_tokens as u32,
@@ -738,7 +738,7 @@ fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: 
     let sel = entry.cached.as_ref().expect("gather_blocks backward needs cached sel buffer");
     let src_size = (dims.bh * dims.seq * dims.hd) as usize;
     let d_src = ctx.alloc_buffer(src_size * 4);
-    compute::gpu_gather_blocks_backward(ctx, out_grad, sel, &d_src, dims);
+    compute::gpu_gather_blocks_backward(ctx, out_grad, &crate::gpu::buf_as_u32(sel), &d_src, dims);
     accumulate_grad(ctx, entry.inputs[0], d_src, src_size);
 }
 

@@ -324,10 +324,7 @@ pub fn load_quantized(
         let dequantized = dequantize(&qt);
         let byte_data: Vec<u8> = dequantized.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-        unsafe {
-            let ptr = param.buffer.contents().as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(byte_data.as_ptr(), ptr, byte_data.len());
-        }
+        crate::gpu::buf_write_bytes(&param.buffer, &byte_data);
 
         if i % 10 == 0 {
             eprintln!("  loaded tensor {}/{}", i + 1, n_tensors);
