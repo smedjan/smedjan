@@ -1,7 +1,7 @@
 use crate::autograd;
 use crate::gpu::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
-use objc2::rc::Retained;
+#[cfg(feature = "metal")]
 use objc2_metal::MTLBuffer;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -52,10 +52,10 @@ pub struct AdamW {
 
 pub struct ParamState {
     pub tensor_id: usize,
-    pub buffer: Retained<GpuBuffer>,
+    pub buffer: crate::gpu::Buf,
     pub size: usize,
-    pub m: Retained<GpuBuffer>, // first moment
-    pub v: Retained<GpuBuffer>, // second moment
+    pub m: crate::gpu::Buf, // first moment
+    pub v: crate::gpu::Buf, // second moment
     pub no_decay: bool, // skip weight decay for norms and embeddings
 }
 
@@ -168,6 +168,7 @@ impl AdamW {
     /// The CPU update runs while the GPU can start the next forward pass.
     /// This hides optimizer latency behind GPU compute.
     pub fn step_cpu(&mut self, lr: f32) {
+        #[cfg(feature = "metal")]
         use objc2_metal::MTLBuffer;
         self.step += 1;
 
@@ -270,14 +271,14 @@ pub struct AdamW8bit {
 
 pub struct Param8State {
     pub tensor_id: usize,
-    pub buffer: Retained<GpuBuffer>,
+    pub buffer: crate::gpu::Buf,
     pub size: usize,
     pub n_blocks: usize,
     pub no_decay: bool,
-    pub m_q: Retained<GpuBuffer>,    // int8 of m, `size` bytes
-    pub v_q: Retained<GpuBuffer>,    // int8 of √v (range-compressed), `size` bytes
-    pub m_scale: Retained<GpuBuffer>, // fp32 absmax(|m|)/127 per block, n_blocks entries
-    pub v_scale: Retained<GpuBuffer>, // fp32 absmax(√v)/127 per block, n_blocks entries
+    pub m_q: crate::gpu::Buf,    // int8 of m, `size` bytes
+    pub v_q: crate::gpu::Buf,    // int8 of √v (range-compressed), `size` bytes
+    pub m_scale: crate::gpu::Buf, // fp32 absmax(|m|)/127 per block, n_blocks entries
+    pub v_scale: crate::gpu::Buf, // fp32 absmax(√v)/127 per block, n_blocks entries
 }
 
 impl AdamW8bit {
@@ -545,10 +546,10 @@ pub struct Sophia {
 
 pub struct SophiaState {
     pub tensor_id: usize,
-    pub buffer: Retained<GpuBuffer>,
+    pub buffer: crate::gpu::Buf,
     pub size: usize,
-    pub m: Retained<GpuBuffer>, // first moment (momentum)
-    pub h: Retained<GpuBuffer>, // diagonal Hessian estimate
+    pub m: crate::gpu::Buf, // first moment (momentum)
+    pub h: crate::gpu::Buf, // diagonal Hessian estimate
 }
 
 impl Sophia {
@@ -615,21 +616,21 @@ pub struct Muon {
 
 pub struct MuonState {
     pub tensor_id: usize,
-    pub buffer: Retained<GpuBuffer>,
+    pub buffer: crate::gpu::Buf,
     pub size: usize,
     pub shape: Vec<usize>,
-    pub m: Retained<GpuBuffer>,    // momentum buffer
+    pub m: crate::gpu::Buf,    // momentum buffer
     pub is_2d: bool,               // true = Muon update, false = AdamW fallback
     pub no_decay: bool,            // AdamW fallback: skip weight decay for 1-D norms/biases
     // AdamW fallback state for non-2D params
-    pub v: Option<Retained<GpuBuffer>>,
+    pub v: Option<crate::gpu::Buf>,
     // Pre-allocated Newton-Schulz workspace (avoids ~100 allocs per 2D param per step)
-    pub ns_x: Option<Retained<GpuBuffer>>,    // [rows, cols] — working copy
-    pub ns_xxt: Option<Retained<GpuBuffer>>,  // [rows, rows] — X @ X^T
-    pub ns_xxtx: Option<Retained<GpuBuffer>>, // [rows, cols] — (X @ X^T) @ X
+    pub ns_x: Option<crate::gpu::Buf>,    // [rows, cols] — working copy
+    pub ns_xxt: Option<crate::gpu::Buf>,  // [rows, rows] — X @ X^T
+    pub ns_xxtx: Option<crate::gpu::Buf>, // [rows, cols] — (X @ X^T) @ X
     // NorMuon per-row state (only Some for 2-D params): the running second moment and a scratch buffer.
-    pub ns_vrow: Option<Retained<GpuBuffer>>,  // [rows] — EMA of per-row mean-square of the orthogonal update
-    pub ns_rowss: Option<Retained<GpuBuffer>>, // [rows] — scratch (per-row sum-of-squares, then the scale)
+    pub ns_vrow: Option<crate::gpu::Buf>,  // [rows] — EMA of per-row mean-square of the orthogonal update
+    pub ns_rowss: Option<crate::gpu::Buf>, // [rows] — scratch (per-row sum-of-squares, then the scale)
 }
 
 impl Muon {

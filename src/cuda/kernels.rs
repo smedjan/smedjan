@@ -645,7 +645,6 @@ extern "C" __global__ void embedding_backward(
     if (pos >= seq_len || d >= dim) return;
     atomicAdd(&grad_table[tokens[pos] * dim + d], grad_out[pos * dim + d]);
 }
-"#;
 
 // ============================================================
 // BATCHED MATMUL: C[b] = A[b] @ B[b]
@@ -1126,3 +1125,4 @@ extern "C" __global__ void silu(const float* input, float* output, unsigned int 
         output[i] = x / (1.0f + expf(-x));
     }
 }
+"#;

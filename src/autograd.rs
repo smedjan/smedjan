@@ -1,6 +1,4 @@
 use crate::gpu::{compute, GpuBuffer, MetalContext};
-use objc2::rc::Retained;
-use objc2_metal::MTLBuffer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,15 +98,15 @@ pub struct TapeEntry {
     pub op: Op,
     pub inputs: Vec<usize>,     // TensorIds of inputs (1-3 typical)
     pub output: usize,          // TensorId of output
-    pub input_buffers: Vec<Retained<GpuBuffer>>,
-    pub output_buffer: Retained<GpuBuffer>,
+    pub input_buffers: Vec<crate::gpu::Buf>,
+    pub output_buffer: crate::gpu::Buf,
     pub shapes: Vec<Vec<usize>>, // Still Vec for now — SmallVec needs a dep, fixed arrays need refactoring all callers
-    pub cached: Option<Retained<GpuBuffer>>,
+    pub cached: Option<crate::gpu::Buf>,
 }
 
 thread_local! {
     static TAPE: RefCell<Vec<TapeEntry>> = const { RefCell::new(Vec::new()) };
-    static GRADS: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
+    static GRADS: RefCell<HashMap<usize, crate::gpu::Buf>> = RefCell::new(HashMap::new());
     static NO_GRAD: RefCell<bool> = const { RefCell::new(false) };
     static RECOMPUTE_REGISTRY: RefCell<HashMap<usize, RecomputeFn>> = RefCell::new(HashMap::new());
 }
@@ -125,7 +123,7 @@ pub fn tape_stats() -> (usize, usize) {
         let tape = tape.borrow();
         let num_ops = tape.len();
         let total_bytes: usize = tape.iter()
-            .map(|entry| entry.output_buffer.length())
+            .map(|entry| crate::gpu::buf_len_bytes(&entry.output_buffer))
             .sum();
         (num_ops, total_bytes)
     })
@@ -140,7 +138,6 @@ pub fn record(entry: TapeEntry) {
 
 /// Clear the tape and all stored gradients.
 pub fn clear_tape() {
-    use objc2_metal::MTLBuffer;
     TAPE.with(|tape| {
         // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
         let entries = std::mem::take(&mut *tape.borrow_mut());
@@ -156,22 +153,22 @@ pub fn clear_tape() {
         // sums — never a param) keeps the conservative whole-tape-input guard.
         let alias_addrs: std::collections::HashSet<usize> = entries.iter()
             .filter_map(|e| {
-                let out = e.output_buffer.contents().as_ptr() as usize;
-                e.input_buffers.iter().any(|b| b.contents().as_ptr() as usize == out).then_some(out)
+                let out = crate::gpu::buf_addr(&e.output_buffer);
+                e.input_buffers.iter().any(|b| crate::gpu::buf_addr(&b) == out).then_some(out)
             })
             .collect();
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
             .flat_map(|e| e.input_buffers.iter())
-            .map(|b| b.contents().as_ptr() as usize)
+            .map(|b| crate::gpu::buf_addr(&b))
             .collect();
         let mut recycled = std::collections::HashSet::new();
         for entry in entries {
-            let out_addr = entry.output_buffer.contents().as_ptr() as usize;
+            let out_addr = crate::gpu::buf_addr(&entry.output_buffer);
             if !alias_addrs.contains(&out_addr) && recycled.insert(out_addr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
-                let c_addr = cached.contents().as_ptr() as usize;
+                let c_addr = crate::gpu::buf_addr(&cached);
                 if !input_addrs.contains(&c_addr) && recycled.insert(c_addr) {
                     MetalContext::recycle_buffer(cached);
                 }
@@ -185,14 +182,13 @@ pub fn clear_tape() {
 /// Used in gradient accumulation: after each micro-step's backward pass we free the tape
 /// to reclaim activation memory, but keep gradients so the next micro-step accumulates on top.
 pub fn clear_tape_keep_grads() {
-    use objc2_metal::MTLBuffer;
 
     // Collect gradient buffer contents() pointers so we don't recycle shared buffers.
     // A buffer in GRADS that's also in the tape (output_buffer/cached) must NOT be recycled,
     // or the next micro-step's forward pass would overwrite the gradient via pool reuse.
     let grad_ptrs: std::collections::HashSet<usize> = GRADS.with(|grads| {
         grads.borrow().values().map(|buf| {
-            buf.contents().as_ptr() as usize
+            crate::gpu::buf_addr(&buf)
         }).collect()
     });
 
@@ -205,7 +201,7 @@ pub fn clear_tape_keep_grads() {
         // with grad buffers and checkpoint outputs, and deduped so a shared buffer is pooled once.
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
             .flat_map(|e| e.input_buffers.iter())
-            .map(|b| b.contents().as_ptr() as usize)
+            .map(|b| crate::gpu::buf_addr(&b))
             .collect();
         let mut recycled = std::collections::HashSet::new();
         let protected = |addr: usize| grad_ptrs.contains(&addr) || input_addrs.contains(&addr);
@@ -214,12 +210,12 @@ pub fn clear_tape_keep_grads() {
             // recompute closure. Recycling them causes the recompute to read garbage data.
             let is_checkpoint = matches!(entry.op, Op::Checkpoint { .. });
 
-            let out_ptr = entry.output_buffer.contents().as_ptr() as usize;
+            let out_ptr = crate::gpu::buf_addr(&entry.output_buffer);
             if !is_checkpoint && !protected(out_ptr) && recycled.insert(out_ptr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
             }
             if let Some(cached) = entry.cached {
-                let cached_ptr = cached.contents().as_ptr() as usize;
+                let cached_ptr = crate::gpu::buf_addr(&cached);
                 if !protected(cached_ptr) && recycled.insert(cached_ptr) {
                     MetalContext::recycle_buffer(cached);
                 }
@@ -241,7 +237,7 @@ pub fn zero_grads() {
 /// otherwise recycled buffers get reused while optimizer is still reading.
 /// Store a gradient for testing purposes (bypasses normal backward flow).
 #[cfg(test)]
-pub fn accumulate_grad_for_test(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
+pub fn accumulate_grad_for_test(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &crate::gpu::Buf, size: usize) {
     accumulate_grad(ctx, tensor_id, grad.clone(), size);
 }
 
@@ -260,7 +256,7 @@ pub fn scale_grads(ctx: &Arc<MetalContext>, factor: f32) {
     GRADS.with(|grads| {
         let grads = grads.borrow();
         for (_id, grad_buf) in grads.iter() {
-            let size = grad_buf.length() / 4; // f32 = 4 bytes
+            let size = crate::gpu::buf_len_bytes(&grad_buf) / 4; // f32 = 4 bytes
             compute::gpu_scale(ctx, grad_buf, size as u32, factor);
         }
     });
@@ -337,7 +333,7 @@ where
 }
 
 /// Get the gradient buffer for a tensor ID.
-pub fn get_grad(tensor_id: usize) -> Option<Retained<GpuBuffer>> {
+pub fn get_grad(tensor_id: usize) -> Option<crate::gpu::Buf> {
     GRADS.with(|grads| grads.borrow().get(&tensor_id).cloned())
 }
 
@@ -348,7 +344,7 @@ pub fn get_grad(tensor_id: usize) -> Option<Retained<GpuBuffer>> {
 /// Accumulate gradient for a tensor. Takes ownership to enable recycling.
 /// On first accumulation: moves buffer into GRADS (no copy).
 /// On subsequent: adds to existing gradient and recycles the new buffer.
-fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: Retained<GpuBuffer>, size: usize) {
+fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: crate::gpu::Buf, size: usize) {
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
         if let Some(existing) = grads.get(&tensor_id) {
@@ -364,7 +360,7 @@ fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: Retained<Gpu
 /// Like accumulate_grad but copies the buffer on first insert.
 /// Use this ONLY when the same grad buffer is passed to multiple tensor IDs
 /// (e.g. backward_add passes out_grad to both inputs).
-fn accumulate_grad_shared(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &Retained<GpuBuffer>, size: usize) {
+fn accumulate_grad_shared(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &crate::gpu::Buf, size: usize) {
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
         if let Some(existing) = grads.get(&tensor_id) {
@@ -406,7 +402,7 @@ pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
 
 /// Dispatch backward computation for a single tape entry.
 /// Shared by both the main backward pass and gradient-checkpointing sub-tape backward.
-fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     match &entry.op {
         Op::Matmul => backward_matmul(ctx, entry, out_grad),
         Op::MatmulDetachedB => backward_matmul_detached_b(ctx, entry, out_grad),
@@ -488,13 +484,13 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
 /// Cast a float buffer to half. Used for FP16 matmul backward (large matrices)
 /// and API diagnostics. The standard FP32 matmul kernels cast internally in shared
 /// memory, making this redundant for most backward passes.
-pub fn cast_buf_f16(ctx: &Arc<MetalContext>, buf: &Retained<GpuBuffer>, num_elements: usize) -> Retained<GpuBuffer> {
+pub fn cast_buf_f16(ctx: &Arc<MetalContext>, buf: &crate::gpu::Buf, num_elements: usize) -> crate::gpu::Buf {
     let f16_buf = ctx.alloc_buffer(num_elements * 2);
     compute::gpu_cast_f32_to_f16(ctx, buf, &f16_buf, num_elements as u32);
     f16_buf
 }
 
-fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // C = A @ B → dA = dC @ B^T, dB = A^T @ dC
     let a_shape = &entry.shapes[0];
     let b_shape = &entry.shapes[1];
@@ -522,7 +518,7 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retain
 
 /// Backward for C = A @ B where B is detached (frozen base weight).
 /// Only computes dA = dC @ B^T. No gradient for B.
-fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let a_shape = &entry.shapes[0];
     let b_shape = &entry.shapes[1];
     let rank_a = a_shape.len();
@@ -539,7 +535,7 @@ fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
     // No dB — base weight is frozen.
 }
 
-fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
     // dA = dC @ B : [M,N] @ [N,K] = [M,K]
     // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
@@ -562,7 +558,7 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     accumulate_grad(ctx, entry.inputs[1], db_buf, n * k);
 }
 
-fn backward_add(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_add(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // d(A + B) = dA = grad, dB = grad
     // SHARED: same out_grad passed to both inputs — must copy on first insert
     let size: usize = entry.shapes[0].iter().product();
@@ -570,7 +566,7 @@ fn backward_add(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<
     accumulate_grad_shared(ctx, entry.inputs[1], out_grad, size);
 }
 
-fn backward_mul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_mul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // d(A * B) → dA = grad * B, dB = grad * A
     let size: usize = entry.shapes[0].iter().product();
 
@@ -583,7 +579,7 @@ fn backward_mul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<
     accumulate_grad(ctx, entry.inputs[1], db_buf, size);
 }
 
-fn backward_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let shape = &entry.shapes[0];
     let cols = *shape.last().unwrap();
     let rows: usize = shape.iter().product::<usize>() / cols;
@@ -596,7 +592,7 @@ fn backward_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retai
 
 /// Backward for fused scaled_causal_softmax.
 /// d(softmax(x * scale, masked))/dx = softmax_backward(d_out, cached_output) * scale
-fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, scale: f32) {
+fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, scale: f32) {
     let shape = &entry.shapes[0];
     let cols = *shape.last().unwrap();
     let rows: usize = shape.iter().product::<usize>() / cols;
@@ -613,7 +609,7 @@ fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, ou
 /// SliceCols backward: scatter gradient back to source column positions.
 /// out_grad: [rows, dst_cols] → grad_source: [rows, src_cols] (zeros with grad at col_offset)
 fn backward_slice_cols(
-    ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>,
+    ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf,
     rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize,
 ) {
     let source_size = rows * src_cols;
@@ -625,7 +621,7 @@ fn backward_slice_cols(
     accumulate_grad(ctx, entry.inputs[0], grad_source, source_size);
 }
 
-fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, eps: f32) {
+fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, eps: f32) {
     let input_shape = &entry.shapes[0];
     let cols = *input_shape.last().unwrap();
     let rows: usize = input_shape.iter().product::<usize>() / cols;
@@ -654,7 +650,7 @@ fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Reta
 /// Backward for fused residual+RMSNorm: rms_norm(a + b, weight, eps)
 /// The cached buffer stores (a+b), which is the effective "input" to rms_norm.
 /// Gradients flow equally to both a and b.
-fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, eps: f32) {
+fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, eps: f32) {
     let input_shape = &entry.shapes[0]; // shape of a (and b)
     let cols = *input_shape.last().unwrap();
     let rows: usize = input_shape.iter().product::<usize>() / cols;
@@ -686,14 +682,14 @@ fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
     accumulate_grad(ctx, entry.inputs[2], grad_weight, cols);
 }
 
-fn backward_silu(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_silu(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
     compute::gpu_silu_backward(ctx, &entry.input_buffers[0], out_grad, &grad_input, size as u32);
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
-fn backward_silu_gate(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_silu_gate(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let size: usize = entry.shapes[0].iter().product();
     let grad_gate = ctx.alloc_buffer(size * 4);
     let grad_up = ctx.alloc_buffer(size * 4);
@@ -710,13 +706,13 @@ fn backward_silu_gate(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Ret
     accumulate_grad(ctx, entry.inputs[1], grad_up, size);
 }
 
-fn backward_reshape(_ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_reshape(_ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // Reshape backward: just pass the gradient through (same data, different shape)
     let size: usize = entry.shapes[0].iter().product();
     accumulate_grad(_ctx, entry.inputs[0], out_grad.clone(), size);
 }
 
-fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // entry.input_buffers[0] = tokens, input_buffers[1] = embedding matrix
     // shapes[0] = tokens shape, shapes[1] = embedding shape [vocab, dim]
     let vocab = entry.shapes[1][0];
@@ -738,7 +734,7 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Ret
 /// Block-gather backward: scatter-add the compact gradient back into the source K/V (transpose
 /// of the gather). The routing `sel` (cached on the tape entry) is a fixed permutation; the
 /// scatter accumulates atomically because multiple query-blocks may select the same source block.
-fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, dims: compute::GatherDims) {
+fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, dims: compute::GatherDims) {
     let sel = entry.cached.as_ref().expect("gather_blocks backward needs cached sel buffer");
     let src_size = (dims.bh * dims.seq * dims.hd) as usize;
     let d_src = ctx.alloc_buffer(src_size * 4);
@@ -746,7 +742,7 @@ fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: 
     accumulate_grad(ctx, entry.inputs[0], d_src, src_size);
 }
 
-fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, factor: f32) {
+fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, factor: f32) {
     // Fused: dst[i] = src[i] * factor in 1 dispatch (was copy + scale = 2)
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
@@ -759,7 +755,7 @@ fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retaine
 fn backward_rope(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     seq_len: u32,
     head_dim: u32,
     offset: u32,
@@ -774,7 +770,7 @@ fn backward_rope(
 }
 
 /// Fused transpose+RoPE backward: inverse RoPE + inverse transpose in one dispatch.
-fn backward_transpose_rope(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, d: compute::TrRopeDims) {
+fn backward_transpose_rope(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, d: compute::TrRopeDims) {
     let size = (d.batch * d.seq * d.n_heads * d.head_dim) as usize;
     let grad_input = ctx.alloc_buffer(size * 4);
     compute::gpu_transpose_rope_backward(ctx, out_grad, &grad_input, d);
@@ -788,7 +784,7 @@ fn backward_transpose_rope(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
 fn backward_checkpoint(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     layer_idx: usize,
 ) {
     // Bypass the buffer pool for the whole recompute + sub-tape backward: its allocations must not
@@ -884,7 +880,7 @@ pub struct TransposeParams {
 fn backward_transpose(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     tp: &TransposeParams,
 ) {
     let TransposeParams { batch, seq_len, n_heads, head_dim, forward_dir } = *tp;
@@ -928,7 +924,7 @@ fn backward_transpose(
 fn backward_slice(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     offset: usize,
     length: usize,
     source_size: usize,
@@ -947,7 +943,7 @@ fn backward_slice(
 fn backward_concat_parts(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     part_sizes: &[usize],
 ) {
     let total: usize = part_sizes.iter().sum();
@@ -964,7 +960,7 @@ fn backward_concat_parts(
 
 /// BatchedMatmul backward: C[b] = A[b] @ B[b]
 /// dA[b] = dC[b] @ B[b]^T, dB[b] = A[b]^T @ dC[b]
-fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let a_shape = &entry.shapes[0]; // [B, M, K]
     let b_shape = &entry.shapes[1]; // [B, K, N]
 
@@ -988,7 +984,7 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
 
 /// BatchedMatmulTransB backward: C[b] = A[b] @ B[b]^T
 /// dA[b] = dC[b] @ B[b], dB[b] = dC[b]^T @ A[b]
-fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let a_shape = &entry.shapes[0]; // [B, M, K]
     let b_shape = &entry.shapes[1]; // [B, N, K]
 
@@ -1010,7 +1006,7 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * n * k);
 }
 
-fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>) {
+fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     // C = A^T @ B where A:[B,M,K], B:[B,M,N], C:[B,K,N], dC = out_grad:[B,K,N]
     // dA = B @ dC^T : [B,M,N] @ [B,N,K] = [B,M,K]   (batched trans_b of B, dC)
     // dB = A @ dC   : [B,M,K] @ [B,K,N] = [B,M,N]   (batched matmul of A, dC)
@@ -1038,7 +1034,7 @@ fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
 fn backward_repeat_kv(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     n_kv_heads: usize,
     group_size: usize,
     seq_len: usize,
@@ -1059,7 +1055,7 @@ fn backward_repeat_kv(
 /// Flash Attention backward: compute dQ, dK, dV using Flash Attention backward kernel.
 /// entry.inputs: [Q_id, K_id, V_id]
 /// entry.cached: O (forward output, for D computation)
-fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, dims: compute::FlashDims) {
+fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, dims: compute::FlashDims) {
     let compute::FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset: _ } = dims;
     let (batch_heads, seq_q, seq_k, head_dim) = (batch_heads as usize, seq_q as usize, seq_k as usize, head_dim as usize);
     let total_q_rows = batch_heads * seq_q;
@@ -1102,7 +1098,7 @@ fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad
 fn backward_scale_rows(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
-    out_grad: &Retained<GpuBuffer>,
+    out_grad: &crate::gpu::Buf,
     rows: usize,
     cols: usize,
 ) {

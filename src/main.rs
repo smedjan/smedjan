@@ -1,3 +1,4 @@
+#[cfg(feature = "metal")]
 pub mod api;
 mod attention;
 mod autograd;

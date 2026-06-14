@@ -3104,7 +3104,7 @@ mod suite {
         let seg_buf = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1, 1, 1]);
         let docb = [3usize, 4, 5, 6]; // docB positions in the row
 
-        let docb_logits = |toks: &[u32], seg: Option<&objc2::rc::Retained<crate::gpu::GpuBuffer>>| -> Vec<f32> {
+        let docb_logits = |toks: &[u32], seg: Option<&crate::gpu::Buf>| -> Vec<f32> {
             autograd::clear_tape();
             autograd::zero_grads();
             let out = model.forward_seg(toks, 1, seq, None, false, seg).to_vec(); // [seq, vocab]

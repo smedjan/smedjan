@@ -1,6 +1,7 @@
 use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::AdamW;
+#[cfg(feature = "metal")]
 use objc2_metal::MTLBuffer;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -67,7 +68,7 @@ pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::R
 pub fn save_checkpoint_ema(
     path: &str,
     model: &Transformer,
-    ema_buffers: &[objc2::rc::Retained<crate::gpu::GpuBuffer>],
+    ema_buffers: &[crate::gpu::Buf],
     step: u32,
 ) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;

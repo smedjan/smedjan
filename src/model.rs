@@ -2,7 +2,6 @@ use crate::attention::{KvCache, MultiHeadAttention};
 use crate::autograd::{self, Op, TapeEntry};
 use crate::gpu::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
-use objc2::rc::Retained;
 use std::sync::Arc;
 
 /// Model configuration — fully parameterized architecture.
@@ -519,7 +518,7 @@ impl TransformerBlock {
         &self,
         x: &Tensor,
         kv_cache: Option<&mut KvCache>,
-        seg_ids: Option<&Retained<GpuBuffer>>,
+        seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         let batch = x.shape[0];
         let seq_len = x.shape[1];
@@ -694,7 +693,7 @@ impl TransformerBlock {
 
     /// Checkpointed block forward with optional packed-sequence segment ids.
     pub fn forward_checkpointed_seg(
-        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&Retained<GpuBuffer>>,
+        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         self.forward_checkpointed_recompute_seg(x, layer_idx, seg_ids)
     }
@@ -705,12 +704,12 @@ impl TransformerBlock {
     }
 
     pub fn forward_checkpointed_recompute_seg(
-        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&Retained<GpuBuffer>>,
+        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         // Save the input tensor's buffer and shape — we need these for the main tape entry
         // and for the recompute closure.
         let input_id = x.id;
-        let input_buffer: Retained<GpuBuffer> = x.buffer.clone();
+        let input_buffer: crate::gpu::Buf = x.buffer.clone();
         let input_shape = x.shape.clone();
         let ctx = Arc::clone(&x.ctx);
 
@@ -745,7 +744,7 @@ impl TransformerBlock {
         let recompute_input_shape = input_shape;
         // Clone the seg buffer (refcount bump) so it outlives the deferred recompute — never a
         // thread-local that could be cleared before the recompute's mask dispatches run (§2).
-        let seg_owned: Option<Retained<GpuBuffer>> = seg_ids.cloned();
+        let seg_owned: Option<crate::gpu::Buf> = seg_ids.cloned();
 
         autograd::register_recompute(layer_idx, Box::new(move |recompute_ctx: &Arc<MetalContext>| {
             // Reconstruct the input tensor from the saved buffer
@@ -1015,7 +1014,7 @@ impl Transformer {
         seq_len: usize,
         kv_caches: Option<&mut Vec<KvCache>>,
         checkpointed: bool,
-        seg_ids: Option<&Retained<GpuBuffer>>,
+        seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         let d = self.config.d_model;
         let v = self.config.vocab_size as usize;

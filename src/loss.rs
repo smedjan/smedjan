@@ -1,15 +1,14 @@
 use crate::autograd::{self, Op, TapeEntry};
 use crate::gpu::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
-use objc2::rc::Retained;
 use std::sync::Arc;
 
 /// Pre-allocated buffers for loss computation — avoids 33MB+ allocation every step.
 pub struct LossWorkspace {
-    pub targets_buf: Retained<GpuBuffer>,   // [batch * seq_len] u32
-    pub losses_buf: Retained<GpuBuffer>,    // [batch * seq_len] f32
-    pub grad_logits_buf: Retained<GpuBuffer>, // [batch * seq_len, vocab] f32
-    pub scalar_buf: Retained<GpuBuffer>,    // [1] f32
+    pub targets_buf: crate::gpu::Buf,   // [batch * seq_len] u32
+    pub losses_buf: crate::gpu::Buf,    // [batch * seq_len] f32
+    pub grad_logits_buf: crate::gpu::Buf, // [batch * seq_len, vocab] f32
+    pub scalar_buf: crate::gpu::Buf,    // [1] f32
 }
 
 impl LossWorkspace {
@@ -30,7 +29,7 @@ pub fn cross_entropy_loss(
     ctx: &Arc<MetalContext>,
     logits: &Tensor,
     targets: &[u32],
-) -> (Tensor, Retained<GpuBuffer>) {
+) -> (Tensor, crate::gpu::Buf) {
     cross_entropy_loss_impl(ctx, logits, targets, None)
 }
 
@@ -40,7 +39,7 @@ pub fn cross_entropy_loss_with_workspace(
     logits: &Tensor,
     targets: &[u32],
     ws: &LossWorkspace,
-) -> (Tensor, Retained<GpuBuffer>) {
+) -> (Tensor, crate::gpu::Buf) {
     cross_entropy_loss_impl(ctx, logits, targets, Some(ws))
 }
 
@@ -49,7 +48,7 @@ fn cross_entropy_loss_impl(
     logits: &Tensor,
     targets: &[u32],
     workspace: Option<&LossWorkspace>,
-) -> (Tensor, Retained<GpuBuffer>) {
+) -> (Tensor, crate::gpu::Buf) {
     let logits_shape = &logits.shape;
     assert_eq!(logits_shape.len(), 2, "logits must be [batch, vocab]");
     let batch = logits_shape[0];
@@ -114,8 +113,8 @@ fn cross_entropy_loss_impl(
 pub fn z_loss(
     ctx: &Arc<MetalContext>,
     logits: &Tensor,
-    loss_buf: &Retained<GpuBuffer>,
-    _grad_buf: &Retained<GpuBuffer>, // z-loss gradients flow through tape, not fused into CE grad
+    loss_buf: &crate::gpu::Buf,
+    _grad_buf: &crate::gpu::Buf, // z-loss gradients flow through tape, not fused into CE grad
     coefficient: f32,
 ) {
     if coefficient <= 0.0 { return; }
@@ -180,7 +179,7 @@ pub fn fused_linear_cross_entropy(
     embedding: &Tensor,      // [vocab, d_model] (weight-tied LM head)
     targets: &[u32],         // [n_tokens]
     chunk_size: usize,       // tokens per chunk (1024 recommended)
-) -> (Tensor, Retained<GpuBuffer>) {
+) -> (Tensor, crate::gpu::Buf) {
     let n_tokens = hidden.shape[0];
     let d_model = hidden.shape[1];
     let vocab = embedding.shape[0];
@@ -298,7 +297,7 @@ pub fn distillation_loss(
     temperature: f32,
     alpha: f32,
     targets: &[u32],
-) -> (Tensor, Retained<GpuBuffer>) {
+) -> (Tensor, crate::gpu::Buf) {
     let shape = &student_logits.shape;
     assert_eq!(shape.len(), 2, "student_logits must be [batch, vocab]");
     let batch = shape[0];

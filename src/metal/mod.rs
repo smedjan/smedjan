@@ -137,6 +137,9 @@ pub type GpuComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 /// `Arc<CudaSlice<f32>>` (also cheap-clone) behind the same alias.
 pub type Buf = objc2::rc::Retained<GpuBuffer>;
 
+/// u32 index/token buffer handle. Metal buffers are untyped, so this is the same as `Buf`.
+pub type BufU32 = objc2::rc::Retained<GpuBuffer>;
+
 /// Address of a buffer's contents, as usize — for pool/dedup/cache keys. Replaces direct
 /// `objc2_metal::MTLBuffer::contents()` calls in shared code so the backend stays swappable.
 #[inline]

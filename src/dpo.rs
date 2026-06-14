@@ -676,7 +676,7 @@ fn compute_dpo_logit_gradients(
 fn inject_loss_gradient(
     ctx: &Arc<MetalContext>,
     logits: &crate::tensor::Tensor,
-    grad_buf: objc2::rc::Retained<crate::gpu::GpuBuffer>,
+    grad_buf: crate::gpu::Buf,
 ) -> usize {
     use crate::autograd::{Op, TapeEntry};
 

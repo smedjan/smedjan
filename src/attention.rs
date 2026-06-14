@@ -1,7 +1,6 @@
 use crate::autograd::{self, Op, TapeEntry};
 use crate::gpu::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
-use objc2::rc::Retained;
 use std::sync::Arc;
 
 /// Token-mixing kind for the attention block. `Softmax` is standard scaled-dot-product
@@ -108,7 +107,7 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
 /// Gather selected source blocks into a compact [bh*nb, k_sel*block, hd] tensor, recording an
 /// `Op::GatherBlocks` tape entry (when recording) so the backward scatter-adds gradients back to
 /// `src`. `sel_buf` is the fixed routing permutation (computed non-differentiably by the caller).
-fn gather_blocks_recorded(src: &Tensor, sel_buf: &Retained<GpuBuffer>, dims: compute::GatherDims) -> Tensor {
+fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::Buf, dims: compute::GatherDims) -> Tensor {
     let (bh, nb, hd, block, k_sel) = (
         dims.bh as usize, dims.nb as usize, dims.hd as usize, dims.block as usize, dims.k_sel as usize,
     );
@@ -471,7 +470,7 @@ impl MultiHeadAttention {
         &self,
         x: &Tensor,
         kv_cache: Option<&mut KvCache>,
-        seg_ids: Option<&Retained<GpuBuffer>>,
+        seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         debug_assert!(
             seg_ids.is_none()

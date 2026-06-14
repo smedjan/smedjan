@@ -1,7 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
 use crate::gpu::{compute, GpuBuffer, MetalContext};
-use objc2::rc::Retained;
-use objc2_metal::MTLBuffer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,11 +9,11 @@ pub type TensorId = usize;
 
 // Thread-local FP16 cast cache: avoids redundant float→half casts for weights.
 thread_local! {
-    static F16_CAST_CACHE: RefCell<HashMap<usize, Retained<GpuBuffer>>> = RefCell::new(HashMap::new());
+    static F16_CAST_CACHE: RefCell<HashMap<usize, crate::gpu::Buf>> = RefCell::new(HashMap::new());
 }
 
 /// Cached ternary quantization state: (packed_ternary, absmean).
-type TernaryCacheEntry = (Retained<GpuBuffer>, Retained<GpuBuffer>);
+type TernaryCacheEntry = (crate::gpu::Buf, crate::gpu::Buf);
 
 // Thread-local ternary weight cache: avoids requantizing every matmul call.
 // Key: buffer pointer. Value: (packed_ternary, absmean) buffers.
@@ -27,7 +25,7 @@ thread_local! {
 #[derive(Clone)]
 pub struct Tensor {
     pub id: TensorId,
-    pub buffer: Retained<GpuBuffer>,
+    pub buffer: crate::gpu::Buf,
     pub shape: Vec<usize>,
     pub requires_grad: bool,
     pub ctx: Arc<MetalContext>,
@@ -57,7 +55,7 @@ impl Tensor {
     }
 
     /// Create a tensor from an existing GPU buffer (no copy).
-    pub fn from_buffer(ctx: Arc<MetalContext>, buffer: Retained<GpuBuffer>, shape: Vec<usize>) -> Self {
+    pub fn from_buffer(ctx: Arc<MetalContext>, buffer: crate::gpu::Buf, shape: Vec<usize>) -> Self {
         let id = autograd::next_id();
         Self { id, buffer, shape, requires_grad: false, ctx }
     }
@@ -165,7 +163,7 @@ impl Tensor {
         let packed_rows = k.div_ceil(16);
 
         // Check ternary cache (same pattern as FP16 cache)
-        let cache_key = weight.buffer.contents().as_ptr() as usize;
+        let cache_key = crate::gpu::buf_addr(&weight.buffer);
         let cached = TERNARY_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
 
         let (packed_buf, absmean_buf) = if let Some((p, a)) = cached {
@@ -256,8 +254,8 @@ impl Tensor {
     /// Cast tensor contents to FP16 buffer with safe clamping.
     /// Uses thread-local cache: same buffer pointer → cached FP16 version.
     /// Call `Tensor::clear_f16_cache()` after optimizer step when weights change.
-    pub fn cast_to_f16(&self) -> Retained<crate::gpu::GpuBuffer> {
-        let key = self.buffer.contents().as_ptr() as usize;
+    pub fn cast_to_f16(&self) -> crate::gpu::Buf {
+        let key = crate::gpu::buf_addr(&self.buffer);
 
         let cached = F16_CAST_CACHE.with(|c| c.borrow().get(&key).cloned());
         if let Some(buf) = cached {
@@ -986,7 +984,7 @@ impl Tensor {
     /// position's segment id. Masks future AND cross-segment positions to -inf, so packed sequences
     /// don't attend across each other. Backward is passthrough (masked → 0 softmax weight → 0 grad),
     /// identical to `causal_mask`.
-    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::gpu::GpuBuffer>, n_heads: usize) -> Tensor {
+    pub fn causal_doc_mask(&self, seg_ids: &crate::gpu::Buf, n_heads: usize) -> Tensor {
         assert_eq!(self.shape.len(), 3, "causal_doc_mask expects [batch_heads, seq, seq] scores");
         let batch_heads = self.shape[0];
         let seq = self.shape[1];
