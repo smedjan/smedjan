@@ -3735,6 +3735,11 @@ mod suite {
             &|t| crate::attention::fused_transpose_rope(&t[0], 1, 4, 2, 4, 0, 10000.0), GC_EPS, GC_ABS, GC_REL, "fused_transpose_rope");
     }
 
+    // NOTE: the chunked SSM backward is verified by `ssm::chunked_grad::ssm_chunked_grad_matches_materialized`
+    // (gradient-equivalence to the materialised form), NOT a finite-diff grad-check here — loga
+    // position 0 has a structurally-zero true gradient (uniform-shift cancellation in the decay), so a
+    // central difference there is pure fp noise and would spuriously fail.
+
     #[test]
     fn gradcheck_transpose_bhs_to_bsh() {
         let ctx = test_ctx();
