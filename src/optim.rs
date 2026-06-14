@@ -38,7 +38,6 @@ impl Default for AdamWHyper {
 }
 
 /// AdamW optimizer with decoupled weight decay.
-/// Supports GALORE: gradient low-rank projection for memory savings.
 pub struct AdamW {
     pub params: Vec<ParamState>,
     pub beta1: f32,
@@ -48,7 +47,6 @@ pub struct AdamW {
     pub update_clip: f32,
     pub weight_decay: f32,
     pub step: u32,
-    pub galore_rank: usize, // 0 = disabled, >0 = project grads to this rank
     ctx: Arc<MetalContext>,
 }
 
@@ -56,20 +54,14 @@ pub struct ParamState {
     pub tensor_id: usize,
     pub buffer: Retained<GpuBuffer>,
     pub size: usize,
-    pub m: Retained<GpuBuffer>, // first moment (full or projected)
-    pub v: Retained<GpuBuffer>, // second moment (full or projected)
-    pub proj: Option<Retained<GpuBuffer>>, // GALORE: random projection matrix [size, rank]
-    pub proj_size: usize, // projected size (rank × smaller_dim)
+    pub m: Retained<GpuBuffer>, // first moment
+    pub v: Retained<GpuBuffer>, // second moment
     pub no_decay: bool, // skip weight decay for norms and embeddings
 }
 
 impl AdamW {
     pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
-        Self::new_with_galore(ctx, params, weight_decay, 0)
-    }
-
-    pub fn new_with_galore(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, galore_rank: usize) -> Self {
-        Self::new_with_config(ctx, params, weight_decay, galore_rank, AdamWHyper::default())
+        Self::new_with_config(ctx, params, weight_decay, AdamWHyper::default())
     }
 
     /// Construct AdamW with explicit hyperparameters (betas/eps/update_clip).
@@ -77,35 +69,16 @@ impl AdamW {
         ctx: &Arc<MetalContext>,
         params: &[&Tensor],
         weight_decay: f32,
-        galore_rank: usize,
         hyper: AdamWHyper,
     ) -> Self {
-        assert!(
-            galore_rank == 0,
-            "GALORE (galore_rank={}) is not yet implemented. The current code allocates \
-             m/v buffers of size `rank` but passes the full param size to the AdamW kernel, \
-             causing out-of-bounds GPU memory access. Set galore_rank=0 to use standard AdamW.",
-            galore_rank,
-        );
         let param_states: Vec<ParamState> = params
             .iter()
             .map(|t| {
                 let size = t.numel();
-                // GALORE: for large params (>4096 elements), use projected m/v
-                let (m_size, proj, proj_size) = if galore_rank > 0 && size > 4096 {
-                    // Project to rank dimensions: m/v stored as [rank] per row
-                    // For a [rows, cols] weight: project cols → rank
-                    let proj_sz = galore_rank; // simplified: project to flat rank
-                    let p = ctx.alloc_buffer(proj_sz * 4);
-                    compute::gpu_fill(ctx, &p, proj_sz as u32, 0.0);
-                    (proj_sz, Some(p), proj_sz)
-                } else {
-                    (size, None, size)
-                };
-                let m = ctx.alloc_buffer(m_size * 4);
-                let v = ctx.alloc_buffer(m_size * 4);
-                compute::gpu_fill(ctx, &m, m_size as u32, 0.0);
-                compute::gpu_fill(ctx, &v, m_size as u32, 0.0);
+                let m = ctx.alloc_buffer(size * 4);
+                let v = ctx.alloc_buffer(size * 4);
+                compute::gpu_fill(ctx, &m, size as u32, 0.0);
+                compute::gpu_fill(ctx, &v, size as u32, 0.0);
                 // Skip weight decay for 1D params (norm weights, biases).
                 // Norm weights are initialized to 1.0 — decay pushes them toward 0,
                 // attenuating signal through the network (0.9^12_norms ≈ 0.28 after 20K steps).
@@ -116,8 +89,6 @@ impl AdamW {
                     size,
                     m,
                     v,
-                    proj,
-                    proj_size,
                     no_decay,
                 }
             })
@@ -137,18 +108,15 @@ impl AdamW {
             update_clip: hyper.update_clip,
             weight_decay,
             step: 0,
-            galore_rank,
             ctx: Arc::clone(ctx),
         }
     }
 
-    /// Memory used by optimizer state (m + v buffers + projection matrices).
+    /// Memory used by optimizer state (m + v buffers). Test-only since the GaLore memory log
+    /// was removed; exercised by `adamw_8bit_memory_is_4x_smaller`.
+    #[cfg(test)]
     pub fn memory_bytes(&self) -> usize {
-        self.params.iter().map(|ps| {
-            let mv = ps.proj_size * 4 * 2;
-            let proj = ps.proj.as_ref().map_or(0, |p| p.length());
-            mv + proj
-        }).sum()
+        self.params.iter().map(|ps| ps.size * 4 * 2).sum()
     }
 
     /// Reset m/v states for specific parameters (by tensor ID).
@@ -158,8 +126,8 @@ impl AdamW {
         let ids: std::collections::HashSet<usize> = params.iter().map(|p| p.id).collect();
         for ps in &self.params {
             if ids.contains(&ps.tensor_id) {
-                compute::gpu_fill(ctx, &ps.m, ps.proj_size as u32, 0.0);
-                compute::gpu_fill(ctx, &ps.v, ps.proj_size as u32, 0.0);
+                compute::gpu_fill(ctx, &ps.m, ps.size as u32, 0.0);
+                compute::gpu_fill(ctx, &ps.v, ps.size as u32, 0.0);
             }
         }
     }
@@ -245,13 +213,13 @@ impl AdamW {
         assert_eq!(states.len(), self.params.len(), "Optimizer state count mismatch");
         self.step = opt_step;
         for (ps, (m_data, v_data)) in self.params.iter().zip(states.iter()) {
-            assert_eq!(m_data.len(), ps.proj_size, "m state size mismatch");
-            assert_eq!(v_data.len(), ps.proj_size, "v state size mismatch");
+            assert_eq!(m_data.len(), ps.size, "m state size mismatch");
+            assert_eq!(v_data.len(), ps.size, "v state size mismatch");
             unsafe {
                 let m_ptr = ps.m.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.proj_size);
+                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.size);
                 let v_ptr = ps.v.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.proj_size);
+                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.size);
             }
         }
     }
@@ -267,8 +235,8 @@ impl AdamW {
     pub fn save_state_blobs(&self) -> Vec<Vec<u8>> {
         let mut blobs = Vec::with_capacity(self.params.len() * 2);
         for ps in &self.params {
-            blobs.push(buf_bytes(&ps.m, ps.proj_size * 4));
-            blobs.push(buf_bytes(&ps.v, ps.proj_size * 4));
+            blobs.push(buf_bytes(&ps.m, ps.size * 4));
+            blobs.push(buf_bytes(&ps.v, ps.size * 4));
         }
         blobs
     }
@@ -288,7 +256,7 @@ impl AdamW {
 /// per 256-element block) instead of fp32 — ~4× less optimizer memory, the direct lever for fitting
 /// a bigger model on the same RAM ("10× capacity"). The update dequantizes, runs the standard AdamW
 /// math (same hardened eps/no_decay/update_clip as `AdamW`), applies the param step, then requantizes
-/// with fresh per-block scales. Pairs with GaLore (rank) and Muon (no v) for further savings.
+/// with fresh per-block scales. Pairs with Muon (no v) for further savings.
 pub struct AdamW8bit {
     pub params: Vec<Param8State>,
     pub beta1: f32,
@@ -889,7 +857,7 @@ impl HybridOptimizer {
         }
         let mut muon = Muon::new(ctx, &muon_params, weight_decay);
         muon.adamw_hyper = hyper; // keep the (unused-here) fallback consistent if a degenerate sneaks in
-        let adamw = AdamW::new_with_config(ctx, &adamw_params, weight_decay, 0, hyper);
+        let adamw = AdamW::new_with_config(ctx, &adamw_params, weight_decay, hyper);
         Self { muon, adamw, muon_lr_scale: 1.0, adamw_lr_scale: 1.0 }
     }
 

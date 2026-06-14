@@ -137,11 +137,6 @@ struct TrainArgs {
         /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
         #[arg(long, default_value = "0.0")]
         prune_threshold: f32,
-        /// GALORE: gradient low-rank projection rank. 0=disabled. NOT YET IMPLEMENTED — any value > 0
-        /// panics at optimizer construction (the projection path is a stub). Use Muon (no v-state) or
-        /// --optimizer adamw-8bit for the optimizer-memory win instead. See docs followup handoff §6.
-        #[arg(long, default_value = "0")]
-        galore_rank: usize,
         /// Speculative pretraining: reference model checkpoint. Skip batches it already knows.
         #[arg(long)]
         reference_model: Option<String>,
@@ -674,7 +669,6 @@ fn main() {
             lowrank,
             shared_layers,
             prune_threshold,
-            galore_rank,
             reference_model,
             speculative_threshold,
             optimizer,
@@ -772,7 +766,6 @@ fn main() {
             config.model_config.lowrank = lowrank;
             config.model_config.shared_layers = shared_layers;
             config.prune_threshold = prune_threshold;
-            config.galore_rank = galore_rank;
             config.optimizer_type = optimizer;
             config.reference_model = reference_model;
             config.speculative_threshold = speculative_threshold;

@@ -88,7 +88,7 @@ energy. Grounded absences are flagged **[MISSING]**.
    matmul/attention as an alternative to hand-rolling.
 2. **8-bit optimizer states [MISSING].** AdamW `m`/`v` are fp32 (`src/optim.rs`). Block-wise int8
    quantization (bitsandbytes-style) → **4× less optimizer memory**. Combined with the existing
-   **GaLore** (`galore_rank`) and **Muon** (no `v` at all), this is the direct lever for fitting much
+   **Muon** (no `v` at all), this is the direct lever for fitting much
    bigger models on the same RAM → "10× capacity."
 3. **MLA — Multi-head Latent Attention [MISSING; only GQA present].** Compress K/V into a low-rank
    latent (DeepSeek-V2/V3): **10–50× KV-cache shrink** → 10× longer context and ⅒ inference memory. Add
@@ -131,14 +131,14 @@ energy. Grounded absences are flagged **[MISSING]**.
 ### What's already strong (don't rebuild)
 GQA, RoPE+NTK scaling, SwiGLU, sliding-window attn, FlashAttention, **linear/SSM/RWKV O(N) mixers**
 (huge for long context), **MoE**, **BitNet 1.58-bit** (massive capacity/usage win), **Muon/Sophia/Lion**,
-**GaLore**, WSD/cosine schedules, SFT/DPO/distillation, gradient checkpointing (fixed), gguf export,
+WSD/cosine schedules, SFT/DPO/distillation, gradient checkpointing (fixed), gguf export,
 speculative decoding, zero-copy unified-memory tensors, well-tuned release profile (LTO, codegen-units=1).
 
 ---
 
 ## 3. The goal, mapped
 
-- **10× capacity**: MoE (have) + MLA (KV compression) + BitNet (have) + 8-bit-optimizer/GaLore (fit
+- **10× capacity**: MoE (have) + MLA (KV compression) + BitNet (have) + 8-bit-optimizer (fit
   bigger) + linear/SSM/RWKV (have, O(N) context).
 - **⅒ usage**: **simdgroup_matrix** (compute) + bf16 default (precision/memory) + KV quant + sequence
   packing + 8-bit optimizer + quantized inference (have basics) + distributed (amortize).

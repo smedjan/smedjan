@@ -45,8 +45,6 @@ pub struct TrainConfig {
     pub lr_restart_period: u32,
     /// Data pruning: skip batches where loss < threshold. 0.0 = disabled.
     pub prune_threshold: f32,
-    /// GALORE: gradient low-rank projection rank. 0 = disabled.
-    pub galore_rank: usize,
     /// Optimizer: "adamw" or "sophia". Default: adamw.
     pub optimizer_type: String,
     /// Speculative pretraining: path to a tiny reference model.
@@ -159,7 +157,6 @@ impl TrainConfig {
             dropout: 0.0,
             lr_restart_period: 0,
             prune_threshold: 0.0,
-            galore_rank: 0,
             optimizer_type: "adamw".to_string(),
             reference_model: None,
             speculative_threshold: 7.0,
@@ -268,7 +265,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let mut optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        let mut optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         // Only restore AdamW state when the main AdamW is the live optimizer and the checkpoint
         // actually carries matching state (non-adamw checkpoints save none — see save_training_state).
         if uses_main_adamw && opt_states.len() == optimizer.params.len() {
@@ -293,13 +290,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.galore_rank, config.adamw_hyper());
+        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     };
 
@@ -375,14 +372,6 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             Some((ty, _, _)) => eprintln!("[WARN] sidecar optimizer '{}' != configured '{}' — starting optimizer state fresh", ty, config.optimizer_type),
             None => {}
         }
-    }
-
-    // Log optimizer info
-    if optimizer.galore_rank > 0 {
-        eprintln!("GALORE: rank={}, optimizer memory={:.1}MB (vs {:.1}MB full)",
-            optimizer.galore_rank,
-            optimizer.memory_bytes() as f32 / 1e6,
-            model.parameters().iter().map(|p| p.numel() * 8).sum::<usize>() as f32 / 1e6);
     }
 
     // μP: scale learning rate by base_width / d_model (WIDTH transfer).

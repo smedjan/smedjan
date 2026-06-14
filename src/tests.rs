@@ -1930,7 +1930,7 @@ mod suite {
         let run = |clip: f32| -> f32 {
             let w = Tensor::zeros(&ctx, vec![4, 4]);
             let mut opt = crate::optim::AdamW::new_with_config(
-                &ctx, &[&w], 0.0, 0,
+                &ctx, &[&w], 0.0,
                 crate::optim::AdamWHyper { beta1: 0.9, beta2: 0.95, eps: 1e-5, update_clip: clip },
             );
             // Pre-seed a collapsed v and a large m → the spike regime.
@@ -2172,7 +2172,7 @@ mod suite {
         let run = |beta2: f32| -> (f32, f32, bool) {
             let w = Tensor::zeros(&ctx, vec![n]);
             let mut opt = crate::optim::AdamW::new_with_config(
-                &ctx, &[&w], 0.0, 0,
+                &ctx, &[&w], 0.0,
                 crate::optim::AdamWHyper { beta1: 0.9, beta2, eps: 1e-5, update_clip: 0.0 },
             );
             let small = ctx.buffer_from_slice(&vec![0.01f32; n]);
