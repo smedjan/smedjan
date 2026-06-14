@@ -130,7 +130,33 @@ mixed-length SFT smoke: tokens/sec should rise (no pad waste) with loss curve un
 
 ---
 
-## 3. Block-sparse TRAINABLE backward (SPEC — task #5)
+## 3. Block-sparse TRAINABLE backward (✅ LANDED 2026-06-14)
+
+**Done.** New `gather_blocks_backward` scatter-add kernel (atomic, exact transpose of `gather_blocks`)
++ `compute::gpu_gather_blocks_backward` + `Op::GatherBlocks` (stores `sel` in `TapeEntry.cached`) +
+`backward_gather_blocks`. `block_sparse_gather_attention` now keeps only the routing/`sel` under
+`no_grad` and records the gathers + attention math, so gradients flow q→scores, v_sel→out, and
+ksel/vsel→(scatter-add)→k/v. Verified by `gradcheck_block_sparse_gather_attention` (finite-diff,
+all-blocks config), `block_sparse_gather_grad_matches_dense_when_full` (q/k/v grads == dense when
+top_k+1≥nb), and `gather_blocks_backward_scatter_add_direct` (hand-computed kernel case:
+accumulation + sentinel skip).
+
+**Latent bug this surfaced (FIXED):** `gpu_batched_matmul_trans_a` (the `dB = Aᵀ@dC` half of every
+batched-matmul backward) declared its param struct `{ m, n, k, batch }` while the MSL kernel reads
+`{ M, K, N, batch }` — K/N swapped. Silently correct only when K==N (all square attention scores, and
+the one square forward test), it corrupted A/B/C strides for **non-square** output. The block-sparse
+gather's `block×sel_w` scores were the first non-square caller. Fix = align the struct to the f16
+sibling's `{ m, k, n, batch }`. Guards added: `gradcheck_batched_matmul_nonsquare`,
+`gradcheck_batched_matmul_trans_b_nonsquare`. This is exactly the bleeding class Phase B's grad-check
+harness was built to catch — "only a real (non-square) run catches it" → CI catches it.
+
+Wiring the (now-trainable) subquadratic gather path into the model as a selectable mixer — replacing
+the O(n²) `AttnKind::BlockSparse` mask path — is a **throughput** change (task #12); it needs a
+convergence run, not just gradient correctness, so it's deliberately left out of this task.
+
+---
+
+### Original spec (for reference)
 
 `block_sparse_gather_attention` (`src/attention.rs:47`) currently wraps the **entire** body in
 `autograd::no_grad(|| …)`, so nothing is recorded → forward/inference only. Two facts make the
@@ -428,7 +454,7 @@ reads on `version >= 12`).
 | GaLore advertised-not-implemented | **HONEST** now (CLI + docs); implement-or-delete is the open call |
 | autograd / checkpoint / DPO / eval / sampling / datapipe / JSON | **VERIFIED SOUND** |
 | Seq-packing model integration | **SPECCED** (§2) — needs Metal build to land safely |
-| Block-sparse trainable backward | **SPECCED** (§3) — needs a new scatter-add kernel + Metal verify |
+| Block-sparse trainable backward | ✅ **LANDED** (§3) — scatter-add kernel + `Op::GatherBlocks`, grad-checked; fixed a latent non-square `batched_matmul_trans_a` param-swap |
 | Chunked O(N) SSM/RWKV forward; MLA absorbed decode; NorMuon; simdgroup >1.29×; CUDA backward | **ENHANCEMENT follow-ups** (not bugs) — documented, hardware-gated |
 
 ### What "fully closed" means here
@@ -497,7 +523,7 @@ that would complete an n-gram already present in the generated history (logit �
 | Feature | Value | Notes |
 |---|---|---|
 | Seq-packing model integration | throughput (no pad waste) | §2 — thread `seg_ids` through forward |
-| Block-sparse trainable backward | cheaper training / long ctx | §3 — one new scatter-add kernel + autograd op |
+| Block-sparse trainable backward | cheaper training / long ctx | ✅ LANDED (§3) — kernel + autograd op + grad-checks; model wiring deferred to #12 |
 | Chunked O(N) SSM/RWKV forward | long-context throughput | mixers materialize today |
 | MLA absorbed-form decode | faster decode | latent-cache decode already done |
 | GaLore (or SCALE) | optimizer memory | currently a panic stub; Muon+8-bit already cover the lever |

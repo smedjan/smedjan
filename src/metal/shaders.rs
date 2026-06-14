@@ -1868,6 +1868,45 @@ kernel void gather_blocks(
 }
 "#;
 
+/// Backward (scatter-add transpose) of `gather_blocks`. For each element of the compact
+/// gradient `d_out` (= dKsel/dVsel, [bh*nb, k_sel*block, hd]) add it back to the SOURCE
+/// position it was gathered from: dK[bh, sel[bnq,slot]*block + w, hd] += dKsel[bnq, slot*block+w, hd].
+/// Multiple query-blocks may select the same source block, so the accumulation MUST be
+/// atomic. Sentinel/out-of-range slots gathered 0 in the forward → scatter nowhere here.
+/// `d_src` must be pre-zeroed by the caller.
+pub const GATHER_BLOCKS_BACKWARD: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GatherParams { uint bh; uint nb; uint seq; uint hd; uint block; uint k_sel; };
+
+kernel void gather_blocks_backward(
+    device const float* d_out [[buffer(0)]],
+    device const uint* sel [[buffer(1)]],
+    device float* d_src [[buffer(2)]],
+    constant GatherParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint sel_w = p.k_sel * p.block;
+    uint total = p.bh * p.nb * sel_w * p.hd;
+    if (gid >= total) return;
+    uint d = gid % p.hd;
+    uint rem = gid / p.hd;
+    uint pos = rem % sel_w;
+    uint bnq = rem / sel_w;
+    uint slot = pos / p.block;
+    uint w = pos % p.block;
+    uint bh_idx = bnq / p.nb;
+    uint block_idx = sel[bnq * p.k_sel + slot];
+    if (block_idx >= p.nb) return;             // sentinel → gathered 0 → no source
+    uint src_row = block_idx * p.block + w;
+    if (src_row >= p.seq) return;
+    atomic_fetch_add_explicit(
+        (device atomic_float*)&d_src[bh_idx * p.seq * p.hd + src_row * p.hd + d],
+        d_out[gid], memory_order_relaxed);
+}
+"#;
+
 /// Causal mask for the gathered block-sparse scores. scores: [bh*nb, block, K_SEL*block]. For query
 /// row `r` of query-block `qb` (global pos qb*block+r) and gathered key column `slot*block+w`
 /// (global pos sel[slot]*block+w), keep iff the key is real (slot in range) and causal

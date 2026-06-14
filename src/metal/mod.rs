@@ -196,6 +196,7 @@ impl MetalContext {
             ("block_mean_keys", shaders::BLOCK_MEAN_KEYS),
             ("block_sparse_topk_mask", shaders::BLOCK_SPARSE_TOPK_MASK),
             ("gather_blocks", shaders::GATHER_BLOCKS),
+            ("gather_blocks_backward", shaders::GATHER_BLOCKS_BACKWARD),
             ("gather_causal_mask", shaders::GATHER_CAUSAL_MASK),
             ("l2_norm", shaders::L2_NORM),
             ("l2_norm_check", shaders::L2_NORM_CHECK),

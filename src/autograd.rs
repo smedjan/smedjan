@@ -86,6 +86,11 @@ pub enum Op {
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
     /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
     FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
+    /// Block gather for subquadratic block-sparse attention: gather selected source K/V blocks
+    /// into a compact [bh*nb, k_sel*block, hd] buffer. inputs: [src], cached: sel buffer (the
+    /// fixed routing permutation, computed non-differentiably). Backward is a scatter-add
+    /// (transpose of the gather): dSrc[bh, sel*block+w, hd] += dOut, accumulated atomically.
+    GatherBlocks { bh: u32, nb: u32, seq: u32, hd: u32, block: u32, k_sel: u32 },
 }
 
 /// A single entry on the autodiff tape.
@@ -454,6 +459,10 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &R
             backward_slice(ctx, entry, out_grad, *offset, *length, *source_size);
         }
         Op::ConcatParts { part_sizes } => backward_concat_parts(ctx, entry, out_grad, part_sizes),
+        Op::GatherBlocks { bh, nb, seq, hd, block, k_sel } => backward_gather_blocks(
+            ctx, entry, out_grad,
+            compute::GatherDims { bh: *bh, nb: *nb, seq: *seq, hd: *hd, block: *block, k_sel: *k_sel },
+        ),
         Op::BatchedMatmul => backward_batched_matmul(ctx, entry, out_grad),
         Op::BatchedMatmulTransB => backward_batched_matmul_trans_b(ctx, entry, out_grad),
         Op::BatchedMatmulTransA => backward_batched_matmul_trans_a(ctx, entry, out_grad),
@@ -714,6 +723,17 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Ret
         dim as u32,
     );
     accumulate_grad(ctx, entry.inputs[1], grad_embeddings, vocab * dim);
+}
+
+/// Block-gather backward: scatter-add the compact gradient back into the source K/V (transpose
+/// of the gather). The routing `sel` (cached on the tape entry) is a fixed permutation; the
+/// scatter accumulates atomically because multiple query-blocks may select the same source block.
+fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, dims: compute::GatherDims) {
+    let sel = entry.cached.as_ref().expect("gather_blocks backward needs cached sel buffer");
+    let src_size = (dims.bh * dims.seq * dims.hd) as usize;
+    let d_src = ctx.alloc_buffer(src_size * 4);
+    compute::gpu_gather_blocks_backward(ctx, out_grad, sel, &d_src, dims);
+    accumulate_grad(ctx, entry.inputs[0], d_src, src_size);
 }
 
 fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &Retained<GpuBuffer>, factor: f32) {

@@ -2044,6 +2044,94 @@ mod suite {
         assert!(max_diff > 1e-3, "top_k=1 must differ from dense (it drops most blocks): {max_diff}");
     }
 
+    /// Finite-difference grad-check of the TRAINABLE block-sparse gather path (q, k, v all tracked).
+    /// Uses the all-blocks config (top_k+1 == nb): each query block selects its own block + all
+    /// strictly-past blocks (no top-k pruning, so the routing is STABLE under ±eps perturbation and
+    /// equal to dense causal attention). This validates the new gather→…→scatter-add backward
+    /// against ground-truth central differences. Key block 0 is selected by every query block, so
+    /// the scatter-add's atomic accumulation (many query-blocks → one source block) is exercised.
+    #[test]
+    fn gradcheck_block_sparse_gather_attention() {
+        let ctx = test_ctx();
+        // bh=2, seq=8, hd=4, block=2 → nb=4, top_k=3 → k_sel=4=nb (all causal blocks selectable).
+        let n = 2 * 8 * 4;
+        grad_check(
+            &ctx,
+            &[(gc_vec(n, 0), vec![2, 8, 4]), (gc_vec(n, 13), vec![2, 8, 4]), (gc_vec(n, 29), vec![2, 8, 4])],
+            &|t| crate::attention::block_sparse_gather_attention(&t[0], &t[1], &t[2], 2, 3),
+            GC_EPS, GC_ABS, GC_REL, "block_sparse_gather_attention",
+        );
+    }
+
+    /// Equivalence guard (spec §3): with top_k+1 == nb (all causal blocks selectable) the gather path
+    /// reduces EXACTLY to dense causal attention, so its q/k/v GRADIENTS must match dense's element-wise.
+    /// This is the end-to-end check that the gather→matmul→softmax→matmul→scatter-add backward is the
+    /// correct factoring of dense attention's backward (it caught the non-square `batched_matmul_trans_a`
+    /// param-order bug: K and V grads diverged while q/forward matched).
+    #[test]
+    fn block_sparse_gather_grad_matches_dense_when_full() {
+        let ctx = test_ctx();
+        compute::set_simdgroup_matmul(false);
+        compute::set_bf16_matmul(false);
+        Tensor::clear_f16_cache();
+        let (bh, seq, hd, block) = (2usize, 8usize, 4usize, 2usize); // nb=4, top_k=3 → all blocks
+        let n = bh * seq * hd;
+        let gen = |off: usize| (0..n).map(|i| gc_in(i + off)).collect::<Vec<f32>>();
+        let (qd, kd, vd) = (gen(0), gen(13), gen(29));
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // Return (q_grad, k_grad, v_grad) for either the dense or the gather forward.
+        let grads = |dense: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            autograd::clear_tape();
+            autograd::zero_grads();
+            let q = Tensor::from_slice(&ctx, &qd, vec![bh, seq, hd]).with_grad();
+            let k = Tensor::from_slice(&ctx, &kd, vec![bh, seq, hd]).with_grad();
+            let v = Tensor::from_slice(&ctx, &vd, vec![bh, seq, hd]).with_grad();
+            let out = if dense {
+                q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v)
+            } else {
+                crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3)
+            };
+            let m: usize = out.shape.iter().product();
+            let seed: Vec<f32> = (0..m).map(gc_seed).collect();
+            let seed_t = Tensor::from_slice(&ctx, &seed, vec![m, 1]);
+            let loss = out.reshape(vec![1, m]).matmul(&seed_t);
+            autograd::backward(&ctx, loss.id);
+            let fetch = |id: usize| Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(id).unwrap(), vec![n]).to_vec();
+            (fetch(q.id), fetch(k.id), fetch(v.id))
+        };
+        let (dq, dk, dv) = grads(true);
+        let (gq, gk, gv) = grads(false);
+        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        for (name, d, g) in [("q", &dq, &gq), ("k", &dk, &gk), ("v", &dv, &gv)] {
+            let md = max_diff(d, g);
+            assert!(md < 2e-3, "{name}-grad gather vs dense max_abs_diff={md:.6} (must reduce to dense)");
+        }
+        autograd::clear_tape();
+    }
+
+    /// Direct unit test of the scatter-add backward kernel (transpose of `gather_blocks`), pinned to a
+    /// hand-computed case independent of the autograd flow. bh=1, nb=2, seq=4, hd=1, block=2, k_sel=2.
+    /// sel = [0, 2, 1, 0]: query-block 0 selects {block 0, sentinel}; query-block 1 selects {block 1,
+    /// block 0}. So source block 0 receives contributions from BOTH query-blocks (accumulation) and the
+    /// sentinel slot (sel==nb) must scatter nowhere.
+    #[test]
+    fn gather_blocks_backward_scatter_add_direct() {
+        let ctx = test_ctx();
+        let dims = compute::GatherDims { bh: 1, nb: 2, seq: 4, hd: 1, block: 2, k_sel: 2 };
+        let sel = ctx.buffer_from_u32_slice(&[0u32, 2, 1, 0]);
+        // d_out [bh*nb=2, sel_w=4, hd=1]; the 99.0 entries are the sentinel slots — must be ignored.
+        let d_out = ctx.buffer_from_slice(&[1.0f32, 2.0, 99.0, 99.0, 3.0, 4.0, 5.0, 6.0]);
+        let d_src = ctx.alloc_buffer(4 * 4);
+        compute::gpu_gather_blocks_backward(&ctx, &d_out, &sel, &d_src, dims);
+        let got = Tensor::from_buffer(Arc::clone(&ctx), d_src, vec![4]).to_vec();
+        // src row0 = out[0]+out[6] = 1+5 = 6; row1 = out[1]+out[7] = 2+6 = 8; row2 = out[4] = 3; row3 = out[5] = 4.
+        let expect = [6.0f32, 8.0, 3.0, 4.0];
+        for (i, (&g, &e)) in got.iter().zip(&expect).enumerate() {
+            assert!((g - e).abs() < 1e-5, "d_src[{i}] = {g} (expected {e}); sentinel/accumulation handling wrong");
+        }
+    }
+
     /// Benchmark (ignored): the gather path's score compute is O(n·(top_k+1)·block) vs dense O(n²) —
     /// must be FASTER at long sequence. Grounds the subquadratic claim. Run with --ignored --nocapture.
     #[test]
@@ -3440,6 +3528,23 @@ mod suite {
         let ctx = test_ctx();
         grad_check(&ctx, &[(gc_vec(6, 1), vec![2, 3]), (gc_vec(6, 9), vec![2, 3])],
             &|t| t[0].matmul_trans_b(&t[1]), GC_EPS, GC_ABS, GC_REL, "matmul_trans_b");
+    }
+
+    #[test]
+    fn gradcheck_batched_matmul_trans_b_nonsquare() {
+        let ctx = test_ctx();
+        // B=1, M=2 (≠ N=8), K=4 — the gather path's score matmul shape (block×sel_w). Standard
+        // attention always has M==N==seq, so this M≠N case is otherwise untested.
+        grad_check(&ctx, &[(gc_vec(8, 0), vec![1, 2, 4]), (gc_vec(32, 5), vec![1, 8, 4])],
+            &|t| t[0].batched_matmul_trans_b(&t[1]), GC_EPS, GC_ABS, GC_REL, "batched_matmul_trans_b_nonsquare");
+    }
+
+    #[test]
+    fn gradcheck_batched_matmul_nonsquare() {
+        let ctx = test_ctx();
+        // B=1, M=2, K=8, N=4 — the gather path's weights@vsel shape (block×sel_w @ sel_w×hd).
+        grad_check(&ctx, &[(gc_vec(16, 0), vec![1, 2, 8]), (gc_vec(32, 5), vec![1, 8, 4])],
+            &|t| t[0].batched_matmul(&t[1]), GC_EPS, GC_ABS, GC_REL, "batched_matmul_nonsquare");
     }
 
     #[test]

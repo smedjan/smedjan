@@ -472,9 +472,13 @@ pub fn gpu_batched_matmul_gqa(
 /// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
 pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
     let BatchedDims { batch, m, n, k } = d;
+    // Kernel struct is `{ M, K, N, batch }` (M=contraction, output is [K,N]). Field order MUST match —
+    // a prior `{ m, n, k, batch }` swapped K/N, which is silently correct only when K==N (all square
+    // attention scores) but corrupts A/B/C strides for non-square output (e.g. block-sparse gather's
+    // block×sel_w scores). The f16 sibling above already uses the correct `{ m, k, n, batch }` order.
     #[repr(C)]
-    struct Params { m: u32, n: u32, k: u32, batch: u32 }
-    let params = Params { m, n, k, batch };
+    struct Params { m: u32, k: u32, n: u32, batch: u32 }
+    let params = Params { m, k, n, batch };
     let params_buf = params_buffer(ctx, &params);
 
     let tile = 32u64;
@@ -1206,6 +1210,24 @@ pub fn gpu_gather_blocks(ctx: &Arc<MetalContext>, src: &GpuBuffer, sel: &GpuBuff
     let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
     let tg = MetalContext::size(tpg, 1, 1);
     dispatch_sync!(ctx, "gather_blocks", grid, tg, 0 => src, 1 => sel, 2 => out, 3 => &params_buf);
+}
+
+/// Backward (scatter-add transpose) of `gpu_gather_blocks`: scatters the compact gradient
+/// `d_out` [bh*nb, k_sel*block, hd] back into `d_src` [bh, seq, hd]. `d_src` is zeroed here
+/// first; the scatter accumulates atomically because multiple query-blocks may select the
+/// same source block. Sentinel slots (gathered 0 in the forward) scatter nowhere.
+pub fn gpu_gather_blocks_backward(ctx: &Arc<MetalContext>, d_out: &GpuBuffer, sel: &GpuBuffer, d_src: &GpuBuffer, d: GatherDims) {
+    let GatherDims { bh, nb, seq, hd, block, k_sel } = d;
+    gpu_fill(ctx, d_src, bh * seq * hd, 0.0);
+    #[repr(C)]
+    struct Params { bh: u32, nb: u32, seq: u32, hd: u32, block: u32, k_sel: u32 }
+    let params = Params { bh, nb, seq, hd, block, k_sel };
+    let params_buf = params_buffer(ctx, &params);
+    let total = (bh * nb * k_sel * block * hd) as u64;
+    let tpg = 256u64;
+    let grid = MetalContext::size(total.div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "gather_blocks_backward", grid, tg, 0 => d_out, 1 => sel, 2 => d_src, 3 => &params_buf);
 }
 
 /// Causal mask for gathered block-sparse scores [bh*nb, block, k_sel*block] (uses selection indices).

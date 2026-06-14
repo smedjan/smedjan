@@ -53,8 +53,10 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
     let k_sel = (top_k + 1).min(nb); // own block + up to top_k past; capped at nb
     let ctx = Arc::clone(&q.ctx);
 
-    autograd::no_grad(|| {
-        // Block means (per query/key block), then block-block scores for selection.
+    // ROUTING (block-mean → CPU top-k → `sel`) is non-differentiable and stays in `no_grad`:
+    // straight-through, exactly like MoE top-k. `sel` is a fixed gather permutation that the
+    // backward reuses to scatter gradients back to the selected source blocks.
+    let sel_buf = autograd::no_grad(|| {
         let mean_q = q.block_mean_keys(block); // [bh, nb, hd]
         let mean_k = k.block_mean_keys(block);
         let block_scores = mean_q.batched_matmul_trans_b(&mean_k).to_vec(); // [bh, nb, nb]
@@ -76,30 +78,58 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
                 }
             }
         }
-        let sel_buf = ctx.buffer_from_u32_slice(&sel);
+        ctx.buffer_from_u32_slice(&sel)
+    });
 
-        // Gather the selected K/V blocks into compact [bh*nb, k_sel*block, hd] buffers.
-        let dims = compute::GatherDims {
-            bh: bh as u32, nb: nb as u32, seq: seq as u32, hd: hd as u32,
-            block: block as u32, k_sel: k_sel as u32,
-        };
-        let sel_w = k_sel * block;
-        let ksel_buf = ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
-        let vsel_buf = ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
-        compute::gpu_gather_blocks(&ctx, &k.buffer, &sel_buf, &ksel_buf, dims);
-        compute::gpu_gather_blocks(&ctx, &v.buffer, &sel_buf, &vsel_buf, dims);
-        let k_sel_t = Tensor::from_buffer(Arc::clone(&ctx), ksel_buf, vec![bh * nb, sel_w, hd]);
-        let v_sel_t = Tensor::from_buffer(Arc::clone(&ctx), vsel_buf, vec![bh * nb, sel_w, hd]);
+    let dims = compute::GatherDims {
+        bh: bh as u32, nb: nb as u32, seq: seq as u32, hd: hd as u32,
+        block: block as u32, k_sel: k_sel as u32,
+    };
 
-        // Attention over the gathered blocks: [bh*nb, block, hd] @ [bh*nb, sel_w, hd]^T.
-        let q_bnq = q.reshape(vec![bh * nb, block, hd]);
-        let scale = 1.0 / (hd as f32).sqrt();
-        let scores = q_bnq.batched_matmul_trans_b(&k_sel_t).scale(scale); // [bh*nb, block, sel_w]
-        compute::gpu_gather_causal_mask(&ctx, &scores.buffer, &sel_buf, (bh * nb) as u32, nb as u32, block as u32, k_sel as u32);
-        let weights = scores.softmax();
-        let out = weights.batched_matmul(&v_sel_t); // [bh*nb, block, hd]
-        out.reshape(vec![bh, seq, hd])
-    })
+    // Gather + attention math are RECORDED (outside `no_grad`) so gradients flow:
+    // q → scores → q, v_sel → out → V, and ksel → scores → (scatter-add) → K. The gathers are
+    // `Op::GatherBlocks`; the downstream reshape/matmul/scale/softmax record themselves as usual.
+    let k_sel_t = gather_blocks_recorded(k, &sel_buf, dims); // [bh*nb, k_sel*block, hd]
+    let v_sel_t = gather_blocks_recorded(v, &sel_buf, dims);
+
+    // Attention over the gathered blocks: [bh*nb, block, hd] @ [bh*nb, sel_w, hd]^T.
+    let q_bnq = q.reshape(vec![bh * nb, block, hd]);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let scores = q_bnq.batched_matmul_trans_b(&k_sel_t).scale(scale); // [bh*nb, block, sel_w]
+    // In-place causal mask sets out-of-causal/sentinel keys to -inf BEFORE softmax → ~0 weight and
+    // ~0 gradient there. Safe under autograd: softmax caches its own output for backward, and the
+    // upstream scale/matmul backwards read their inputs (q_bnq, k_sel_t), not this masked buffer.
+    compute::gpu_gather_causal_mask(&ctx, &scores.buffer, &sel_buf, (bh * nb) as u32, nb as u32, block as u32, k_sel as u32);
+    let weights = scores.softmax();
+    let out = weights.batched_matmul(&v_sel_t); // [bh*nb, block, hd]
+    out.reshape(vec![bh, seq, hd])
+}
+
+/// Gather selected source blocks into a compact [bh*nb, k_sel*block, hd] tensor, recording an
+/// `Op::GatherBlocks` tape entry (when recording) so the backward scatter-adds gradients back to
+/// `src`. `sel_buf` is the fixed routing permutation (computed non-differentiably by the caller).
+fn gather_blocks_recorded(src: &Tensor, sel_buf: &Retained<GpuBuffer>, dims: compute::GatherDims) -> Tensor {
+    let (bh, nb, hd, block, k_sel) = (
+        dims.bh as usize, dims.nb as usize, dims.hd as usize, dims.block as usize, dims.k_sel as usize,
+    );
+    let sel_w = k_sel * block;
+    let out_buf = src.ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
+    compute::gpu_gather_blocks(&src.ctx, &src.buffer, sel_buf, &out_buf, dims);
+    let out = Tensor::from_buffer(Arc::clone(&src.ctx), out_buf, vec![bh * nb, sel_w, hd]);
+    if autograd::is_recording() {
+        autograd::record(TapeEntry {
+            op: Op::GatherBlocks {
+                bh: dims.bh, nb: dims.nb, seq: dims.seq, hd: dims.hd, block: dims.block, k_sel: dims.k_sel,
+            },
+            inputs: vec![src.id],
+            output: out.id,
+            input_buffers: vec![src.buffer.clone()],
+            output_buffer: out.buffer.clone(),
+            shapes: vec![src.shape.clone()],
+            cached: Some(sel_buf.clone()),
+        });
+    }
+    out
 }
 
 /// Multi-head attention with rotary positional encoding, KV cache, and
