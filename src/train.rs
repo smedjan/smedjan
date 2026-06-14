@@ -2,8 +2,8 @@ use crate::autograd;
 use crate::checkpoint;
 use crate::data::DataLoader;
 use crate::loss;
-use crate::metal::compute;
-use crate::metal::MetalContext;
+use crate::gpu::compute;
+use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use std::io::Write as IoWrite;
@@ -445,7 +445,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // EMA (Exponential Moving Average) model for self-distillation
     // The EMA is a running average of weights that's always a better model than the snapshot.
     // Used as a teacher for KL-divergence self-distillation during training.
-    let ema_buffers: Vec<objc2::rc::Retained<crate::metal::GpuBuffer>> = if config.ema_decay > 0.0 {
+    let ema_buffers: Vec<objc2::rc::Retained<crate::gpu::GpuBuffer>> = if config.ema_decay > 0.0 {
         eprintln!("Self-distillation: EMA decay={}", config.ema_decay);
         model.parameters().iter().map(|p| {
             let buf = ctx.alloc_buffer(p.numel() * 4);
@@ -1041,7 +1041,7 @@ fn compute_validation_loss(
 /// Encodes norm kernels into the existing batch — 1 sync for backward+norms.
 fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
-    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::gpu::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
 
     // Encode norm kernels into the EXISTING batch (no begin_batch — reuses backward's)
     for param in &params {
@@ -1103,7 +1103,7 @@ fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: 
 /// Fused: expects a command batch already open (from backward); 1 sync for backward+norms.
 fn clip_gradients_per_tensor_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f32) {
     let params = model.parameters();
-    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::gpu::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
 
     for param in &params {
         if let Some(grad) = autograd::get_grad(param.id) {
@@ -1192,7 +1192,7 @@ pub fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f3
     let params = model.parameters();
 
     // Phase 1: Compute all per-parameter L2 norms + NaN checks on GPU (batched).
-    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::metal::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
+    let mut norm_bufs: Vec<Option<(objc2::rc::Retained<crate::gpu::GpuBuffer>, usize)>> = Vec::with_capacity(params.len());
 
     ctx.begin_batch();
     for param in &params {

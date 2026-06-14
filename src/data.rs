@@ -1,4 +1,4 @@
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::tokenizer::{BpeTokenizer, PAD_TOKEN};
 use memmap2::Mmap;
 use std::fs::File;
@@ -194,7 +194,7 @@ pub fn pad_sequences(sequences: &[Vec<u32>], max_len: usize) -> Vec<u32> {
 /// Also verifies the GPU transpose kernel by transposing a small matrix and checking the result.
 /// Returns the number of verified tokens. Panics on mismatch.
 pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_size: usize) -> usize {
-    use crate::metal::compute;
+    use crate::gpu::compute;
 
     let dataset = Dataset::load(dataset_path).expect("Failed to load dataset for verification");
     let count = sample_size.min(dataset.len());

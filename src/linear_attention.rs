@@ -28,7 +28,7 @@
 //! for linear-attention / SSM token mixers (cf. RetNet's post-mix GroupNorm).
 
 
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -187,7 +187,7 @@ pub fn linear_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
 mod tests {
     use super::*;
     use crate::autograd;
-    use crate::metal::MetalContext;
+    use crate::gpu::MetalContext;
 
     fn ctx() -> Arc<MetalContext> {
         MetalContext::new()

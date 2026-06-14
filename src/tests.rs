@@ -2,7 +2,7 @@
 mod suite {
     use crate::autograd;
     use crate::datapipe;
-    use crate::metal::{compute, MetalContext};
+    use crate::gpu::{compute, MetalContext};
     use crate::model::{ModelConfig, Transformer};
     use crate::tensor::Tensor;
     use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, SPECIAL_TOKENS};
@@ -1304,7 +1304,7 @@ mod suite {
         let input_buf = ctx.buffer_from_slice(&input_data);
         let output_buf = ctx.alloc_buffer((rows * cols) as usize * 4);
 
-        crate::metal::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, rows, cols);
+        crate::gpu::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, rows, cols);
 
         let result = MetalContext::read_buffer(&output_buf, (rows * cols) as usize);
         let expected = vec![1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0];
@@ -1323,7 +1323,7 @@ mod suite {
         let input_buf = ctx.buffer_from_slice(&input_data);
         let output_buf = ctx.alloc_buffer((n * n) as usize * 4);
 
-        crate::metal::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, n, n);
+        crate::gpu::compute::gpu_transpose_2d(&ctx, &input_buf, &output_buf, n, n);
 
         let result = MetalContext::read_buffer(&output_buf, (n * n) as usize);
         let expected = vec![1.0f32, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0];
@@ -3104,7 +3104,7 @@ mod suite {
         let seg_buf = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1, 1, 1]);
         let docb = [3usize, 4, 5, 6]; // docB positions in the row
 
-        let docb_logits = |toks: &[u32], seg: Option<&objc2::rc::Retained<crate::metal::GpuBuffer>>| -> Vec<f32> {
+        let docb_logits = |toks: &[u32], seg: Option<&objc2::rc::Retained<crate::gpu::GpuBuffer>>| -> Vec<f32> {
             autograd::clear_tape();
             autograd::zero_grads();
             let out = model.forward_seg(toks, 1, seq, None, false, seg).to_vec(); // [seq, vocab]
@@ -4356,7 +4356,7 @@ mod suite {
 
         // Do a fake optimizer step to populate m/v buffers
         let fake_grad = ctx.alloc_buffer(param_refs[0].numel() * 4);
-        crate::metal::compute::gpu_fill(&ctx, &fake_grad, param_refs[0].numel() as u32, 0.01);
+        crate::gpu::compute::gpu_fill(&ctx, &fake_grad, param_refs[0].numel() as u32, 0.01);
         autograd::accumulate_grad_for_test(&ctx, param_refs[0].id, &fake_grad, param_refs[0].numel());
         ctx.begin_batch();
         optimizer.step(1e-4);
@@ -4488,7 +4488,7 @@ mod suite {
 
         // Simulate gradient = 0.1 for all elements
         let grad = ctx.alloc_buffer(4 * 4);
-        crate::metal::compute::gpu_fill(&ctx, &grad, 4, 0.1);
+        crate::gpu::compute::gpu_fill(&ctx, &grad, 4, 0.1);
         autograd::accumulate_grad_for_test(&ctx, param.id, &grad, 4);
 
         let param_refs = vec![&param];

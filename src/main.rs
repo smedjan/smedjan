@@ -583,14 +583,14 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let ctx = metal::MetalContext::new();
+    let ctx = crate::gpu::MetalContext::new();
 
     eprintln!("AndreAI v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("Metal device: {}", ctx.device_name());
 
     // Hardware matrix units (simdgroup MMA): bit-identical, ~+27% inference / +31% training. On by
     // default for every command; `bench` and `train` force it from their own flags below.
-    metal::compute::set_simdgroup_matmul(true);
+    crate::gpu::compute::set_simdgroup_matmul(true);
 
     match cli.command {
         Commands::Tokenizer {
@@ -1174,13 +1174,13 @@ fn main() {
 
                 // Accumulate: base += other
                 for (bp, op) in base_params.iter().zip(other_params.iter()) {
-                    crate::metal::compute::gpu_add_inplace(&ctx, &bp.buffer, &op.buffer, bp.numel() as u32);
+                    crate::gpu::compute::gpu_add_inplace(&ctx, &bp.buffer, &op.buffer, bp.numel() as u32);
                 }
             }
 
             // Divide by N to get mean
             for bp in &base_params {
-                crate::metal::compute::gpu_scale(&ctx, &bp.buffer, bp.numel() as u32, 1.0 / n);
+                crate::gpu::compute::gpu_scale(&ctx, &bp.buffer, bp.numel() as u32, 1.0 / n);
             }
 
             // Save merged checkpoint
@@ -1297,7 +1297,7 @@ fn main() {
                 batch_size, seq_len, batch_size * seq_len);
             eprintln!("Fused kernels: {}", if fused_eligible { "ACTIVE (inference)" } else { "disabled" });
             eprintln!("Warmup: {}, Timed iters: {}", warmup, iters);
-            metal::compute::set_simdgroup_matmul(simdgroup_matmul);
+            crate::gpu::compute::set_simdgroup_matmul(simdgroup_matmul);
             eprintln!("Matmul path: {}", if simdgroup_matmul { "hardware simdgroup MMA" } else { "scalar-MAC tiled" });
             eprintln!();
 
@@ -1489,7 +1489,7 @@ fn main() {
             // --- Allocation profile ---
             eprintln!();
             eprintln!("--- Allocation Profile (1 forward+backward step) ---");
-            metal::MetalContext::enable_alloc_log(true);
+            crate::gpu::MetalContext::enable_alloc_log(true);
             {
                 autograd::clear_tape();
                 ctx.begin_batch();
@@ -1499,8 +1499,8 @@ fn main() {
                 ctx.flush_batch();
                 autograd::clear_tape();
             }
-            metal::MetalContext::dump_alloc_log("1 train step");
-            metal::MetalContext::enable_alloc_log(false);
+            crate::gpu::MetalContext::dump_alloc_log("1 train step");
+            crate::gpu::MetalContext::enable_alloc_log(false);
 
             // --- 7. Memory & Pool ---
             eprintln!();
@@ -1510,7 +1510,7 @@ fn main() {
                 param_bytes as f64 / 1e6, params as f64 / 1e6);
             eprintln!("  Estimated training RAM: {:.0} MB", config.training_memory_bytes() as f64 / 1e6);
             eprintln!("  Estimated inference RAM: {:.0} MB", config.inference_memory_bytes() as f64 / 1e6);
-            let (pool_hits, pool_misses) = metal::MetalContext::pool_stats();
+            let (pool_hits, pool_misses) = crate::gpu::MetalContext::pool_stats();
             let pool_total = pool_hits + pool_misses;
             eprintln!("  Buffer pool: {}/{} hits ({:.0}% reuse), {} new allocs",
                 pool_hits, pool_total,

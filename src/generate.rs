@@ -1,7 +1,7 @@
 use crate::attention::KvCache;
 use crate::autograd;
-use crate::metal::compute::{gpu_argmax, gpu_temperature_scale};
-use crate::metal::MetalContext;
+use crate::gpu::compute::{gpu_argmax, gpu_temperature_scale};
+use crate::gpu::MetalContext;
 use crate::model::Transformer;
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN};
 use rand::Rng;

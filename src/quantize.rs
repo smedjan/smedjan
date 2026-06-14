@@ -1,5 +1,5 @@
 use crate::checkpoint;
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use objc2_metal::MTLBuffer;
 use std::io::{Read, Write};

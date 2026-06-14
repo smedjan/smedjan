@@ -132,6 +132,26 @@ pub type GpuPipeline = ProtocolObject<dyn MTLComputePipelineState>;
 pub type GpuCommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 pub type GpuComputeEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 
+/// Backend-agnostic buffer handle. Metal: a refcounted `Retained<MTLBuffer>` (cheap `.clone()` = share).
+/// Shared code uses `crate::gpu::Buf` instead of naming objc2 types directly, so CUDA can substitute
+/// `Arc<CudaSlice<f32>>` (also cheap-clone) behind the same alias.
+pub type Buf = objc2::rc::Retained<GpuBuffer>;
+
+/// Address of a buffer's contents, as usize — for pool/dedup/cache keys. Replaces direct
+/// `objc2_metal::MTLBuffer::contents()` calls in shared code so the backend stays swappable.
+#[inline]
+pub fn buf_addr(b: &Buf) -> usize {
+    use objc2_metal::MTLBuffer;
+    b.contents().as_ptr() as usize
+}
+
+/// Byte length of a buffer. Replaces direct `MTLBuffer::length()` calls in shared code.
+#[inline]
+pub fn buf_len_bytes(b: &Buf) -> usize {
+    use objc2_metal::MTLBuffer;
+    b.length()
+}
+
 /// Active command batch for kernel fusion. Accumulates multiple kernel dispatches
 /// into a single command buffer, then commits and waits once.
 /// This eliminates the per-kernel commit+wait overhead (~50-80% of wall time).

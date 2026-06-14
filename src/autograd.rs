@@ -1,4 +1,4 @@
-use crate::metal::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{compute, GpuBuffer, MetalContext};
 use objc2::rc::Retained;
 use objc2_metal::MTLBuffer;
 use std::cell::RefCell;
@@ -794,7 +794,7 @@ fn backward_checkpoint(
     // Bypass the buffer pool for the whole recompute + sub-tape backward: its allocations must not
     // reuse pooled buffers the outer backward still references (which would silently corrupt
     // gradients), and its freed buffers must not pollute the pool the outer backward relies on.
-    let _bypass = crate::metal::PoolBypassGuard::new();
+    let _bypass = crate::gpu::PoolBypassGuard::new();
 
     // Temporarily remove the recompute fn from the registry so we can call it
     // without holding a RefCell borrow (the fn itself will borrow TAPE via

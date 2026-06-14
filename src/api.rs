@@ -1,7 +1,7 @@
 use crate::checkpoint;
 use crate::generate::{self, SamplingConfig};
 use crate::gpu::GpuContext as MetalContext;
-use crate::metal::compute;
+use crate::gpu::compute;
 use crate::model::Transformer;
 use crate::tokenizer::BpeTokenizer;
 use std::sync::Arc;

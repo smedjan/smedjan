@@ -2,7 +2,7 @@
 //! Measures model quality against domain-specific benchmarks.
 
 use crate::generate::{self, SamplingConfig};
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::model::Transformer;
 use crate::tensor::Tensor;
 use crate::tokenizer::BpeTokenizer;

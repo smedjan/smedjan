@@ -25,7 +25,7 @@
 //! decay-weighted chunk prefix — is the follow-up optimisation; the recurrence semantics are here.)
 
 
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -187,7 +187,7 @@ pub fn ssm(q: &Tensor, k: &Tensor, v: &Tensor, loga: &Tensor) -> Tensor {
 mod tests {
     use super::*;
     use crate::autograd;
-    use crate::metal::MetalContext;
+    use crate::gpu::MetalContext;
 
     fn ctx() -> Arc<MetalContext> {
         MetalContext::new()

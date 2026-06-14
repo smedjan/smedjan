@@ -1,8 +1,8 @@
 use crate::autograd;
 use crate::checkpoint;
 use crate::loss;
-use crate::metal::compute;
-use crate::metal::MetalContext;
+use crate::gpu::compute;
+use crate::gpu::MetalContext;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN};
@@ -324,7 +324,7 @@ impl SftConfig {
 /// tokens contribute to the loss.
 fn apply_loss_mask(
     ctx: &Arc<MetalContext>,
-    grad_logits: &crate::metal::GpuBuffer,
+    grad_logits: &crate::gpu::GpuBuffer,
     mask: &[bool],
     vocab_size: usize,
 ) -> f32 {

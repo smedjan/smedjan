@@ -24,7 +24,7 @@
 //! form is the production follow-up. The recurrence semantics and selectivity are proven here.
 
 
-use crate::metal::MetalContext;
+use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -134,7 +134,7 @@ pub fn time_mix(r: &Tensor, k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> T
 mod tests {
     use super::*;
     use crate::autograd;
-    use crate::metal::MetalContext;
+    use crate::gpu::MetalContext;
 
     fn ctx() -> Arc<MetalContext> {
         MetalContext::new()

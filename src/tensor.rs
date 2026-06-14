@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::metal::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{compute, GpuBuffer, MetalContext};
 use objc2::rc::Retained;
 use objc2_metal::MTLBuffer;
 use std::cell::RefCell;
@@ -256,7 +256,7 @@ impl Tensor {
     /// Cast tensor contents to FP16 buffer with safe clamping.
     /// Uses thread-local cache: same buffer pointer → cached FP16 version.
     /// Call `Tensor::clear_f16_cache()` after optimizer step when weights change.
-    pub fn cast_to_f16(&self) -> Retained<crate::metal::GpuBuffer> {
+    pub fn cast_to_f16(&self) -> Retained<crate::gpu::GpuBuffer> {
         let key = self.buffer.contents().as_ptr() as usize;
 
         let cached = F16_CAST_CACHE.with(|c| c.borrow().get(&key).cloned());
@@ -986,7 +986,7 @@ impl Tensor {
     /// position's segment id. Masks future AND cross-segment positions to -inf, so packed sequences
     /// don't attend across each other. Backward is passthrough (masked → 0 softmax weight → 0 grad),
     /// identical to `causal_mask`.
-    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::metal::GpuBuffer>, n_heads: usize) -> Tensor {
+    pub fn causal_doc_mask(&self, seg_ids: &Retained<crate::gpu::GpuBuffer>, n_heads: usize) -> Tensor {
         assert_eq!(self.shape.len(), 3, "causal_doc_mask expects [batch_heads, seq, seq] scores");
         let batch_heads = self.shape[0];
         let seq = self.shape[1];

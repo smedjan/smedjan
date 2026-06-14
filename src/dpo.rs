@@ -1,7 +1,7 @@
 use crate::autograd;
 use crate::checkpoint;
-use crate::metal::compute;
-use crate::metal::MetalContext;
+use crate::gpu::compute;
+use crate::gpu::MetalContext;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN};
@@ -676,7 +676,7 @@ fn compute_dpo_logit_gradients(
 fn inject_loss_gradient(
     ctx: &Arc<MetalContext>,
     logits: &crate::tensor::Tensor,
-    grad_buf: objc2::rc::Retained<crate::metal::GpuBuffer>,
+    grad_buf: objc2::rc::Retained<crate::gpu::GpuBuffer>,
 ) -> usize {
     use crate::autograd::{Op, TapeEntry};
 
@@ -906,7 +906,7 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::autograd;
-    use crate::metal::MetalContext;
+    use crate::gpu::MetalContext;
     use crate::model::{ModelConfig, Transformer};
     use std::io::Write;
 

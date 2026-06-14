@@ -1,5 +1,5 @@
 use crate::autograd;
-use crate::metal::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{compute, GpuBuffer, MetalContext};
 use crate::tensor::Tensor;
 use objc2::rc::Retained;
 use objc2_metal::MTLBuffer;
