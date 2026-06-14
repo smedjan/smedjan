@@ -106,3 +106,37 @@ H100 for this — save it for actual scale training once the backend is green.
 `cargo build --no-default-features --features cuda` green; Tier-A kernels each CPU-match + grad-check
 green; a `train --size tiny` smoke on the GPU shows finite, decreasing loss tracking the Metal run.
 Then the Mac stops being the ceiling and fp8/fp4 + multi-GPU become the next (separate) campaign.
+
+---
+
+## RUNTIME BRING-UP PROGRESS (2026-06-15, overnight)
+
+**Status: CUDA backend COMPILES (0 errors) and RUNS.** nvrtc compiles all kernels for sm_120 on the
+RTX 5090 (CUDA 12.8); the model initialises; the forward executes through embedding + linear matmuls
++ batched attention matmuls, panicking at the first not-yet-wired kernel. Metal green throughout
+(verified each step). Commits: `52322bd` (compiles), `149b8b1` (matmul batch + fp32 path).
+
+**Design decisions taken:**
+- CUDA stays **fp32** for now: `cast_to_f16` is a no-op (shares the fp32 buffer); the f16 matmul
+  entry points delegate to the fp32 kernels. (f16 perf path is a later optimisation.)
+- Typed-buffer abstraction: `Buf`=Arc<CudaSlice<f32>>, `BufU32`=Arc<CudaSlice<u32>>, with
+  `u32_to_buf`/`buf_as_u32` transmute helpers so the untyped Metal tape (`Vec<Buf>`) can hold u32
+  token/sel buffers. `buf_write_bytes`/`buf_bytes` do dtoh/htod for the Metal unified-memory paths.
+- Metal-only CPU-pointer paths (`step_cpu`, opt-state load, 8bit init, `api` harness) are cfg-gated.
+
+**Remaining = kernel wiring (mechanical), then port the fused ones:**
+Most kernels already exist in `ALL_KERNELS` + `KERNEL_NAMES`; the `cuda/compute.rs` stub just needs a
+launch (mirror an existing wrapper; grid from the kernel's blockIdx convention). Compose the fused:
+- `transpose_rope` = `transpose_perm_forward` then `rope`; `transpose_rope_backward` = `rope_backward`
+  then `transpose_perm_backward`. (Both component kernels exist.)
+- Wire stub→existing kernel: `transpose_perm_forward`/`_backward`, `rope_copy`/`_backward_copy`,
+  `rms_norm_residual`, `scaled_causal_softmax`(+`_window`), `silu`/`silu_backward`/`silu_gate_backward`,
+  `rms_norm_backward`, `softmax_backward`, `embedding_backward`, `scale_rows`, `row_dot_reduce`,
+  `broadcast_rows`, `slice_cols`, `concat_cols`, `repeat_kv`(+`_backward`), `transpose_2d`, `zero_rows`.
+- DEFER (no CUDA kernel; advanced, off the minimal dense-LM path): flash-attention(±), block-sparse
+  gather/mask, MoE gather/scatter, ternary/BitNet, sophia/lion/8bit, muon_frob.
+
+**Resume loop:** replace next `unimplemented!` stub → push → `bench --size tiny` → fix next panic →
+repeat until forward green, then backward, then `train --size tiny --steps 50` smoke (loss finite +
+decreasing). Build env: `CUDA_PATH=/usr/local/cuda-12.8 LD_LIBRARY_PATH=$CUDA_PATH/lib64`,
+`cargo build --release --no-default-features --features cuda`.
