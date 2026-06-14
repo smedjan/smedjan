@@ -103,6 +103,27 @@ Land order (ROI, from §6/§7 of the buffer-hazard handoff):
 Each needs Metal hardware to implement + verify — by design these were **specced, not
 blind-written**, so they land fast once you're on the Mac with the harness in place.
 
+### Phase B grad-check coverage EXTENDED to the whole attention kernel path (2026-06-14)
+
+The B1 finite-diff harness now covers every custom/fused backward kernel on the hot path — the
+class that previously had *no* numerical check and that hid two real bugs this session:
+
+- **`batched_matmul_trans_a`** (the `dB = Aᵀ@dC` half of every batched-matmul backward) had its
+  param struct fields swapped (`{m,n,k}` vs kernel `{M,K,N}`) — silently correct only for K==N
+  (all square attention scores), wrong for non-square. Caught by `gradcheck_batched_matmul_nonsquare`
+  / `…_trans_b_nonsquare`. Fixed.
+- **Flash Attention** partial-last-q-block (see table above). Caught by `gradcheck_flash_attention`
+  + `flash_attention_matches_dense_causal`. Fixed.
+
+New grad-checks, all PASS (kernels verified sound): `scaled_causal_softmax`, `apply_rope`,
+`fused_transpose_rope`, `transpose_bsh_to_bhs`, `transpose_bhs_to_bsh`, `rms_norm_residual`,
+`scale_rows`, `repeat_kv` (GQA), `flash_attention`, `block_sparse_gather_attention`. Remaining
+unchecked customs are low-risk (`embedding` = the validated scatter-add precedent, `concat_parts`,
+`slice`, `matmul_detached_b` STE, `checkpoint` recompute). SSM/RWKV are pure compositions of
+already-grad-checked primitives (forward also CPU-verified), so their backward is correct by
+construction. **Lesson: a custom fused backward with only a "gradient is finite/non-zero" test is
+unverified — finite-diff it.**
+
 ---
 
 ## Ground state (verified this session, air / M-series Mac)

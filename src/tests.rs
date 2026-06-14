@@ -3670,6 +3670,80 @@ mod suite {
             &|t| t[0].rms_norm(&t[1], 1e-5), GC_EPS, GC_ABS, GC_REL, "rms_norm");
     }
 
+    // ---- Custom/fused backward kernels that previously had NO finite-diff grad-check (the
+    // class that hid the Flash partial-block bug). All are on the hot attention/training path.
+
+    #[test]
+    fn gradcheck_scaled_causal_softmax() {
+        let ctx = test_ctx();
+        // Fused scale + causal mask + softmax over [bh, seq, seq]. Masked (upper-tri) score grads must
+        // be ~0 both analytically and numerically. This is the standard non-flash attention path.
+        grad_check(&ctx, &[(gc_vec(16, 2), vec![1, 4, 4])],
+            &|t| t[0].scaled_causal_softmax(0.5, 0), GC_EPS, GC_ABS, GC_REL, "scaled_causal_softmax");
+    }
+
+    #[test]
+    fn gradcheck_apply_rope() {
+        let ctx = test_ctx();
+        // RoPE rotation over [batch_heads, seq, head_dim] (head_dim even). Backward = inverse rotation.
+        grad_check(&ctx, &[(gc_vec(2 * 8 * 4, 0), vec![2, 8, 4])],
+            &|t| t[0].apply_rope(0, 10000.0), GC_EPS, GC_ABS, GC_REL, "apply_rope");
+    }
+
+    #[test]
+    fn gradcheck_rms_norm_residual() {
+        let ctx = test_ctx();
+        // Fused residual-add + RMS norm: rms_norm(x + residual, weight). Inputs: x, residual, weight.
+        grad_check(&ctx,
+            &[(gc_vec(8, 0), vec![2, 4]), (gc_vec(8, 9), vec![2, 4]), (gc_vec(4, 21), vec![4])],
+            &|t| t[0].rms_norm_residual(&t[1], &t[2], 1e-5), GC_EPS, GC_ABS, GC_REL, "rms_norm_residual");
+    }
+
+    #[test]
+    fn gradcheck_scale_rows() {
+        let ctx = test_ctx();
+        // Per-row scaling: out[r][c] = x[r][c] * scales[r]. Inputs: x [rows, cols], scales [rows].
+        grad_check(&ctx, &[(gc_vec(12, 0), vec![3, 4]), (gc_vec(3, 17), vec![3])],
+            &|t| t[0].scale_rows(&t[1]), GC_EPS, GC_ABS, GC_REL, "scale_rows");
+    }
+
+    #[test]
+    fn gradcheck_repeat_kv() {
+        let ctx = test_ctx();
+        // GQA KV expansion: each of n_kv heads repeated group_size times. Backward = sum the
+        // group_size gradient blocks back into each KV head. kv [n_kv=2, seq=4, hd=3], group=2.
+        grad_check(&ctx, &[(gc_vec(2 * 4 * 3, 0), vec![2, 4, 3])],
+            &|t| crate::attention::repeat_kv(&t[0], 2, 4, 3, 2), GC_EPS, GC_ABS, GC_REL, "repeat_kv");
+    }
+
+    #[test]
+    fn gradcheck_transpose_bsh_to_bhs() {
+        let ctx = test_ctx();
+        // Head transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]. batch=1,
+        // seq=4, n_heads=2, head_dim=4 → input [4, 8]. Backward = inverse permutation.
+        grad_check(&ctx, &[(gc_vec(4 * 8, 0), vec![4, 8])],
+            &|t| crate::attention::transpose_bsh_to_bhs(&t[0], 1, 4, 2, 4), GC_EPS, GC_ABS, GC_REL, "transpose_bsh_to_bhs");
+    }
+
+    #[test]
+    fn gradcheck_fused_transpose_rope() {
+        let ctx = test_ctx();
+        // Fused head-transpose + RoPE (distinct kernel from apply_rope; runs in every attention fwd).
+        // [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + rotation. Backward = inverse
+        // RoPE + inverse transpose in one dispatch. batch=1, seq=4, n_heads=2, head_dim=4.
+        grad_check(&ctx, &[(gc_vec(4 * 8, 0), vec![4, 8])],
+            &|t| crate::attention::fused_transpose_rope(&t[0], 1, 4, 2, 4, 0, 10000.0), GC_EPS, GC_ABS, GC_REL, "fused_transpose_rope");
+    }
+
+    #[test]
+    fn gradcheck_transpose_bhs_to_bsh() {
+        let ctx = test_ctx();
+        // Reverse head transpose (attention-output path): [batch*n_heads, seq, head_dim] →
+        // [batch*seq, n_heads*head_dim]. batch=1, n_heads=2, seq=4, head_dim=4 → input [2,4,4].
+        grad_check(&ctx, &[(gc_vec(2 * 4 * 4, 0), vec![2, 4, 4])],
+            &|t| crate::attention::transpose_bhs_to_bsh(&t[0], 1, 4, 2, 4), GC_EPS, GC_ABS, GC_REL, "transpose_bhs_to_bsh");
+    }
+
     #[test]
     fn gradcheck_slice_cols() {
         let ctx = test_ctx();

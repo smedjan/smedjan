@@ -741,7 +741,7 @@ impl MultiHeadAttention {
 /// Records a tape entry so gradients flow through.
 /// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
 /// Saves 2 dispatches (transpose + RoPE → 1) and eliminates the intermediate buffer.
-fn fused_transpose_rope(
+pub(crate) fn fused_transpose_rope(
     t: &Tensor,
     batch: usize,
     seq_len: usize,
@@ -783,7 +783,7 @@ fn fused_transpose_rope(
     result
 }
 
-fn transpose_bsh_to_bhs(
+pub(crate) fn transpose_bsh_to_bhs(
     t: &Tensor,
     batch: usize,
     seq_len: usize,
@@ -837,7 +837,7 @@ fn transpose_bsh_to_bhs(
 
 /// Transpose [batch*n_heads, seq, head_dim] → [batch*seq, n_heads*head_dim]
 /// Records a tape entry (reverse direction) so gradients flow through.
-fn transpose_bhs_to_bsh(
+pub(crate) fn transpose_bhs_to_bsh(
     t: &Tensor,
     batch: usize,
     seq_len: usize,
