@@ -169,9 +169,10 @@ struct TrainArgs {
         /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
         #[arg(long, default_value = "1.0")]
         adamw_lr_scale: f32,
-        /// Route the default fp16 matmul through the hardware simdgroup MMA units (~1.3× faster, bit-identical).
-        #[arg(long)]
-        simdgroup_matmul: bool,
+        /// Disable the hardware simdgroup MMA matmul (ON by default; bit-identical, ~+31% training).
+        /// Use only to fall back to scalar-MAC kernels or to enable --bf16-matmul.
+        #[arg(long = "no-simdgroup-matmul")]
+        no_simdgroup_matmul: bool,
         /// Route the default matmul through bf16: fp32 RANGE (no fp16 ±65504 clamp) but only ~7-bit
         /// mantissa (vs fp16's 10). Use ONLY when fp16 overflows (NaN at large activations) — its
         /// coarser precision DESTABILIZES otherwise (verified: diverged to ~475 on a real run where
@@ -587,6 +588,10 @@ fn main() {
     eprintln!("AndreAI v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("Metal device: {}", ctx.device_name());
 
+    // Hardware matrix units (simdgroup MMA): bit-identical, ~+27% inference / +31% training. On by
+    // default for every command; `bench` and `train` force it from their own flags below.
+    metal::compute::set_simdgroup_matmul(true);
+
     match cli.command {
         Commands::Tokenizer {
             input,
@@ -695,7 +700,7 @@ fn main() {
             per_tensor_clip,
             muon_lr_scale,
             adamw_lr_scale,
-            simdgroup_matmul,
+            no_simdgroup_matmul,
             bf16_matmul,
             lr_ref_batch,
             normuon,
@@ -792,7 +797,7 @@ fn main() {
             config.per_tensor_clip = per_tensor_clip;
             config.muon_lr_scale = muon_lr_scale;
             config.adamw_lr_scale = adamw_lr_scale;
-            config.simdgroup_matmul = simdgroup_matmul;
+            config.simdgroup_matmul = !no_simdgroup_matmul;
             config.bf16_matmul = bf16_matmul;
             config.lr_ref_batch = lr_ref_batch;
             config.normuon = normuon;
@@ -1292,10 +1297,8 @@ fn main() {
                 batch_size, seq_len, batch_size * seq_len);
             eprintln!("Fused kernels: {}", if fused_eligible { "ACTIVE (inference)" } else { "disabled" });
             eprintln!("Warmup: {}, Timed iters: {}", warmup, iters);
-            if simdgroup_matmul {
-                metal::compute::set_simdgroup_matmul(true);
-            }
-            eprintln!("Matmul path: {}", if simdgroup_matmul { "hardware simdgroup MMA" } else { "scalar-MAC tiled (default)" });
+            metal::compute::set_simdgroup_matmul(simdgroup_matmul);
+            eprintln!("Matmul path: {}", if simdgroup_matmul { "hardware simdgroup MMA" } else { "scalar-MAC tiled" });
             eprintln!();
 
             let model = model::Transformer::new(&ctx, config.clone());

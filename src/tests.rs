@@ -2608,6 +2608,47 @@ mod suite {
         compute::set_simdgroup_matmul(prev);
     }
 
+    /// The MMA path is now ON by default, so its backward must be verified end-to-end through
+    /// autograd — the grad-check harness forces the flag off, leaving this path uncovered otherwise.
+    /// Run a full forward+backward both ways and assert the input gradients agree (fp16-fragment
+    /// precision → fp16-scale relative tolerance). Ragged dims exercise the 64×64 edge tiles.
+    #[test]
+    fn backward_matmul_mma_gradients_match_scalar() {
+        let ctx = test_ctx();
+        let (m, k, n) = (40usize, 72usize, 56usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+
+        let run = |sg: bool| -> (Vec<f32>, Vec<f32>) {
+            let prev = compute::set_simdgroup_matmul(sg);
+            autograd::clear_tape();
+            autograd::clear_recompute_registry();
+            autograd::zero_grads();
+            let a = Tensor::from_slice(&ctx, &a_data, vec![m, k]).with_grad();
+            let b = Tensor::from_slice(&ctx, &b_data, vec![k, n]).with_grad();
+            let c = a.matmul(&b);
+            autograd::backward(&ctx, c.id);
+            let ga = MetalContext::read_buffer(&autograd::get_grad(a.id).unwrap(), m * k);
+            let gb = MetalContext::read_buffer(&autograd::get_grad(b.id).unwrap(), k * n);
+            autograd::clear_tape();
+            compute::set_simdgroup_matmul(prev);
+            (ga, gb)
+        };
+
+        let (ga_off, gb_off) = run(false);
+        let (ga_on, gb_on) = run(true);
+
+        let rel = |x: &[f32], y: &[f32]| -> f32 {
+            x.iter().zip(y).map(|(p, q)| (p - q).abs() / (1.0 + p.abs())).fold(0.0f32, f32::max)
+        };
+        let da = rel(&ga_off, &ga_on);
+        let db = rel(&gb_off, &gb_on);
+        eprintln!("backward MMA vs scalar: dA rel={da:.5}, dB rel={db:.5}");
+        assert!(ga_on.iter().all(|x| x.is_finite()) && gb_on.iter().all(|x| x.is_finite()), "MMA grads non-finite");
+        assert!(da < 5e-2, "dA gradient mismatch scalar vs MMA: {da}");
+        assert!(db < 5e-2, "dB gradient mismatch scalar vs MMA: {db}");
+    }
+
     /// The bf16 default-matmul flag gives `Tensor::matmul` fp32 RANGE: a value above the fp16 max
     /// (65504) is preserved, where the default fp16 path overflows/clamps it. And for normal-range
     /// values bf16-on agrees with the fp16 default to bf16 precision. Restores the default after.

@@ -176,7 +176,7 @@ impl TrainConfig {
             per_tensor_clip: false,
             muon_lr_scale: 1.0,
             adamw_lr_scale: 1.0,
-            simdgroup_matmul: false,
+            simdgroup_matmul: true,
             bf16_matmul: false,
             lr_ref_batch: 0,
             normuon: false,
@@ -202,11 +202,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     );
     eprintln!("Tokenizer: {}", config.tokenizer_path);
 
-    // Opt-in: route the default fp16 matmul through the hardware simdgroup MMA units (bit-identical,
-    // ~1.3× faster at 1024³ on M3). Process-global switch read inside Tensor::matmul.
+    // Hardware simdgroup MMA matmul (bit-identical, ~+31% training). ON by default; force from config
+    // so --no-simdgroup-matmul (and --bf16-matmul) override the binary-wide default-on set in main().
+    compute::set_simdgroup_matmul(config.simdgroup_matmul);
     if config.simdgroup_matmul {
-        compute::set_simdgroup_matmul(true);
-        eprintln!("Matmul: hardware simdgroup MMA fast path enabled");
+        eprintln!("Matmul: hardware simdgroup MMA fast path enabled (default; --no-simdgroup-matmul to disable)");
     } else if config.bf16_matmul {
         compute::set_bf16_matmul(true);
         eprintln!("Matmul: bf16 path enabled (fp32 range, ~7-bit mantissa — OVERFLOW-MITIGATION ONLY; \
