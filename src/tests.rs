@@ -3266,6 +3266,421 @@ mod suite {
         assert!(max_grad_err < 1e-2, "transpose_rope backward disagrees with finite differences: {max_grad_err}");
     }
 
+    // ========================================================================
+    // Phase B harness — finite-difference gradient checks for the core autograd
+    // ops. Each builds a tiny graph  loss = Σ_i op(x)_i · seed_i  (a fixed varied
+    // seed, realized on-tape as `op(x).reshape([1,n]) @ seed[n,1]`), runs the REAL
+    // `autograd::backward`, and compares dL/dx to central finite differences.
+    // This is the gate the unit suite previously lacked: a wrong analytic backward
+    // (the transposed-dB / per-column-scale / Newton-Schulz class) is caught here in
+    // CI on tiny tensors, instead of only surfacing in a full training run.
+    // ========================================================================
+
+    /// Deterministic, varied, non-zero input value for element `i`.
+    fn gc_in(i: usize) -> f32 {
+        (((i * 37 + 11) % 23) as f32) * 0.1 - 1.05
+    }
+    /// Deterministic upstream-gradient weight (dL/dout) for output element `i`.
+    fn gc_seed(i: usize) -> f32 {
+        (((i * 31 + 7) % 19) as f32) * 0.1 - 0.9
+    }
+
+    /// Central finite-difference gradient check against the real `autograd::backward`.
+    /// `inputs`: (data, shape) per input tensor (all tracked with_grad). `forward` composes
+    /// the op(s) under test on the rebuilt tensors. For each input, sampled element grads are
+    /// compared to central differences; passes if abs OR rel error is within tolerance
+    /// (fp16 paths can't hit tight abs at large magnitude; tiny grads can't hit rel).
+    fn grad_check(
+        ctx: &Arc<MetalContext>,
+        inputs: &[(Vec<f32>, Vec<usize>)],
+        forward: &dyn Fn(&[Tensor]) -> Tensor,
+        eps: f32,
+        abs_tol: f32,
+        rel_tol: f32,
+        name: &str,
+    ) {
+        // Hermetic environment: a gradient check must run on the default, precise
+        // matmul path with no stale cross-test cast cache. cargo reuses worker
+        // threads, so a prior test on this thread can leave a thread-local path
+        // flag set, or a fp16/ternary cache entry keyed to a buffer address our
+        // pool then re-hands out — either silently drifts the fp16 matmul past
+        // tolerance and fails an otherwise-correct backward only in the full
+        // parallel suite. Reset both so the check is deterministic.
+        compute::set_simdgroup_matmul(false);
+        compute::set_bf16_matmul(false);
+        Tensor::clear_f16_cache();
+
+        // --- analytic gradients via the real backward ---
+        autograd::clear_tape();
+        autograd::zero_grads();
+        let tensors: Vec<Tensor> = inputs
+            .iter()
+            .map(|(d, s)| Tensor::from_slice(ctx, d, s.clone()).with_grad())
+            .collect();
+        let ids: Vec<usize> = tensors.iter().map(|t| t.id).collect();
+        let out = forward(&tensors);
+        let n: usize = out.shape.iter().product();
+        let seed: Vec<f32> = (0..n).map(gc_seed).collect();
+        let seed_t = Tensor::from_slice(ctx, &seed, vec![n, 1]);
+        let loss = out.reshape(vec![1, n]).matmul(&seed_t);
+        autograd::backward(ctx, loss.id);
+        let analytic: Vec<Vec<f32>> = ids
+            .iter()
+            .zip(inputs)
+            .map(|(&id, (d, _))| {
+                let g = autograd::get_grad(id)
+                    .unwrap_or_else(|| panic!("grad_check {name}: no gradient reached input id {id}"));
+                Tensor::from_buffer(Arc::clone(ctx), g, vec![d.len()]).to_vec()
+            })
+            .collect();
+        autograd::clear_tape();
+        autograd::zero_grads();
+
+        // --- L(data) with grad off, for central differences ---
+        let loss_at = |all: &[Vec<f32>]| -> f32 {
+            autograd::no_grad(|| {
+                let ts: Vec<Tensor> = all
+                    .iter()
+                    .zip(inputs)
+                    .map(|(d, (_, s))| Tensor::from_slice(ctx, d, s.clone()))
+                    .collect();
+                forward(&ts)
+                    .to_vec()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v * gc_seed(i))
+                    .sum()
+            })
+        };
+
+        let base: Vec<Vec<f32>> = inputs.iter().map(|(d, _)| d.clone()).collect();
+        for (k, (d, _)) in inputs.iter().enumerate() {
+            let len = d.len();
+            let stride = (len / 5).max(1);
+            let mut i = 0;
+            while i < len {
+                let mut up = base.clone();
+                let mut dn = base.clone();
+                up[k][i] += eps;
+                dn[k][i] -= eps;
+                let fd = (loss_at(&up) - loss_at(&dn)) / (2.0 * eps);
+                let an = analytic[k][i];
+                let abs = (fd - an).abs();
+                let rel = abs / (fd.abs().max(an.abs()) + 1e-3);
+                assert!(
+                    abs <= abs_tol || rel <= rel_tol,
+                    "grad_check {name}: input[{k}][{i}] analytic={an:.5} numeric={fd:.5} \
+                     abs_err={abs:.5} (tol {abs_tol}) rel_err={rel:.5} (tol {rel_tol})"
+                );
+                i += stride;
+            }
+        }
+    }
+
+    // 2e-2 abs / 5e-2 rel: comfortably passes the fp16-accumulate matmul paths while still
+    // failing a structurally-wrong backward (those miss by >50%, not a few percent).
+    const GC_EPS: f32 = 1e-2;
+    const GC_ABS: f32 = 2e-2;
+    const GC_REL: f32 = 5e-2;
+
+    fn gc_vec(n: usize, off: usize) -> Vec<f32> {
+        (0..n).map(|i| gc_in(i + off)).collect()
+    }
+
+    #[test]
+    fn gradcheck_matmul() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 5), vec![3, 2])],
+            &|t| t[0].matmul(&t[1]), GC_EPS, GC_ABS, GC_REL, "matmul");
+    }
+
+    #[test]
+    fn gradcheck_matmul_trans_b() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 1), vec![2, 3]), (gc_vec(6, 9), vec![2, 3])],
+            &|t| t[0].matmul_trans_b(&t[1]), GC_EPS, GC_ABS, GC_REL, "matmul_trans_b");
+    }
+
+    #[test]
+    fn gradcheck_add() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 3), vec![2, 3])],
+            &|t| t[0].add(&t[1]), GC_EPS, GC_ABS, GC_REL, "add");
+    }
+
+    #[test]
+    fn gradcheck_mul() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 2), vec![2, 3]), (gc_vec(6, 7), vec![2, 3])],
+            &|t| t[0].mul(&t[1]), GC_EPS, GC_ABS, GC_REL, "mul");
+    }
+
+    #[test]
+    fn gradcheck_softmax() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 4), vec![2, 3])],
+            &|t| t[0].softmax(), GC_EPS, GC_ABS, GC_REL, "softmax");
+    }
+
+    #[test]
+    fn gradcheck_rms_norm() {
+        let ctx = test_ctx();
+        // x [2,4], weight [4]
+        grad_check(&ctx, &[(gc_vec(8, 0), vec![2, 4]), (gc_vec(4, 13), vec![4])],
+            &|t| t[0].rms_norm(&t[1], 1e-5), GC_EPS, GC_ABS, GC_REL, "rms_norm");
+    }
+
+    #[test]
+    fn gradcheck_slice_cols() {
+        let ctx = test_ctx();
+        // x [2,4] → columns [1,3)
+        grad_check(&ctx, &[(gc_vec(8, 6), vec![2, 4])],
+            &|t| t[0].slice_cols(1, 2), GC_EPS, GC_ABS, GC_REL, "slice_cols");
+    }
+
+    #[test]
+    fn gradcheck_silu() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 1), vec![2, 3])],
+            &|t| t[0].silu(), GC_EPS, GC_ABS, GC_REL, "silu");
+    }
+
+    #[test]
+    fn gradcheck_silu_gate() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 8), vec![2, 3])],
+            &|t| t[0].silu_gate(&t[1]), GC_EPS, GC_ABS, GC_REL, "silu_gate");
+    }
+
+    #[test]
+    fn gradcheck_scale() {
+        let ctx = test_ctx();
+        grad_check(&ctx, &[(gc_vec(6, 3), vec![2, 3])],
+            &|t| t[0].scale(0.7), GC_EPS, GC_ABS, GC_REL, "scale");
+    }
+
+    // ========================================================================
+    // Phase B harness — buffer-pool sanitizer (feature = "bufsan").
+    // Trains a tiny model with pooled buffers NaN-poisoned at every flush; a
+    // use-after-recycle / under-dispatch reads NaN → the loss blows up. With
+    // quarantine on, intra-batch reissue is forbidden, so a correct run is
+    // unchanged — a divergence flags reliance on intra-batch buffer aliasing.
+    // ========================================================================
+    #[cfg(feature = "bufsan")]
+    fn bufsan_train_tiny(ctx: &Arc<MetalContext>, quarantine: bool) -> Vec<f32> {
+        MetalContext::clear_pool();
+        MetalContext::set_pool_quarantine(quarantine);
+        let vocab = 48u32;
+        let cfg = ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64);
+        let model = Transformer::new(ctx, cfg);
+        let (batch, seq_len) = (1usize, 16usize);
+        let tokens: Vec<u32> = (0..16).map(|i| (i * 3 % 48) as u32).collect();
+        let targets: Vec<u32> = vec![5; 16];
+        let params = model.parameters();
+        let prefs: Vec<&Tensor> = params.to_vec();
+        let mut opt = crate::optim::Muon::new(ctx, &prefs, 0.0);
+        let mut losses = Vec::new();
+        for step in 0..14 {
+            let logits = model.forward(&tokens, batch, seq_len, None, false);
+            let (loss, _) = crate::loss::cross_entropy_loss(ctx, &logits, &targets);
+            losses.push(loss.to_vec()[0]);
+            autograd::backward(ctx, loss.id);
+            autograd::clear_tape_keep_grads();
+            crate::train::clip_gradients(ctx, &model, 1.0);
+            opt.step(1e-2 * (((step + 1) as f32) / 8.0).min(1.0));
+            autograd::zero_grads_recycle();
+        }
+        autograd::clear_tape();
+        autograd::zero_grads();
+        MetalContext::set_pool_quarantine(false);
+        losses
+    }
+
+    #[cfg(feature = "bufsan")]
+    #[test]
+    fn bufsan_training_stays_finite_under_poison() {
+        let ctx = test_ctx();
+        let losses = bufsan_train_tiny(&ctx, false);
+        for (s, l) in losses.iter().enumerate() {
+            assert!(l.is_finite(), "bufsan poison surfaced a non-finite loss at step {s}: {l} — \
+                a recycled buffer was read before being overwritten (use-after-recycle / under-dispatch)");
+        }
+        assert!(*losses.last().unwrap() < 30.0, "bufsan run diverged: {losses:?}");
+    }
+
+    #[cfg(feature = "bufsan")]
+    #[test]
+    fn bufsan_quarantine_matches_default() {
+        let ctx = test_ctx();
+        let off = bufsan_train_tiny(&ctx, false);
+        let on = bufsan_train_tiny(&ctx, true);
+        let (lo, ln) = (*off.last().unwrap(), *on.last().unwrap());
+        assert!(lo.is_finite() && ln.is_finite(), "non-finite final loss off={lo} on={ln}");
+        let rel = (lo - ln).abs() / lo.abs().max(1.0);
+        assert!(
+            rel < 0.20,
+            "quarantine changed the run materially (off={lo} on={ln}, rel={rel:.3}) — \
+             indicates reliance on intra-batch buffer aliasing (the loss-readout-class hazard)"
+        );
+    }
+
+    // ========================================================================
+    // Phase B harness — golden tests vs an independent CPU reference. Pins the
+    // hand-written Metal forward kernels to known-correct output (catches the
+    // wrong-transpose / under-dispatch / per-column-scale class on the forward
+    // side, which finite-diff grad checks alone don't see).
+    // ========================================================================
+    fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut o = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for p in 0..k {
+                    s += a[i * k + p] * b[p * n + j];
+                }
+                o[i * n + j] = s;
+            }
+        }
+        o
+    }
+    fn cpu_matmul_trans_b(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        // a[m,k], b[n,k] → a · bᵀ  [m,n]
+        let mut o = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for p in 0..k {
+                    s += a[i * k + p] * b[j * k + p];
+                }
+                o[i * n + j] = s;
+            }
+        }
+        o
+    }
+    fn cpu_softmax_rows(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut o = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let row = &x[r * cols..(r + 1) * cols];
+            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for (c, &v) in row.iter().enumerate() {
+                let e = (v - mx).exp();
+                o[r * cols + c] = e;
+                sum += e;
+            }
+            for c in 0..cols {
+                o[r * cols + c] /= sum;
+            }
+        }
+        o
+    }
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn golden_matmul_precise() {
+        let ctx = test_ctx();
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let a: Vec<f32> = (0..m * k).map(gc_in).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| gc_in(i + 5)).collect();
+        let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
+        let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
+        let got = autograd::no_grad(|| at.matmul_precise(&bt).to_vec());
+        let d = max_abs_diff(&got, &cpu_matmul(&a, &b, m, k, n));
+        assert!(d < 1e-3, "matmul_precise (fp32) vs CPU: max abs diff {d}");
+    }
+
+    #[test]
+    fn golden_matmul_fp16_default() {
+        // The default fp16-input/fp32-accumulate path used in training. Looser tol, but a
+        // structural error (wrong index, under-dispatch) misses by orders of magnitude.
+        let ctx = test_ctx();
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let a: Vec<f32> = (0..m * k).map(gc_in).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| gc_in(i + 5)).collect();
+        let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
+        let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
+        let got = autograd::no_grad(|| at.matmul(&bt).to_vec());
+        let d = max_abs_diff(&got, &cpu_matmul(&a, &b, m, k, n));
+        assert!(d < 3e-2, "matmul (fp16) vs CPU: max abs diff {d}");
+    }
+
+    #[test]
+    fn golden_matmul_trans_b() {
+        let ctx = test_ctx();
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let a: Vec<f32> = (0..m * k).map(gc_in).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| gc_in(i + 9)).collect(); // [n,k]
+        let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
+        let bt = Tensor::from_slice(&ctx, &b, vec![n, k]);
+        let got = autograd::no_grad(|| at.matmul_trans_b(&bt).to_vec());
+        let d = max_abs_diff(&got, &cpu_matmul_trans_b(&a, &b, m, k, n));
+        assert!(d < 3e-2, "matmul_trans_b vs CPU: max abs diff {d}");
+    }
+
+    #[test]
+    fn golden_softmax() {
+        let ctx = test_ctx();
+        let (r, c) = (3usize, 5usize);
+        let x: Vec<f32> = (0..r * c).map(|i| gc_in(i + 2)).collect();
+        let xt = Tensor::from_slice(&ctx, &x, vec![r, c]);
+        let got = autograd::no_grad(|| xt.softmax().to_vec());
+        let d = max_abs_diff(&got, &cpu_softmax_rows(&x, r, c));
+        assert!(d < 2e-3, "softmax vs CPU row-softmax: max abs diff {d}");
+    }
+
+    /// Locks the BitNet fix (§6): `ternary_matmul` must scale output column j by `absmean[j]`,
+    /// not by the global `absmean[0]`. Drives the same ternary kernels, then applies the
+    /// per-column scale on the CPU. W is built so per-column absmean genuinely differs, so a
+    /// regression to a single global scale fails for every column but the first.
+    #[test]
+    fn golden_ternary_matmul_per_column_scale() {
+        let ctx = test_ctx();
+        let (m, k, n) = (2usize, 32usize, 3usize);
+        let x: Vec<f32> = (0..m * k).map(gc_in).collect();
+        // column c scaled by (c+1) → column absmean grows with c.
+        let mut w = vec![0.0f32; k * n];
+        for r in 0..k {
+            for c in 0..n {
+                w[r * n + c] = gc_in(r * n + c + 3) * ((c + 1) as f32);
+            }
+        }
+        let xt = Tensor::from_slice(&ctx, &x, vec![m, k]);
+        let wt = Tensor::from_slice(&ctx, &w, vec![k, n]);
+
+        // Reproduce the framework's ternary pipeline, but read raw product + per-col absmean out.
+        let packed_rows = k.div_ceil(16);
+        let absmean = ctx.alloc_buffer(n * 4);
+        compute::gpu_ternary_absmean(&ctx, &wt.buffer, &absmean, k as u32, n as u32);
+        let packed = ctx.alloc_buffer(packed_rows * n * 4);
+        compute::gpu_ternary_pack(&ctx, &wt.buffer, &absmean, &packed, k as u32, n as u32);
+        let raw = ctx.alloc_buffer(m * n * 4);
+        compute::gpu_ternary_matmul(&ctx, &xt.buffer, &packed, &raw, m as u32, n as u32, k as u32);
+        ctx.wait_gpu();
+        let absmean_v = MetalContext::read_buffer(&absmean, n);
+        let raw_v = MetalContext::read_buffer(&raw, m * n);
+
+        let spread = absmean_v.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - absmean_v.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(spread > 1e-3, "test setup: per-column absmean must differ, got {absmean_v:?}");
+
+        let mut want = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                want[i * n + j] = raw_v[i * n + j] * absmean_v[j];
+            }
+        }
+        let got = autograd::no_grad(|| xt.ternary_matmul(&wt).to_vec());
+        let d = max_abs_diff(&got, &want);
+        assert!(
+            d < 1e-3,
+            "ternary_matmul per-column scale vs reference: max abs diff {d}\n absmean={absmean_v:?}"
+        );
+        autograd::clear_tape();
+        autograd::zero_grads();
+    }
+
     /// End-to-end integration of linear (O(N) kernel) attention in the real Transformer:
     ///   * forward through every layer produces finite logits of the right shape,
     ///   * the backward pass differentiates the linear-attention path (finite grad reaches w_q),

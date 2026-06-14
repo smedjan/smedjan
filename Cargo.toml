@@ -9,6 +9,10 @@ default = ["metal"]
 metal = ["objc2", "objc2-foundation", "objc2-metal"]
 cuda = ["cudarc"]
 andreos = []  # Zero dependencies — direct hardware access
+# Buffer-pool sanitizer (debug/CI only; zero overhead when off). Poisons recycled buffers
+# at flush time and can quarantine intra-batch reissue — surfaces use-after-recycle / under-
+# dispatch hazards as NaN/divergence instead of silent corruption in a real run.
+bufsan = []
 
 [dependencies]
 # Metal backend (macOS/Apple Silicon)

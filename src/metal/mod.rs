@@ -37,6 +37,67 @@ thread_local! {
     static POOL_BYPASS: Cell<usize> = const { Cell::new(0) };
 }
 
+// ---------------------------------------------------------------------------
+// Buffer-pool sanitizer (feature = "bufsan"). Compiles to nothing when off.
+//
+// The hazard (see docs/HANDOFF_buffer_hazard_and_followups.md §1): the pool reissues a
+// buffer the instant it is recycled, but dispatch_kernel only ENCODES into the active
+// command batch — nothing runs until flush. A buffer recycled-then-reissued within one
+// uncommitted batch gets a new owner whose write clobbers data the old owner still needs.
+//
+// Two instruments, both keyed off a per-flush generation counter:
+//   * POISON: a buffer recycled in generation G is only provably dead once G has been
+//     flushed (commit+wait). So we NaN-fill pooled buffers at FLUSH time (never at recycle
+//     time — that would corrupt reads still legitimately pending in the current batch). A
+//     later read-before-overwrite (use-after-recycle) or a too-small dispatch then surfaces
+//     as NaN instead of silently-wrong data.
+//   * QUARANTINE (opt-in): alloc may only reissue a buffer whose recycle-generation is
+//     strictly less than the current generation, i.e. recycled in an already-flushed batch.
+//     This makes intra-batch recycle→reissue aliasing impossible by construction — the exact
+//     loss-readout-class failure. Used as a differential: a correct run is unchanged by it.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "bufsan")]
+thread_local! {
+    /// Bumped on every flush (commit+wait). Marks command-batch boundaries.
+    static BATCH_GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// buffer address → generation at which it was recycled.
+    static RECYCLE_GEN: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
+    /// When true, alloc reissues only flushed-generation buffers (no intra-batch reuse).
+    static BUFSAN_QUARANTINE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(feature = "bufsan")]
+#[inline]
+fn bufsan_addr(buf: &GpuBuffer) -> usize {
+    use objc2_metal::MTLBuffer;
+    buf.contents().as_ptr() as usize
+}
+
+/// Called at the end of every flush, AFTER waitUntilCompleted. Bumps the generation and
+/// NaN-poisons every pooled buffer (all are now from flushed generations → provably dead).
+#[cfg(feature = "bufsan")]
+fn bufsan_on_flush() {
+    use objc2_metal::MTLBuffer;
+    BATCH_GENERATION.with(|g| g.set(g.get() + 1));
+    let nan = f32::from_bits(0x7FC0_0000);
+    BUFFER_POOL.with(|pool| {
+        let p = pool.borrow();
+        for bufs in p.values() {
+            for b in bufs {
+                let n = b.length() / 4;
+                let ptr = b.contents().as_ptr() as *mut f32;
+                // SAFETY: shared-storage buffer; it is in the free pool (no live tensor owns
+                // it) and its last GPU use completed at the wait that just returned.
+                unsafe {
+                    for i in 0..n {
+                        *ptr.add(i) = nan;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// RAII guard that bypasses the buffer pool while alive (used during checkpoint recompute).
 pub struct PoolBypassGuard;
 
@@ -260,7 +321,31 @@ impl MetalContext {
             BUFFER_POOL.with(|pool| {
                 let mut p = pool.borrow_mut();
                 if let Some(list) = p.get_mut(&size_bytes) {
+                    // Sanitizer quarantine: reissue only a buffer recycled in an already-flushed
+                    // generation, so a buffer recycled in THIS batch can't be handed back out and
+                    // overwritten while the old owner still needs it.
+                    #[cfg(feature = "bufsan")]
+                    if BUFSAN_QUARANTINE.with(|q| q.get()) {
+                        let cur = BATCH_GENERATION.with(|g| g.get());
+                        let pick = RECYCLE_GEN.with(|rg| {
+                            let rg = rg.borrow();
+                            list.iter().position(|b| {
+                                rg.get(&bufsan_addr(b)).copied().is_none_or(|g| g < cur)
+                            })
+                        });
+                        return match pick {
+                            Some(i) => {
+                                let buf = list.remove(i);
+                                RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&bufsan_addr(&buf)); });
+                                POOL_STATS.with(|s| s.borrow_mut().0 += 1);
+                                Some(buf)
+                            }
+                            None => None, // all same-generation → force a fresh allocation
+                        };
+                    }
                     if let Some(buf) = list.pop() {
+                        #[cfg(feature = "bufsan")]
+                        RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&bufsan_addr(&buf)); });
                         POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                         return Some(buf);
                     }
@@ -296,6 +381,8 @@ impl MetalContext {
             return;
         }
         let size = buf.length();
+        #[cfg(feature = "bufsan")]
+        let addr = bufsan_addr(&buf);
         BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             let list = p.entry(size).or_default();
@@ -303,6 +390,13 @@ impl MetalContext {
             // 64 allows gradient-checkpointed backward to find reusable buffers
             // across layer recomputes (was 32, causing ~63% miss rate).
             if list.len() < 64 {
+                #[cfg(feature = "bufsan")]
+                {
+                    let gen = BATCH_GENERATION.with(|g| g.get());
+                    RECYCLE_GEN.with(|rg| {
+                        rg.borrow_mut().insert(addr, gen);
+                    });
+                }
                 list.push(buf);
             }
         });
@@ -340,6 +434,26 @@ impl MetalContext {
     pub fn clear_pool() {
         BUFFER_POOL.with(|pool| pool.borrow_mut().clear());
         POOL_STATS.with(|s| *s.borrow_mut() = (0, 0));
+        #[cfg(feature = "bufsan")]
+        {
+            RECYCLE_GEN.with(|rg| rg.borrow_mut().clear());
+            BATCH_GENERATION.with(|g| g.set(0));
+        }
+    }
+
+    /// Sanitizer (feature = "bufsan"): enable/disable buffer-pool quarantine. When on, alloc
+    /// reissues only buffers recycled in an already-flushed generation, eliminating intra-batch
+    /// recycle→reissue aliasing. A correct run is byte-unchanged by it; a use-after-recycle path
+    /// behaves differently — use as a differential.
+    #[cfg(feature = "bufsan")]
+    pub fn set_pool_quarantine(on: bool) {
+        BUFSAN_QUARANTINE.with(|q| q.set(on));
+    }
+
+    /// Sanitizer (feature = "bufsan"): current command-batch generation (flush count).
+    #[cfg(feature = "bufsan")]
+    pub fn pool_generation() -> u64 {
+        BATCH_GENERATION.with(|g| g.get())
     }
 
     /// Return total bytes cached in the buffer pool and the number of buffers.
@@ -360,7 +474,7 @@ impl MetalContext {
     pub fn buffer_from_slice(&self, data: &[f32]) -> Retained<GpuBuffer> {
         let byte_len = std::mem::size_of_val(data);
         let ptr = NonNull::new(data.as_ptr() as *mut c_void).unwrap();
-        unsafe {
+        let buf = unsafe {
             self.device
                 .newBufferWithBytes_length_options(
                     ptr,
@@ -368,7 +482,15 @@ impl MetalContext {
                     MTLResourceOptions::StorageModeShared,
                 )
                 .expect("Failed to create buffer from slice")
-        }
+        };
+        // Same staleness hazard as alloc_buffer: this fresh buffer may reuse the address of a
+        // just-freed buffer whose fp16/ternary conversion is still cached. Drop any stale entry
+        // so a later cast_to_f16/ternary on this address can't return a false hit. (Surfaced by
+        // the grad-check harness: a perturbed from_slice input was silently ignored by a cached
+        // fp16 cast → numeric gradient of exactly 0.)
+        use objc2_metal::MTLBuffer;
+        crate::tensor::Tensor::invalidate_conversion_cache(buf.contents().as_ptr() as usize);
+        buf
     }
 
     /// Write u32 data into an existing buffer (shared memory, zero-copy).
@@ -448,16 +570,24 @@ impl MetalContext {
     /// Called before any GPU→CPU data read to ensure coherence.
     /// The batch is restarted so subsequent kernel dispatches continue batching.
     fn auto_flush_batch() {
-        ACTIVE_BATCH.with(|batch| {
+        let flushed = ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(cb) = b.take() {
                 if cb.dispatch_count > 0 {
                     cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
+                    return true;
                 }
             }
+            false
         });
+        #[cfg(feature = "bufsan")]
+        if flushed {
+            bufsan_on_flush();
+        }
+        #[cfg(not(feature = "bufsan"))]
+        let _ = flushed;
     }
 
     /// Get a pipeline by name, panics if not found.
@@ -486,26 +616,35 @@ impl MetalContext {
     /// creation overhead (~300μs) across all dispatches instead of per-dispatch.
     /// Call `flush_batch()` when you need results.
     pub fn begin_batch(&self) {
-        ACTIVE_BATCH.with(|batch| {
+        let flushed = ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             // If a batch is already active, flush it first
+            let mut did = false;
             if let Some(cb) = b.take() {
                 if cb.dispatch_count > 0 {
                     cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
+                    did = true;
                 }
             }
             let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
             let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
             *b = Some(CommandBatch { cmd, encoder, dispatch_count: 0 });
+            did
         });
+        #[cfg(feature = "bufsan")]
+        if flushed {
+            bufsan_on_flush();
+        }
+        #[cfg(not(feature = "bufsan"))]
+        let _ = flushed;
     }
 
     /// Flush the current command batch: end encoder, commit, and wait for GPU completion.
     /// Returns the number of kernels that were batched.
     pub fn flush_batch(&self) -> usize {
-        ACTIVE_BATCH.with(|batch| {
+        let count = ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(cb) = b.take() {
                 if cb.dispatch_count > 0 {
@@ -517,7 +656,12 @@ impl MetalContext {
             } else {
                 0
             }
-        })
+        });
+        #[cfg(feature = "bufsan")]
+        if count > 0 {
+            bufsan_on_flush();
+        }
+        count
     }
 
     /// Flush without waiting — commit the command buffer but don't block.
