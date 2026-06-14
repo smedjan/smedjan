@@ -2649,6 +2649,30 @@ mod suite {
         assert!(db < 5e-2, "dB gradient mismatch scalar vs MMA: {db}");
     }
 
+    /// Backward MMA (batched): the simdgroup batched trans_a (attention dK/dV + block-sparse gather
+    /// backward) must match the scalar batched trans_a. Non-square K≠N + batch>1 catches the
+    /// {M,K,N,batch} param-order bug (a K/N swap is silently correct only when K==N).
+    #[test]
+    fn batched_matmul_simdgroup_trans_a_matches_scalar() {
+        let ctx = test_ctx();
+        let prev = compute::set_simdgroup_matmul(false);
+        let (batch, m, k, n) = (3usize, 20usize, 44usize, 28usize); // M=contraction, out [K,N], K≠N
+        let a = Tensor::randn(&ctx, vec![batch, m, k], 0.3); // [batch, M, K]
+        let b = Tensor::randn(&ctx, vec![batch, m, n], 0.3); // [batch, M, N]
+        let out_sg = ctx.alloc_buffer(batch * k * n * 4);
+        let out_ref = ctx.alloc_buffer(batch * k * n * 4);
+        let dims = compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 };
+        compute::gpu_batched_matmul_trans_a_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, dims);
+        compute::gpu_batched_matmul_trans_a(&ctx, &a.buffer, &b.buffer, &out_ref, dims);
+        let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![batch, k, n]).to_vec();
+        let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![batch, k, n]).to_vec();
+        let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("batched simdgroup_trans_a vs scalar [b{batch} {m}x{k}x{n}]: max_diff={max_diff:.5}");
+        assert!(sg.iter().all(|x| x.is_finite()), "batched trans_a simdgroup non-finite");
+        assert!(max_diff < 2e-2, "batched trans_a simdgroup disagrees: {max_diff}");
+        compute::set_simdgroup_matmul(prev);
+    }
+
     /// The bf16 default-matmul flag gives `Tensor::matmul` fp32 RANGE: a value above the fp16 max
     /// (65504) is preserved, where the default fp16 path overflows/clamps it. And for normal-range
     /// values bf16-on agrees with the fp16 default to bf16 precision. Restores the default after.

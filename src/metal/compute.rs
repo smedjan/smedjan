@@ -400,6 +400,9 @@ pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b:
 /// Batched C[b] = A[b] @ B[b] for all b in [0, batch). Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, K, N], C: [batch, M, N]
 pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    if simdgroup_matmul_enabled() {
+        return gpu_batched_matmul_simdgroup(ctx, a, b, c, d);
+    }
     let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
@@ -444,9 +447,26 @@ pub fn gpu_batched_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuff
     dispatch_sync!(ctx, "batched_matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
+/// Batched simdgroup matmul with A transposed: C[b] = A[b]ᵀ @ B[b]. A:[batch,M,K], B:[batch,M,N],
+/// C:[batch,K,N]; contraction over M. Fast backward drop-in for gpu_batched_matmul_trans_a.
+pub fn gpu_batched_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    #[repr(C)]
+    struct Params { m: u32, k: u32, n: u32, batch: u32 }
+    let params = Params { m, k, n, batch };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (k as u64).div_ceil(tile), batch as u64);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "batched_matmul_simdgroup_trans_a", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 /// Batched C[b] = A[b] @ B[b]^T for all b. Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, N, K], C: [batch, M, N]
 pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    if simdgroup_matmul_enabled() {
+        return gpu_batched_matmul_trans_b_simdgroup(ctx, a, b, c, d);
+    }
     let BatchedDims { batch, m, n, k } = d;
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32, batch: u32 }
@@ -501,6 +521,9 @@ pub fn gpu_batched_matmul_gqa(
 /// Batched C[b] = A[b]^T @ B[b] for all b. Single GPU dispatch.
 /// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
 pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    if simdgroup_matmul_enabled() {
+        return gpu_batched_matmul_trans_a_simdgroup(ctx, a, b, c, d);
+    }
     let BatchedDims { batch, m, n, k } = d;
     // Kernel struct is `{ M, K, N, batch }` (M=contraction, output is [K,N]). Field order MUST match —
     // a prior `{ m, n, k, batch }` swapped K/N, which is silently correct only when K==N (all square
