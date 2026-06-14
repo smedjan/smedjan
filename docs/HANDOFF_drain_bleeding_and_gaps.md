@@ -93,11 +93,11 @@ Land order (ROI, from §6/§7 of the buffer-hazard handoff):
 | Gap | Where it's specced | Notes |
 |---|---|---|
 | **Seq-packing model integration** | `HANDOFF_buffer_hazard…` §2 | Op-level packing exists; model-integration reverted once (buffer hazard). Re-land **behind Phase B's sanitizer**. |
-| **Block-sparse trainable backward** | §3 | Needs a new **scatter-add** Metal kernel. Forward (gather) already landed. |
+| **Block-sparse trainable backward** | §3 | ✅ LANDED — scatter-add kernel + `Op::GatherBlocks`, grad-checked; fixed a latent non-square `batched_matmul_trans_a` param-swap. |
 | **Delete GaLore** | §6 / §7 #2 | Dead code that panics at `--galore-rank>0`; field moved to SCALE (arXiv 2506.16659). Remove code + any stale claim, or target SCALE — do **not** build GaLore. |
 | **Chunked O(N) SSM/RWKV forward** | §7 #4 | Currently materialized; throughput, not correctness. |
 | **MLA absorbed-form decode** | §7 #3 | Incremental decode done; absorbed form is the high-value compute follow-up. |
-| **Flash Attention** | `ROADMAP.md` Phase 1 | Highest throughput lever (2× seq=256, 4×+ seq=1024); tiled fwd+bwd kernels, then CUDA port. |
+| **Flash Attention** | `ROADMAP.md` Phase 1 | Tiled fwd+bwd kernels existed but were UNVERIFIED (only a constructability test). ✅ Now grad-checked + dense-equivalence tested — which caught & fixed a **partial-last-q-block** bug: out-of-range query threads returned before the cooperative K/V tile load, leaving `K/V_shared` unloaded → wrong out+grad for any seq_q not a multiple of 32 with >1 q-block (fwd+bwd both fixed). CUDA port still pending. |
 | **CUDA backward stubs** | closure table | Metal is the source of truth; CUDA backward is incomplete. Only if CUDA targets matter. |
 
 Each needs Metal hardware to implement + verify — by design these were **specced, not

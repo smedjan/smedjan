@@ -4128,11 +4128,14 @@ kernel void flash_attention_forward(
     threadgroup half K_shared[FA_BC][128]; // max head_dim=128
     threadgroup half V_shared[FA_BC][128];
 
-    // Each thread handles one query row within the block
+    // Each thread handles one query row within the block. Threads whose query row is past the end
+    // of a PARTIAL last block are inactive for the per-query math — but they must STILL participate in
+    // the cooperative K/V tile load and hit every threadgroup_barrier (Metal requires barriers in
+    // uniform control flow; an early `return` here left K/V_shared rows unloaded for the surviving
+    // rows of a non-first partial block → wrong output, only for seq_q not a multiple of FA_BR).
     uint local_q = thread_index;  // 0..FA_BR-1
     uint global_q = q_start + local_q;
-
-    if (global_q >= seq_q) return;
+    bool active = (global_q < seq_q);
 
     // Per-query state for online softmax
     float row_max = -INFINITY;
@@ -4142,10 +4145,12 @@ kernel void flash_attention_forward(
     float o_acc[128];
     for (uint i = 0; i < d; i++) o_acc[i] = 0.0f;
 
-    // Load query row into registers (float for precision)
+    // Load query row into registers (float for precision) — active threads only (OOB Q read otherwise)
     float q_row[128];
-    for (uint i = 0; i < d; i++) {
-        q_row[i] = Q_bh[global_q * d + i];
+    if (active) {
+        for (uint i = 0; i < d; i++) {
+            q_row[i] = Q_bh[global_q * d + i];
+        }
     }
 
     // Iterate over key/value blocks
@@ -4153,7 +4158,7 @@ kernel void flash_attention_forward(
         uint k_end = min(k_start + FA_BC, seq_k);
         uint tile_len = k_end - k_start;
 
-        // === COOPERATIVE TILE LOAD: all 32 threads load K/V into shared memory ===
+        // === COOPERATIVE TILE LOAD: ALL 32 threads load K/V into shared memory (incl. inactive ones) ===
         // Each thread loads tile_len/32 rows (or 1 row for tile_len <= 32)
         for (uint j = thread_index; j < tile_len; j += FA_BR) {
             uint global_k = k_start + j;
@@ -4171,51 +4176,54 @@ kernel void flash_attention_forward(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // === COMPUTE: each thread computes scores from shared memory ===
-        float s_vals[FA_BC];
-        float block_max = -INFINITY;
+        // === COMPUTE: each ACTIVE thread computes scores from shared memory ===
+        if (active) {
+            float s_vals[FA_BC];
+            float block_max = -INFINITY;
 
-        for (uint j = 0; j < tile_len; j++) {
-            uint global_k = k_start + j;
-            if (global_k > global_q + kv_offset) {
-                s_vals[j] = -INFINITY;
-                continue;
+            for (uint j = 0; j < tile_len; j++) {
+                uint global_k = k_start + j;
+                if (global_k > global_q + kv_offset) {
+                    s_vals[j] = -INFINITY;
+                    continue;
+                }
+                // Dot product from shared memory (half → float accumulate)
+                float dot = 0.0f;
+                for (uint i = 0; i < d; i++) {
+                    dot += q_row[i] * (float)K_shared[j][i];
+                }
+                s_vals[j] = dot * scale;
+                block_max = max(block_max, s_vals[j]);
             }
-            // Dot product from shared memory (half → float accumulate)
-            float dot = 0.0f;
-            for (uint i = 0; i < d; i++) {
-                dot += q_row[i] * (float)K_shared[j][i];
+
+            // Online softmax update
+            float new_max = max(row_max, block_max);
+            float old_correction = exp(row_max - new_max);
+            float new_sum = old_correction * row_sum;
+            for (uint i = 0; i < d; i++) o_acc[i] *= old_correction;
+
+            // Accumulate output from V shared memory
+            for (uint j = 0; j < tile_len; j++) {
+                float p = exp(s_vals[j] - new_max);
+                new_sum += p;
+                for (uint i = 0; i < d; i++) {
+                    o_acc[i] += p * (float)V_shared[j][i];
+                }
             }
-            s_vals[j] = dot * scale;
-            block_max = max(block_max, s_vals[j]);
+
+            row_max = new_max;
+            row_sum = new_sum;
         }
-        for (uint j = tile_len; j < FA_BC; j++) s_vals[j] = -INFINITY;
-
-        // Online softmax update
-        float new_max = max(row_max, block_max);
-        float old_correction = exp(row_max - new_max);
-        float new_sum = old_correction * row_sum;
-        for (uint i = 0; i < d; i++) o_acc[i] *= old_correction;
-
-        // Accumulate output from V shared memory
-        for (uint j = 0; j < tile_len; j++) {
-            float p = exp(s_vals[j] - new_max);
-            new_sum += p;
-            for (uint i = 0; i < d; i++) {
-                o_acc[i] += p * (float)V_shared[j][i];
-            }
-        }
-
-        row_max = new_max;
-        row_sum = new_sum;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Final normalization
-    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-    for (uint i = 0; i < d; i++) {
-        O_bh[global_q * d + i] = o_acc[i] * inv_sum;
+    // Final normalization — active threads only
+    if (active) {
+        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        for (uint i = 0; i < d; i++) {
+            O_bh[global_q * d + i] = o_acc[i] * inv_sum;
+        }
     }
 }
 "#;
@@ -4284,13 +4292,17 @@ kernel void flash_attention_backward(
     uint local_q = thread_index;
     uint global_q = q_start + local_q;
 
-    if (bh >= params.batch_heads || global_q >= params.seq_q) return;
+    // `bh >= batch_heads` is uniform across the threadgroup (bh = group_id.x) → safe early return.
+    // `global_q >= seq_q` is PER-THREAD: inactive threads must still cooperate in the K/V tile loads
+    // and hit every barrier (same partial-last-q-block hazard as the forward), so it becomes a flag.
+    if (bh >= params.batch_heads) return;
 
     uint seq_q = params.seq_q;
     uint seq_k = params.seq_k;
     uint d = params.head_dim;
     float scale = params.scale;
     uint kv_offset = params.kv_offset;
+    bool active = (global_q < seq_q);
 
     device const float* Q_bh = Q + bh * seq_q * d;
     device const float* K_bh = K + bh * seq_k * d;
@@ -4305,13 +4317,16 @@ kernel void flash_attention_backward(
     threadgroup half K_shared[32][128];
     threadgroup half V_shared[32][128];
 
-    // Load query row and dO row into registers
+    // Load query row and dO row into registers (active threads only — OOB read otherwise)
     float q_row[128], do_row[128];
-    for (uint i = 0; i < d; i++) {
-        q_row[i] = Q_bh[global_q * d + i];
-        do_row[i] = dO_bh[global_q * d + i];
+    float d_val = 0.0f;
+    if (active) {
+        for (uint i = 0; i < d; i++) {
+            q_row[i] = Q_bh[global_q * d + i];
+            do_row[i] = dO_bh[global_q * d + i];
+        }
+        d_val = D_bh[global_q];
     }
-    float d_val = D_bh[global_q];
 
     float dq_acc[128];
     for (uint i = 0; i < d; i++) dq_acc[i] = 0.0f;
@@ -4324,22 +4339,24 @@ kernel void flash_attention_backward(
         uint k_end = min(k_start + 32u, seq_k);
         uint tile_len = k_end - k_start;
 
-        // Cooperative K tile load
+        // Cooperative K tile load — ALL threads (incl. inactive) participate
         for (uint j = thread_index; j < tile_len; j += 32) {
             for (uint i = 0; i < d; i++)
                 K_shared[j][i] = (half)K_bh[(k_start + j) * d + i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint j = 0; j < tile_len; j++) {
-            uint gk = k_start + j;
-            if (gk > global_q + kv_offset) continue;
-            float dot = 0.0f;
-            for (uint i = 0; i < d; i++) dot += q_row[i] * (float)K_shared[j][i];
-            float s = dot * scale;
-            float new_max = max(row_max, s);
-            row_sum = row_sum * exp(row_max - new_max) + exp(s - new_max);
-            row_max = new_max;
+        if (active) {
+            for (uint j = 0; j < tile_len; j++) {
+                uint gk = k_start + j;
+                if (gk > global_q + kv_offset) continue;
+                float dot = 0.0f;
+                for (uint i = 0; i < d; i++) dot += q_row[i] * (float)K_shared[j][i];
+                float s = dot * scale;
+                float new_max = max(row_max, s);
+                row_sum = row_sum * exp(row_max - new_max) + exp(s - new_max);
+                row_max = new_max;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -4351,7 +4368,7 @@ kernel void flash_attention_backward(
         uint k_end = min(k_start + 32u, seq_k);
         uint tile_len = k_end - k_start;
 
-        // Cooperative K/V tile load
+        // Cooperative K/V tile load — ALL threads (incl. inactive) participate
         for (uint j = thread_index; j < tile_len; j += 32) {
             for (uint i = 0; i < d; i++) {
                 K_shared[j][i] = (half)K_bh[(k_start + j) * d + i];
@@ -4360,35 +4377,39 @@ kernel void flash_attention_backward(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint j = 0; j < tile_len; j++) {
-            uint gk = k_start + j;
-            if (gk > global_q + kv_offset) continue;
+        if (active) {
+            for (uint j = 0; j < tile_len; j++) {
+                uint gk = k_start + j;
+                if (gk > global_q + kv_offset) continue;
 
-            float dot = 0.0f;
-            for (uint i = 0; i < d; i++) dot += q_row[i] * (float)K_shared[j][i];
-            float s = dot * scale;
-            float p = exp(s - row_max) * inv_sum;
+                float dot = 0.0f;
+                for (uint i = 0; i < d; i++) dot += q_row[i] * (float)K_shared[j][i];
+                float s = dot * scale;
+                float p = exp(s - row_max) * inv_sum;
 
-            float dov = 0.0f;
-            for (uint i = 0; i < d; i++) dov += do_row[i] * (float)V_shared[j][i];
-            float ds = p * (dov - d_val) * scale;
+                float dov = 0.0f;
+                for (uint i = 0; i < d; i++) dov += do_row[i] * (float)V_shared[j][i];
+                float ds = p * (dov - d_val) * scale;
 
-            // dQ (thread-local, no race)
-            for (uint i = 0; i < d; i++) dq_acc[i] += ds * (float)K_shared[j][i];
+                // dQ (thread-local, no race)
+                for (uint i = 0; i < d; i++) dq_acc[i] += ds * (float)K_shared[j][i];
 
-            // dK, dV — multiple Q threads accumulate to the same K/V position.
-            // Atomic adds prevent data races between threads in the threadgroup.
-            for (uint i = 0; i < d; i++) {
-                atomic_fetch_add_explicit((device atomic_float*)&dK_bh[gk * d + i], ds * q_row[i], memory_order_relaxed);
-                atomic_fetch_add_explicit((device atomic_float*)&dV_bh[gk * d + i], p * do_row[i], memory_order_relaxed);
+                // dK, dV — multiple Q threads accumulate to the same K/V position.
+                // Atomic adds prevent data races between threads in the threadgroup.
+                for (uint i = 0; i < d; i++) {
+                    atomic_fetch_add_explicit((device atomic_float*)&dK_bh[gk * d + i], ds * q_row[i], memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_float*)&dV_bh[gk * d + i], p * do_row[i], memory_order_relaxed);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write dQ
-    for (uint i = 0; i < d; i++) {
-        dQ_bh[global_q * d + i] = dq_acc[i];
+    // Write dQ — active threads only
+    if (active) {
+        for (uint i = 0; i < d; i++) {
+            dQ_bh[global_q * d + i] = dq_acc[i];
+        }
     }
 }
 "#;

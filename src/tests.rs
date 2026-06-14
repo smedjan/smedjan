@@ -1703,6 +1703,100 @@ mod suite {
         };
     }
 
+    /// Run the Flash-Attention forward kernel and record `Op::FlashAttention` (mirrors the seq≥2048
+    /// path in `MultiHeadAttention::forward`) so the fused forward+backward can be exercised at small,
+    /// cross-tile sizes the production gate never reaches. q/k/v: [bh, seq, hd]; causal, kv_offset=0.
+    fn flash_fwd_recorded(ctx: &Arc<MetalContext>, q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
+        let (bh, seq, hd) = (q.shape[0], q.shape[1], q.shape[2]);
+        let out_buf = ctx.alloc_buffer(bh * seq * hd * 4);
+        compute::gpu_flash_attention_forward(ctx, &q.buffer, &k.buffer, &v.buffer, &out_buf,
+            compute::FlashDims { batch_heads: bh as u32, seq_q: seq as u32, seq_k: seq as u32, head_dim: hd as u32, kv_offset: 0 });
+        let out = Tensor::from_buffer(Arc::clone(ctx), out_buf.clone(), vec![bh, seq, hd]);
+        if autograd::is_recording() {
+            autograd::record(autograd::TapeEntry {
+                op: autograd::Op::FlashAttention { batch_heads: bh, seq_q: seq, seq_k: seq, head_dim: hd, kv_offset: 0 },
+                inputs: vec![q.id, k.id, v.id],
+                output: out.id,
+                input_buffers: vec![q.buffer.clone(), k.buffer.clone(), v.buffer.clone()],
+                output_buffer: out_buf.clone(),
+                shapes: vec![q.shape.clone(), k.shape.clone(), v.shape.clone(), out.shape.clone()],
+                cached: Some(out_buf),
+            });
+        }
+        out
+    }
+
+    /// Flash-Attention forward == dense causal attention. seq=40 > FA_BR=32 so the online-softmax
+    /// max/sum rescaling ACROSS key blocks is exercised (single-tile would hide a cross-tile bug).
+    #[test]
+    fn flash_attention_matches_dense_causal() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let (bh, seq, hd) = (2usize, 40usize, 16usize);
+            let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05).collect::<Vec<f32>>();
+            let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
+            let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
+            let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+            let flash = flash_fwd_recorded(&ctx, &q, &k, &v).to_vec();
+            // The kernel keeps Q in fp32 (`float q_row[]`) but stores K/V tiles as `half`, so it
+            // implements fp16-K/V attention. Compare to a dense reference with K/V rounded through
+            // fp16 (Q untouched): isolates the kernel MATH from the fp16 representation. A raw fp32
+            // dense compare leaves ~3e-2 of pure rounding and would mask nothing useful.
+            let fp16_round = |t: &Tensor| -> Tensor {
+                let len: usize = t.shape.iter().product();
+                let f16 = ctx.alloc_buffer(len * 2);
+                compute::gpu_cast_f32_to_f16(&ctx, &t.buffer, &f16, len as u32);
+                let back = ctx.alloc_buffer(len * 4);
+                compute::gpu_cast_f16_to_f32(&ctx, &f16, &back, len as u32);
+                Tensor::from_buffer(Arc::clone(&ctx), back, t.shape.clone())
+            };
+            let (kf, vf) = (fp16_round(&k), fp16_round(&v));
+            let scale = 1.0 / (hd as f32).sqrt();
+            let dense = q.batched_matmul_trans_b(&kf).scale(scale).causal_mask(0).softmax().batched_matmul(&vf).to_vec();
+            let md = flash.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(flash.iter().all(|x| x.is_finite()), "flash output must be finite");
+            assert!(md < 6e-3, "flash vs fp16-K/V dense causal max_abs_diff={md:.5} (kernel math, fp16 rep removed)");
+        });
+    }
+
+    /// Regression guard for the partial-last-q-block bug: a non-first q-block with fewer than FA_BR=32
+    /// valid query rows (seq 33, 40 — NOT a multiple of 32) used to leave K/V_shared rows unloaded
+    /// because out-of-range query threads returned before the cooperative tile load. Every seq, incl.
+    /// the partial ones, must match dense causal attention within the fp16-K/V floor.
+    #[test]
+    fn flash_attention_partial_blocks_match_dense() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            for &seq in &[31usize, 32, 33, 40, 47, 64, 65] {
+                let (bh, hd) = (1usize, 16usize);
+                let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05).collect::<Vec<f32>>();
+                let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
+                let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
+                let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+                let flash = flash_fwd_recorded(&ctx, &q, &k, &v).to_vec();
+                let scale = 1.0 / (hd as f32).sqrt();
+                let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
+                let md = flash.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(flash.iter().all(|x| x.is_finite()), "seq={seq}: flash output must be finite");
+                assert!(md < 2e-3, "seq={seq}: flash vs dense max_abs_diff={md:.5} (partial-block regression)");
+            }
+        });
+    }
+
+    /// Finite-difference grad-check of the Flash-Attention fused forward+backward (dQ/dK/dV) at a
+    /// cross-tile size (seq=40). Validates the online-softmax backward (D-term + block rescaling) end
+    /// to end — previously only `flash_attention_op_variant_exists` (a constructability check) existed.
+    #[test]
+    fn gradcheck_flash_attention() {
+        let ctx = test_ctx();
+        let (bh, seq, hd) = (2usize, 40usize, 16usize);
+        let n = bh * seq * hd;
+        grad_check(&ctx,
+            &[(gc_vec(n, 0), vec![bh, seq, hd]), (gc_vec(n, 7), vec![bh, seq, hd]), (gc_vec(n, 19), vec![bh, seq, hd])],
+            &|t| flash_fwd_recorded(&ctx, &t[0], &t[1], &t[2]),
+            GC_EPS, GC_ABS, GC_REL, "flash_attention");
+    }
+
     #[test]
     fn fp16_reverse_cast() {
         let ctx = MetalContext::new();
