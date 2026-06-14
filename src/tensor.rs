@@ -254,6 +254,7 @@ impl Tensor {
     /// Cast tensor contents to FP16 buffer with safe clamping.
     /// Uses thread-local cache: same buffer pointer → cached FP16 version.
     /// Call `Tensor::clear_f16_cache()` after optimizer step when weights change.
+    #[cfg(feature = "metal")]
     pub fn cast_to_f16(&self) -> crate::gpu::Buf {
         let key = crate::gpu::buf_addr(&self.buffer);
 
@@ -267,6 +268,13 @@ impl Tensor {
         compute::gpu_cast_f32_to_f16(&self.ctx, &self.buffer, &f16_buf, size as u32);
         F16_CAST_CACHE.with(|c| c.borrow_mut().insert(key, f16_buf.clone()));
         f16_buf
+    }
+
+    /// CUDA: matmuls run fp32 (no half kernels wired yet), so the f16 "cast" is a no-op that shares
+    /// the fp32 buffer; the f16 matmul entry points delegate to the fp32 kernels.
+    #[cfg(not(feature = "metal"))]
+    pub fn cast_to_f16(&self) -> crate::gpu::Buf {
+        self.buffer.clone()
     }
 
     /// FP16 roundtrip: cast FP32→FP16→FP32 to reduce activation precision.

@@ -298,26 +298,21 @@ pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_cast_f16_to_f32 not yet ported") }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_f16 not yet ported") }
+// CUDA stays fp32 (cast_to_f16 is a no-op on CUDA), so the f16 entry points delegate to fp32 kernels.
+pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul(ctx, a, b, c, m, n, k) }
+pub fn gpu_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul_trans_b(ctx, a, b, c, m, n, k) }
+pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) { gpu_matmul_trans_a(ctx, a, b, c, m, k, n) }
+pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul(ctx, a, b, c, d) }
+pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_b(ctx, a, b, c, d) }
+pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_a(ctx, a, b, c, d) }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_trans_b_f16 not yet ported") }
-
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32)  { unimplemented!("cuda backend: gpu_matmul_trans_a_f16 not yet ported") }
-
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_f16 not yet ported") }
-
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_b_f16 not yet ported") }
-
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_a_f16 not yet ported") }
-
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul not yet ported") }
+pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_batched_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_simdgroup not yet ported") }
@@ -329,7 +324,12 @@ pub fn gpu_batched_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuff
 pub fn gpu_batched_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_a_simdgroup not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_b not yet ported") }
+pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled_trans_b").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_batched_matmul_gqa_trans_b( ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims, group_size: u32, )  { unimplemented!("cuda backend: gpu_batched_matmul_gqa_trans_b not yet ported") }
@@ -338,7 +338,12 @@ pub fn gpu_batched_matmul_gqa_trans_b( ctx: &Arc<MetalContext>, a: &GpuBuffer, b
 pub fn gpu_batched_matmul_gqa( ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims, group_size: u32, )  { unimplemented!("cuda backend: gpu_batched_matmul_gqa not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_a not yet ported") }
+pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled_trans_a").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_rms_norm_residual( ctx: &Arc<MetalContext>, input: &GpuBuffer, residual: &GpuBuffer, weight: &GpuBuffer, output: &GpuBuffer, sum_out: &GpuBuffer, d: RmsResDims, )  { unimplemented!("cuda backend: gpu_rms_norm_residual not yet ported") }
