@@ -474,6 +474,173 @@ kernel void matmul_simdgroup_f16(
 }
 "#;
 
+/// simdgroup_matrix C(fp32) = A(fp32) @ B(fp32)ᵀ on the hardware MMA units — the fast backward
+/// drop-in for `matmul_tiled_trans_b` (dA = dC @ Wᵀ). fp32 in / fp32 out, fp16 MMA fragments (same
+/// precision as the scalar trans_b, which also casts to half + clamps in the tile load). 64×64 tile
+/// / 4 simdgroups (the layout that measured fastest). A:[M,K] row-major, B:[N,K] row-major (read
+/// transposed: Bᵀ[k,n]=B[n,k]), C:[M,N]. Edges zero-padded.
+pub const MATMUL_SIMDGROUP_TRANS_B: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct MatmulParams { uint M; uint N; uint K; };
+
+#define TILE 64
+
+kernel void matmul_simdgroup_trans_b(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = params.M, N = params.N, K = params.K;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+    uint q_row = (sgid >> 1) * 32;
+    uint q_col = (sgid & 1) * 32;
+
+    threadgroup half As[TILE * 8];   // 64×8 (M×K-step)
+    threadgroup half Bs[8 * TILE];   // 8×64 (K-step×N)
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 3;             // 0..63 (M)
+            uint c = idx & 7;              // 0..7  (K)
+            uint gr = tile_row + r;
+            uint gc = k0 + c;
+            As[r * 8 + c] = (half)clamp((gr < M && gc < K) ? A[gr * K + gc] : 0.0f, -65504.0f, 65504.0f);
+        }
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 6;             // 0..7  (K)
+            uint c = idx & 63;             // 0..63 (N)
+            uint gr = k0 + r;
+            uint gc = tile_col + c;
+            // B is [N,K] row-major; Bᵀ[k,n] = B[n,k] = B[gc*K + gr]
+            Bs[r * TILE + c] = (half)clamp((gr < K && gc < N) ? B[gc * K + gr] : 0.0f, -65504.0f, 65504.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 a[4], b[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t;          // 0..4095
+        uint r = idx >> 6;                 // 0..63
+        uint c = idx & 63;                 // 0..63
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < M && gc < N) C[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
+/// simdgroup_matrix C(fp32) = A(fp32)ᵀ @ B(fp32) on the hardware MMA units — the fast backward
+/// drop-in for `matmul_trans_a_tiled` (dB = Aᵀ @ dC). fp32 in / fp32 out, fp16 MMA fragments. 64×64
+/// tile / 4 simdgroups. A:[M,K] row-major (read transposed: Aᵀ[k,m]=A[m,k]), B:[M,N] row-major,
+/// C:[K,N]. Contraction is over M. Params are {M(=contraction), K(=out rows), N(=out cols)}.
+pub const MATMUL_SIMDGROUP_TRANS_A: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct MatmulParams { uint M; uint K; uint N; };
+
+#define TILE 64
+
+kernel void matmul_simdgroup_trans_a(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = params.M, Kd = params.K, N = params.N;   // M=contraction, Kd=out rows, N=out cols
+    uint tile_row = group_id.y * TILE;   // over Kd
+    uint tile_col = group_id.x * TILE;   // over N
+    uint q_row = (sgid >> 1) * 32;
+    uint q_col = (sgid & 1) * 32;
+
+    threadgroup half As[TILE * 8];   // 64×8 (Kd × M-step)
+    threadgroup half Bs[8 * TILE];   // 8×64 (M-step × N)
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < M; k0 += 8) {          // contraction over M
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 3;             // 0..63 (Kd)
+            uint c = idx & 7;              // 0..7  (M)
+            uint gr = tile_row + r;        // Kd index (out row)
+            uint gc = k0 + c;              // M index (contraction)
+            // Aᵀ[kd,m] = A[m,kd] = A[gc*Kd + gr]
+            As[r * 8 + c] = (half)clamp((gr < Kd && gc < M) ? A[gc * Kd + gr] : 0.0f, -65504.0f, 65504.0f);
+        }
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;       // 0..511
+            uint r = idx >> 6;             // 0..7  (M)
+            uint c = idx & 63;             // 0..63 (N)
+            uint gr = k0 + r;              // M index (contraction)
+            uint gc = tile_col + c;        // N index (out col)
+            Bs[r * TILE + c] = (half)clamp((gr < M && gc < N) ? B[gr * N + gc] : 0.0f, -65504.0f, 65504.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 a[4], b[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t;          // 0..4095
+        uint r = idx >> 6;                 // 0..63 (Kd)
+        uint c = idx & 63;                 // 0..63 (N)
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < Kd && gc < N) C[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
 /// Batched simdgroup-matrix matmul: C[b] = A[b] @ B[b] on the hardware MMA units (extends the
 /// simdgroup fast path beyond the batch==1 projections to the batched attention matmuls). fp32 in /
 /// fp32 out, half MMA fragments (same precision as batched_matmul_tiled). 64×64 tile / 4 simdgroups,

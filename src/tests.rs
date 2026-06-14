@@ -2560,6 +2560,54 @@ mod suite {
         }
     }
 
+    /// Backward MMA: the simdgroup trans_b kernel (dA = dC @ Wᵀ) must match the scalar trans_b on the
+    /// same fp32 inputs — both fp16-fragment precision, so fp16-scale tolerance. Ragged + aligned dims
+    /// exercise the zero-padded edge tiles. The flag is forced off so the reference takes the scalar path.
+    #[test]
+    fn matmul_simdgroup_trans_b_matches_scalar() {
+        let ctx = test_ctx();
+        let prev = compute::set_simdgroup_matmul(false);
+        for &(m, n, k) in &[(33usize, 29usize, 47usize), (64, 64, 64), (96, 40, 16)] {
+            // C[M,N] = A[M,K] @ B[N,K]ᵀ
+            let a = Tensor::randn(&ctx, vec![m, k], 0.3);
+            let b = Tensor::randn(&ctx, vec![n, k], 0.3);
+            let out_sg = ctx.alloc_buffer(m * n * 4);
+            let out_ref = ctx.alloc_buffer(m * n * 4);
+            compute::gpu_matmul_trans_b_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_trans_b(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32);
+            let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
+            let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
+            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            eprintln!("simdgroup_trans_b vs scalar [{m}x{k}x{n}]: max_diff={max_diff:.5}");
+            assert!(sg.iter().all(|x| x.is_finite()), "trans_b simdgroup non-finite ({m}x{n}x{k})");
+            assert!(max_diff < 2e-2, "trans_b simdgroup disagrees ({m}x{n}x{k}): {max_diff}");
+        }
+        compute::set_simdgroup_matmul(prev);
+    }
+
+    /// Backward MMA: the simdgroup trans_a kernel (dB = Aᵀ @ dC) must match the scalar trans_a.
+    #[test]
+    fn matmul_simdgroup_trans_a_matches_scalar() {
+        let ctx = test_ctx();
+        let prev = compute::set_simdgroup_matmul(false);
+        for &(m, k, n) in &[(33usize, 47usize, 29usize), (64, 64, 64), (40, 96, 16)] {
+            // A:[M,K], B:[M,N], C:[K,N] = Aᵀ @ B
+            let a = Tensor::randn(&ctx, vec![m, k], 0.3);
+            let b = Tensor::randn(&ctx, vec![m, n], 0.3);
+            let out_sg = ctx.alloc_buffer(k * n * 4);
+            let out_ref = ctx.alloc_buffer(k * n * 4);
+            compute::gpu_matmul_trans_a_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, k as u32, n as u32);
+            compute::gpu_matmul_trans_a(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, k as u32, n as u32);
+            let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![k, n]).to_vec();
+            let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![k, n]).to_vec();
+            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            eprintln!("simdgroup_trans_a vs scalar [{m}x{k}x{n}]: max_diff={max_diff:.5}");
+            assert!(sg.iter().all(|x| x.is_finite()), "trans_a simdgroup non-finite");
+            assert!(max_diff < 2e-2, "trans_a simdgroup disagrees ({m}x{k}x{n}): {max_diff}");
+        }
+        compute::set_simdgroup_matmul(prev);
+    }
+
     /// The bf16 default-matmul flag gives `Tensor::matmul` fp32 RANGE: a value above the fp16 max
     /// (65504) is preserved, where the default fp16 path overflows/clamps it. And for normal-range
     /// values bf16-on agrees with the fp16 default to bf16 precision. Restores the default after.

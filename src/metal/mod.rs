@@ -175,6 +175,8 @@ impl MetalContext {
             ("matmul_simdgroup_f16", shaders::MATMUL_SIMDGROUP_F16),
             ("batched_matmul_simdgroup", shaders::BATCHED_MATMUL_SIMDGROUP),
             ("batched_matmul_simdgroup_trans_b", shaders::BATCHED_MATMUL_SIMDGROUP_TRANS_B),
+            ("matmul_simdgroup_trans_b", shaders::MATMUL_SIMDGROUP_TRANS_B),
+            ("matmul_simdgroup_trans_a", shaders::MATMUL_SIMDGROUP_TRANS_A),
             ("matmul_tiled_trans_b", shaders::MATMUL_TILED_TRANS_B),
             ("softmax", shaders::SOFTMAX),
             ("rms_norm", shaders::RMS_NORM),

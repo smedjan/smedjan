@@ -146,6 +146,33 @@ pub fn gpu_matmul_simdgroup_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuB
     dispatch_sync!(ctx, "matmul_simdgroup_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
+/// simdgroup MMA: C(f32) = A(f32) @ B(f32)ᵀ — A:[M,K], B:[N,K], C:[M,N]. Fast backward drop-in for
+/// gpu_matmul_trans_b (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate — same
+/// precision as the scalar trans_b (which also casts to half), MMA inner loop instead of scalar MACs.
+pub fn gpu_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    #[repr(C)]
+    struct Params { m: u32, n: u32, k: u32 }
+    let params = Params { m, n, k };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
+/// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:[M,K], B:[M,N], C:[K,N]. Fast backward drop-in for
+/// gpu_matmul_trans_a (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate.
+pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) {
+    #[repr(C)]
+    struct Params { m: u32, k: u32, n: u32 }
+    let params = Params { m, k, n };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (k as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "matmul_simdgroup_trans_a", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
+}
+
 // These matmul-path switches are THREAD-LOCAL, not process-global. Compute is single-threaded
 // (the training loop / generation / CLI all set the flag and run every dispatch on one thread —
 // there is no worker-thread pool in src/), so thread-local matches production exactly. The reason it
@@ -263,6 +290,9 @@ pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuf
 
 /// C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
 pub fn gpu_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    if simdgroup_matmul_enabled() {
+        return gpu_matmul_trans_b_simdgroup(ctx, a, b, c, m, n, k);
+    }
     #[repr(C)]
     struct Params { m: u32, n: u32, k: u32 }
     let params = Params { m, n, k };
@@ -1554,6 +1584,9 @@ pub fn gpu_matmul_trans_a(
     k: u32,
     n: u32,
 ) {
+    if simdgroup_matmul_enabled() {
+        return gpu_matmul_trans_a_simdgroup(ctx, a, b, c, m, k, n);
+    }
     #[repr(C)]
     struct Params { m: u32, k: u32, n: u32 }
     let params = Params { m, k, n };
