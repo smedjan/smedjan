@@ -524,8 +524,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // ANDREAI_NO_POOL; a completion barrier (flush between micro-steps) does NOT fix it because
         // the buffer is still logically live, not merely mid-dispatch. Guard the loop with the same
         // pool-bypass the recompute path uses (src/autograd.rs) — no intra-accumulation reuse, so no
-        // aliasing. Engaged only when actually accumulating (grad_accum_steps > 1).
-        let accum_guard = (grad_accum_steps > 1).then(crate::gpu::PoolBypassGuard::new);
+        // aliasing. Engaged when accumulating (grad_accum_steps > 1) OR when block-sparse attention
+        // is configured: the gather/scatter path has its own residual pooled-mode aliasing that
+        // corrupts gradients (block-sparse trained only under ANDREAI_NO_POOL), so bypass the pool
+        // for its whole forward+backward too. Both are forward+backward multi-pass regions; the guard
+        // is dropped before the optimizer step, which pools normally.
+        let bypass_pool = grad_accum_steps > 1 || config.model_config.block_sparse_top_k > 0;
+        let accum_guard = bypass_pool.then(crate::gpu::PoolBypassGuard::new);
         for _micro_step in 0..grad_accum_steps {
             // Get a micro-batch. With curriculum learning, truncate to effective_seq.
             let (full_inputs, full_targets) = data_loader.next_batch();

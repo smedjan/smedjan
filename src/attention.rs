@@ -616,14 +616,24 @@ impl MultiHeadAttention {
                 seq_q_len, seq_k,
                 "block-sparse attention is full-sequence forward only (seq_q == seq_k)"
             );
-            // MoBA/NSA routing: score each K block by query·block-mean-key, keep own block + top-k
-            // past blocks, mask the rest. Block scores drive selection only (not differentiated).
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-            let block_means = k_for_attn.block_mean_keys(self.block_size); // [bh, nb, hd], no tape
-            let block_scores = q.batched_matmul_trans_b(&block_means);     // [bh, seq, nb]
-            let scores = q.batched_matmul_trans_b(&k_for_attn).scale(scale); // [bh, seq, seq]
-            let masked = scores.block_sparse_mask(&block_scores, self.block_size, self.block_sparse_top_k);
-            masked.softmax().batched_matmul(&v_for_attn)
+            // MoBA/NSA: own block + top-k past blocks selected by block-mean score. Route training
+            // and prefill through the trainable GATHER path (block_sparse_gather_attention): its
+            // scatter-add backward is gradcheck-verified, so gradients flow. The inline
+            // block_sparse_mask path below records only an Op::Reshape passthrough and does NOT train
+            // (loss pinned at init). The gather path needs seq % block == 0; otherwise fall back to
+            // the (forward-correct, non-training) mask path. NOTE: block-sparse training also relies
+            // on the step-level pool bypass in train.rs — a residual pooled-mode buffer aliasing in
+            // the gather path makes the buffer pool corrupt its gradients; pooled-mode is a follow-up.
+            if seq_q_len % self.block_size == 0 {
+                block_sparse_gather_attention(&q, &k_for_attn, &v_for_attn, self.block_size, self.block_sparse_top_k)
+            } else {
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                let block_means = k_for_attn.block_mean_keys(self.block_size); // [bh, nb, hd], no tape
+                let block_scores = q.batched_matmul_trans_b(&block_means);     // [bh, seq, nb]
+                let scores = q.batched_matmul_trans_b(&k_for_attn).scale(scale); // [bh, seq, seq]
+                let masked = scores.block_sparse_mask(&block_scores, self.block_size, self.block_sparse_top_k);
+                masked.softmax().batched_matmul(&v_for_attn)
+            }
         } else if seq_q_len >= 2048 && !use_gqa_strided && seg_ids.is_none() {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
