@@ -517,6 +517,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let mut last_loss_tensor: Option<crate::tensor::Tensor> = None;
 
         // === Gradient accumulation loop ===
+        // Gradient accumulation is a multi-pass region (like checkpoint recompute): across
+        // micro-steps, a pooled buffer the running accumulation still references gets reissued by
+        // alloc_buffer and overwritten before its consumer runs, silently corrupting the gradient.
+        // At seq_len >= 256 this diverged the loss (6.4 -> 7.4) and was clean only under
+        // ANDREAI_NO_POOL; a completion barrier (flush between micro-steps) does NOT fix it because
+        // the buffer is still logically live, not merely mid-dispatch. Guard the loop with the same
+        // pool-bypass the recompute path uses (src/autograd.rs) — no intra-accumulation reuse, so no
+        // aliasing. Engaged only when actually accumulating (grad_accum_steps > 1).
+        let accum_guard = (grad_accum_steps > 1).then(crate::gpu::PoolBypassGuard::new);
         for _micro_step in 0..grad_accum_steps {
             // Get a micro-batch. With curriculum learning, truncate to effective_seq.
             let (full_inputs, full_targets) = data_loader.next_batch();
@@ -738,6 +747,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             last_loss_tensor = Some(loss_tensor);
         }
+        drop(accum_guard); // re-enable the buffer pool for the optimizer step + gradient recycle
 
         // Progressive layer freezing: zero gradients for bottom layers after training progresses.
         // Frozen layers still run forward but don't get weight updates → saves optimizer compute.
