@@ -140,3 +140,38 @@ launch (mirror an existing wrapper; grid from the kernel's blockIdx convention).
 repeat until forward green, then backward, then `train --size tiny --steps 50` smoke (loss finite +
 decreasing). Build env: `CUDA_PATH=/usr/local/cuda-12.8 LD_LIBRARY_PATH=$CUDA_PATH/lib64`,
 `cargo build --release --no-default-features --features cuda`.
+
+---
+
+## TRAINING BRING-UP (2026-06-15, cont.) — full forward+backward path memcheck-clean
+
+All Tier-A kernels wired (one `python3` batch over the stubs + composed fused ones); `bench --size
+tiny` runs every section (forward 45k tok/s, decode, **Training Forward+Backward 13.3k tok/s** vs Metal
+M1 3.3k, checkpointed, roofline) with exit 0. Then drove an actual `train` to expose what the bench's
+non-asserting run hid:
+
+**Bugs found + fixed (each verified, Metal kept green):**
+- **`gpu_scaled_causal_softmax` OOB (false-green).** `SoftmaxDims.total_rows` is ALREADY
+  `batch_heads*seq_q` (see `Tensor::scaled_causal_softmax`); the composed wrapper multiplied by `seq_q`
+  AGAIN for the copy/scale size, passed `total_rows` (not `total_rows/seq_q`) as causal_mask
+  batch_heads, and `total_rows*seq_q` as softmax rows. Overran the `[total_rows,seq_k]` score buffer by
+  ~seq_q×. At bench dims it silently overran into valid pool memory (so "forward ran" was a LIE — it
+  was corrupting); at train dims it faulted `CUDA_ERROR_ILLEGAL_ADDRESS`. Fix: `n=total_rows*seq_k`,
+  `causal_mask(total_rows/seq_q, seq_q, seq_k)`, `softmax rows=total_rows`. **Lesson: "kernel ran" ≠
+  "kernel correct" — sanitize, don't trust a clean exit.**
+- **Raw `result::memcpy_htod_sync` needs the ctx bound.** `write_u32_to_buffer` / `buf_write_bytes`
+  (the in-place htod for the loss workspace + checkpoint writes) used the raw driver memcpy, which —
+  unlike the safe `device.htod_*` wrappers — does not make the primary context current on the thread.
+  Added `buf.device().bind_to_thread()` before the copy + a sized assert.
+- **Bench KV-cache overflow (harness, both backends).** Decode hardcoded a 16-token prefill but cache
+  capacity == `config.max_seq_len` (= `--seq-len`). Sized the prefill to leave room for warmup+iters.
+- **`gpu_mega_ffn` is Metal-only.** Gated `use_mega` on `cfg!(feature="metal")`; CUDA decode falls
+  back to the primitive `rms_norm_residual`+`swiglu_ffn` path.
+
+**Diagnostic recipe (worked):** `CUDA_LAUNCH_BLOCKING=1` to localize, then nvrtc
+`--generate-line-info` + `compute-sanitizer --tool memcheck` to NAME the faulting kernel + caller +
+the exact OOB address. **`compute-sanitizer` on a full 1-step train (fwd+bwd+loss+clip+optimizer):
+0 errors.** Run detached on the box (`nohup ... > log &`) — it's 50–100× slower and an idle SSH will
+time out mid-run; poll the log. Keep a persistent SSH master (`ssh -fNM -o ServerAliveInterval=30`).
+
+**Status: training is memcheck-clean; 50-step `train` loss-curve verification in progress.**
