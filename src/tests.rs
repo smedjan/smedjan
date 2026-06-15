@@ -3028,7 +3028,7 @@ mod suite {
     fn causal_doc_mask_blocks_cross_segment() {
         let ctx = test_ctx();
         let scores = Tensor::zeros(&ctx, vec![1, 4, 4]); // all 0 → unmasked entries stay 0
-        let seg = ctx.buffer_from_u32_slice(&[0u32, 0, 1, 1]);
+        let seg = crate::gpu::u32_to_buf(ctx.buffer_from_u32_slice(&[0u32, 0, 1, 1]));
         let m = scores.causal_doc_mask(&seg, 1).to_vec();
         let at = |q: usize, k: usize| m[q * 4 + k];
         // q=0 (seg0): sees k=0; future k=1,2,3 masked.
@@ -3061,7 +3061,7 @@ mod suite {
             (0..seq * hd).map(|i| (((i * 7 + salt * 13) % 17) as f32 - 8.0) * 0.1).collect()
         };
         let (qd, kd, vd) = (gen(1), gen(2), gen(3));
-        let seg = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1]);
+        let seg = crate::gpu::u32_to_buf(ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1]));
 
         // Packed run: scores → block-diagonal mask → softmax → @v.
         let q = Tensor::from_slice(&ctx, &qd, vec![1, seq, hd]);
@@ -3101,7 +3101,7 @@ mod suite {
         let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
         let seq = 7usize;
         // Row = docA (3 tok) + docB (4 tok); seg id per position.
-        let seg_buf = ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1, 1, 1]);
+        let seg_buf = crate::gpu::u32_to_buf(ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1, 1, 1]));
         let docb = [3usize, 4, 5, 6]; // docB positions in the row
 
         let docb_logits = |toks: &[u32], seg: Option<&crate::gpu::Buf>| -> Vec<f32> {
