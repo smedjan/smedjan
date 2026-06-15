@@ -177,7 +177,8 @@ pub fn gpu_embedding_lookup(ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, ta
 // ===== Cast =====
 
 pub fn gpu_cast_f32_to_f16(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
-    let cfg = launch_cfg(256, size.div_ceil(256));
+    let n_words = size.div_ceil(2); // 2 halves packed per 4-byte word
+    let cfg = launch_cfg(256, n_words.div_ceil(256));
     let f = ctx.device.get_func("andreai", "cast_f32_to_f16").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
@@ -305,7 +306,10 @@ pub fn gpu_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &
 pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) { gpu_matmul_trans_a(ctx, a, b, c, m, k, n) }
 
 pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
-    gpu_copy(ctx, input, output, size)
+    let n_words = size.div_ceil(2); // unpack 2 halves per 4-byte word (matches cast_f32_to_f16)
+    let cfg = launch_cfg(256, n_words.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "cast_f16_to_f32").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
 // CUDA stays fp32 (cast_to_f16 is a no-op on CUDA), so the f16 entry points delegate to fp32 kernels.

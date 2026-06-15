@@ -515,16 +515,27 @@ extern "C" __global__ void causal_mask(
 // ============================================================
 // FP16 cast kernels
 // ============================================================
-extern "C" __global__ void cast_f32_to_f16(const float* input, __half* output, unsigned int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size)
-        output[i] = __float2half(fminf(fmaxf(input[i], -65504.0f), 65504.0f));
+// The "f16" buffer is a CudaSlice<f32> (4-byte elements); accessing it as __half* (2-byte stride)
+// does not round-trip through cudarc. Pack TWO halves per 4-byte word and access it as unsigned int*
+// (element size matches the f32 buffer exactly). One thread per packed word (= 2 source floats).
+extern "C" __global__ void cast_f32_to_f16(const float* input, unsigned int* output, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; // packed-word index
+    unsigned int n_words = (size + 1) / 2;
+    if (i >= n_words) return;
+    unsigned int lo_idx = 2 * i, hi_idx = 2 * i + 1;
+    unsigned short lo = __half_as_ushort(__float2half(fminf(fmaxf(input[lo_idx], -65504.0f), 65504.0f)));
+    unsigned short hi = 0;
+    if (hi_idx < size) hi = __half_as_ushort(__float2half(fminf(fmaxf(input[hi_idx], -65504.0f), 65504.0f)));
+    output[i] = ((unsigned int)hi << 16) | (unsigned int)lo;
 }
 
-extern "C" __global__ void cast_f16_to_f32(const __half* input, float* output, unsigned int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size)
-        output[i] = __half2float(input[i]);
+extern "C" __global__ void cast_f16_to_f32(const unsigned int* input, float* output, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; // packed-word index
+    unsigned int n_words = (size + 1) / 2;
+    if (i >= n_words) return;
+    unsigned int packed = input[i];
+    output[2 * i] = __half2float(__ushort_as_half((unsigned short)(packed & 0xFFFF)));
+    if (2 * i + 1 < size) output[2 * i + 1] = __half2float(__ushort_as_half((unsigned short)(packed >> 16)));
 }
 
 // ============================================================
