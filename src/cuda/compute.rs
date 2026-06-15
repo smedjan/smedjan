@@ -287,8 +287,12 @@ pub fn gpu_matmul_fp32(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c:
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_bf16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_bf16 not yet ported") }
+pub fn gpu_matmul_bf16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    let tile = 32u32;
+    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
+    let f = ctx.device.get_func("andreai", "matmul_tiled_bf16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+}
 
 // No hardware MMA path on CUDA: the "simdgroup" matmul = the precise fp32 tiled kernel (matches the
 // fp32 reference the tests check against at 1e-3); the trans/f16 variants alias their tiled equivalents.
@@ -740,8 +744,11 @@ thread_local! {
 }
 pub fn set_simdgroup_matmul(on: bool) -> bool { SIMDGROUP_MATMUL.with(|c| c.replace(on)) }
 pub fn simdgroup_matmul_enabled() -> bool { SIMDGROUP_MATMUL.with(|c| c.get()) }
-pub fn set_bf16_matmul(_on: bool) -> bool { false }
-pub fn bf16_matmul_enabled() -> bool { false }
+thread_local! {
+    static BF16_MATMUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn set_bf16_matmul(on: bool) -> bool { BF16_MATMUL.with(|c| c.replace(on)) }
+pub fn bf16_matmul_enabled() -> bool { BF16_MATMUL.with(|c| c.get()) }
 thread_local! {
     static RMSNORM_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }

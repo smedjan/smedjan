@@ -24,11 +24,13 @@ pub const KERNEL_NAMES: &[&str] = &[
     "gather_causal_mask",
     "muon_frob_normalize", "inv_sqrt_bc",
     "matmul_tiled_fp32", "moe_gather", "moe_scatter_add",
+    "matmul_tiled_bf16",
 ];
 
 /// All CUDA kernels in a single compilation unit.
 pub const ALL_KERNELS: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // ============================================================
 // Tiled Matrix Multiply: C = A @ B
@@ -1456,5 +1458,58 @@ extern "C" __global__ void moe_scatter_add(const float* expert_output, const uns
     unsigned int token_idx = token_indices[slot];
     float val = expert_output[slot * dim + d] * weights[slot];
     atomicAdd(&combined_output[token_idx * dim + d], val);
+}
+
+// ===== bf16-tile matmul — C = A @ B with __nv_bfloat16 shared tiles, fp32 accumulate =====
+// fp32 exponent range (NO ±65504 clamp, unlike the fp16 path) at bf16 mantissa precision (~7 bits).
+extern "C" __global__ void matmul_tiled_bf16(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    int local_row = threadIdx.x / 8;
+    int local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * TILE;
+    int tile_col = blockIdx.x * TILE;
+
+    __shared__ __nv_bfloat16 As[TILE][TILE];
+    __shared__ __nv_bfloat16 Bs[TILE][TILE];
+    float acc[THREAD_TILE][THREAD_TILE] = {{0.0f}};
+
+    for (int k_block = 0; k_block < K; k_block += TILE) {
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gr = tile_row + r, gc = k_block + c;
+            As[r][c] = __float2bfloat16((gr < M && gc < K) ? A[gr * K + gc] : 0.0f);
+        }
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gr = k_block + r, gc = tile_col + c;
+            Bs[r][c] = __float2bfloat16((gr < K && gc < N) ? B[gr * N + gc] : 0.0f);
+        }
+        __syncthreads();
+
+        for (int k = 0; k < TILE; k++) {
+            __nv_bfloat16 a_vals[THREAD_TILE], b_vals[THREAD_TILE];
+            for (int i = 0; i < THREAD_TILE; i++)
+                a_vals[i] = As[local_row * THREAD_TILE + i][k];
+            for (int j = 0; j < THREAD_TILE; j++)
+                b_vals[j] = Bs[k][local_col * THREAD_TILE + j];
+            for (int i = 0; i < THREAD_TILE; i++)
+                for (int j = 0; j < THREAD_TILE; j++)
+                    acc[i][j] += __bfloat162float(a_vals[i]) * __bfloat162float(b_vals[j]);
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < THREAD_TILE; i++)
+        for (int j = 0; j < THREAD_TILE; j++) {
+            int gr = tile_row + local_row * THREAD_TILE + i;
+            int gc = tile_col + local_col * THREAD_TILE + j;
+            if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
+        }
 }
 "#;
