@@ -413,10 +413,18 @@ pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuf
 pub fn gpu_sophia_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, h: &GpuBuffer, size: u32, p: SophiaParams)  { unimplemented!("cuda backend: gpu_sophia_update not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32)  { unimplemented!("cuda backend: gpu_scale_rows not yet ported") }
+pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    let cfg = launch_cfg(256, (rows * cols).div_ceil(256));
+    let f = ctx.device.get_func("andreai","scale_rows").unwrap();
+    unsafe { f.launch(cfg, (input, scales, output, rows, cols)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_row_dot_reduce(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32)  { unimplemented!("cuda backend: gpu_row_dot_reduce not yet ported") }
+pub fn gpu_row_dot_reduce(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    let cfg = launch_cfg(256, rows.div_ceil(256));
+    let f = ctx.device.get_func("andreai","row_dot_reduce").unwrap();
+    unsafe { f.launch(cfg, (a, b, output, rows, cols)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &CudaSlice<u32>, gathered: &GpuBuffer, n_routed: u32, dim: u32)  { unimplemented!("cuda backend: gpu_moe_gather not yet ported") }
@@ -602,22 +610,38 @@ pub fn gpu_compute_inv_rms(ctx: &Arc<MetalContext>, input: &GpuBuffer, inv_rms: 
 pub fn gpu_fused_norm_matmul( ctx: &Arc<MetalContext>, a: &GpuBuffer, norm_weight: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: NormMatmulDims, )  { unimplemented!("cuda backend: gpu_fused_norm_matmul not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32)  { unimplemented!("cuda backend: gpu_axpy not yet ported") }
+pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","axpy").unwrap();
+    unsafe { f.launch(cfg, (y, x, size, alpha)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_relu not yet ported") }
+pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","relu").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_broadcast_rows(ctx: &Arc<MetalContext>, vec: &GpuBuffer, out: &GpuBuffer, rows: u32, cols: u32)  { unimplemented!("cuda backend: gpu_broadcast_rows not yet ported") }
+pub fn gpu_broadcast_rows(ctx: &Arc<MetalContext>, vec: &GpuBuffer, out: &GpuBuffer, rows: u32, cols: u32) {
+    let cfg = launch_cfg(256, (rows * cols).div_ceil(256));
+    let f = ctx.device.get_func("andreai","broadcast_rows").unwrap();
+    unsafe { f.launch(cfg, (vec, out, rows, cols)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_exp not yet ported") }
+pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","exp_kernel").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_relu_backward(ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai","silu_backward").unwrap(); // no relu kernel; relu unused on this path
-    let _ = (input, grad_output, grad_input, &f, &cfg); unimplemented!("cuda: gpu_relu_backward (no kernel)")
+    let f = ctx.device.get_func("andreai", "relu_backward").unwrap();
+    unsafe { f.launch(cfg, (input, grad_output, grad_input, size)) }.unwrap();
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
@@ -643,10 +667,18 @@ pub fn gpu_muon_frob_normalize(ctx: &Arc<MetalContext>, m: &GpuBuffer, x: &GpuBu
 pub fn gpu_inv_sqrt_bc(ctx: &Arc<MetalContext>, v: &GpuBuffer, out: &GpuBuffer, size: u32, bias_correction: f32, eps: f32)  { unimplemented!("cuda backend: gpu_inv_sqrt_bc not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)  { unimplemented!("cuda backend: gpu_concat_cols not yet ported") }
+pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32) {
+    let cfg = launch_cfg(256, (rows * src_cols).div_ceil(256));
+    let f = ctx.device.get_func("andreai","concat_cols").unwrap();
+    unsafe { f.launch(cfg, (src, dst, rows, src_cols, dst_cols, col_offset)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_slice_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)  { unimplemented!("cuda backend: gpu_slice_cols not yet ported") }
+pub fn gpu_slice_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32) {
+    let cfg = launch_cfg(256, (rows * dst_cols).div_ceil(256));
+    let f = ctx.device.get_func("andreai","slice_cols").unwrap();
+    unsafe { f.launch(cfg, (src, dst, rows, src_cols, dst_cols, col_offset)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_repeat_kv(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)  {

@@ -18,6 +18,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "silu_backward", "silu_gate_backward", "rms_norm_backward", "softmax_backward", "embedding_backward",
     "l2_norm_check", "argmax", "temperature_scale", "gradient_mask", "zero_rows",
     "ema_update", "repeat_kv", "repeat_kv_backward", "causal_doc_mask",
+    "relu", "relu_backward", "exp_kernel", "axpy", "scale_rows", "row_dot_reduce",
+    "broadcast_rows", "slice_cols", "concat_cols",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1184,6 +1186,51 @@ extern "C" __global__ void causal_doc_mask(float* scores, const unsigned int* se
     if (bh >= batch_heads || q >= seq || k >= seq) return;
     unsigned int base = (bh / n_heads) * seq;
     if (k > q || seg_ids[base + q] != seg_ids[base + k])
-        scores[bh * seq * seq + q * seq + k] = -1e30f;
+        scores[bh * seq * seq + q * seq + k] = __int_as_float(0xff800000); // -inf (nvrtc lacks INFINITY)
+}
+
+extern "C" __global__ void relu(const float* input, float* output, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) output[i] = fmaxf(input[i], 0.0f);
+}
+extern "C" __global__ void relu_backward(const float* input, const float* grad_out, float* grad_in, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) grad_in[i] = input[i] > 0.0f ? grad_out[i] : 0.0f;
+}
+extern "C" __global__ void exp_kernel(const float* input, float* output, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) output[i] = expf(input[i]);
+}
+extern "C" __global__ void axpy(float* y, const float* x, unsigned int size, float alpha) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) y[i] += alpha * x[i];
+}
+extern "C" __global__ void scale_rows(const float* input, const float* scales, float* output, unsigned int rows, unsigned int cols) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    output[idx] = input[idx] * scales[idx / cols];
+}
+extern "C" __global__ void row_dot_reduce(const float* a, const float* b, float* output, unsigned int rows, unsigned int cols) {
+    unsigned int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float s = 0.0f;
+    for (unsigned int c = 0; c < cols; c++) s += a[r * cols + c] * b[r * cols + c];
+    output[r] = s;
+}
+extern "C" __global__ void broadcast_rows(const float* vec, float* out, unsigned int rows, unsigned int cols) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * cols) out[i] = vec[i % cols];
+}
+extern "C" __global__ void slice_cols(const float* src, float* dst, unsigned int rows, unsigned int src_cols, unsigned int dst_cols, unsigned int col_offset) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * dst_cols) return;
+    unsigned int r = idx / dst_cols, c = idx % dst_cols;
+    dst[idx] = src[r * src_cols + col_offset + c];
+}
+extern "C" __global__ void concat_cols(const float* src, float* dst, unsigned int rows, unsigned int src_cols, unsigned int dst_cols, unsigned int col_offset) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * src_cols) return;
+    unsigned int r = idx / src_cols, c = idx % src_cols;
+    dst[r * dst_cols + col_offset + c] = src[idx];
 }
 "#;
