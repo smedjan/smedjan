@@ -428,7 +428,11 @@ pub fn gpu_moe_scatter_add(ctx: &Arc<MetalContext>, expert_out: &GpuBuffer, indi
 pub fn gpu_causal_mask_window( ctx: &Arc<MetalContext>, scores: &GpuBuffer, batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32, window: u32, )  { unimplemented!("cuda backend: gpu_causal_mask_window not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_causal_doc_mask( ctx: &Arc<MetalContext>, scores: &GpuBuffer, seg_ids: &CudaSlice<u32>, batch_heads: u32, seq: u32, n_heads: u32, )  { unimplemented!("cuda backend: gpu_causal_doc_mask not yet ported") }
+pub fn gpu_causal_doc_mask( ctx: &Arc<MetalContext>, scores: &GpuBuffer, seg_ids: &CudaSlice<u32>, batch_heads: u32, seq: u32, n_heads: u32, )  {
+    let cfg = launch_cfg_3d(batch_heads, seq, 1, seq.min(1024));
+    let f = ctx.device.get_func("andreai", "causal_doc_mask").unwrap();
+    unsafe { f.launch(cfg, (scores, seg_ids, batch_heads, seq, n_heads)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_block_mean_keys(ctx: &Arc<MetalContext>, k: &GpuBuffer, out: &GpuBuffer, d: BlockMeanDims)  { unimplemented!("cuda backend: gpu_block_mean_keys not yet ported") }
@@ -478,7 +482,8 @@ pub fn gpu_silu_gate_backward( ctx: &Arc<MetalContext>, gate: &GpuBuffer, up: &G
 pub fn gpu_rms_norm_backward( ctx: &Arc<MetalContext>, input: &GpuBuffer, weight: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, grad_weight: &GpuBuffer, params: &RmsNormBackwardParams, ) {
     let cfg = launch_cfg_2d(params.rows, 1, next_power_of_2_clamped(params.cols as u64) as u32, 1);
     let f = ctx.device.get_func("andreai","rms_norm_backward").unwrap();
-    unsafe { f.launch(cfg, (input, weight, grad_output, grad_input, grad_weight, params.rows, params.cols, params.eps)) }.unwrap();
+    let clamp_on: u32 = if rmsnorm_clamp_enabled() { 1 } else { 0 };
+    unsafe { f.launch(cfg, (input, weight, grad_output, grad_input, grad_weight, params.rows, params.cols, params.eps, clamp_on)) }.unwrap();
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
@@ -644,15 +649,29 @@ pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer
 pub fn gpu_slice_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32)  { unimplemented!("cuda backend: gpu_slice_cols not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_repeat_kv(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)  { unimplemented!("cuda backend: gpu_repeat_kv not yet ported") }
+pub fn gpu_repeat_kv(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)  {
+    let total = n_kv_total * group_size * seq_len * head_dim;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "repeat_kv").unwrap();
+    unsafe { f.launch(cfg, (input, output, n_kv_total, group_size, seq_len, head_dim)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_repeat_kv_backward(ctx: &Arc<MetalContext>, out_grad: &GpuBuffer, kv_grad: &GpuBuffer, n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)  { unimplemented!("cuda backend: gpu_repeat_kv_backward not yet ported") }
+pub fn gpu_repeat_kv_backward(ctx: &Arc<MetalContext>, out_grad: &GpuBuffer, kv_grad: &GpuBuffer, n_kv_total: u32, group_size: u32, seq_len: u32, head_dim: u32)  {
+    let total = n_kv_total * seq_len * head_dim;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "repeat_kv_backward").unwrap();
+    unsafe { f.launch(cfg, (out_grad, kv_grad, n_kv_total, group_size, seq_len, head_dim)) }.unwrap();
+}
 
 // ===== Matmul-path flags: Metal-only (simdgroup MMA / bf16 / rmsnorm-clamp). No-ops on CUDA. =====
 pub fn set_simdgroup_matmul(_on: bool) -> bool { false }
 pub fn simdgroup_matmul_enabled() -> bool { false }
 pub fn set_bf16_matmul(_on: bool) -> bool { false }
 pub fn bf16_matmul_enabled() -> bool { false }
-pub fn set_rmsnorm_clamp(_on: bool) -> bool { false }
+thread_local! {
+    static RMSNORM_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+pub fn set_rmsnorm_clamp(on: bool) -> bool { RMSNORM_CLAMP.with(|c| c.replace(on)) }
+fn rmsnorm_clamp_enabled() -> bool { RMSNORM_CLAMP.with(|c| c.get()) }
 pub const ADAM8_BLOCK: usize = 256;

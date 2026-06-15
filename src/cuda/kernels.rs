@@ -17,7 +17,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "compact_strided_copy", "strided_batch_copy", "buffer_copy",
     "silu_backward", "silu_gate_backward", "rms_norm_backward", "softmax_backward", "embedding_backward",
     "l2_norm_check", "argmax", "temperature_scale", "gradient_mask", "zero_rows",
-    "ema_update",
+    "ema_update", "repeat_kv", "repeat_kv_backward", "causal_doc_mask",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -583,7 +583,7 @@ extern "C" __global__ void silu_gate_backward(
 extern "C" __global__ void rms_norm_backward(
     const float* input, const float* weight, const float* grad_out,
     float* grad_input, float* grad_weight,
-    unsigned int rows, unsigned int cols, float eps
+    unsigned int rows, unsigned int cols, float eps, unsigned int clamp_on
 ) {
     // One block per row; blockDim is a power of 2 (>= a divisor sweep of cols via grid-stride).
     int row = blockIdx.x;
@@ -602,6 +602,8 @@ extern "C" __global__ void rms_norm_backward(
     __syncthreads();
     for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
     float inv_rms = rsqrtf(sh[0] / (float)cols + eps);
+    // Collapsed-row guard: bound inv_rms so the inv_rms^3 correction can't explode (mean_sq->0).
+    if (clamp_on) inv_rms = fminf(inv_rms, 31.62f);
     __syncthreads();
 
     // dot_sum = sum_c(grad_out[c] * weight[c] * x[c])
@@ -615,7 +617,8 @@ extern "C" __global__ void rms_norm_backward(
     // grad_input = grad_out*weight*inv_rms - x * (dot_sum * inv_rms^3 / cols)
     float correction = dot_sum * inv_rms * inv_rms * inv_rms / (float)cols;
     for (int c = tid; c < cols; c += nt) {
-        gi[c] = go[c] * weight[c] * inv_rms - x[c] * correction;
+        float g = go[c] * weight[c] * inv_rms - x[c] * correction;
+        gi[c] = clamp_on ? fmaxf(-1.0e3f, fminf(1.0e3f, g)) : g;
         atomicAdd(&grad_weight[c], go[c] * x[c] * inv_rms);
     }
 }
@@ -1143,5 +1146,44 @@ extern "C" __global__ void silu(const float* input, float* output, unsigned int 
 extern "C" __global__ void ema_update(float* ema, const float* src, unsigned int size, float decay) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) ema[i] = ema[i] * decay + src[i] * (1.0f - decay);
+}
+
+// GQA: expand [n_kv_total, seq, hd] -> [n_kv_total*group_size, seq, hd] by repeating each KV head.
+extern "C" __global__ void repeat_kv(const float* input, float* output,
+    unsigned int n_kv_total, unsigned int group_size, unsigned int seq_len, unsigned int head_dim) {
+    unsigned int head_block = seq_len * head_dim;
+    unsigned int total = n_kv_total * group_size * head_block;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    unsigned int out_head = tid / head_block;
+    unsigned int in_head = out_head / group_size;
+    output[tid] = input[in_head * head_block + (tid % head_block)];
+}
+
+// GQA backward: sum the group_size expanded-head gradients back into each KV head.
+extern "C" __global__ void repeat_kv_backward(const float* out_grad, float* kv_grad,
+    unsigned int n_kv_total, unsigned int group_size, unsigned int seq_len, unsigned int head_dim) {
+    unsigned int head_block = seq_len * head_dim;
+    unsigned int total = n_kv_total * head_block;
+    unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+    unsigned int kv_head = tid / head_block;
+    unsigned int off = tid % head_block;
+    float sum = 0.0f;
+    for (unsigned int g = 0; g < group_size; g++)
+        sum += out_grad[(kv_head * group_size + g) * head_block + off];
+    kv_grad[tid] = sum;
+}
+
+// Seq-packing: mask future (k>q) and cross-document (seg_ids differ) positions.
+extern "C" __global__ void causal_doc_mask(float* scores, const unsigned int* seg_ids,
+    unsigned int batch_heads, unsigned int seq, unsigned int n_heads) {
+    unsigned int bh = blockIdx.x;
+    unsigned int q = blockIdx.y;
+    unsigned int k = threadIdx.x;
+    if (bh >= batch_heads || q >= seq || k >= seq) return;
+    unsigned int base = (bh / n_heads) * seq;
+    if (k > q || seg_ids[base + q] != seg_ids[base + k])
+        scores[bh * seq * seq + q * seq + k] = -1e30f;
 }
 "#;

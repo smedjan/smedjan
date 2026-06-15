@@ -562,7 +562,9 @@ impl MultiHeadAttention {
         // GQA strided path: skip repeat_kv copy, use GQA-aware matmuls directly.
         // Only for inference (no tape) — training backward needs expanded K/V for gradient flow.
         // Block-sparse needs the expanded K/V (block-mean + dense scores), so it's excluded too.
-        let use_gqa_strided = !linear && !ssm && !rwkv && !block_sparse && group_size > 1 && !autograd::is_recording();
+        // The strided GQA matmuls are a Metal-only kernel; CUDA falls back to the repeat_kv path.
+        let use_gqa_strided = cfg!(feature = "metal")
+            && !linear && !ssm && !rwkv && !block_sparse && group_size > 1 && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
