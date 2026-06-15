@@ -565,7 +565,9 @@ impl TransformerBlock {
         // MEGA-KERNEL: fuse norm + FFN + residual into single dispatch for d≤256.
         // Per-token threadgroups lose to tiled matmul at large token counts.
         // Only active for small batches (≤8 tokens) where dispatch overhead dominates.
-        let use_mega = self.lowrank == 0 && self.n_experts <= 1 && !self.bitnet
+        // The fused norm+FFN megakernel is a hand-written Metal optimization; the CUDA
+        // backend has no such kernel, so there it falls back to the primitive FFN path.
+        let use_mega = cfg!(feature = "metal") && self.lowrank == 0 && self.n_experts <= 1 && !self.bitnet
             && d <= 256 && self.ffn_w1.shape[1] <= 1024
             && batch * seq_len <= 8
             && !autograd::is_recording();
