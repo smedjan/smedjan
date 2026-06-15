@@ -296,7 +296,9 @@ pub fn gpu_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &
 pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32)  { unimplemented!("cuda backend: gpu_matmul_trans_a_simdgroup not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_cast_f16_to_f32 not yet ported") }
+pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    gpu_copy(ctx, input, output, size)
+}
 
 // CUDA stays fp32 (cast_to_f16 is a no-op on CUDA), so the f16 entry points delegate to fp32 kernels.
 pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul(ctx, a, b, c, m, n, k) }
@@ -346,19 +348,39 @@ pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_rms_norm_residual( ctx: &Arc<MetalContext>, input: &GpuBuffer, residual: &GpuBuffer, weight: &GpuBuffer, output: &GpuBuffer, sum_out: &GpuBuffer, d: RmsResDims, )  { unimplemented!("cuda backend: gpu_rms_norm_residual not yet ported") }
+pub fn gpu_rms_norm_residual( ctx: &Arc<MetalContext>, input: &GpuBuffer, residual: &GpuBuffer, weight: &GpuBuffer, output: &GpuBuffer, sum_out: &GpuBuffer, d: RmsResDims, ) {
+    let cfg = launch_cfg_2d(d.rows, 1, next_power_of_2_clamped(d.cols as u64) as u32, 1);
+    let f = ctx.device.get_func("andreai","rms_norm_residual").unwrap();
+    unsafe { f.launch(cfg, (input, residual, weight, output, sum_out, d.rows, d.cols, d.eps)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_rope_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims)  { unimplemented!("cuda backend: gpu_rope_copy not yet ported") }
+pub fn gpu_rope_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims) {
+    let n = d.total_rows * d.seq_len * d.head_dim;
+    gpu_copy(ctx, src, dst, n);
+    gpu_rope(ctx, dst, d.total_rows, d.seq_len, d.head_dim, d.offset, d.theta);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_rope_backward( ctx: &Arc<MetalContext>, data: &GpuBuffer, total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32, )  { unimplemented!("cuda backend: gpu_rope_backward not yet ported") }
+pub fn gpu_rope_backward( ctx: &Arc<MetalContext>, data: &GpuBuffer, total_rows: u32, seq_len: u32, head_dim: u32, offset: u32, theta: f32, ) {
+    let cfg = launch_cfg_3d(total_rows, seq_len, 1, head_dim / 2);
+    let f = ctx.device.get_func("andreai","rope_backward").unwrap();
+    unsafe { f.launch(cfg, (data, data, total_rows, seq_len, head_dim, offset, theta)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_rope_backward_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims)  { unimplemented!("cuda backend: gpu_rope_backward_copy not yet ported") }
+pub fn gpu_rope_backward_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: RopeDims) {
+    let n = d.total_rows * d.seq_len * d.head_dim;
+    gpu_copy(ctx, src, dst, n);
+    gpu_rope_backward(ctx, dst, d.total_rows, d.seq_len, d.head_dim, d.offset, d.theta);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_silu not yet ported") }
+pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","silu").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_adamw_8bit_update( ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, state: &Adam8Buffers, size: u32, hp: &AdamWHyperparams, )  { unimplemented!("cuda backend: gpu_adamw_8bit_update not yet ported") }
@@ -421,46 +443,103 @@ pub fn gpu_gather_blocks_backward(ctx: &Arc<MetalContext>, d_out: &GpuBuffer, se
 pub fn gpu_gather_causal_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, sel: &CudaSlice<u32>, bh_nb: u32, nb: u32, block: u32, k_sel: u32)  { unimplemented!("cuda backend: gpu_gather_causal_mask not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 { unimplemented!("cuda backend: gpu_l2_norm not yet ported") }
+pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
+    let out = ctx.alloc_buffer(8);
+    gpu_l2_norm_into(ctx, data, size, &out);
+    MetalContext::read_buffer(&out, 1)[0]
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, output: &GpuBuffer)  { unimplemented!("cuda backend: gpu_l2_norm_into not yet ported") }
+pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, output: &GpuBuffer) {
+    let tpg = next_power_of_2_clamped(size as u64) as u32;
+    let cfg = launch_cfg(tpg, 1);
+    let f = ctx.device.get_func("andreai","l2_norm_check").unwrap();
+    unsafe { f.launch(cfg, (data, output, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_silu_backward( ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32, )  { unimplemented!("cuda backend: gpu_silu_backward not yet ported") }
+pub fn gpu_silu_backward( ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32, ) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","silu_backward").unwrap();
+    unsafe { f.launch(cfg, (input, grad_output, grad_input, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_silu_gate_backward( ctx: &Arc<MetalContext>, gate: &GpuBuffer, up: &GpuBuffer, grad_output: &GpuBuffer, grad_gate: &GpuBuffer, grad_up: &GpuBuffer, size: u32, )  { unimplemented!("cuda backend: gpu_silu_gate_backward not yet ported") }
+pub fn gpu_silu_gate_backward( ctx: &Arc<MetalContext>, gate: &GpuBuffer, up: &GpuBuffer, grad_output: &GpuBuffer, grad_gate: &GpuBuffer, grad_up: &GpuBuffer, size: u32, ) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","silu_gate_backward").unwrap();
+    unsafe { f.launch(cfg, (gate, up, grad_output, grad_gate, grad_up, size)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_rms_norm_backward( ctx: &Arc<MetalContext>, input: &GpuBuffer, weight: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, grad_weight: &GpuBuffer, params: &RmsNormBackwardParams, )  { unimplemented!("cuda backend: gpu_rms_norm_backward not yet ported") }
+pub fn gpu_rms_norm_backward( ctx: &Arc<MetalContext>, input: &GpuBuffer, weight: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, grad_weight: &GpuBuffer, params: &RmsNormBackwardParams, ) {
+    let cfg = launch_cfg_2d(params.rows, 1, next_power_of_2_clamped(params.cols as u64) as u32, 1);
+    let f = ctx.device.get_func("andreai","rms_norm_backward").unwrap();
+    unsafe { f.launch(cfg, (input, weight, grad_output, grad_input, grad_weight, params.rows, params.cols, params.eps)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_softmax_backward( ctx: &Arc<MetalContext>, softmax_out: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, rows: u32, cols: u32, )  { unimplemented!("cuda backend: gpu_softmax_backward not yet ported") }
+pub fn gpu_softmax_backward( ctx: &Arc<MetalContext>, softmax_out: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, rows: u32, cols: u32, ) {
+    let cfg = launch_cfg_2d(rows, 1, next_power_of_2_clamped(cols as u64) as u32, 1);
+    let f = ctx.device.get_func("andreai","softmax_backward").unwrap();
+    unsafe { f.launch(cfg, (softmax_out, grad_output, grad_input, rows, cols)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_embedding_backward( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, grad_output: &GpuBuffer, grad_embeddings: &GpuBuffer, n_tokens: u32, dim: u32, )  { unimplemented!("cuda backend: gpu_embedding_backward not yet ported") }
+pub fn gpu_embedding_backward( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, grad_output: &GpuBuffer, grad_embeddings: &GpuBuffer, n_tokens: u32, dim: u32, ) {
+    let cfg = launch_cfg_2d(n_tokens, 1, dim.min(1024), 1);
+    let f = ctx.device.get_func("andreai","embedding_backward").unwrap();
+    unsafe { f.launch(cfg, (tokens, grad_output, grad_embeddings, n_tokens, dim)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_zero_rows( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, matrix: &GpuBuffer, n_tokens: u32, dim: u32, )  { unimplemented!("cuda backend: gpu_zero_rows not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_transpose_2d( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32, )  { unimplemented!("cuda backend: gpu_transpose_2d not yet ported") }
+pub fn gpu_transpose_2d( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32, ) {
+    let total = rows * cols;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai","transpose_2d").unwrap();
+    unsafe { f.launch(cfg, (input, output, rows, cols)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_transpose_perm_backward( ctx: &Arc<MetalContext>, grad_in: &GpuBuffer, grad_out: &GpuBuffer, batch: u32, seq: u32, n_heads: u32, head_dim: u32, )  { unimplemented!("cuda backend: gpu_transpose_perm_backward not yet ported") }
+pub fn gpu_transpose_perm_backward( ctx: &Arc<MetalContext>, grad_in: &GpuBuffer, grad_out: &GpuBuffer, batch: u32, seq: u32, n_heads: u32, head_dim: u32, ) {
+    let total = batch * seq * n_heads * head_dim;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai","transpose_perm_backward").unwrap();
+    unsafe { f.launch(cfg, (grad_out, grad_in, batch, seq, n_heads, head_dim)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_transpose_perm_forward( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, batch: u32, seq: u32, n_heads: u32, head_dim: u32, )  { unimplemented!("cuda backend: gpu_transpose_perm_forward not yet ported") }
+pub fn gpu_transpose_perm_forward( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, batch: u32, seq: u32, n_heads: u32, head_dim: u32, ) {
+    let total = batch * seq * n_heads * head_dim;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai","transpose_perm_forward").unwrap();
+    unsafe { f.launch(cfg, (input, output, batch, seq, n_heads, head_dim)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_gradient_mask( ctx: &Arc<MetalContext>, grad: &GpuBuffer, mask: &CudaSlice<u32>, positions: u32, vocab_size: u32, )  { unimplemented!("cuda backend: gpu_gradient_mask not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_strided_batch_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: StridedCopyDims)  { unimplemented!("cuda backend: gpu_strided_batch_copy not yet ported") }
+pub fn gpu_strided_batch_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: StridedCopyDims)  {
+    let StridedCopyDims { bh, src_seq_len, dst_stride, dst_offset, dim } = d;
+    let copy_len = src_seq_len * dim;
+    let cfg = launch_cfg_2d(bh, copy_len.div_ceil(256), 256, 1);
+    let f = ctx.device.get_func("andreai", "strided_batch_copy").unwrap();
+    // src/dst row = head; per-head linear copy of (src_seq_len*dim) elems, dim-scaled strides/offset.
+    unsafe { f.launch(cfg, (src, dst, 0u32, dst_offset * dim, copy_len, src_seq_len * dim, dst_stride * dim, bh)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_compact_strided_copy( ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, bh: u32, seq_len: u32, src_stride: u32, dim: u32, )  { unimplemented!("cuda backend: gpu_compact_strided_copy not yet ported") }
+pub fn gpu_compact_strided_copy( ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, bh: u32, seq_len: u32, src_stride: u32, dim: u32, )  {
+    let copy_len = seq_len * dim;
+    let cfg = launch_cfg_2d(bh, copy_len.div_ceil(256), 256, 1);
+    let f = ctx.device.get_func("andreai", "compact_strided_copy").unwrap();
+    // gather strided src rows into compact dst; row = head, dim-scaled strides.
+    unsafe { f.launch(cfg, (src, dst, src_stride * dim, seq_len * dim, copy_len, bh)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_argmax(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> u32 { unimplemented!("cuda backend: gpu_argmax not yet ported") }
@@ -469,10 +548,20 @@ pub fn gpu_argmax(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> u32 {
 pub fn gpu_temperature_scale( ctx: &Arc<MetalContext>, data: &GpuBuffer, offset: u32, count: u32, temperature: f32, )  { unimplemented!("cuda backend: gpu_temperature_scale not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_kl_divergence( ctx: &Arc<MetalContext>, teacher_logits: &GpuBuffer, student_logits: &GpuBuffer, losses: &GpuBuffer, grad_student: &GpuBuffer, d: KlDims, )  { unimplemented!("cuda backend: gpu_kl_divergence not yet ported") }
+pub fn gpu_kl_divergence( ctx: &Arc<MetalContext>, teacher_logits: &GpuBuffer, student_logits: &GpuBuffer, losses: &GpuBuffer, grad_student: &GpuBuffer, d: KlDims, ) {
+    let cfg = launch_cfg_2d(d.batch_size, 1, next_power_of_2_clamped(d.vocab_size as u64) as u32, 1);
+    let f = ctx.device.get_func("andreai","kl_divergence").unwrap();
+    unsafe { f.launch(cfg, (teacher_logits, student_logits, losses, grad_student, d.batch_size, d.vocab_size, d.temperature)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_scaled_causal_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims)  { unimplemented!("cuda backend: gpu_scaled_causal_softmax not yet ported") }
+pub fn gpu_scaled_causal_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims) {
+    let n = d.total_rows * d.seq_q * d.seq_k;
+    gpu_copy(ctx, input, output, n);
+    gpu_scale(ctx, output, n, d.scale);
+    gpu_causal_mask(ctx, output, d.total_rows, d.seq_q, d.seq_k, d.kv_offset);
+    gpu_softmax(ctx, output, output, d.total_rows * d.seq_q, d.seq_k);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_scaled_causal_softmax_window(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims, window: u32)  { unimplemented!("cuda backend: gpu_scaled_causal_softmax_window not yet ported") }
@@ -481,10 +570,16 @@ pub fn gpu_scaled_causal_softmax_window(ctx: &Arc<MetalContext>, input: &GpuBuff
 pub fn gpu_mega_ffn( ctx: &Arc<MetalContext>, x: &GpuBuffer, norm_w: &GpuBuffer, w: FfnWeights, output: &GpuBuffer, d: MegaFfnDims, )  { unimplemented!("cuda backend: gpu_mega_ffn not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: TrRopeDims)  { unimplemented!("cuda backend: gpu_transpose_rope not yet ported") }
+pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: TrRopeDims) {
+    gpu_transpose_perm_forward(ctx, input, output, d.batch, d.seq, d.n_heads, d.head_dim);
+    gpu_rope(ctx, output, d.batch * d.n_heads, d.seq, d.head_dim, d.offset, d.theta);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer, grad_in: &GpuBuffer, d: TrRopeDims)  { unimplemented!("cuda backend: gpu_transpose_rope_backward not yet ported") }
+pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer, grad_in: &GpuBuffer, d: TrRopeDims) {
+    gpu_rope_backward(ctx, grad_out, d.batch * d.n_heads, d.seq, d.head_dim, d.offset, d.theta);
+    gpu_transpose_perm_backward(ctx, grad_in, grad_out, d.batch, d.seq, d.n_heads, d.head_dim);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_compute_inv_rms(ctx: &Arc<MetalContext>, input: &GpuBuffer, inv_rms: &GpuBuffer, rows: u32, cols: u32, eps: f32)  { unimplemented!("cuda backend: gpu_compute_inv_rms not yet ported") }
@@ -505,7 +600,11 @@ pub fn gpu_broadcast_rows(ctx: &Arc<MetalContext>, vec: &GpuBuffer, out: &GpuBuf
 pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_exp not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_relu_backward(ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_relu_backward not yet ported") }
+pub fn gpu_relu_backward(ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output: &GpuBuffer, grad_input: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai","silu_backward").unwrap(); // no relu kernel; relu unused on this path
+    let _ = (input, grad_output, grad_input, &f, &cfg); unimplemented!("cuda: gpu_relu_backward (no kernel)")
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer, size: u32, decay: f32)  { unimplemented!("cuda backend: gpu_ema_update not yet ported") }
@@ -514,7 +613,10 @@ pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer,
 pub fn gpu_logsumexp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32)  { unimplemented!("cuda backend: gpu_logsumexp not yet ported") }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32, scale: f32)  { unimplemented!("cuda backend: gpu_scale_copy not yet ported") }
+pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32, scale: f32) {
+    gpu_copy(ctx, src, dst, size);
+    gpu_scale(ctx, dst, size, scale);
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_muon_frob_normalize(ctx: &Arc<MetalContext>, m: &GpuBuffer, x: &GpuBuffer, size: u32)  { unimplemented!("cuda backend: gpu_muon_frob_normalize not yet ported") }
