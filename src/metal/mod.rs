@@ -56,29 +56,40 @@ thread_local! {
 //     This makes intra-batch recycle→reissue aliasing impossible by construction — the exact
 //     loss-readout-class failure. Used as a differential: a correct run is unchanged by it.
 // ---------------------------------------------------------------------------
-#[cfg(feature = "bufsan")]
 thread_local! {
-    /// Bumped on every flush (commit+wait). Marks command-batch boundaries.
+    /// Bumped on every WAITING flush (commit+wait). Marks command-batch boundaries so the pool
+    /// can distinguish "recycled in an already-completed batch" (safe to reissue) from "recycled
+    /// in the current uncommitted batch" (reissue would alias a dispatch the GPU hasn't run yet).
     static BATCH_GENERATION: Cell<u64> = const { Cell::new(0) };
     /// buffer address → generation at which it was recycled.
     static RECYCLE_GEN: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
-    /// When true, alloc reissues only flushed-generation buffers (no intra-batch reuse).
-    static BUFSAN_QUARANTINE: Cell<bool> = const { Cell::new(false) };
+    /// Pool quarantine — DEFAULT ON. Alloc reissues only buffers recycled in an already-flushed
+    /// generation, making intra-batch recycle→reissue aliasing impossible by construction. This is
+    /// the fix for silent gradient corruption that surfaced as loss divergence at seq_len ≥ 256
+    /// (the pooled attention-backward buffers aliased a still-pending dispatch). Toggleable so the
+    /// `bufsan` differential test can compare against the old unsafe behaviour; production keeps it
+    /// on. `ANDREAI_NO_POOL` (full bypass) remains as the even-stronger diagnostic.
+    static QUARANTINE: Cell<bool> = const { Cell::new(true) };
 }
 
-#[cfg(feature = "bufsan")]
 #[inline]
-fn bufsan_addr(buf: &GpuBuffer) -> usize {
+fn buf_contents_addr(buf: &GpuBuffer) -> usize {
     use objc2_metal::MTLBuffer;
     buf.contents().as_ptr() as usize
 }
 
-/// Called at the end of every flush, AFTER waitUntilCompleted. Bumps the generation and
-/// NaN-poisons every pooled buffer (all are now from flushed generations → provably dead).
-#[cfg(feature = "bufsan")]
-fn bufsan_on_flush() {
-    use objc2_metal::MTLBuffer;
+/// Called at the end of every WAITING flush (commit+wait). Bumps the command-batch generation so
+/// quarantine can release buffers recycled in now-completed batches. Under `bufsan` it also
+/// NaN-poisons the (now provably-dead) pooled buffers so a use-after-recycle surfaces as NaN.
+fn on_flush() {
     BATCH_GENERATION.with(|g| g.set(g.get() + 1));
+    #[cfg(feature = "bufsan")]
+    bufsan_poison_pool();
+}
+
+#[cfg(feature = "bufsan")]
+fn bufsan_poison_pool() {
+    use objc2_metal::MTLBuffer;
     let nan = f32::from_bits(0x7FC0_0000);
     BUFFER_POOL.with(|pool| {
         let p = pool.borrow();
@@ -342,6 +353,18 @@ impl MetalContext {
         })
     }
 
+    /// Diagnostic: when `ANDREAI_NO_POOL` is set in the environment, every `alloc_buffer`
+    /// bypasses the size-keyed reuse pool and returns a brand-new buffer. This removes
+    /// intra-batch buffer aliasing (the #1 known GPU-correctness hazard: a pooled buffer
+    /// recycled then re-handed-out while a still-pending dispatch needs it) as a variable
+    /// when bisecting gradient-corruption bugs. Process-global, env read once. Slower + more
+    /// memory, so OFF by default; pure diagnostic, never a correctness dependency.
+    fn pool_disabled() -> bool {
+        use std::sync::OnceLock;
+        static D: OnceLock<bool> = OnceLock::new();
+        *D.get_or_init(|| std::env::var("ANDREAI_NO_POOL").is_ok())
+    }
+
     /// Allocate a shared-mode Metal buffer (CPU + GPU accessible, zero-copy on M1).
     /// Checks the buffer pool first for a cached buffer of the same size.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Retained<GpuBuffer> {
@@ -355,29 +378,30 @@ impl MetalContext {
 
         // Try pool first (unless bypassed — e.g. during checkpoint recompute, where reusing a
         // pooled buffer the outer backward still references would corrupt gradients).
-        let bypass = POOL_BYPASS.with(|b| b.get()) > 0;
+        let bypass = POOL_BYPASS.with(|b| b.get()) > 0 || Self::pool_disabled();
         let pooled = if bypass {
             None
         } else {
             BUFFER_POOL.with(|pool| {
                 let mut p = pool.borrow_mut();
                 if let Some(list) = p.get_mut(&size_bytes) {
-                    // Sanitizer quarantine: reissue only a buffer recycled in an already-flushed
-                    // generation, so a buffer recycled in THIS batch can't be handed back out and
-                    // overwritten while the old owner still needs it.
-                    #[cfg(feature = "bufsan")]
-                    if BUFSAN_QUARANTINE.with(|q| q.get()) {
+                    // Quarantine (default): reissue only a buffer recycled in an already-flushed
+                    // generation, so a buffer recycled in THIS uncommitted batch can't be handed
+                    // back out and overwritten while a still-pending dispatch needs it. Forcing a
+                    // fresh allocation when every pooled buffer is same-generation is what keeps
+                    // gradients correct at seq_len ≥ 256.
+                    if QUARANTINE.with(|q| q.get()) {
                         let cur = BATCH_GENERATION.with(|g| g.get());
                         let pick = RECYCLE_GEN.with(|rg| {
                             let rg = rg.borrow();
                             list.iter().position(|b| {
-                                rg.get(&bufsan_addr(b)).copied().is_none_or(|g| g < cur)
+                                rg.get(&buf_contents_addr(b)).copied().is_none_or(|g| g < cur)
                             })
                         });
                         return match pick {
                             Some(i) => {
                                 let buf = list.remove(i);
-                                RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&bufsan_addr(&buf)); });
+                                RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
                                 POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                                 Some(buf)
                             }
@@ -385,8 +409,7 @@ impl MetalContext {
                         };
                     }
                     if let Some(buf) = list.pop() {
-                        #[cfg(feature = "bufsan")]
-                        RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&bufsan_addr(&buf)); });
+                        RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
                         POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                         return Some(buf);
                     }
@@ -422,8 +445,7 @@ impl MetalContext {
             return;
         }
         let size = buf.length();
-        #[cfg(feature = "bufsan")]
-        let addr = bufsan_addr(&buf);
+        let addr = buf_contents_addr(&buf);
         BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             let list = p.entry(size).or_default();
@@ -431,13 +453,12 @@ impl MetalContext {
             // 64 allows gradient-checkpointed backward to find reusable buffers
             // across layer recomputes (was 32, causing ~63% miss rate).
             if list.len() < 64 {
-                #[cfg(feature = "bufsan")]
-                {
-                    let gen = BATCH_GENERATION.with(|g| g.get());
-                    RECYCLE_GEN.with(|rg| {
-                        rg.borrow_mut().insert(addr, gen);
-                    });
-                }
+                // Stamp the recycle generation so quarantine won't reissue this buffer until the
+                // batch it was recycled in has been flushed (committed + waited).
+                let gen = BATCH_GENERATION.with(|g| g.get());
+                RECYCLE_GEN.with(|rg| {
+                    rg.borrow_mut().insert(addr, gen);
+                });
                 list.push(buf);
             }
         });
@@ -475,24 +496,19 @@ impl MetalContext {
     pub fn clear_pool() {
         BUFFER_POOL.with(|pool| pool.borrow_mut().clear());
         POOL_STATS.with(|s| *s.borrow_mut() = (0, 0));
-        #[cfg(feature = "bufsan")]
-        {
-            RECYCLE_GEN.with(|rg| rg.borrow_mut().clear());
-            BATCH_GENERATION.with(|g| g.set(0));
-        }
+        RECYCLE_GEN.with(|rg| rg.borrow_mut().clear());
+        BATCH_GENERATION.with(|g| g.set(0));
     }
 
-    /// Sanitizer (feature = "bufsan"): enable/disable buffer-pool quarantine. When on, alloc
-    /// reissues only buffers recycled in an already-flushed generation, eliminating intra-batch
-    /// recycle→reissue aliasing. A correct run is byte-unchanged by it; a use-after-recycle path
-    /// behaves differently — use as a differential.
-    #[cfg(feature = "bufsan")]
+    /// Enable/disable buffer-pool quarantine. ON by default (the gradient-corruption fix). When on,
+    /// alloc reissues only buffers recycled in an already-flushed generation, eliminating
+    /// intra-batch recycle→reissue aliasing. Exposed mainly so the `bufsan` differential test can
+    /// toggle it; production should leave it on.
     pub fn set_pool_quarantine(on: bool) {
-        BUFSAN_QUARANTINE.with(|q| q.set(on));
+        QUARANTINE.with(|q| q.set(on));
     }
 
-    /// Sanitizer (feature = "bufsan"): current command-batch generation (flush count).
-    #[cfg(feature = "bufsan")]
+    /// Current command-batch generation (count of waiting flushes since start/clear).
     pub fn pool_generation() -> u64 {
         BATCH_GENERATION.with(|g| g.get())
     }
@@ -628,12 +644,9 @@ impl MetalContext {
             }
             false
         });
-        #[cfg(feature = "bufsan")]
         if flushed {
-            bufsan_on_flush();
+            on_flush();
         }
-        #[cfg(not(feature = "bufsan"))]
-        let _ = flushed;
     }
 
     /// Get a pipeline by name, panics if not found.
@@ -679,12 +692,9 @@ impl MetalContext {
             *b = Some(CommandBatch { cmd, encoder, dispatch_count: 0 });
             did
         });
-        #[cfg(feature = "bufsan")]
         if flushed {
-            bufsan_on_flush();
+            on_flush();
         }
-        #[cfg(not(feature = "bufsan"))]
-        let _ = flushed;
     }
 
     /// Flush the current command batch: end encoder, commit, and wait for GPU completion.
@@ -703,9 +713,8 @@ impl MetalContext {
                 0
             }
         });
-        #[cfg(feature = "bufsan")]
         if count > 0 {
-            bufsan_on_flush();
+            on_flush();
         }
         count
     }
