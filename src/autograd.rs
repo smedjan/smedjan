@@ -738,6 +738,12 @@ fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: 
     let sel = entry.cached.as_ref().expect("gather_blocks backward needs cached sel buffer");
     let src_size = (dims.bh * dims.seq * dims.hd) as usize;
     let d_src = ctx.alloc_buffer(src_size * 4);
+    // gpu_gather_blocks_backward SCATTER-ADDS (atomic_fetch_add) into d_src, so it must start zeroed
+    // — alloc_buffer returns a POOLED buffer with stale contents, which the scatter accumulates onto
+    // → corrupt K/V gradients (block-sparse training stayed pinned at init; clean only under
+    // ANDREAI_NO_POOL, where fresh OS pages happen to be zero). Every other scatter-add backward
+    // (flash dk/dv, embedding) pre-zeros the same way; this one was missing it.
+    compute::gpu_fill(ctx, &d_src, src_size as u32, 0.0);
     compute::gpu_gather_blocks_backward(ctx, out_grad, &crate::gpu::buf_as_u32(sel), &d_src, dims);
     accumulate_grad(ctx, entry.inputs[0], d_src, src_size);
 }
