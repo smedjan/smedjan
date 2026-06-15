@@ -135,6 +135,9 @@ pub fn gpu_cross_entropy(ctx: &Arc<MetalContext>, logits: &GpuBuffer, targets: &
     let cfg = launch_cfg_2d(batch, 1, tpg, 1);
     let f = ctx.device.get_func("andreai", "cross_entropy").unwrap();
     unsafe { f.launch(cfg, (logits, targets, losses, grad, batch, vocab)) }.unwrap();
+    // Loss is the mean over batch; scale grad by 1/batch to match (Metal does this in-kernel).
+    // Done here in Rust because the in-kernel `batch` was unreliable for this scale under nvrtc.
+    gpu_scale(ctx, grad, batch * vocab, 1.0 / batch as f32);
 }
 
 pub fn gpu_reduce_sum(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
@@ -613,7 +616,11 @@ pub fn gpu_relu_backward(ctx: &Arc<MetalContext>, input: &GpuBuffer, grad_output
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer, size: u32, decay: f32)  { unimplemented!("cuda backend: gpu_ema_update not yet ported") }
+pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer, size: u32, decay: f32)  {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "ema_update").unwrap();
+    unsafe { f.launch(cfg, (ema, src, size, decay)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_logsumexp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32)  { unimplemented!("cuda backend: gpu_logsumexp not yet ported") }

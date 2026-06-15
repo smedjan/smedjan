@@ -17,6 +17,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "compact_strided_copy", "strided_batch_copy", "buffer_copy",
     "silu_backward", "silu_gate_backward", "rms_norm_backward", "softmax_backward", "embedding_backward",
     "l2_norm_check", "argmax", "temperature_scale", "gradient_mask", "zero_rows",
+    "ema_update",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -419,10 +420,12 @@ extern "C" __global__ void cross_entropy(
         losses[row] = -(row_in[target] - log_sum_exp);
 
     float inv_sum = 1.0f / shared_sum[0];
-    float inv_batch = 1.0f / (float)batch; // loss is mean over batch; scale grad to match (parity with Metal)
+    // grad = softmax - onehot (unscaled). The /batch mean-scaling is applied by the
+    // gpu_cross_entropy wrapper via gpu_scale — the in-kernel `batch` param proved unreliable
+    // in this expression under nvrtc (grid/loss saw 4, but 1.0f/(float)batch evaluated to 1.0).
     for (int c = tid; c < vocab; c += nthreads) {
         float prob = expf(row_in[c] - row_max) * inv_sum;
-        row_grad[c] = (prob - (c == target ? 1.0f : 0.0f)) * inv_batch;
+        row_grad[c] = prob - (c == target ? 1.0f : 0.0f);
     }
 }
 
@@ -1134,5 +1137,11 @@ extern "C" __global__ void silu(const float* input, float* output, unsigned int 
         float x = input[i];
         output[i] = x / (1.0f + expf(-x));
     }
+}
+
+// EMA update: ema = ema*decay + src*(1-decay)
+extern "C" __global__ void ema_update(float* ema, const float* src, unsigned int size, float decay) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) ema[i] = ema[i] * decay + src[i] * (1.0f - decay);
 }
 "#;
