@@ -163,7 +163,7 @@ pub struct AdamWHyperparams {
 pub fn gpu_adamw_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, v: &GpuBuffer, size: u32, hp: &AdamWHyperparams) {
     let cfg = launch_cfg(256, size.div_ceil(256));
     let f = ctx.device.get_func("andreai", "adamw_update").unwrap();
-    unsafe { f.launch(cfg, (param, grad, m, v, size, hp.lr, hp.beta1, hp.beta2, hp.eps, hp.weight_decay, hp.step as i32)) }.unwrap();
+    unsafe { f.launch(cfg, (param, grad, m, v, size, hp.lr, hp.beta1, hp.beta2, hp.eps, hp.weight_decay, hp.step as i32, hp.update_clip)) }.unwrap();
 }
 
 // ===== Embedding =====

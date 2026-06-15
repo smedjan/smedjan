@@ -455,7 +455,7 @@ extern "C" __global__ void reduce_sum(const float* input, float* output, unsigne
 extern "C" __global__ void adamw_update(
     float* param, const float* grad, float* m, float* v,
     unsigned int size, float lr, float beta1, float beta2,
-    float eps, float weight_decay, int step
+    float eps, float weight_decay, int step, float update_clip
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= size) return;
@@ -469,7 +469,10 @@ extern "C" __global__ void adamw_update(
     float m_hat = m_val / (1.0f - powf(beta1, (float)step));
     float v_hat = v_val / (1.0f - powf(beta2, (float)step));
 
-    param[i] = param[i] * (1.0f - lr * weight_decay) - lr * m_hat / (sqrtf(v_hat) + eps);
+    // Normalized Adam update; update_clip bounds it at the source (0 = disabled).
+    float update = m_hat / (sqrtf(v_hat) + eps);
+    if (update_clip > 0.0f) update = fmaxf(-update_clip, fminf(update_clip, update));
+    param[i] = param[i] * (1.0f - lr * weight_decay) - lr * update;
 }
 
 // ============================================================
