@@ -419,9 +419,10 @@ extern "C" __global__ void cross_entropy(
         losses[row] = -(row_in[target] - log_sum_exp);
 
     float inv_sum = 1.0f / shared_sum[0];
+    float inv_batch = 1.0f / (float)batch; // loss is mean over batch; scale grad to match (parity with Metal)
     for (int c = tid; c < vocab; c += nthreads) {
         float prob = expf(row_in[c] - row_max) * inv_sum;
-        row_grad[c] = prob - (c == target ? 1.0f : 0.0f);
+        row_grad[c] = (prob - (c == target ? 1.0f : 0.0f)) * inv_batch;
     }
 }
 
@@ -581,30 +582,39 @@ extern "C" __global__ void rms_norm_backward(
     float* grad_input, float* grad_weight,
     unsigned int rows, unsigned int cols, float eps
 ) {
-    // Simplified — full implementation needs shared memory reduction
-    // This is a placeholder that handles the per-element gradient
+    // One block per row; blockDim is a power of 2 (>= a divisor sweep of cols via grid-stride).
     int row = blockIdx.x;
-    int col = threadIdx.x;
-    if (row >= rows || col >= cols) return;
+    if (row >= rows) return;
+    int tid = threadIdx.x, nt = blockDim.x;
+    const float* x = input + row * cols;
+    const float* go = grad_out + row * cols;
+    float* gi = grad_input + row * cols;
 
-    // Compute RMS for this row
-    float ss = 0.0f;
-    for (int c = 0; c < cols; c++) {
-        float v = input[row * cols + c];
-        ss += v * v;
+    __shared__ float sh[256];
+
+    // sum of squares -> inv_rms
+    float local_ss = 0.0f;
+    for (int c = tid; c < cols; c += nt) local_ss += x[c] * x[c];
+    sh[tid] = local_ss;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+    float inv_rms = rsqrtf(sh[0] / (float)cols + eps);
+    __syncthreads();
+
+    // dot_sum = sum_c(grad_out[c] * weight[c] * x[c])
+    float local_dot = 0.0f;
+    for (int c = tid; c < cols; c += nt) local_dot += go[c] * weight[c] * x[c];
+    sh[tid] = local_dot;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+    float dot_sum = sh[0];
+
+    // grad_input = grad_out*weight*inv_rms - x * (dot_sum * inv_rms^3 / cols)
+    float correction = dot_sum * inv_rms * inv_rms * inv_rms / (float)cols;
+    for (int c = tid; c < cols; c += nt) {
+        gi[c] = go[c] * weight[c] * inv_rms - x[c] * correction;
+        atomicAdd(&grad_weight[c], go[c] * x[c] * inv_rms);
     }
-    float rms = sqrtf(ss / (float)cols + eps);
-    float inv_rms = 1.0f / rms;
-
-    float x = input[row * cols + col];
-    float w = weight[col];
-    float go = grad_out[row * cols + col];
-
-    // grad_input (simplified — ignores cross-term)
-    grad_input[row * cols + col] = go * w * inv_rms;
-
-    // grad_weight (needs atomicAdd across rows)
-    atomicAdd(&grad_weight[col], go * x * inv_rms);
 }
 
 extern "C" __global__ void softmax_backward(
