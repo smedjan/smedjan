@@ -444,9 +444,9 @@ pub fn gpu_gather_causal_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, sel: 
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 {
-    let out = ctx.alloc_buffer(8);
+    let out = ctx.alloc_buffer(8); // l2_norm_check writes [sum_sq, nan_flag]
     gpu_l2_norm_into(ctx, data, size, &out);
-    MetalContext::read_buffer(&out, 1)[0]
+    MetalContext::read_buffer(&out, 2)[0]
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
