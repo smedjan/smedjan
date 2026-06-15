@@ -48,6 +48,7 @@ pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
     for i in 0..n {
         f[i] = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
     }
+    buf.device().bind_to_thread().expect("bind CUDA context");
     unsafe { cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f).expect("htod buf_write_bytes"); }
 }
 
@@ -81,6 +82,8 @@ impl MetalContext {
         let cuda_inc = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".into()) + "/include";
         let opts = cudarc::nvrtc::CompileOptions {
             include_paths: vec![cuda_inc],
+            // line info lets compute-sanitizer name the faulting kernel + source line.
+            options: vec!["--generate-line-info".to_string()],
             ..Default::default()
         };
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(kernels::ALL_KERNELS, opts)
@@ -134,6 +137,11 @@ impl MetalContext {
     /// Overwrite an existing u32 device buffer with host data (htod into the live allocation).
     /// Mirrors Metal's unified-memory in-place write; here a low-level synchronous htod memcpy.
     pub fn write_u32_to_buffer(buf: &CudaSlice<u32>, data: &[u32]) {
+        assert!(buf.len() >= data.len(),
+            "write_u32_to_buffer: dst {} < src {} elems", buf.len(), data.len());
+        // Raw driver memcpy requires the device's primary context current on this thread;
+        // the safe htod_* wrappers bind it, result::* does not. Bind before copying.
+        buf.device().bind_to_thread().expect("bind CUDA context");
         unsafe {
             cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), data)
                 .expect("Failed to write u32 to device buffer");

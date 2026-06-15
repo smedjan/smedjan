@@ -556,11 +556,14 @@ pub fn gpu_kl_divergence( ctx: &Arc<MetalContext>, teacher_logits: &GpuBuffer, s
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_scaled_causal_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims) {
-    let n = d.total_rows * d.seq_q * d.seq_k;
+    // SoftmaxDims.total_rows ALREADY = batch_heads * seq_q (see Tensor::scaled_causal_softmax).
+    // The score buffer is [total_rows, seq_k]; causal_mask wants the real batch_heads = total_rows/seq_q.
+    let SoftmaxDims { total_rows, seq_q, seq_k, scale, kv_offset } = d;
+    let n = total_rows * seq_k;
     gpu_copy(ctx, input, output, n);
-    gpu_scale(ctx, output, n, d.scale);
-    gpu_causal_mask(ctx, output, d.total_rows, d.seq_q, d.seq_k, d.kv_offset);
-    gpu_softmax(ctx, output, output, d.total_rows * d.seq_q, d.seq_k);
+    gpu_scale(ctx, output, n, scale);
+    gpu_causal_mask(ctx, output, total_rows / seq_q, seq_q, seq_k, kv_offset);
+    gpu_softmax(ctx, output, output, total_rows, seq_k);
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]

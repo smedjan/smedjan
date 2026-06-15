@@ -6,3 +6,6 @@
 checkpoints/
 .DS_Store
 src/metal/compute_head.tmp
+corpus.txt
+tok.bin
+dataset.bin
