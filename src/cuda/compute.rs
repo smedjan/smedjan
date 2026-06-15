@@ -280,8 +280,12 @@ pub struct RmsNormBackwardParams {
     pub eps: f32,
 }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_fp32(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_fp32 not yet ported") }
+pub fn gpu_matmul_fp32(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    let tile = 32u32;
+    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
+    let f = ctx.device.get_func("andreai", "matmul_tiled_fp32").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_matmul_bf16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_bf16 not yet ported") }
@@ -426,11 +430,17 @@ pub fn gpu_row_dot_reduce(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     unsafe { f.launch(cfg, (a, b, output, rows, cols)) }.unwrap();
 }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &CudaSlice<u32>, gathered: &GpuBuffer, n_routed: u32, dim: u32)  { unimplemented!("cuda backend: gpu_moe_gather not yet ported") }
+pub fn gpu_moe_gather(ctx: &Arc<MetalContext>, input: &GpuBuffer, indices: &CudaSlice<u32>, gathered: &GpuBuffer, n_routed: u32, dim: u32) {
+    let cfg = launch_cfg_2d(n_routed.div_ceil(16), dim.div_ceil(16), 16, 16);
+    let f = ctx.device.get_func("andreai", "moe_gather").unwrap();
+    unsafe { f.launch(cfg, (input, indices, gathered, n_routed, dim)) }.unwrap();
+}
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_moe_scatter_add(ctx: &Arc<MetalContext>, expert_out: &GpuBuffer, indices: &CudaSlice<u32>, weights: &GpuBuffer, combined: &GpuBuffer, n_routed: u32, dim: u32)  { unimplemented!("cuda backend: gpu_moe_scatter_add not yet ported") }
+pub fn gpu_moe_scatter_add(ctx: &Arc<MetalContext>, expert_out: &GpuBuffer, indices: &CudaSlice<u32>, weights: &GpuBuffer, combined: &GpuBuffer, n_routed: u32, dim: u32) {
+    let cfg = launch_cfg_2d(n_routed.div_ceil(16), dim.div_ceil(16), 16, 16);
+    let f = ctx.device.get_func("andreai", "moe_scatter_add").unwrap();
+    unsafe { f.launch(cfg, (expert_out, indices, weights, combined, n_routed, dim)) }.unwrap();
+}
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_causal_mask_window( ctx: &Arc<MetalContext>, scores: &GpuBuffer, batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32, window: u32, )  { unimplemented!("cuda backend: gpu_causal_mask_window not yet ported") }

@@ -23,6 +23,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "block_mean_keys", "block_sparse_topk_mask", "gather_blocks", "gather_blocks_backward",
     "gather_causal_mask",
     "muon_frob_normalize", "inv_sqrt_bc",
+    "matmul_tiled_fp32", "moe_gather", "moe_scatter_add",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1378,5 +1379,82 @@ extern "C" __global__ void inv_sqrt_bc(const float* v, float* out, unsigned int 
         float vhat = v[gid] * bias_correction;
         out[gid] = 1.0f / (sqrtf(vhat) + eps);
     }
+}
+
+// ===== Precise fp32-tile matmul (no fp16 downcast/clamp) — C = A @ B, A[M,K] B[K,N] C[M,N] =====
+// Identical tiling to matmul_tiled but float shared tiles: full fp32 range + precision (matmul_precise).
+extern "C" __global__ void matmul_tiled_fp32(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    int local_row = threadIdx.x / 8;
+    int local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * TILE;
+    int tile_col = blockIdx.x * TILE;
+
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+    float acc[THREAD_TILE][THREAD_TILE] = {{0.0f}};
+
+    for (int k_block = 0; k_block < K; k_block += TILE) {
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gr = tile_row + r, gc = k_block + c;
+            As[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gr = k_block + r, gc = tile_col + c;
+            Bs[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int k = 0; k < TILE; k++) {
+            float a_vals[THREAD_TILE], b_vals[THREAD_TILE];
+            for (int i = 0; i < THREAD_TILE; i++)
+                a_vals[i] = As[local_row * THREAD_TILE + i][k];
+            for (int j = 0; j < THREAD_TILE; j++)
+                b_vals[j] = Bs[k][local_col * THREAD_TILE + j];
+            for (int i = 0; i < THREAD_TILE; i++)
+                for (int j = 0; j < THREAD_TILE; j++)
+                    acc[i][j] += a_vals[i] * b_vals[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < THREAD_TILE; i++)
+        for (int j = 0; j < THREAD_TILE; j++) {
+            int gr = tile_row + local_row * THREAD_TILE + i;
+            int gc = tile_col + local_col * THREAD_TILE + j;
+            if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
+        }
+}
+
+// ===== MoE token routing: gather tokens for one expert + weighted scatter-add back =====
+
+// gather: gathered[slot,d] = input[token_indices[slot], d]. 2D grid (slot, d).
+extern "C" __global__ void moe_gather(const float* input, const unsigned int* token_indices, float* gathered,
+    unsigned int n_routed, unsigned int dim) {
+    unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int d = blockIdx.y * blockDim.y + threadIdx.y;
+    if (slot >= n_routed || d >= dim) return;
+    unsigned int token_idx = token_indices[slot];
+    gathered[slot * dim + d] = input[token_idx * dim + d];
+}
+
+// scatter-add: combined[token,d] += weight[slot] * expert_output[slot,d]. Multiple slots may map to
+// one token (top-k routing), so accumulate atomically (metal's plain read-add-write is a latent race).
+extern "C" __global__ void moe_scatter_add(const float* expert_output, const unsigned int* token_indices,
+    const float* weights, float* combined_output, unsigned int n_routed, unsigned int dim) {
+    unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int d = blockIdx.y * blockDim.y + threadIdx.y;
+    if (slot >= n_routed || d >= dim) return;
+    unsigned int token_idx = token_indices[slot];
+    float val = expert_output[slot * dim + d] * weights[slot];
+    atomicAdd(&combined_output[token_idx * dim + d], val);
 }
 "#;
