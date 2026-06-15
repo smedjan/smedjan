@@ -36,13 +36,16 @@ pub enum AttnKind {
     BlockSparse,
 }
 
-/// SUBQUADRATIC block-sparse attention (forward / inference). Unlike `AttnKind::BlockSparse` (which
-/// masks the full O(n²) scores — correct + trainable, but no compute saving), this GATHERS only the
-/// selected key/value blocks and runs attention over them, so the score compute is
-/// O(n · (top_k+1) · block) instead of O(n²) — the genuine subquadratic speedup. Per-query-block
-/// routing: each query block attends its own block + the top_k past blocks by block-mean-query ·
-/// block-mean-key. Forward-only (no tape) — for inference; a trainable version needs custom gather
-/// backward (documented follow-up). q/k/v: [bh, seq, hd] (expanded), seq % block == 0. Returns
+/// SUBQUADRATIC block-sparse attention (training + inference). This GATHERS only the selected
+/// key/value blocks and runs attention over them, so the score compute is O(n · (top_k+1) · block)
+/// instead of O(n²) — the genuine subquadratic speedup. Per-query-block routing: each query block
+/// attends its own block + the top_k past blocks by block-mean-query · block-mean-key. TRAINABLE:
+/// the gather + attention math is recorded on the tape and the gather's scatter-add backward is
+/// gradcheck-verified, so gradients flow to q/k/v (the routing selection itself is straight-through,
+/// like MoE top-k). This is the path `AttnKind::BlockSparse` uses for training/prefill. The inline
+/// `block_sparse_mask` path (used only as a seq % block != 0 fallback) is forward-correct but NOT
+/// trainable — it records an `Op::Reshape` passthrough, so no gradient flows through block selection
+/// and loss stays pinned at init. q/k/v: [bh, seq, hd] (expanded), seq % block == 0. Returns
 /// [bh, seq, hd].
 pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: usize, top_k: usize) -> Tensor {
     assert_eq!(q.shape.len(), 3, "block_sparse_gather expects [bh, seq, hd]");

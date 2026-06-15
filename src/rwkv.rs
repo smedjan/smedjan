@@ -13,19 +13,29 @@
 //!     wkv_t[d] = Σ_{i<t} exp(-(t-1-i)·w[d] + k_i[d]) v_i[d]  +  exp(u[d] + k_t[d]) v_t[d]
 //! ```
 //!
-//! Computed without a sequence/channel transpose: with `ek = exp(k)`, `P = ek·v`, and a per-channel
-//! cumulative decay, `S_t[d] = Σ_{i≤t} exp(-(t-i)w[d]) P_i[d] = exp(-t·w[d]) · cumsum_i(exp(i·w[d]) P_i[d])`,
-//! where the cumsum over the sequence is an inclusive lower-triangular matmul (which preserves the
-//! channel dim). Then `wkv_t = exp(w)·(S_t − P_t) + exp(u)·P_t`. Composed from existing ops + `exp`,
-//! so the autograd tape supplies the backward for free. Validated against a CPU reference.
+//! Computed stably as a per-channel decay matmul, with the channel axis folded into the batch so an
+//! existing batched matmul does the work: with `ek = exp(k)`, `P = ek·v`, build the strict-lower
+//! decay `D[(b,d),t,i] = exp(-(t-1-i)·w[d])` for `i < t` (zero otherwise). Every exponent is `≤ 0`
+//! (decay `w > 0`), so `D ∈ (0, 1]` — no `exp(i·w)` factor that overflows fp16/loses fp32 precision.
+//! Then `past_t[d] = Σ_{i<t} D[t,i,d]·P_i[d]` (a `[bh·hd,seq,seq] @ [bh·hd,seq,1]` batched matmul, the
+//! channel `d` carried in the batch via the same `head_dim=1` transpose the SSM/attention paths use)
+//! and `wkv_t = past_t + exp(u)·P_t`. Composed from existing ops + `exp`, so the autograd tape
+//! supplies the backward for free. Validated against a CPU reference at short and long sequence.
 //!
-//! Note: the `exp(i·w)` factor grows with position, so this materialised form is numerically exact
-//! only for short sequences (the in-kernel exp clamp prevents NaN); the chunked/running-max stable
-//! form is the production follow-up. The recurrence semantics and selectivity are proven here.
+//! Earlier this used the algebraically-equivalent `exp(-t·w)·cumsum_i(exp(i·w)·P_i)` factorization,
+//! which is exact in real arithmetic but collapses in fp32/fp16: `exp(i·w)` reaches `~e^63 ≈ 2e27` at
+//! seq 64 with `w ≈ 1` (the trained decay is `exp(rwkv_w) ≈ 1`), overflowing fp16 matmul accumulators
+//! and drowning early positions below fp32 epsilon — which pinned RWKV training loss flat. The direct
+//! decay form above removes the blowup entirely.
+//!
+//! Note: this materialised form is `O(bh·hd·seq²)` memory (`≈ batch·dim·seq²`); for long sequences the
+//! chunked/running-state scan is the production follow-up. Correctness and trainability are proven here.
 
 
-use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
+#[cfg(test)]
+use crate::gpu::MetalContext;
+#[cfg(test)]
 use std::sync::Arc;
 
 /// One-step causal shift matrix `[bh, seq, seq]`: `Shift[t,i] = 1` iff `i == t-1`.
@@ -38,32 +48,6 @@ fn shift_matrix(ctx: &Arc<MetalContext>, bh: usize, seq: usize) -> Tensor {
         }
     }
     Tensor::from_slice(ctx, &data, vec![bh, seq, seq])
-}
-
-/// Inclusive lower-triangular ones `[bh, seq, seq]` (for the per-channel cumulative sum).
-fn lower_tri_inclusive(ctx: &Arc<MetalContext>, bh: usize, seq: usize) -> Tensor {
-    let mut data = vec![0.0f32; bh * seq * seq];
-    for t in 0..seq {
-        for i in 0..=t {
-            for b in 0..bh {
-                data[(b * seq + t) * seq + i] = 1.0;
-            }
-        }
-    }
-    Tensor::from_slice(ctx, &data, vec![bh, seq, seq])
-}
-
-/// Constant position matrix `[bh, seq, hd]` with `pos[b,t,d] = t`.
-fn position_matrix(ctx: &Arc<MetalContext>, bh: usize, seq: usize, hd: usize) -> Tensor {
-    let mut data = vec![0.0f32; bh * seq * hd];
-    for b in 0..bh {
-        for t in 0..seq {
-            for d in 0..hd {
-                data[(b * seq + t) * hd + d] = t as f32;
-            }
-        }
-    }
-    Tensor::from_slice(ctx, &data, vec![bh, seq, hd])
 }
 
 /// Broadcast a per-channel vector `[hd]` to `[bh, seq, hd]` (constant across batch & time),
@@ -94,26 +78,44 @@ pub fn wkv(k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
     assert_eq!(u.shape, vec![hd]);
 
     let ek = k.exp(); // exp(k) — RWKV weights values by exp(key)
-    let p = ek.mul(v); // P = ek · v
+    let p = ek.mul(v); // P = ek · v   [bh, seq, hd]
 
-    let wmat = broadcast_hd(w, bh, seq); // [bh,seq,hd], = w[d]
-    let pos = position_matrix(&k.ctx, bh, seq, hd); // = t
-    let posw = pos.mul(&wmat); // t·w[d]
-    let g = posw.exp(); // exp(t·w[d])
-    let ginv = posw.scale(-1.0).exp(); // exp(-t·w[d])
+    // Strict-lower per-channel decay D[(b,d),t,i] = exp(-(t-1-i)·w[d]) for i < t, else 0.
+    // negr[t,i] = -(t-1-i) and mask[t,i] = 1 over the strict lower triangle (constant, per-call upload
+    // like the other mixers' index matrices). Folding channel d into the batch lets one batched matmul
+    // do the per-channel contraction.
+    let bhd = bh * hd;
+    let mut negr = vec![0.0f32; seq * seq];
+    let mut mask = vec![0.0f32; seq * seq];
+    for t in 0..seq {
+        for i in 0..t {
+            negr[t * seq + i] = -((t - 1 - i) as f32);
+            mask[t * seq + i] = 1.0;
+        }
+    }
+    let negr_b = Tensor::from_slice(&k.ctx, &negr, vec![seq * seq]).broadcast_rows(bhd); // [bhd, seq*seq]
+    let mask_t = Tensor::from_slice(&k.ctx, &mask, vec![seq * seq])
+        .broadcast_rows(bhd)
+        .reshape(vec![bhd, seq, seq]);
 
-    // S_t[d] = exp(-t·w) · cumsum_i( exp(i·w) P_i )   = Σ_{i≤t} exp(-(t-i)w) P_i
-    let cw = lower_tri_inclusive(&k.ctx, bh, seq).batched_matmul(&g.mul(&p));
-    let s = ginv.mul(&cw);
+    // w tiled across the batch: w_tiled[b·hd + d] = w[d]; then E = -(t-1-i)·w[d] = negr · w_tiled per row.
+    // All exponents ≤ 0 → exp ∈ (0,1], fp16-safe. The strict-lower mask zeroes i ≥ t (where negr=0 → exp=1).
+    let w_tiled = w.broadcast_rows(bh).reshape(vec![bhd]); // [bh, hd] → [bh*hd]
+    let d2 = negr_b
+        .scale_rows(&w_tiled)
+        .exp()
+        .reshape(vec![bhd, seq, seq])
+        .mul(&mask_t); // [bhd, seq, seq]
 
-    // wkv_t = exp(w)·(S_t − P_t) + exp(u)·P_t.
-    // The inline exp(w)/exp(u) temporaries are safe now: alloc_buffer invalidates the address-keyed
-    // fp16 cache, so a reused buffer address can't return a stale conversion — the bug this used to
-    // hit (exp(u) reading exp(w)'s cached fp16) is fixed at the allocator.
-    let expw = broadcast_hd(&w.exp(), bh, seq);
+    // P with channel folded into batch: P2[(b,d),i,0] = P[b,i,d]; out2[(b,d),t,0] = Σ_{i<t} D·P2.
+    let p2 = crate::attention::transpose_bsh_to_bhs(&p, bh, seq, hd, 1).reshape(vec![bhd, seq, 1]);
+    let out2 = d2.batched_matmul(&p2); // [bhd, seq, 1]
+    // transpose_bhs_to_bsh returns the flattened [bh·seq, hd]; reshape back to [bh, seq, hd].
+    let past = crate::attention::transpose_bhs_to_bsh(&out2, bh, seq, hd, 1).reshape(vec![bh, seq, hd]);
+
+    // Current-token bonus: exp(u[d])·P_t[d].
     let expu = broadcast_hd(&u.exp(), bh, seq);
-    let past = expw.mul(&s.add(&p.scale(-1.0))); // exp(w)·(S − P)
-    let current = expu.mul(&p); // exp(u)·P
+    let current = expu.mul(&p);
     past.add(&current)
 }
 
@@ -195,6 +197,35 @@ mod tests {
         let want = cpu_wkv(&k, &v, &w, &u, bh, seq, hd);
         for (idx, (g, ww)) in got.iter().zip(want.iter()).enumerate() {
             assert!((g - ww).abs() <= 0.02 * (1.0 + ww.abs()), "wkv mismatch at {idx}: gpu={g} cpu={ww}");
+        }
+    }
+
+    /// The stable form must stay exact at the long-sequence / `w ≈ 1` regime where the old
+    /// `exp(i·w)` factorization collapsed (`e^40 ≈ 2e17` overflows fp16, drowns early positions in
+    /// fp32). The trained decay is `exp(rwkv_w) ≈ 1`, so this is the real operating point.
+    #[test]
+    fn wkv_stable_at_long_seq() {
+        let ctx = ctx();
+        let (bh, seq, hd) = (2usize, 40usize, 4usize);
+        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
+        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.3).collect();
+        let w: Vec<f32> = (0..hd).map(|d| 0.9 + d as f32 * 0.05).collect(); // ≈ exp(rwkv_w) ≈ 1
+        let u: Vec<f32> = (0..hd).map(|d| 0.1 - d as f32 * 0.03).collect();
+
+        let got = autograd::no_grad(|| {
+            let kt = Tensor::from_slice(&ctx, &k, vec![bh, seq, hd]);
+            let vt = Tensor::from_slice(&ctx, &v, vec![bh, seq, hd]);
+            let wt = Tensor::from_slice(&ctx, &w, vec![hd]);
+            let ut = Tensor::from_slice(&ctx, &u, vec![hd]);
+            wkv(&kt, &vt, &wt, &ut).to_vec()
+        });
+        let want = cpu_wkv(&k, &v, &w, &u, bh, seq, hd);
+        assert!(got.iter().all(|x| x.is_finite()), "non-finite wkv output at seq {seq}");
+        for (idx, (g, ww)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - ww).abs() <= 0.02 * (1.0 + ww.abs()),
+                "wkv mismatch at {idx} (seq {seq}, w≈1): gpu={g} cpu={ww}"
+            );
         }
     }
 

@@ -3865,20 +3865,20 @@ mod suite {
     /// RWKV WKV time-mixing: per-channel decayed-cumsum + bonus. Inputs k,v [bh,seq,hd], decay-rate
     /// w [hd] (>0), bonus u [hd]. Backward flows through exp(±t·w), exp(k), exp(w), exp(u). w stays
     /// ≥0.3 under ±eps so the decay rate doesn't cross 0. Previously only a finite/non-zero check.
-    /// Wider rel-tol (12%) for the w/u params: they enter exp(±t·w), so the fp16 cumsum matmul
-    /// (`lower_tri @ (exp(t·w)·p)`) amplifies their gradient error — VERIFIED to be fp16 precision,
-    /// not a structural bug, by magnitude convergence (8.9% err at w~0.5 → 6.0% at w~0.2). k/v pass
-    /// at the standard 5%. The forward is tightly CPU-checked separately (`wkv_matches_cpu`).
+    /// WKV backward vs central differences. The stable decay form (`exp(-(t-1-i)·w)`, all ≤ 0) has no
+    /// `exp(±t·w)` fp16 amplification, so all of k/v/w/u pass at the standard 5% rel-tol — `w ≈ 1` (the
+    /// `exp(rwkv_w)` operating point) included. The forward is tightly CPU-checked separately
+    /// (`wkv_matches_cpu`, `wkv_stable_at_long_seq`).
     #[test]
     fn gradcheck_wkv() {
         let ctx = test_ctx();
         let (bh, seq, hd) = (2usize, 5usize, 4usize);
-        let w = vec![0.3f32, 0.45, 0.55, 0.65]; // positive decay rate, ±eps stays > 0
+        let w = vec![0.9f32, 1.0, 1.1, 0.8]; // ≈ exp(rwkv_w) ≈ 1 (the real decay), ±eps stays > 0
         let u = vec![0.1f32, -0.2, 0.15, -0.05];
         grad_check(&ctx,
             &[(gc_vec(bh * seq * hd, 0), vec![bh, seq, hd]), (gc_vec(bh * seq * hd, 11), vec![bh, seq, hd]),
               (w, vec![hd]), (u, vec![hd])],
-            &|t| crate::rwkv::wkv(&t[0], &t[1], &t[2], &t[3]), GC_EPS, GC_ABS, 1.2e-1, "wkv");
+            &|t| crate::rwkv::wkv(&t[0], &t[1], &t[2], &t[3]), GC_EPS, GC_ABS, GC_REL, "wkv");
     }
 
     #[test]
