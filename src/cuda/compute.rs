@@ -508,7 +508,9 @@ pub fn gpu_transpose_perm_backward( ctx: &Arc<MetalContext>, grad_in: &GpuBuffer
     let total = batch * seq * n_heads * head_dim;
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx.device.get_func("andreai","transpose_perm_backward").unwrap();
-    unsafe { f.launch(cfg, (grad_out, grad_in, batch, seq, n_heads, head_dim)) }.unwrap();
+    // Contract (matches Metal): 1st buffer param = source [bh,seq,hd] (read), 2nd = dest [b,s,d] (write).
+    // The kernel reads arg0, writes arg1 — so pass (grad_in, grad_out) in that order.
+    unsafe { f.launch(cfg, (grad_in, grad_out, batch, seq, n_heads, head_dim)) }.unwrap();
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
@@ -581,7 +583,8 @@ pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &G
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer, grad_in: &GpuBuffer, d: TrRopeDims) {
     gpu_rope_backward(ctx, grad_out, d.batch * d.n_heads, d.seq, d.head_dim, d.offset, d.theta);
-    gpu_transpose_perm_backward(ctx, grad_in, grad_out, d.batch, d.seq, d.n_heads, d.head_dim);
+    // grad_out (rope'd [bh,seq,hd]) is the source; grad_in ([b,seq,d]) is the dest.
+    gpu_transpose_perm_backward(ctx, grad_out, grad_in, d.batch, d.seq, d.n_heads, d.head_dim);
 }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
