@@ -27,6 +27,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "matmul_tiled_bf16",
     "ternary_matmul", "ternary_absmean", "ternary_pack",
     "adamw_8bit_update",
+    "flash_attention_forward", "flash_attn_precompute_d", "flash_attention_backward",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1633,5 +1634,191 @@ extern "C" __global__ void adamw_8bit_update(
         m_q[gid] = new_ms > 0.0f ? (signed char)(int)roundf(fmaxf(-127.0f, fminf(127.0f, m_new / new_ms))) : (signed char)0;
         v_q[gid] = new_vs > 0.0f ? (signed char)(int)roundf(fmaxf(0.0f, fminf(127.0f, sqrt_v_new / new_vs))) : (signed char)0;
     }
+}
+
+// ===== Flash Attention (Dao et al.) — fused tiled attention, online softmax, never stores N*N =====
+#define FA_BR 32
+#define FA_BC 32
+#define NEG_INF __int_as_float(0xff800000)
+
+// One block per (batch_head, query-block); 32 threads, one query row each. K/V tiled in shared (half).
+extern "C" __global__ void flash_attention_forward(
+    const float* Q, const float* K, const float* V, float* O,
+    unsigned int batch_heads, unsigned int seq_q, unsigned int seq_k, unsigned int head_dim,
+    float scale, unsigned int kv_offset
+) {
+    unsigned int bh = blockIdx.x;
+    unsigned int q_block = blockIdx.y;
+    unsigned int q_start = q_block * FA_BR;
+    if (bh >= batch_heads) return;
+    unsigned int d = head_dim;
+    const float* Q_bh = Q + bh * seq_q * d;
+    const float* K_bh = K + bh * seq_k * d;
+    const float* V_bh = V + bh * seq_k * d;
+    float* O_bh = O + bh * seq_q * d;
+
+    __shared__ __half K_shared[FA_BC][128];
+    __shared__ __half V_shared[FA_BC][128];
+
+    unsigned int local_q = threadIdx.x;
+    unsigned int global_q = q_start + local_q;
+    bool active = (global_q < seq_q);
+
+    float row_max = NEG_INF, row_sum = 0.0f;
+    float o_acc[128];
+    for (unsigned int i = 0; i < d; i++) o_acc[i] = 0.0f;
+    float q_row[128];
+    if (active) for (unsigned int i = 0; i < d; i++) q_row[i] = Q_bh[global_q * d + i];
+
+    for (unsigned int k_start = 0; k_start < seq_k; k_start += FA_BC) {
+        unsigned int k_end = k_start + FA_BC; if (k_end > seq_k) k_end = seq_k;
+        unsigned int tile_len = k_end - k_start;
+        // cooperative load (ALL threads, incl. inactive) — must hit every barrier in uniform control flow
+        for (unsigned int j = threadIdx.x; j < tile_len; j += FA_BR) {
+            unsigned int gk = k_start + j;
+            for (unsigned int i = 0; i < d; i++) {
+                K_shared[j][i] = __float2half(K_bh[gk * d + i]);
+                V_shared[j][i] = __float2half(V_bh[gk * d + i]);
+            }
+        }
+        for (unsigned int j = tile_len + threadIdx.x; j < FA_BC; j += FA_BR)
+            for (unsigned int i = 0; i < d; i++) { K_shared[j][i] = __float2half(0.0f); V_shared[j][i] = __float2half(0.0f); }
+        __syncthreads();
+
+        if (active) {
+            float s_vals[FA_BC];
+            float block_max = NEG_INF;
+            for (unsigned int j = 0; j < tile_len; j++) {
+                unsigned int gk = k_start + j;
+                if (gk > global_q + kv_offset) { s_vals[j] = NEG_INF; continue; }
+                float dot = 0.0f;
+                for (unsigned int i = 0; i < d; i++) dot += q_row[i] * __half2float(K_shared[j][i]);
+                s_vals[j] = dot * scale;
+                block_max = fmaxf(block_max, s_vals[j]);
+            }
+            float new_max = fmaxf(row_max, block_max);
+            float old_correction = expf(row_max - new_max);
+            float new_sum = old_correction * row_sum;
+            for (unsigned int i = 0; i < d; i++) o_acc[i] *= old_correction;
+            for (unsigned int j = 0; j < tile_len; j++) {
+                float p = expf(s_vals[j] - new_max);
+                new_sum += p;
+                for (unsigned int i = 0; i < d; i++) o_acc[i] += p * __half2float(V_shared[j][i]);
+            }
+            row_max = new_max;
+            row_sum = new_sum;
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        for (unsigned int i = 0; i < d; i++) O_bh[global_q * d + i] = o_acc[i] * inv_sum;
+    }
+}
+
+extern "C" __global__ void flash_attn_precompute_d(
+    const float* dO, const float* O, float* D, unsigned int total_rows, unsigned int head_dim
+) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total_rows) return;
+    float sum = 0.0f;
+    for (unsigned int i = 0; i < head_dim; i++) sum += dO[gid * head_dim + i] * O[gid * head_dim + i];
+    D[gid] = sum;
+}
+
+struct FlashBwdParams { unsigned int seq_q; unsigned int seq_k; unsigned int head_dim; unsigned int batch_heads; float scale; unsigned int kv_offset; };
+
+// Recomputes attention tile-by-tile; dQ thread-local, dK/dV atomic scatter (caller pre-zeros them).
+extern "C" __global__ void flash_attention_backward(
+    const float* Q, const float* K, const float* V, const float* O, const float* dO, const float* D,
+    float* dQ, float* dK, float* dV, FlashBwdParams p
+) {
+    unsigned int bh = blockIdx.x;
+    unsigned int q_block = blockIdx.y;
+    unsigned int q_start = q_block * 32;
+    unsigned int local_q = threadIdx.x;
+    unsigned int global_q = q_start + local_q;
+    if (bh >= p.batch_heads) return;
+    unsigned int seq_q = p.seq_q, seq_k = p.seq_k, d = p.head_dim, kv_offset = p.kv_offset;
+    float scale = p.scale;
+    bool active = (global_q < seq_q);
+
+    const float* Q_bh = Q + bh * seq_q * d;
+    const float* K_bh = K + bh * seq_k * d;
+    const float* V_bh = V + bh * seq_k * d;
+    const float* dO_bh = dO + bh * seq_q * d;
+    const float* D_bh = D + bh * seq_q;
+    float* dQ_bh = dQ + bh * seq_q * d;
+    float* dK_bh = dK + bh * seq_k * d;
+    float* dV_bh = dV + bh * seq_k * d;
+
+    __shared__ __half K_shared[32][128];
+    __shared__ __half V_shared[32][128];
+
+    float q_row[128], do_row[128];
+    float d_val = 0.0f;
+    if (active) {
+        for (unsigned int i = 0; i < d; i++) { q_row[i] = Q_bh[global_q * d + i]; do_row[i] = dO_bh[global_q * d + i]; }
+        d_val = D_bh[global_q];
+    }
+    float dq_acc[128];
+    for (unsigned int i = 0; i < d; i++) dq_acc[i] = 0.0f;
+
+    // Pass 1: recompute row_max / row_sum
+    float row_max = NEG_INF, row_sum = 0.0f;
+    for (unsigned int k_start = 0; k_start < seq_k; k_start += 32) {
+        unsigned int k_end = k_start + 32; if (k_end > seq_k) k_end = seq_k;
+        unsigned int tile_len = k_end - k_start;
+        for (unsigned int j = threadIdx.x; j < tile_len; j += 32)
+            for (unsigned int i = 0; i < d; i++) K_shared[j][i] = __float2half(K_bh[(k_start + j) * d + i]);
+        __syncthreads();
+        if (active) {
+            for (unsigned int j = 0; j < tile_len; j++) {
+                unsigned int gk = k_start + j;
+                if (gk > global_q + kv_offset) continue;
+                float dot = 0.0f;
+                for (unsigned int i = 0; i < d; i++) dot += q_row[i] * __half2float(K_shared[j][i]);
+                float s = dot * scale;
+                float new_max = fmaxf(row_max, s);
+                row_sum = row_sum * expf(row_max - new_max) + expf(s - new_max);
+                row_max = new_max;
+            }
+        }
+        __syncthreads();
+    }
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+
+    // Pass 2: gradients
+    for (unsigned int k_start = 0; k_start < seq_k; k_start += 32) {
+        unsigned int k_end = k_start + 32; if (k_end > seq_k) k_end = seq_k;
+        unsigned int tile_len = k_end - k_start;
+        for (unsigned int j = threadIdx.x; j < tile_len; j += 32)
+            for (unsigned int i = 0; i < d; i++) {
+                K_shared[j][i] = __float2half(K_bh[(k_start + j) * d + i]);
+                V_shared[j][i] = __float2half(V_bh[(k_start + j) * d + i]);
+            }
+        __syncthreads();
+        if (active) {
+            for (unsigned int j = 0; j < tile_len; j++) {
+                unsigned int gk = k_start + j;
+                if (gk > global_q + kv_offset) continue;
+                float dot = 0.0f;
+                for (unsigned int i = 0; i < d; i++) dot += q_row[i] * __half2float(K_shared[j][i]);
+                float s = dot * scale;
+                float pr = expf(s - row_max) * inv_sum;
+                float dov = 0.0f;
+                for (unsigned int i = 0; i < d; i++) dov += do_row[i] * __half2float(V_shared[j][i]);
+                float ds = pr * (dov - d_val) * scale;
+                for (unsigned int i = 0; i < d; i++) dq_acc[i] += ds * __half2float(K_shared[j][i]);
+                for (unsigned int i = 0; i < d; i++) {
+                    atomicAdd(&dK_bh[gk * d + i], ds * q_row[i]);
+                    atomicAdd(&dV_bh[gk * d + i], pr * do_row[i]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (active) for (unsigned int i = 0; i < d; i++) dQ_bh[global_q * d + i] = dq_acc[i];
 }
 "#;

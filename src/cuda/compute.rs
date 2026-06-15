@@ -403,11 +403,37 @@ pub fn gpu_adamw_8bit_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &
     unsafe { f.launch(cfg, (param, grad, m_q, v_q, m_scale, v_scale, p)) }.unwrap();
 }
 
-pub fn gpu_flash_attention_forward( _ctx: &Arc<MetalContext>, _q: &GpuBuffer, _k: &GpuBuffer, _v: &GpuBuffer, _o: &GpuBuffer, _d: FlashDims, ) { unimplemented!("cuda backend: gpu_flash_attention_forward not yet ported") }
+pub fn gpu_flash_attention_forward( ctx: &Arc<MetalContext>, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, o: &GpuBuffer, d: FlashDims, ) {
+    let FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset } = d;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let q_blocks = seq_q.div_ceil(32);
+    let cfg = launch_cfg_3d(batch_heads, q_blocks, 1, 32); // grid (bh, q_blocks), 32 threads/block (one per query row)
+    let f = ctx.device.get_func("andreai", "flash_attention_forward").unwrap();
+    unsafe { f.launch(cfg, (q, k, v, o, batch_heads, seq_q, seq_k, head_dim, scale, kv_offset)) }.unwrap();
+}
 
-pub fn gpu_flash_attn_precompute_d( _ctx: &Arc<MetalContext>, _d_out: &GpuBuffer, _output: &GpuBuffer, _d_buf: &GpuBuffer, _total_rows: u32, _head_dim: u32, ) { unimplemented!("cuda backend: gpu_flash_attn_precompute_d not yet ported") }
+pub fn gpu_flash_attn_precompute_d( ctx: &Arc<MetalContext>, d_out: &GpuBuffer, output: &GpuBuffer, d_buf: &GpuBuffer, total_rows: u32, head_dim: u32, ) {
+    let cfg = launch_cfg(256, total_rows.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "flash_attn_precompute_d").unwrap();
+    unsafe { f.launch(cfg, (d_out, output, d_buf, total_rows, head_dim)) }.unwrap();
+}
 
-pub fn gpu_flash_attention_backward(_ctx: &Arc<MetalContext>, _b: FlashBwdBufs, _d: FlashDims) { unimplemented!("cuda backend: gpu_flash_attention_backward not yet ported") }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashBwdParams { seq_q: u32, seq_k: u32, head_dim: u32, batch_heads: u32, scale: f32, kv_offset: u32 }
+unsafe impl DeviceRepr for FlashBwdParams {}
+
+pub fn gpu_flash_attention_backward(ctx: &Arc<MetalContext>, b: FlashBwdBufs, d: FlashDims) {
+    let FlashBwdBufs { q, k, v, output, d_out, d_buf, dq, dk, dv } = b;
+    let FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset } = d;
+    // dq written fresh; dk/dv are atomic scatter targets pre-zeroed by the caller (autograd). 9 buffers
+    // + 6 scalars exceed cudarc's 12-arg cap, so the scalars go in one by-value DeviceRepr struct.
+    let p = FlashBwdParams { seq_q, seq_k, head_dim, batch_heads, scale: 1.0 / (head_dim as f32).sqrt(), kv_offset };
+    let q_blocks = seq_q.div_ceil(32);
+    let cfg = launch_cfg_3d(batch_heads, q_blocks, 1, 32);
+    let f = ctx.device.get_func("andreai", "flash_attention_backward").unwrap();
+    unsafe { f.launch(cfg, (q, k, v, output, d_out, d_buf, dq, dk, dv, p)) }.unwrap();
+}
 
 pub fn gpu_ternary_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, w_packed: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
     let cfg = launch_cfg_2d(n.div_ceil(16), m.div_ceil(16), 16, 16);
