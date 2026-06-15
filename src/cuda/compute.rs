@@ -290,17 +290,15 @@ pub fn gpu_matmul_fp32(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c:
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_matmul_bf16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_bf16 not yet ported") }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_simdgroup not yet ported") }
+// No hardware MMA path on CUDA: the "simdgroup" matmul = the precise fp32 tiled kernel (matches the
+// fp32 reference the tests check against at 1e-3); the trans/f16 variants alias their tiled equivalents.
+pub fn gpu_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul_fp32(ctx, a, b, c, m, n, k) }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_simdgroup_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_simdgroup_f16 not yet ported") }
+pub fn gpu_matmul_simdgroup_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul_f16(ctx, a, b, c, m, n, k) }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32)  { unimplemented!("cuda backend: gpu_matmul_trans_b_simdgroup not yet ported") }
+pub fn gpu_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul_trans_b(ctx, a, b, c, m, n, k) }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32)  { unimplemented!("cuda backend: gpu_matmul_trans_a_simdgroup not yet ported") }
+pub fn gpu_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) { gpu_matmul_trans_a(ctx, a, b, c, m, k, n) }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
@@ -323,14 +321,11 @@ pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer,
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_simdgroup not yet ported") }
+pub fn gpu_batched_matmul_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul(ctx, a, b, c, d) }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_b_simdgroup not yet ported") }
+pub fn gpu_batched_matmul_trans_b_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_b(ctx, a, b, c, d) }
 
-#[allow(unused_variables, clippy::too_many_arguments)]
-pub fn gpu_batched_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims)  { unimplemented!("cuda backend: gpu_batched_matmul_trans_a_simdgroup not yet ported") }
+pub fn gpu_batched_matmul_trans_a_simdgroup(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_a(ctx, a, b, c, d) }
 
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
@@ -738,9 +733,13 @@ pub fn gpu_repeat_kv_backward(ctx: &Arc<MetalContext>, out_grad: &GpuBuffer, kv_
     unsafe { f.launch(cfg, (out_grad, kv_grad, n_kv_total, group_size, seq_len, head_dim)) }.unwrap();
 }
 
-// ===== Matmul-path flags: Metal-only (simdgroup MMA / bf16 / rmsnorm-clamp). No-ops on CUDA. =====
-pub fn set_simdgroup_matmul(_on: bool) -> bool { false }
-pub fn simdgroup_matmul_enabled() -> bool { false }
+// ===== Matmul-path flags. On CUDA "simdgroup" has no hardware analogue, so the flag selects
+// fp32-precise vs the default fp16-tiled matmul (the simdgroup wrappers below alias accordingly). =====
+thread_local! {
+    static SIMDGROUP_MATMUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn set_simdgroup_matmul(on: bool) -> bool { SIMDGROUP_MATMUL.with(|c| c.replace(on)) }
+pub fn simdgroup_matmul_enabled() -> bool { SIMDGROUP_MATMUL.with(|c| c.get()) }
 pub fn set_bf16_matmul(_on: bool) -> bool { false }
 pub fn bf16_matmul_enabled() -> bool { false }
 thread_local! {
