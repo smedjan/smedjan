@@ -25,6 +25,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "muon_frob_normalize", "inv_sqrt_bc",
     "matmul_tiled_fp32", "moe_gather", "moe_scatter_add",
     "matmul_tiled_bf16",
+    "ternary_matmul", "ternary_absmean", "ternary_pack",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1511,5 +1512,69 @@ extern "C" __global__ void matmul_tiled_bf16(
             int gc = tile_col + local_col * THREAD_TILE + j;
             if (gr < M && gc < N) C[gr * N + gc] = acc[i][j];
         }
+}
+
+// ===== BitNet b1.58 ternary {-1,0,+1} matmul + quantize (16 weights packed per u32) =====
+// C = A @ W, A[M,K] float, W[K,N] packed ternary. No fp multiply — conditional add/sub. 2D grid (col,row).
+extern "C" __global__ void ternary_matmul(const float* A, const unsigned int* W_packed, float* C,
+    unsigned int M, unsigned int N, unsigned int K) {
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+    const float* a_row = A + row * K;
+    float acc = 0.0f;
+    unsigned int k = 0;
+    for (; k + 16 <= K; k += 16) {
+        unsigned int packed = W_packed[(k / 16) * N + col];
+        for (unsigned int i = 0; i < 16; i++) {
+            unsigned int bits = (packed >> (i * 2)) & 0x3u;
+            if (bits == 1) acc += a_row[k + i];
+            else if (bits == 2) acc -= a_row[k + i];
+        }
+    }
+    if (k < K) {                                   // tail (K not a multiple of 16)
+        unsigned int packed = W_packed[(k / 16) * N + col];
+        for (unsigned int i = 0; i < K - k; i++) {
+            unsigned int bits = (packed >> (i * 2)) & 0x3u;
+            if (bits == 1) acc += a_row[k + i];
+            else if (bits == 2) acc -= a_row[k + i];
+        }
+    }
+    C[row * N + col] = acc;
+}
+
+// absmean per column (quantization threshold). 1D grid over cols.
+extern "C" __global__ void ternary_absmean(const float* weights, float* absmean,
+    unsigned int rows, unsigned int cols) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= cols) return;
+    float sum = 0.0f;
+    for (unsigned int r = 0; r < rows; r++) sum += fabsf(weights[r * cols + gid]);
+    absmean[gid] = sum / (float)rows;
+}
+
+// quantize to ternary via absmean threshold and pack 16/u32. 2D grid (col, pack_row=K/16).
+extern "C" __global__ void ternary_pack(const float* weights, const float* absmean, unsigned int* packed,
+    unsigned int rows, unsigned int cols) {
+    unsigned int pack_row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int K = rows, N = cols;
+    if (col >= N) return;
+    unsigned int k_start = pack_row * 16;
+    if (k_start >= K) return;
+    float threshold = absmean[col];
+    float inv_thresh = (threshold > 1e-8f) ? (1.0f / threshold) : 0.0f;
+    unsigned int packed_val = 0;
+    unsigned int k_end = k_start + 16; if (k_end > K) k_end = K;
+    for (unsigned int i = 0; i < k_end - k_start; i++) {
+        float w = weights[(k_start + i) * N + col];
+        float scaled = w * inv_thresh;
+        unsigned int ternary;
+        if (scaled > 0.5f) ternary = 1;            // +1
+        else if (scaled < -0.5f) ternary = 2;      // -1 (0b10)
+        else ternary = 0;
+        packed_val |= (ternary << (i * 2));
+    }
+    packed[pack_row * N + col] = packed_val;
 }
 "#;
