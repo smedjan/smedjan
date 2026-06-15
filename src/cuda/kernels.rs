@@ -26,6 +26,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "matmul_tiled_fp32", "moe_gather", "moe_scatter_add",
     "matmul_tiled_bf16",
     "ternary_matmul", "ternary_absmean", "ternary_pack",
+    "adamw_8bit_update",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1576,5 +1577,61 @@ extern "C" __global__ void ternary_pack(const float* weights, const float* absme
         packed_val |= (ternary << (i * 2));
     }
     packed[pack_row * N + col] = packed_val;
+}
+
+// ===== 8-bit (block-wise int8) AdamW — bitsandbytes-style, 1 block per 256-elem param-block =====
+// m is signed-linear int8; v is int8 of sqrt(v) (range-compressed). Per-block fp32 absmax scales.
+// Params packed in one POD struct (>12 launch args otherwise). signed char for the signed m quant.
+struct Adam8Params {
+    unsigned int size;
+    float lr; float beta1; float beta2; float eps; float weight_decay;
+    float bias_correction1; float bias_correction2; float update_clip;
+};
+extern "C" __global__ void adamw_8bit_update(
+    float* param, const float* grad,
+    signed char* m_q, signed char* v_q, float* m_scale, float* v_scale,
+    Adam8Params p
+) {
+    __shared__ float sm[256];
+    __shared__ float sv[256];
+    unsigned int lid = threadIdx.x;
+    unsigned int bid = blockIdx.x;
+    unsigned int gid = bid * blockDim.x + lid;
+
+    bool active = gid < p.size;
+    float ms = m_scale[bid];
+    float vs = v_scale[bid];                    // scale for sqrt(v), not v
+    float g = active ? grad[gid] : 0.0f;
+    float m_old = active ? (float)((int)m_q[gid]) * ms : 0.0f;
+    float sqrt_v_old = active ? (float)((int)v_q[gid]) * vs : 0.0f;
+    float v_old = sqrt_v_old * sqrt_v_old;
+    float m_new = p.beta1 * m_old + (1.0f - p.beta1) * g;
+    float v_new = p.beta2 * v_old + (1.0f - p.beta2) * g * g;
+    float sqrt_v_new = sqrtf(v_new);
+
+    if (active) {
+        float m_hat = m_new / p.bias_correction1;
+        float v_hat = v_new / p.bias_correction2;
+        float upd = m_hat / (sqrtf(v_hat) + p.eps);
+        if (p.update_clip > 0.0f) upd = fmaxf(-p.update_clip, fminf(p.update_clip, upd));
+        param[gid] = param[gid] * (1.0f - p.lr * p.weight_decay) - p.lr * upd;
+    }
+
+    // Block absmax reduction (|m| and sqrt(v)) for requantization.
+    sm[lid] = active ? fabsf(m_new) : 0.0f;
+    sv[lid] = active ? sqrt_v_new : 0.0f;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (lid < s) { sm[lid] = fmaxf(sm[lid], sm[lid + s]); sv[lid] = fmaxf(sv[lid], sv[lid + s]); }
+        __syncthreads();
+    }
+    float new_ms = sm[0] > 0.0f ? sm[0] / 127.0f : 0.0f;
+    float new_vs = sv[0] > 0.0f ? sv[0] / 127.0f : 0.0f;
+    if (lid == 0) { m_scale[bid] = new_ms; v_scale[bid] = new_vs; }
+
+    if (active) {
+        m_q[gid] = new_ms > 0.0f ? (signed char)(int)roundf(fmaxf(-127.0f, fminf(127.0f, m_new / new_ms))) : (signed char)0;
+        v_q[gid] = new_vs > 0.0f ? (signed char)(int)roundf(fmaxf(0.0f, fminf(127.0f, sqrt_v_new / new_vs))) : (signed char)0;
+    }
 }
 "#;

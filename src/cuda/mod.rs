@@ -96,7 +96,7 @@ impl MetalContext {
 
     /// Allocate a GPU buffer (device memory).
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
-        let n_floats = size_bytes / 4;
+        let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
         Arc::new(self.device.alloc_zeros::<f32>(n_floats)
             .expect("Failed to allocate CUDA buffer"))
     }

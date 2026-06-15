@@ -2,7 +2,7 @@
 //! Each function launches a CUDA kernel with the appropriate grid/block dimensions.
 
 use super::MetalContext; // aliased CudaContext
-use cudarc::driver::{CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 type GpuBuffer = CudaSlice<f32>;
@@ -377,7 +377,31 @@ pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, 
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
-pub fn gpu_adamw_8bit_update( _ctx: &Arc<MetalContext>, _param: &GpuBuffer, _grad: &GpuBuffer, _state: &Adam8Buffers, _size: u32, _hp: &AdamWHyperparams, ) { unimplemented!("cuda backend: gpu_adamw_8bit_update not yet ported") }
+// 9 scalars exceed cudarc's 12-arg launch tuple when combined with 6 buffers, so pass them as one
+// by-value POD struct (matches the kernel's `struct Adam8Params`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Adam8Params {
+    size: u32,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
+    bias_correction1: f32, bias_correction2: f32, update_clip: f32,
+}
+unsafe impl DeviceRepr for Adam8Params {}
+
+pub fn gpu_adamw_8bit_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, state: &Adam8Buffers, size: u32, hp: &AdamWHyperparams) {
+    let Adam8Buffers { m_q, v_q, m_scale, v_scale } = *state;
+    let AdamWHyperparams { lr, beta1, beta2, eps, weight_decay, step, update_clip } = *hp;
+    let p = Adam8Params {
+        size, lr, beta1, beta2, eps, weight_decay,
+        bias_correction1: 1.0 - beta1.powi(step as i32),
+        bias_correction2: 1.0 - beta2.powi(step as i32),
+        update_clip,
+    };
+    let n_blocks = size.div_ceil(ADAM8_BLOCK as u32);
+    let cfg = launch_cfg(ADAM8_BLOCK as u32, n_blocks); // one block (256 threads) per param-block
+    let f = ctx.device.get_func("andreai", "adamw_8bit_update").unwrap();
+    unsafe { f.launch(cfg, (param, grad, m_q, v_q, m_scale, v_scale, p)) }.unwrap();
+}
 
 pub fn gpu_flash_attention_forward( _ctx: &Arc<MetalContext>, _q: &GpuBuffer, _k: &GpuBuffer, _v: &GpuBuffer, _o: &GpuBuffer, _d: FlashDims, ) { unimplemented!("cuda backend: gpu_flash_attention_forward not yet ported") }
 
