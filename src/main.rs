@@ -129,6 +129,22 @@ struct TrainArgs {
         /// Block-sparse attention block length. Default 64.
         #[arg(long, default_value = "64")]
         block_size: usize,
+        /// Selective state-space (Mamba-2/SSD) mixer in every block instead of attention. O(N) sequence mixing.
+        #[arg(long)]
+        ssm: bool,
+        /// RWKV-style time-mix (per-channel WKV + receptance) in every block instead of attention. O(N).
+        /// Takes precedence over --ssm if both are set. EXPERIMENTAL: the materialised wkv path does not
+        /// currently converge (loss stays flat even at short seq, token-shift omitted) — wired for
+        /// development, not production. --ssm and --linear-attn do train.
+        #[arg(long)]
+        rwkv: bool,
+        /// Linear (kernel) O(N) attention in every block instead of softmax attention.
+        #[arg(long)]
+        linear_attn: bool,
+        /// Hybrid mixer cadence: every Nth layer is linear attention, the rest softmax. 0=off.
+        /// e.g. 4 → "3 softmax : 1 linear". Ignored when --ssm/--rwkv/--linear-attn replace every block.
+        #[arg(long, default_value = "0")]
+        linear_attn_period: usize,
         /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
         #[arg(long, default_value = "0")]
         lowrank: usize,
@@ -675,6 +691,10 @@ fn main() {
             mla_latent_dim,
             block_sparse_top_k,
             block_size,
+            ssm,
+            rwkv,
+            linear_attn,
+            linear_attn_period,
             lowrank,
             shared_layers,
             prune_threshold,
@@ -772,6 +792,10 @@ fn main() {
             config.model_config.mla_latent_dim = mla_latent_dim;
             config.model_config.block_sparse_top_k = block_sparse_top_k;
             config.model_config.block_size = block_size;
+            config.model_config.ssm = ssm;
+            config.model_config.rwkv = rwkv;
+            config.model_config.linear_attn = linear_attn;
+            config.model_config.linear_attn_period = linear_attn_period;
             config.model_config.lowrank = lowrank;
             config.model_config.shared_layers = shared_layers;
             config.prune_threshold = prune_threshold;
