@@ -1345,10 +1345,13 @@ fn main() {
             autograd::no_grad(|| {
                 let mut kv_caches = model.init_kv_caches_preallocated(1);
 
-                // Prefill with 16 tokens
-                let prompt: Vec<u32> = (0..16).map(|i| (i * 7 + 13) % vocab).collect();
+                // Prefill must leave cache room for the (warmup + iters) decode steps that follow,
+                // since cache capacity == config.max_seq_len (set to --seq-len above).
+                let decode_budget = warmup + iters;
+                let prefill_len = (seq_len.saturating_sub(decode_budget)).max(1);
+                let prompt: Vec<u32> = (0..prefill_len).map(|i| (i as u32 * 7 + 13) % vocab).collect();
                 ctx.begin_batch();
-                let _logits = model.forward(&prompt, 1, 16, Some(&mut kv_caches), false);
+                let _logits = model.forward(&prompt, 1, prefill_len, Some(&mut kv_caches), false);
                 ctx.flush_batch();
 
                 // Warmup decode
