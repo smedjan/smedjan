@@ -20,6 +20,9 @@ pub const KERNEL_NAMES: &[&str] = &[
     "ema_update", "repeat_kv", "repeat_kv_backward", "causal_doc_mask",
     "relu", "relu_backward", "exp_kernel", "axpy", "scale_rows", "row_dot_reduce",
     "broadcast_rows", "slice_cols", "concat_cols",
+    "block_mean_keys", "block_sparse_topk_mask", "gather_blocks", "gather_blocks_backward",
+    "gather_causal_mask",
+    "muon_frob_normalize", "inv_sqrt_bc",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -1235,5 +1238,145 @@ extern "C" __global__ void concat_cols(const float* src, float* dst, unsigned in
     if (idx >= rows * src_cols) return;
     unsigned int r = idx / src_cols, c = idx % src_cols;
     dst[r * dst_cols + col_offset + c] = src[idx];
+}
+
+// ===== Block-sparse attention (MoBA/NSA): block-mean routing + gather/scatter + masks =====
+
+// Mean of keys within each block: K[bh,seq,hd] -> out[bh,nb,hd]. One thread per output element.
+extern "C" __global__ void block_mean_keys(const float* k, float* out,
+    unsigned int bh, unsigned int seq, unsigned int hd, unsigned int nb, unsigned int block_size) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = bh * nb * hd;
+    if (idx >= total) return;
+    unsigned int d = idx % hd;
+    unsigned int t = idx / hd;
+    unsigned int blk = t % nb;
+    unsigned int bh_i = t / nb;
+    unsigned int start = blk * block_size;
+    unsigned int end = start + block_size; if (end > seq) end = seq;
+    float s = 0.0f; unsigned int cnt = 0;
+    for (unsigned int i = start; i < end; i++) { s += k[bh_i * seq * hd + i * hd + d]; cnt++; }
+    out[bh_i * nb * hd + blk * hd + d] = cnt > 0 ? s / (float)cnt : 0.0f;
+}
+
+// Top-k block-sparse mask (own block + top-k past blocks by score), masks dense scores[bh,seq,seq]
+// in place; includes the causal mask. block_scores: [bh,seq,nb]. (Non-training fallback path.)
+extern "C" __global__ void block_sparse_topk_mask(float* scores, const float* block_scores,
+    unsigned int bh, unsigned int seq, unsigned int nb, unsigned int block_size, unsigned int top_k) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = bh * seq * seq;
+    if (gid >= total) return;
+    unsigned int k = gid % seq;
+    unsigned int t = gid / seq;
+    unsigned int q = t % seq;
+    unsigned int b = t / seq;
+    unsigned int idx = b * seq * seq + q * seq + k;
+    if (k > q) { scores[idx] = __int_as_float(0xff800000); return; } // causal
+    unsigned int qb = q / block_size, kb = k / block_size;
+    if (kb == qb) return; // own block always attended
+    float my = block_scores[b * seq * nb + q * nb + kb];
+    unsigned int better = 0;
+    for (unsigned int j = 0; j < qb; j++) {
+        if (block_scores[b * seq * nb + q * nb + j] > my) better++;
+    }
+    if (better >= top_k) scores[idx] = __int_as_float(0xff800000); // outside top-k
+}
+
+// Gather selected K/V blocks into compact [bh*nb, k_sel*block, hd]. sel: [bh*nb*k_sel] u32 indices
+// (sentinel >= nb -> zero-filled padding). One thread per output element.
+extern "C" __global__ void gather_blocks(const float* src, const unsigned int* sel, float* out,
+    unsigned int bh, unsigned int nb, unsigned int seq, unsigned int hd, unsigned int block, unsigned int k_sel) {
+    unsigned int sel_w = k_sel * block;
+    unsigned int total = bh * nb * sel_w * hd;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    unsigned int d = gid % hd;
+    unsigned int rem = gid / hd;
+    unsigned int pos = rem % sel_w;
+    unsigned int bnq = rem / sel_w;
+    unsigned int slot = pos / block;
+    unsigned int w = pos % block;
+    unsigned int bh_idx = bnq / nb;
+    unsigned int block_idx = sel[bnq * k_sel + slot];
+    if (block_idx >= nb) { out[gid] = 0.0f; return; }
+    unsigned int src_row = block_idx * block + w;
+    if (src_row >= seq) { out[gid] = 0.0f; return; }
+    out[gid] = src[bh_idx * seq * hd + src_row * hd + d];
+}
+
+// Backward (scatter-add transpose) of gather_blocks. d_src MUST be pre-zeroed (the wrapper does it);
+// multiple query-blocks may select the same source block, so accumulate atomically.
+extern "C" __global__ void gather_blocks_backward(const float* d_out, const unsigned int* sel, float* d_src,
+    unsigned int bh, unsigned int nb, unsigned int seq, unsigned int hd, unsigned int block, unsigned int k_sel) {
+    unsigned int sel_w = k_sel * block;
+    unsigned int total = bh * nb * sel_w * hd;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    unsigned int d = gid % hd;
+    unsigned int rem = gid / hd;
+    unsigned int pos = rem % sel_w;
+    unsigned int bnq = rem / sel_w;
+    unsigned int slot = pos / block;
+    unsigned int w = pos % block;
+    unsigned int bh_idx = bnq / nb;
+    unsigned int block_idx = sel[bnq * k_sel + slot];
+    if (block_idx >= nb) return;             // sentinel gathered 0 -> no source
+    unsigned int src_row = block_idx * block + w;
+    if (src_row >= seq) return;
+    atomicAdd(&d_src[bh_idx * seq * hd + src_row * hd + d], d_out[gid]);
+}
+
+// Causal mask for gathered scores [bh*nb, block, k_sel*block]: -inf where the gathered key column is
+// padding or violates causality (key_global > query_global). One thread per score element.
+extern "C" __global__ void gather_causal_mask(float* scores, const unsigned int* sel,
+    unsigned int bh_nb, unsigned int nb, unsigned int block, unsigned int k_sel) {
+    unsigned int sel_w = k_sel * block;
+    unsigned int total = bh_nb * block * sel_w;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    unsigned int c = gid % sel_w;
+    unsigned int t = gid / sel_w;
+    unsigned int r = t % block;
+    unsigned int bnq = t / block;
+    unsigned int qb = bnq % nb;
+    unsigned int q_global = qb * block + r;
+    unsigned int slot = c / block;
+    unsigned int w = c % block;
+    unsigned int block_idx = sel[bnq * k_sel + slot];
+    unsigned int idx = bnq * block * sel_w + r * sel_w + c;
+    bool masked;
+    if (block_idx >= nb) { masked = true; }
+    else { unsigned int k_global = block_idx * block + w; masked = k_global > q_global; }
+    if (masked) scores[idx] = __int_as_float(0xff800000);
+}
+
+// ===== Muon optimizer: Frobenius normalize (for Newton-Schulz) + NorMuon per-neuron scale =====
+
+// Single-block sum-of-squares reduction then per-element scale by rsqrt(ssq+eps): X = M / ||M||_F.
+// Bounds the spectral norm so the cubic Newton-Schulz that follows always converges. Launch with ONE
+// block of next_pow2(size)<=256 threads (matches metal's single-threadgroup dispatch).
+extern "C" __global__ void muon_frob_normalize(const float* m, float* x, unsigned int size) {
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int tpg = blockDim.x;
+    float local = 0.0f;
+    for (unsigned int i = tid; i < size; i += tpg) { float v = m[i]; local += v * v; }
+    sdata[tid] = local;
+    __syncthreads();
+    for (unsigned int stride = tpg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sdata[0] + 1e-14f);
+    for (unsigned int i = tid; i < size; i += tpg) { x[i] = m[i] * inv; }
+}
+
+// NorMuon per-neuron scale: out[i] = 1/(sqrt(v[i]*bias_correction) + eps), elementwise over [size].
+extern "C" __global__ void inv_sqrt_bc(const float* v, float* out, unsigned int size, float bias_correction, float eps) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < size) {
+        float vhat = v[gid] * bias_correction;
+        out[gid] = 1.0f / (sqrtf(vhat) + eps);
+    }
 }
 "#;
