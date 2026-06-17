@@ -633,6 +633,11 @@ pub struct Muon {
     pub normalized: bool,
     pub norm_beta2: f32,
     pub norm_eps: f32,
+    /// Cautious Muon (Liang et al. 2024, arXiv 2411.16085): each step, zero the orthogonalized-update
+    /// components whose sign disagrees with the current gradient, then renormalize to preserve the
+    /// update magnitude. A near-free convergence improvement. Off by default; composes with NorMuon
+    /// (applied after it, to the final update).
+    pub cautious: bool,
     ctx: Arc<MetalContext>,
 }
 
@@ -698,6 +703,7 @@ impl Muon {
             normalized: false,
             norm_beta2: 0.95,
             norm_eps: 1e-8,
+            cautious: false,
             ctx: Arc::clone(ctx),
         }
     }
@@ -710,6 +716,14 @@ impl Muon {
         self.normalized = true;
         self.norm_beta2 = beta2;
         self.norm_eps = eps;
+    }
+
+    /// Enable Cautious Muon (Liang et al. 2024): each step, mask out the orthogonalized-update
+    /// components whose sign disagrees with the current gradient, then renormalize to preserve the
+    /// update magnitude (so it is LR-neutral vs plain Muon). A near-free convergence gain. Composes
+    /// with NorMuon. Off by default.
+    pub fn set_cautious(&mut self, on: bool) {
+        self.cautious = on;
     }
 
     pub fn step(&mut self, lr: f32) {
@@ -779,6 +793,19 @@ impl Muon {
                     compute::gpu_inv_sqrt_bc(&self.ctx, vrow, rowss, rows, bias_correction, self.norm_eps);
                     // X[i,j] *= scale[i]  (in-place: each thread reads+writes its own element)
                     compute::gpu_scale_rows(&self.ctx, x_buf, rowss, x_buf, rows, cols);
+                }
+
+                // Cautious Muon (Liang et al. 2024): zero update components whose sign disagrees with
+                // the current gradient (u·g ≤ 0), then renormalize by size/(kept+1) so the update
+                // magnitude — and the effective LR — is preserved. Applied to the FINAL update (after
+                // NorMuon). Reuses the post-NS scratch (ns_xxtx [size] as the keep-mask, ns_xxt for the
+                // 1-element kept-count) — no new optimizer state, no CPU readback.
+                if self.cautious {
+                    let keep = ps.ns_xxtx.as_ref().unwrap();
+                    let kept_sum = ps.ns_xxt.as_ref().unwrap();
+                    compute::gpu_cautious_mask(&self.ctx, x_buf, &grad, keep, size);
+                    compute::gpu_reduce_sum(&self.ctx, keep, kept_sum, size);
+                    compute::gpu_cautious_scale(&self.ctx, x_buf, kept_sum, size);
                 }
 
                 // Apply: theta = theta * (1 - lr * wd) - lr * X

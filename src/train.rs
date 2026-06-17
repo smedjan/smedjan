@@ -117,6 +117,9 @@ pub struct TrainConfig {
     /// NorMuon: per-neuron (per-row) second-moment normalization of the Muon/​hybrid orthogonalized
     /// update (~+11% over Muon). Only affects `--optimizer muon` / `hybrid`. Default false = plain Muon.
     pub normuon: bool,
+    /// Cautious optimizer (Liang et al. 2024): mask Muon/hybrid orthogonalized-update components whose
+    /// sign disagrees with the gradient, then renormalize. Near-free convergence gain. Off by default.
+    pub cautious: bool,
 }
 
 impl TrainConfig {
@@ -180,6 +183,7 @@ impl TrainConfig {
             bf16_matmul: false,
             lr_ref_batch: 0,
             normuon: false,
+            cautious: false,
         }
     }
 }
@@ -322,6 +326,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             m.set_normalization(0.95, 1e-8);
             eprintln!("  NorMuon: per-neuron second-moment normalization ON");
         }
+        if config.cautious {
+            m.set_cautious(true);
+            eprintln!("  Cautious Muon: sign-agreement update masking ON");
+        }
         Some(m)
     } else {
         None
@@ -339,6 +347,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         if config.normuon {
             h.muon.set_normalization(0.95, 1e-8);
             eprintln!("  NorMuon: per-neuron second-moment normalization ON (Muon group)");
+        }
+        if config.cautious {
+            h.muon.set_cautious(true);
+            eprintln!("  Cautious Muon: sign-agreement update masking ON (Muon group)");
         }
         let (n_muon, n_adamw) = h.split_counts();
         eprintln!("Using Muon+AdamW hybrid: {} matrices on Muon (lr×{}), {} params on AdamW (embeddings/head/routers/norms, lr×{})",

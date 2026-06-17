@@ -516,6 +516,31 @@ mod suite {
         assert_eq!(readback, data);
     }
 
+    #[test]
+    fn cautious_mask_zeros_disagreeing_and_renormalizes() {
+        // Cautious Muon (Liang et al. 2024): keep update components whose sign agrees with the
+        // gradient (u·g > 0), zero the rest, emit a 1/0 keep-mask, then renormalize by size/(kept+1).
+        let ctx = test_ctx();
+        let u = ctx.buffer_from_slice(&[1.0f32, -2.0, 3.0, -4.0]); // candidate update
+        let g = ctx.buffer_from_slice(&[1.0f32, 5.0, -1.0, -4.0]); // gradient
+        // agree: idx0 (1·1>0), idx3 (-4·-4>0); disagree: idx1 (-2·5<0), idx2 (3·-1<0)
+        let keep = ctx.alloc_buffer(4 * 4);
+        compute::gpu_cautious_mask(&ctx, &u, &g, &keep, 4);
+        assert_eq!(MetalContext::read_buffer(&u, 4), vec![1.0, 0.0, 0.0, -4.0]);
+        assert_eq!(MetalContext::read_buffer(&keep, 4), vec![1.0, 0.0, 0.0, 1.0]);
+
+        // Renorm: scale = size/(kept+1) = 4/(2+1) = 4/3; zeroed entries stay zero.
+        let sum = ctx.alloc_buffer(4);
+        compute::gpu_reduce_sum(&ctx, &keep, &sum, 4);
+        compute::gpu_cautious_scale(&ctx, &u, &sum, 4);
+        let out = MetalContext::read_buffer(&u, 4);
+        let s = 4.0f32 / 3.0;
+        assert!((out[0] - s).abs() < 1e-4, "got {}", out[0]);
+        assert!((out[3] - (-4.0 * s)).abs() < 1e-4, "got {}", out[3]);
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[2], 0.0);
+    }
+
     // =========================================================================
     // 6. Model config
     // =========================================================================

@@ -2054,6 +2054,32 @@ pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer,
     dispatch_sync!(ctx, "ema_update", grid, tg, 0 => ema, 1 => src, 2 => &params_buf);
 }
 
+/// Cautious mask (Liang et al. 2024): zero update components that disagree in sign with the gradient
+/// (u·g ≤ 0), writing a 1.0/0.0 keep-mask into `keep` for renormalization. In-place on `update`.
+pub fn gpu_cautious_mask(ctx: &Arc<MetalContext>, update: &GpuBuffer, grad: &GpuBuffer, keep: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "cautious_mask", grid, tg, 0 => update, 1 => grad, 2 => keep, 3 => &params_buf);
+}
+
+/// Cautious renormalization: x *= size / (kept_sum[0] + 1), restoring update magnitude after masking.
+/// `kept_sum` is a 1-element GPU buffer (e.g. from gpu_reduce_sum on the keep-mask) — no CPU readback.
+pub fn gpu_cautious_scale(ctx: &Arc<MetalContext>, x: &GpuBuffer, kept_sum: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params { size: u32 }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "cautious_scale", grid, tg, 0 => x, 1 => kept_sum, 2 => &params_buf);
+}
+
 /// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j]))). Numerically stable.
 pub fn gpu_logsumexp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
     #[repr(C)]

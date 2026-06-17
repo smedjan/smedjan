@@ -205,6 +205,11 @@ struct TrainArgs {
         /// update (~+11% over Muon). Only affects --optimizer muon / hybrid. Default false.
         #[arg(long)]
         normuon: bool,
+        /// Cautious optimizer (Liang et al. 2024): mask Muon/hybrid orthogonalized-update components
+        /// that disagree in sign with the gradient, then renormalize. Near-free convergence gain.
+        /// Only affects `--optimizer muon` / `hybrid`. Composes with --normuon. Default false.
+        #[arg(long)]
+        cautious: bool,
         /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
         #[arg(long, default_value = "0")]
         n_predict: usize,
@@ -725,6 +730,7 @@ fn main() {
             bf16_matmul,
             lr_ref_batch,
             normuon,
+            cautious,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -826,6 +832,7 @@ fn main() {
             config.bf16_matmul = bf16_matmul;
             config.lr_ref_batch = lr_ref_batch;
             config.normuon = normuon;
+            config.cautious = cautious;
 
             train::train(&ctx, &config).expect("Training failed");
         }

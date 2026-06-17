@@ -2408,6 +2408,56 @@ kernel void ema_update(
 }
 "#;
 
+/// Cautious mask (Liang et al. 2024, "Cautious Optimizers: Improving Training with One Line of
+/// Code"): zero the update components whose sign disagrees with the gradient (u·g ≤ 0), and emit a
+/// 1.0/0.0 keep-mask so the caller can renormalize the update to preserve its magnitude. In-place
+/// on `u`, same launch shape as `ema_update`.
+pub const CAUTIOUS_MASK: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CautiousParams {
+    uint size;
+};
+
+kernel void cautious_mask(
+    device float* u [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device float* keep [[buffer(2)]],
+    constant CautiousParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    // select(false_val, true_val, cond): keep = (u*g > 0) ? 1 : 0. NaN/Inf products → 0 (masked).
+    float k = select(0.0f, 1.0f, u[gid] * g[gid] > 0.0f);
+    keep[gid] = k;
+    u[gid] = u[gid] * k;
+}
+"#;
+
+/// Cautious renormalization: x[i] *= size / (kept_sum[0] + 1). Restores the update magnitude after
+/// `cautious_mask` zeroed the disagreeing components, so the cautious update is LR-neutral vs the
+/// uncautious one. Reads the kept-count from a GPU buffer — no CPU readback (no command-batch flush).
+pub const CAUTIOUS_SCALE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CautiousScaleParams {
+    uint size;
+};
+
+kernel void cautious_scale(
+    device float* x [[buffer(0)]],
+    device const float* kept_sum [[buffer(1)]],
+    constant CautiousScaleParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float scale = float(params.size) / (kept_sum[0] + 1.0f);
+    x[gid] = x[gid] * scale;
+}
+"#;
+
 pub const LOGSUMEXP: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

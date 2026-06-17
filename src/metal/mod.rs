@@ -311,6 +311,8 @@ impl MetalContext {
             ("exp_fwd", shaders::EXP),
             ("broadcast_rows", shaders::BROADCAST_ROWS),
             ("ema_update", shaders::EMA_UPDATE),
+            ("cautious_mask", shaders::CAUTIOUS_MASK),
+            ("cautious_scale", shaders::CAUTIOUS_SCALE),
             ("logsumexp", shaders::LOGSUMEXP),
             ("concat_cols", shaders::CONCAT_COLS),
             ("slice_cols", shaders::SLICE_COLS),
