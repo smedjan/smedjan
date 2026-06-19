@@ -6,6 +6,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "matmul_tiled", "matmul_tiled_trans_b", "matmul_trans_a_tiled",
     "batched_matmul_tiled", "batched_matmul_tiled_trans_b", "batched_matmul_tiled_trans_a",
     "matmul_tiled_f16", "matmul_tiled_trans_b_f16", "matmul_trans_a_tiled_f16",
+    "batched_matmul_tiled_f16", "batched_matmul_tiled_trans_b_f16", "batched_matmul_tiled_trans_a_f16",
     "softmax", "rms_norm", "rms_norm_residual",
     "rope", "rope_backward",
     "add_kernel", "add_inplace", "mul_kernel", "scale_kernel", "fill_kernel", "copy_kernel",
@@ -22,12 +23,14 @@ pub const KERNEL_NAMES: &[&str] = &[
     "broadcast_rows", "slice_cols", "concat_cols",
     "block_mean_keys", "block_sparse_topk_mask", "gather_blocks", "gather_blocks_backward",
     "gather_causal_mask",
-    "muon_frob_normalize", "inv_sqrt_bc",
+    "muon_frob_normalize", "inv_sqrt_bc", "cautious_mask", "cautious_scale",
     "matmul_tiled_fp32", "moe_gather", "moe_scatter_add",
     "matmul_tiled_bf16",
     "ternary_matmul", "ternary_absmean", "ternary_pack",
     "adamw_8bit_update",
     "flash_attention_forward", "flash_attn_precompute_d", "flash_attention_backward",
+    "lion_update", "sophia_update", "argmax", "temperature_scale", "zero_rows", "gradient_mask",
+    "logsumexp", "compute_inv_rms", "causal_mask_window",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -492,7 +495,7 @@ extern "C" __global__ void embedding_lookup(
     unsigned int seq_len, unsigned int dim
 ) {
     int pos = blockIdx.x;
-    int d = threadIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (pos >= seq_len || d >= dim) return;
     output[pos * dim + d] = table[tokens[pos] * dim + d];
 }
@@ -506,7 +509,7 @@ extern "C" __global__ void causal_mask(
 ) {
     int bh = blockIdx.x;
     int q = blockIdx.y;
-    int k = threadIdx.x;
+    int k = blockIdx.z * blockDim.x + threadIdx.x;
     if (bh >= batch_heads || q >= seq_q || k >= seq_k) return;
     if (k > q + offset)
         scores[bh * seq_q * seq_k + q * seq_k + k] = -1e9f;
@@ -682,7 +685,7 @@ extern "C" __global__ void embedding_backward(
     unsigned int seq_len, unsigned int dim
 ) {
     int pos = blockIdx.x;
-    int d = threadIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (pos >= seq_len || d >= dim) return;
     atomicAdd(&grad_table[tokens[pos] * dim + d], grad_out[pos * dim + d]);
 }
@@ -932,6 +935,129 @@ extern "C" __global__ void matmul_trans_a_tiled_f16(
     for(int i=0;i<4;i++) for(int j=0;j<4;j++){
         int gr=tile_row+local_row*4+i,gc=tile_col+local_col*4+j;
         if(gr<K&&gc<N) C[gr*N+gc]=acc[i][j];
+    }
+}
+
+// Batched FP16-input variants (half* A,B → float C). Identical tiling/compute to the f32 batched
+// kernels (which cast f32→half in-tile), but read pre-packed halves directly → bit-identical results,
+// half the input bandwidth. Inputs come from cast_to_f16 (attention) or gpu_cast_f32_to_f16 (tests).
+extern "C" __global__ void batched_matmul_tiled_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const __half* A_b = A + batch_idx * M * K;
+    const __half* B_b = B + batch_idx * K * N;
+    float* C_b = C + batch_idx * M * N;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = tile_row+r, gc = kb+c;
+            As[r][c] = (gr<M&&gc<K) ? A_b[gr*K+gc] : __float2half(0.f);
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = kb+r, gc = tile_col+c;
+            Bs[r][c] = (gr<K&&gc<N) ? B_b[gr*N+gc] : __float2half(0.f);
+        }
+        __syncthreads();
+        for (int k = 0; k < 32; k++) {
+            __half av[4], bv[4];
+            for (int i=0;i<4;i++) av[i] = As[local_row*4+i][k];
+            for (int j=0;j<4;j++) bv[j] = Bs[k][local_col*4+j];
+            for (int i=0;i<4;i++) for (int j=0;j<4;j++)
+                acc[i][j] += __half2float(__hmul(av[i], bv[j]));
+        }
+        __syncthreads();
+    }
+    for (int i=0;i<4;i++) for (int j=0;j<4;j++) {
+        int gr = tile_row+local_row*4+i, gc = tile_col+local_col*4+j;
+        if (gr<M&&gc<N) C_b[gr*N+gc] = acc[i][j];
+    }
+}
+
+extern "C" __global__ void batched_matmul_tiled_trans_b_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const __half* A_b = A + batch_idx * M * K;
+    const __half* B_b = B + batch_idx * N * K;
+    float* C_b = C + batch_idx * M * N;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = tile_row+r, gc = kb+c;
+            As[r][c] = (gr<M&&gc<K) ? A_b[gr*K+gc] : __float2half(0.f);
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gk = kb+r, gn = tile_col+c;
+            Bs[r][c] = (gk<K&&gn<N) ? B_b[gn*K+gk] : __float2half(0.f);
+        }
+        __syncthreads();
+        for (int k=0;k<32;k++) {
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+extern "C" __global__ void batched_matmul_tiled_trans_a_f16(
+    const __half* A, const __half* B, float* C,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const __half* A_b = A + batch_idx * M * K;
+    const __half* B_b = B + batch_idx * M * N;
+    float* C_b = C + batch_idx * K * N;
+    __shared__ __half As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int mb = 0; mb < M; mb += 32) {
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gk=tile_row+r, gm=mb+c;
+            As[r][c]=(gk<K&&gm<M)?A_b[gm*K+gk]:__float2half(0.f);
+        }
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gm=mb+r, gn=tile_col+c;
+            Bs[r][c]=(gm<M&&gn<N)?B_b[gm*N+gn]:__float2half(0.f);
+        }
+        __syncthreads();
+        for(int m=0;m<32;m++){
+            __half av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][m];
+            for(int j=0;j<4;j++) bv[j]=Bs[m][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<K&&gc<N) C_b[gr*N+gc]=acc[i][j];
     }
 }
 
@@ -1205,7 +1331,7 @@ extern "C" __global__ void causal_doc_mask(float* scores, const unsigned int* se
     unsigned int batch_heads, unsigned int seq, unsigned int n_heads) {
     unsigned int bh = blockIdx.x;
     unsigned int q = blockIdx.y;
-    unsigned int k = threadIdx.x;
+    unsigned int k = blockIdx.z * blockDim.x + threadIdx.x;
     if (bh >= batch_heads || q >= seq || k >= seq) return;
     unsigned int base = (bh / n_heads) * seq;
     if (k > q || seg_ids[base + q] != seg_ids[base + k])
@@ -1831,5 +1957,121 @@ extern "C" __global__ void flash_attention_backward(
         __syncthreads();
     }
     if (active) for (unsigned int i = 0; i < d; i++) dQ_bh[global_q * d + i] = dq_acc[i];
+}
+
+// ===== Optimizers: Lion (sign-momentum) + Sophia (clipped diagonal-Hessian) =====
+extern "C" __global__ void cautious_mask(float* u, const float* g, float* keep, unsigned int size) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float k = (u[gid] * g[gid] > 0.0f) ? 1.0f : 0.0f;
+    keep[gid] = k;
+    u[gid] *= k;
+}
+
+extern "C" __global__ void cautious_scale(float* x, const float* kept_sum, unsigned int size) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float scale = (float)size / (kept_sum[0] + 1.0f);
+    x[gid] *= scale;
+}
+
+extern "C" __global__ void lion_update(float* param, const float* grad, float* m,
+    unsigned int size, float lr, float beta1, float beta2, float weight_decay) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float g = grad[gid], m_val = m[gid];
+    float update = m_val * beta1 + g * (1.0f - beta1);
+    float s = (update > 0.0f) ? 1.0f : ((update < 0.0f) ? -1.0f : 0.0f);
+    param[gid] = param[gid] * (1.0f - lr * weight_decay) - lr * s;
+    m[gid] = m_val * beta2 + g * (1.0f - beta2);
+}
+extern "C" __global__ void sophia_update(float* param, const float* grad, float* m, float* h,
+    unsigned int size, float lr, float beta1, float beta2, float eps, float rho, float weight_decay) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float g = grad[gid];
+    float m_val = beta1 * m[gid] + (1.0f - beta1) * g; m[gid] = m_val;
+    float h_val = beta2 * h[gid] + (1.0f - beta2) * g * g; h[gid] = h_val;
+    float update = m_val / fmaxf(h_val, eps);
+    update = fmaxf(-rho, fminf(rho, update));
+    param[gid] = param[gid] * (1.0f - lr * weight_decay) - lr * update;
+}
+
+// ===== Sampling / generation utilities =====
+// argmax over a flat array → index, single-block reduction (grid-stride for size > blockDim).
+extern "C" __global__ void argmax(const float* data, unsigned int* result, unsigned int size) {
+    __shared__ float sv[256];
+    __shared__ unsigned int si[256];
+    unsigned int tid = threadIdx.x, tpg = blockDim.x;
+    float local_max = __int_as_float(0xff800000); unsigned int local_idx = 0;
+    for (unsigned int i = tid; i < size; i += tpg)
+        if (data[i] > local_max) { local_max = data[i]; local_idx = i; }
+    sv[tid] = local_max; si[tid] = local_idx;
+    __syncthreads();
+    for (unsigned int s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s && sv[tid + s] > sv[tid]) { sv[tid] = sv[tid + s]; si[tid] = si[tid + s]; }
+        __syncthreads();
+    }
+    if (tid == 0) result[0] = si[0];
+}
+extern "C" __global__ void temperature_scale(float* data, unsigned int offset, unsigned int count, float inv_temperature) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    data[offset + gid] *= inv_temperature;
+}
+
+// ===== Training utilities: zero rows by token index, mask gradients by position =====
+extern "C" __global__ void zero_rows(const unsigned int* tokens, float* matrix, unsigned int n_tokens, unsigned int dim) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int token_idx = gid / dim, dim_idx = gid % dim;
+    if (token_idx >= n_tokens) return;
+    matrix[tokens[token_idx] * dim + dim_idx] = 0.0f;
+}
+extern "C" __global__ void gradient_mask(float* grad, const unsigned int* mask, unsigned int total, unsigned int vocab_size) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    if (mask[gid / vocab_size] == 0u) grad[gid] = 0.0f;
+}
+
+// ===== Per-row reductions: logsumexp, inverse-RMS (one block per row, blockDim = next_pow2(cols)) =====
+extern "C" __global__ void logsumexp(const float* input, float* output, unsigned int rows, unsigned int cols) {
+    __shared__ float sh[256];
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* row_in = input + row * cols;
+    unsigned int tid = threadIdx.x, tpg = blockDim.x;
+    float local_max = __int_as_float(0xff800000);
+    for (unsigned int c = tid; c < cols; c += tpg) local_max = fmaxf(local_max, row_in[c]);
+    sh[tid] = local_max; __syncthreads();
+    for (unsigned int s = tpg / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] = fmaxf(sh[tid], sh[tid + s]); __syncthreads(); }
+    float row_max = sh[0]; __syncthreads();
+    float local_sum = 0.0f;
+    for (unsigned int c = tid; c < cols; c += tpg) local_sum += expf(row_in[c] - row_max);
+    sh[tid] = local_sum; __syncthreads();
+    for (unsigned int s = tpg / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+    if (tid == 0) output[row] = row_max + logf(sh[0]);
+}
+extern "C" __global__ void compute_inv_rms(const float* input, float* inv_rms, unsigned int rows, unsigned int cols, float eps) {
+    __shared__ float sh[256];
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* row_in = input + row * cols;
+    unsigned int tid = threadIdx.x, tpg = blockDim.x;
+    float local = 0.0f;
+    for (unsigned int c = tid; c < cols; c += tpg) { float v = row_in[c]; local += v * v; }
+    sh[tid] = local; __syncthreads();
+    for (unsigned int s = tpg / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+    if (tid == 0) inv_rms[row] = rsqrtf(sh[0] / (float)cols + eps);
+}
+
+// ===== Sliding-window causal mask: -inf for future (k>q+offset) OR too-far-back (k<q+offset-window) =====
+extern "C" __global__ void causal_mask_window(float* scores, unsigned int batch_heads, unsigned int seq_q,
+    unsigned int seq_k, unsigned int offset, unsigned int window) {
+    unsigned int bh = blockIdx.x, q = blockIdx.y, k = blockIdx.z * blockDim.x + threadIdx.x;
+    if (bh >= batch_heads || q >= seq_q || k >= seq_k) return;
+    unsigned int q_pos = q + offset;
+    bool future = k > q_pos;
+    bool too_far = (window > 0) && (q_pos >= window) && (k < q_pos - window);
+    if (future || too_far) scores[bh * seq_q * seq_k + q * seq_k + k] = __int_as_float(0xff800000);
 }
 "#;

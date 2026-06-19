@@ -169,7 +169,7 @@ pub fn gpu_adamw_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBu
 // ===== Embedding =====
 
 pub fn gpu_embedding_lookup(ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, table: &GpuBuffer, output: &GpuBuffer, seq_len: u32, dim: u32) {
-    let cfg = launch_cfg_2d(seq_len, 1, dim.min(1024), 1);
+    let cfg = launch_cfg_3d(seq_len, dim.div_ceil(256), 1, 256);
     let f = ctx.device.get_func("andreai", "embedding_lookup").unwrap();
     unsafe { f.launch(cfg, (table, tokens, output, seq_len, dim)) }.unwrap();
 }
@@ -207,7 +207,7 @@ pub fn gpu_buffer_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer
 
 // Causal mask
 pub fn gpu_causal_mask(ctx: &Arc<MetalContext>, scores: &GpuBuffer, batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32) {
-    let cfg = launch_cfg_3d(batch_heads, seq_q, 1, seq_k.min(1024));
+    let cfg = launch_cfg_3d(batch_heads, seq_q, seq_k.div_ceil(256), 256);
     let f = ctx.device.get_func("andreai", "causal_mask").unwrap();
     unsafe { f.launch(cfg, (scores, batch_heads, seq_q, seq_k, offset)) }.unwrap();
 }
@@ -312,13 +312,42 @@ pub fn gpu_cast_f16_to_f32(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
-// CUDA stays fp32 (cast_to_f16 is a no-op on CUDA), so the f16 entry points delegate to fp32 kernels.
-pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul(ctx, a, b, c, m, n, k) }
-pub fn gpu_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) { gpu_matmul_trans_b(ctx, a, b, c, m, n, k) }
-pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) { gpu_matmul_trans_a(ctx, a, b, c, m, k, n) }
-pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul(ctx, a, b, c, d) }
-pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_b(ctx, a, b, c, d) }
-pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) { gpu_batched_matmul_trans_a(ctx, a, b, c, d) }
+// Real FP16-input matmuls: read packed-half buffers (from cast_to_f16, now a real pack on CUDA).
+// Tiling/compute identical to the f32 kernels (which cast f32→half in-tile) → bit-identical values,
+// half the input bandwidth. m/n/k = logical dims; inputs are half-packed (2 halves per 4-byte word).
+pub fn gpu_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), 1, 64);
+    let f = ctx.device.get_func("andreai", "matmul_tiled_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+}
+pub fn gpu_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, n: u32, k: u32) {
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), 1, 64);
+    let f = ctx.device.get_func("andreai", "matmul_tiled_trans_b_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+}
+pub fn gpu_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, m: u32, k: u32, n: u32) {
+    let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), 1, 64);
+    let f = ctx.device.get_func("andreai", "matmul_trans_a_tiled_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, k, n)) }.unwrap();
+}
+pub fn gpu_batched_matmul_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+}
+pub fn gpu_batched_matmul_trans_b_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled_trans_b_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+}
+pub fn gpu_batched_matmul_trans_a_f16(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
+    let BatchedDims { batch, m, n, k } = d;
+    let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
+    let f = ctx.device.get_func("andreai", "batched_matmul_tiled_trans_a_f16").unwrap();
+    unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
+}
 
 pub fn gpu_batched_matmul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
     let BatchedDims { batch, m, n, k } = d;
@@ -458,9 +487,19 @@ pub fn gpu_ternary_pack(ctx: &Arc<MetalContext>, weights: &GpuBuffer, absmean: &
     unsafe { f.launch(cfg, (weights, absmean, packed, rows, cols)) }.unwrap();
 }
 
-pub fn gpu_lion_update(_ctx: &Arc<MetalContext>, _param: &GpuBuffer, _grad: &GpuBuffer, _m: &GpuBuffer, _size: u32, _p: LionParams) { unimplemented!("cuda backend: gpu_lion_update not yet ported") }
+pub fn gpu_lion_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, size: u32, p: LionParams) {
+    let LionParams { lr, beta1, beta2, weight_decay } = p;
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "lion_update").unwrap();
+    unsafe { f.launch(cfg, (param, grad, m, size, lr, beta1, beta2, weight_decay)) }.unwrap();
+}
 
-pub fn gpu_sophia_update(_ctx: &Arc<MetalContext>, _param: &GpuBuffer, _grad: &GpuBuffer, _m: &GpuBuffer, _h: &GpuBuffer, _size: u32, _p: SophiaParams) { unimplemented!("cuda backend: gpu_sophia_update not yet ported") }
+pub fn gpu_sophia_update(ctx: &Arc<MetalContext>, param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, h: &GpuBuffer, size: u32, p: SophiaParams) {
+    let SophiaParams { lr, beta1, beta2, eps, rho, weight_decay } = p;
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "sophia_update").unwrap();
+    unsafe { f.launch(cfg, (param, grad, m, h, size, lr, beta1, beta2, eps, rho, weight_decay)) }.unwrap();
+}
 
 pub fn gpu_scale_rows(ctx: &Arc<MetalContext>, input: &GpuBuffer, scales: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
     let cfg = launch_cfg(256, (rows * cols).div_ceil(256));
@@ -486,10 +525,14 @@ pub fn gpu_moe_scatter_add(ctx: &Arc<MetalContext>, expert_out: &GpuBuffer, indi
     unsafe { f.launch(cfg, (expert_out, indices, weights, combined, n_routed, dim)) }.unwrap();
 }
 
-pub fn gpu_causal_mask_window( _ctx: &Arc<MetalContext>, _scores: &GpuBuffer, _batch_heads: u32, _seq_q: u32, _seq_k: u32, _offset: u32, _window: u32, ) { unimplemented!("cuda backend: gpu_causal_mask_window not yet ported") }
+pub fn gpu_causal_mask_window( ctx: &Arc<MetalContext>, scores: &GpuBuffer, batch_heads: u32, seq_q: u32, seq_k: u32, offset: u32, window: u32, ) {
+    let cfg = launch_cfg_3d(batch_heads, seq_q, seq_k.div_ceil(256), 256);
+    let f = ctx.device.get_func("andreai", "causal_mask_window").unwrap();
+    unsafe { f.launch(cfg, (scores, batch_heads, seq_q, seq_k, offset, window)) }.unwrap();
+}
 
 pub fn gpu_causal_doc_mask( ctx: &Arc<MetalContext>, scores: &GpuBuffer, seg_ids: &CudaSlice<u32>, batch_heads: u32, seq: u32, n_heads: u32, )  {
-    let cfg = launch_cfg_3d(batch_heads, seq, 1, seq.min(1024));
+    let cfg = launch_cfg_3d(batch_heads, seq, seq.div_ceil(256), 256);
     let f = ctx.device.get_func("andreai", "causal_doc_mask").unwrap();
     unsafe { f.launch(cfg, (scores, seg_ids, batch_heads, seq, n_heads)) }.unwrap();
 }
@@ -573,12 +616,16 @@ pub fn gpu_softmax_backward( ctx: &Arc<MetalContext>, softmax_out: &GpuBuffer, g
 }
 
 pub fn gpu_embedding_backward( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, grad_output: &GpuBuffer, grad_embeddings: &GpuBuffer, n_tokens: u32, dim: u32, ) {
-    let cfg = launch_cfg_2d(n_tokens, 1, dim.min(1024), 1);
+    let cfg = launch_cfg_3d(n_tokens, dim.div_ceil(256), 1, 256);
     let f = ctx.device.get_func("andreai","embedding_backward").unwrap();
     unsafe { f.launch(cfg, (tokens, grad_output, grad_embeddings, n_tokens, dim)) }.unwrap();
 }
 
-pub fn gpu_zero_rows( _ctx: &Arc<MetalContext>, _tokens: &CudaSlice<u32>, _matrix: &GpuBuffer, _n_tokens: u32, _dim: u32, ) { unimplemented!("cuda backend: gpu_zero_rows not yet ported") }
+pub fn gpu_zero_rows( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, matrix: &GpuBuffer, n_tokens: u32, dim: u32, ) {
+    let cfg = launch_cfg(256, (n_tokens * dim).div_ceil(256));
+    let f = ctx.device.get_func("andreai", "zero_rows").unwrap();
+    unsafe { f.launch(cfg, (tokens, matrix, n_tokens, dim)) }.unwrap();
+}
 
 pub fn gpu_transpose_2d( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32, ) {
     let total = rows * cols;
@@ -603,7 +650,12 @@ pub fn gpu_transpose_perm_forward( ctx: &Arc<MetalContext>, input: &GpuBuffer, o
     unsafe { f.launch(cfg, (input, output, batch, seq, n_heads, head_dim)) }.unwrap();
 }
 
-pub fn gpu_gradient_mask( _ctx: &Arc<MetalContext>, _grad: &GpuBuffer, _mask: &CudaSlice<u32>, _positions: u32, _vocab_size: u32, ) { unimplemented!("cuda backend: gpu_gradient_mask not yet ported") }
+pub fn gpu_gradient_mask( ctx: &Arc<MetalContext>, grad: &GpuBuffer, mask: &CudaSlice<u32>, positions: u32, vocab_size: u32, ) {
+    let total = positions * vocab_size;
+    let cfg = launch_cfg(256, total.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "gradient_mask").unwrap();
+    unsafe { f.launch(cfg, (grad, mask, total, vocab_size)) }.unwrap();
+}
 
 pub fn gpu_strided_batch_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, d: StridedCopyDims)  {
     let StridedCopyDims { bh, src_seq_len, dst_stride, dst_offset, dim } = d;
@@ -622,9 +674,21 @@ pub fn gpu_compact_strided_copy( ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: 
     unsafe { f.launch(cfg, (src, dst, src_stride * dim, seq_len * dim, copy_len, bh)) }.unwrap();
 }
 
-pub fn gpu_argmax(_ctx: &Arc<MetalContext>, _data: &GpuBuffer, _size: u32) -> u32 { unimplemented!("cuda backend: gpu_argmax not yet ported") }
+pub fn gpu_argmax(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> u32 {
+    let result = ctx.buffer_from_u32_slice(&[0u32]);
+    let threads = next_power_of_2_clamped(size as u64) as u32;
+    let cfg = launch_cfg(threads, 1); // single block, grid-stride over size
+    let f = ctx.device.get_func("andreai", "argmax").unwrap();
+    unsafe { f.launch(cfg, (data, result.as_ref(), size)) }.unwrap();
+    MetalContext::read_buffer_u32(result.as_ref(), 1)[0]
+}
 
-pub fn gpu_temperature_scale( _ctx: &Arc<MetalContext>, _data: &GpuBuffer, _offset: u32, _count: u32, _temperature: f32, ) { unimplemented!("cuda backend: gpu_temperature_scale not yet ported") }
+pub fn gpu_temperature_scale( ctx: &Arc<MetalContext>, data: &GpuBuffer, offset: u32, count: u32, temperature: f32, ) {
+    let inv_temperature = 1.0 / temperature;
+    let cfg = launch_cfg(256, count.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "temperature_scale").unwrap();
+    unsafe { f.launch(cfg, (data, offset, count, inv_temperature)) }.unwrap();
+}
 
 pub fn gpu_kl_divergence( ctx: &Arc<MetalContext>, teacher_logits: &GpuBuffer, student_logits: &GpuBuffer, losses: &GpuBuffer, grad_student: &GpuBuffer, d: KlDims, ) {
     let cfg = launch_cfg_2d(d.batch_size, 1, next_power_of_2_clamped(d.vocab_size as u64) as u32, 1);
@@ -643,9 +707,33 @@ pub fn gpu_scaled_causal_softmax(ctx: &Arc<MetalContext>, input: &GpuBuffer, out
     gpu_softmax(ctx, output, output, total_rows, seq_k);
 }
 
-pub fn gpu_scaled_causal_softmax_window(_ctx: &Arc<MetalContext>, _input: &GpuBuffer, _output: &GpuBuffer, _d: SoftmaxDims, _window: u32) { unimplemented!("cuda backend: gpu_scaled_causal_softmax_window not yet ported") }
+pub fn gpu_scaled_causal_softmax_window(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: SoftmaxDims, window: u32) {
+    let SoftmaxDims { total_rows, seq_q, seq_k, scale, kv_offset } = d;
+    let n = total_rows * seq_k;
+    gpu_copy(ctx, input, output, n);
+    gpu_scale(ctx, output, n, scale);
+    gpu_causal_mask_window(ctx, output, total_rows / seq_q, seq_q, seq_k, kv_offset, window);
+    gpu_softmax(ctx, output, output, total_rows, seq_k);
+}
 
-pub fn gpu_mega_ffn( _ctx: &Arc<MetalContext>, _x: &GpuBuffer, _norm_w: &GpuBuffer, _w: FfnWeights, _output: &GpuBuffer, _d: MegaFfnDims, ) { unimplemented!("cuda backend: gpu_mega_ffn not yet ported (CUDA uses primitive FFN)") }
+pub fn gpu_mega_ffn( ctx: &Arc<MetalContext>, x: &GpuBuffer, norm_w: &GpuBuffer, w: FfnWeights, output: &GpuBuffer, d: MegaFfnDims, ) {
+    // CUDA composes the SwiGLU FFN from primitives (no monolithic fused kernel): output =
+    // x + (silu(rms_norm(x) @ w1) * (rms_norm(x) @ w3)) @ w2 — bit-identical to the standard path.
+    let FfnWeights { w1, w2, w3 } = w;
+    let MegaFfnDims { batch_tokens, d_model, d_ff, eps } = d;
+    let (bt, dm, df) = (batch_tokens, d_model, d_ff);
+    let normed = ctx.alloc_buffer((bt * dm * 4) as usize);
+    gpu_rms_norm(ctx, x, norm_w, &normed, bt, dm, eps);
+    let gate = ctx.alloc_buffer((bt * df * 4) as usize);
+    gpu_matmul(ctx, &normed, w1, &gate, bt, df, dm);
+    let up = ctx.alloc_buffer((bt * df * 4) as usize);
+    gpu_matmul(ctx, &normed, w3, &up, bt, df, dm);
+    let hidden = ctx.alloc_buffer((bt * df * 4) as usize);
+    gpu_silu_gate(ctx, &gate, &up, &hidden, bt * df);
+    let down = ctx.alloc_buffer((bt * dm * 4) as usize);
+    gpu_matmul(ctx, &hidden, w2, &down, bt, dm, df);
+    gpu_add(ctx, x, &down, output, bt * dm);
+}
 
 pub fn gpu_transpose_rope(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, d: TrRopeDims) {
     gpu_transpose_perm_forward(ctx, input, output, d.batch, d.seq, d.n_heads, d.head_dim);
@@ -658,9 +746,20 @@ pub fn gpu_transpose_rope_backward(ctx: &Arc<MetalContext>, grad_out: &GpuBuffer
     gpu_transpose_perm_backward(ctx, grad_out, grad_in, d.batch, d.seq, d.n_heads, d.head_dim);
 }
 
-pub fn gpu_compute_inv_rms(_ctx: &Arc<MetalContext>, _input: &GpuBuffer, _inv_rms: &GpuBuffer, _rows: u32, _cols: u32, _eps: f32) { unimplemented!("cuda backend: gpu_compute_inv_rms not yet ported") }
+pub fn gpu_compute_inv_rms(ctx: &Arc<MetalContext>, input: &GpuBuffer, inv_rms: &GpuBuffer, rows: u32, cols: u32, eps: f32) {
+    let tpg = next_power_of_2_clamped(cols as u64) as u32;
+    let cfg = launch_cfg(tpg, rows); // one block per row
+    let f = ctx.device.get_func("andreai", "compute_inv_rms").unwrap();
+    unsafe { f.launch(cfg, (input, inv_rms, rows, cols, eps)) }.unwrap();
+}
 
-pub fn gpu_fused_norm_matmul( _ctx: &Arc<MetalContext>, _a: &GpuBuffer, _norm_weight: &GpuBuffer, _b: &GpuBuffer, _c: &GpuBuffer, _d: NormMatmulDims, ) { unimplemented!("cuda backend: gpu_fused_norm_matmul not yet ported") }
+pub fn gpu_fused_norm_matmul( ctx: &Arc<MetalContext>, a: &GpuBuffer, norm_weight: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: NormMatmulDims, ) {
+    // C = rms_norm(A[m,k], norm_weight) @ B[k,n]. Composed from primitives (CUDA has no fused kernel).
+    let NormMatmulDims { m, n, k, eps } = d;
+    let normed = ctx.alloc_buffer((m * k * 4) as usize);
+    gpu_rms_norm(ctx, a, norm_weight, &normed, m, k, eps);
+    gpu_matmul(ctx, &normed, b, c, m, n, k);
+}
 
 pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
@@ -698,7 +797,12 @@ pub fn gpu_ema_update(ctx: &Arc<MetalContext>, ema: &GpuBuffer, src: &GpuBuffer,
     unsafe { f.launch(cfg, (ema, src, size, decay)) }.unwrap();
 }
 
-pub fn gpu_logsumexp(_ctx: &Arc<MetalContext>, _input: &GpuBuffer, _output: &GpuBuffer, _rows: u32, _cols: u32) { unimplemented!("cuda backend: gpu_logsumexp not yet ported") }
+pub fn gpu_logsumexp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32) {
+    let tpg = next_power_of_2_clamped(cols as u64) as u32;
+    let cfg = launch_cfg(tpg, rows); // one block per row
+    let f = ctx.device.get_func("andreai", "logsumexp").unwrap();
+    unsafe { f.launch(cfg, (input, output, rows, cols)) }.unwrap();
+}
 
 pub fn gpu_scale_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32, scale: f32) {
     gpu_copy(ctx, src, dst, size);
@@ -716,6 +820,18 @@ pub fn gpu_inv_sqrt_bc(ctx: &Arc<MetalContext>, v: &GpuBuffer, out: &GpuBuffer, 
     let cfg = launch_cfg(256, size.div_ceil(256));
     let f = ctx.device.get_func("andreai", "inv_sqrt_bc").unwrap();
     unsafe { f.launch(cfg, (v, out, size, bias_correction, eps)) }.unwrap();
+}
+
+pub fn gpu_cautious_mask(ctx: &Arc<MetalContext>, update: &GpuBuffer, grad: &GpuBuffer, keep: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "cautious_mask").unwrap();
+    unsafe { f.launch(cfg, (update, grad, keep, size)) }.unwrap();
+}
+
+pub fn gpu_cautious_scale(ctx: &Arc<MetalContext>, x: &GpuBuffer, kept_sum: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("andreai", "cautious_scale").unwrap();
+    unsafe { f.launch(cfg, (x, kept_sum, size)) }.unwrap();
 }
 
 pub fn gpu_concat_cols(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, rows: u32, src_cols: u32, dst_cols: u32, col_offset: u32) {
