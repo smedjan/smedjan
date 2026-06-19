@@ -37,11 +37,13 @@ gate() { # name  command...
 }
 
 # §5 protocol
-gate unit       cargo test   "${FEAT[@]}"
+# Metal tests share a real GPU and thread-local backend flags/caches. Run GPU gates serially;
+# default rust-test parallelism has produced false failures in exact numeric comparisons.
+gate unit       cargo test   "${FEAT[@]}" -- --test-threads=1
 gate serial_gpu cargo test   "${FEAT[@]}" -- --include-ignored --test-threads=1
 gate clippy     cargo clippy "${FEAT[@]}" --all-targets -- -D warnings
 # Phase B sanitizer: whole suite under NaN-poison + a quarantine differential
-gate bufsan     cargo test   --no-default-features --features metal,bufsan
+gate bufsan     cargo test   --no-default-features --features metal,bufsan -- --test-threads=1
 
 echo "== summary @ $(ts) — $HEAD =="
 fail=0

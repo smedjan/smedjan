@@ -1,8 +1,6 @@
 use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::AdamW;
-#[cfg(feature = "metal")]
-use objc2_metal::MTLBuffer;
 use std::io::{Read, Write};
 use std::sync::Arc;
 

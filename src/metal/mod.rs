@@ -37,6 +37,13 @@ thread_local! {
     static POOL_BYPASS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(feature = "bufsan")]
+thread_local! {
+    /// Free-pool buffer addresses already NaN-poisoned since their last recycle. Avoids rewriting
+    /// the entire unchanged pool after every synchronous dispatch in sanitizer builds.
+    static POISONED_POOL_ADDRS: RefCell<std::collections::HashSet<usize>> = RefCell::new(std::collections::HashSet::new());
+}
+
 // ---------------------------------------------------------------------------
 // Buffer-pool sanitizer (feature = "bufsan"). Compiles to nothing when off.
 //
@@ -88,24 +95,35 @@ fn on_flush() {
 }
 
 #[cfg(feature = "bufsan")]
-fn bufsan_poison_pool() {
+fn bufsan_poison_buffer(buf: &GpuBuffer) {
     use objc2_metal::MTLBuffer;
     let nan = f32::from_bits(0x7FC0_0000);
+    let n = buf.length() / 4;
+    let ptr = buf.contents().as_ptr() as *mut f32;
+    // SAFETY: shared-storage buffer; caller only invokes this for free-pool buffers or freshly
+    // allocated/reissued buffers before handing them to a new owner.
+    unsafe {
+        for i in 0..n {
+            *ptr.add(i) = nan;
+        }
+    }
+}
+
+#[cfg(feature = "bufsan")]
+fn bufsan_poison_pool() {
     BUFFER_POOL.with(|pool| {
         let p = pool.borrow();
-        for bufs in p.values() {
-            for b in bufs {
-                let n = b.length() / 4;
-                let ptr = b.contents().as_ptr() as *mut f32;
-                // SAFETY: shared-storage buffer; it is in the free pool (no live tensor owns
-                // it) and its last GPU use completed at the wait that just returned.
-                unsafe {
-                    for i in 0..n {
-                        *ptr.add(i) = nan;
+        POISONED_POOL_ADDRS.with(|poisoned| {
+            let mut poisoned = poisoned.borrow_mut();
+            for bufs in p.values() {
+                for b in bufs {
+                    let addr = buf_contents_addr(b);
+                    if poisoned.insert(addr) {
+                        bufsan_poison_buffer(b);
                     }
                 }
             }
-        }
+        });
     });
 }
 
@@ -404,6 +422,8 @@ impl MetalContext {
                             Some(i) => {
                                 let buf = list.remove(i);
                                 RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                                #[cfg(feature = "bufsan")]
+                                POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&buf_contents_addr(&buf)); });
                                 POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                                 Some(buf)
                             }
@@ -412,6 +432,8 @@ impl MetalContext {
                     }
                     if let Some(buf) = list.pop() {
                         RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                        #[cfg(feature = "bufsan")]
+                        POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&buf_contents_addr(&buf)); });
                         POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                         return Some(buf);
                     }
@@ -436,6 +458,8 @@ impl MetalContext {
         // such stale entry so a later cast_to_f16/ternary on this address can't get a false hit.
         use objc2_metal::MTLBuffer;
         crate::tensor::Tensor::invalidate_conversion_cache(buf.contents().as_ptr() as usize);
+        #[cfg(feature = "bufsan")]
+        bufsan_poison_buffer(&buf);
         buf
     }
 
@@ -451,6 +475,9 @@ impl MetalContext {
         BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             let list = p.entry(size).or_default();
+            if list.iter().any(|b| buf_contents_addr(b) == addr) {
+                return;
+            }
             // Cap pool size per bucket to avoid unbounded memory growth.
             // 64 allows gradient-checkpointed backward to find reusable buffers
             // across layer recomputes (was 32, causing ~63% miss rate).
@@ -461,6 +488,8 @@ impl MetalContext {
                 RECYCLE_GEN.with(|rg| {
                     rg.borrow_mut().insert(addr, gen);
                 });
+                #[cfg(feature = "bufsan")]
+                POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&addr); });
                 list.push(buf);
             }
         });
@@ -500,6 +529,8 @@ impl MetalContext {
         POOL_STATS.with(|s| *s.borrow_mut() = (0, 0));
         RECYCLE_GEN.with(|rg| rg.borrow_mut().clear());
         BATCH_GENERATION.with(|g| g.set(0));
+        #[cfg(feature = "bufsan")]
+        POISONED_POOL_ADDRS.with(|p| p.borrow_mut().clear());
     }
 
     /// Enable/disable buffer-pool quarantine. ON by default (the gradient-corruption fix). When on,
@@ -767,7 +798,7 @@ impl MetalContext {
         let pipeline = self.pipelines.get(pipeline_name)
             .unwrap_or_else(|| panic!("Unknown pipeline: {}", pipeline_name));
 
-        ACTIVE_BATCH.with(|batch| {
+        let completed_sync_dispatch = ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
             if let Some(ref mut cb) = *b {
                 // Batched path: encode into the persistent compute encoder (no encoder create/destroy overhead)
@@ -779,6 +810,7 @@ impl MetalContext {
                     cb.encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
                 }
                 cb.dispatch_count += 1;
+                false
             } else {
                 // Unbatched path: one-off command buffer with sync wait
                 let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
@@ -793,7 +825,11 @@ impl MetalContext {
                 encoder.endEncoding();
                 cmd.commit();
                 cmd.waitUntilCompleted();
+                true
             }
         });
+        if completed_sync_dispatch {
+            on_flush();
+        }
     }
 }

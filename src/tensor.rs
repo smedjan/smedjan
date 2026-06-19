@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::gpu::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{compute, MetalContext};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;

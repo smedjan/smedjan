@@ -1,5 +1,5 @@
 use super::{GpuBuffer, GpuComputeEncoder, MetalContext};
-use objc2_metal::{MTLComputeCommandEncoder as MTLComputeCommandEncoderTrait, MTLDevice, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder as MTLComputeCommandEncoderTrait, MTLDevice, MTLResourceOptions};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -1516,7 +1516,7 @@ pub fn gpu_softmax_backward(
     );
 }
 
-/// Embedding backward: scatter-add gradients into embedding matrix.
+/// Embedding backward: scatter-add gradients into a dense embedding gradient matrix.
 /// Uses 1D threadgroup dispatch (one threadgroup per dim position) with
 /// threadgroup-local accumulation to reduce atomic contention on common tokens.
 pub fn gpu_embedding_backward(
@@ -1527,10 +1527,10 @@ pub fn gpu_embedding_backward(
     n_tokens: u32,
     dim: u32,
 ) {
-    // Zero only the rows that will be touched by scatter-add, instead of
-    // zeroing the entire vocab_size × dim matrix. For typical training
-    // (batch=4, seq=512, vocab=32K), this zeros ~2K rows instead of 32K.
-    gpu_zero_rows(ctx, tokens, grad_embeddings, n_tokens, dim);
+    // The optimizer and gradient clipping consume the whole embedding gradient
+    // tensor. Since grad_embeddings comes from the reuse pool, untouched rows may
+    // contain stale/poisoned values; fully zero it before the atomic scatter-add.
+    gpu_fill(ctx, grad_embeddings, (grad_embeddings.length() / 4) as u32, 0.0);
 
     #[repr(C)]
     struct Params { n_tokens: u32, dim: u32 }
@@ -1545,31 +1545,6 @@ pub fn gpu_embedding_backward(
 
     dispatch_sync!(ctx, "embedding_backward", grid, tg,
         0 => tokens, 1 => grad_output, 2 => grad_embeddings, 3 => &params_buf
-    );
-}
-
-/// Zero only the rows of a matrix that correspond to given token IDs.
-/// Used before embedding backward scatter-add to avoid zeroing the full matrix.
-pub fn gpu_zero_rows(
-    ctx: &Arc<MetalContext>,
-    tokens: &GpuBuffer,
-    matrix: &GpuBuffer,
-    n_tokens: u32,
-    dim: u32,
-) {
-    #[repr(C)]
-    struct Params { n_tokens: u32, dim: u32 }
-    let params = Params { n_tokens, dim };
-    let params_buf = params_buffer(ctx, &params);
-
-    let total = (n_tokens as u64) * (dim as u64);
-    let tpg = 256u64;
-    let groups = total.div_ceil(tpg);
-    let grid = MetalContext::size(groups, 1, 1);
-    let tg = MetalContext::size(tpg, 1, 1);
-
-    dispatch_sync!(ctx, "zero_rows", grid, tg,
-        0 => tokens, 1 => matrix, 2 => &params_buf
     );
 }
 

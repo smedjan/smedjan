@@ -2,7 +2,7 @@
 //! Each function launches a CUDA kernel with the appropriate grid/block dimensions.
 
 use super::MetalContext; // aliased CudaContext
-use cudarc::driver::{CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaSlice, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 type GpuBuffer = CudaSlice<f32>;
@@ -616,15 +616,12 @@ pub fn gpu_softmax_backward( ctx: &Arc<MetalContext>, softmax_out: &GpuBuffer, g
 }
 
 pub fn gpu_embedding_backward( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, grad_output: &GpuBuffer, grad_embeddings: &GpuBuffer, n_tokens: u32, dim: u32, ) {
+    // The optimizer and gradient clipping consume the whole embedding gradient
+    // tensor, so pooled/stale rows must be zero even when no token touched them.
+    gpu_fill(ctx, grad_embeddings, grad_embeddings.len() as u32, 0.0);
     let cfg = launch_cfg_3d(n_tokens, dim.div_ceil(256), 1, 256);
     let f = ctx.device.get_func("andreai","embedding_backward").unwrap();
     unsafe { f.launch(cfg, (tokens, grad_output, grad_embeddings, n_tokens, dim)) }.unwrap();
-}
-
-pub fn gpu_zero_rows( ctx: &Arc<MetalContext>, tokens: &CudaSlice<u32>, matrix: &GpuBuffer, n_tokens: u32, dim: u32, ) {
-    let cfg = launch_cfg(256, (n_tokens * dim).div_ceil(256));
-    let f = ctx.device.get_func("andreai", "zero_rows").unwrap();
-    unsafe { f.launch(cfg, (tokens, matrix, n_tokens, dim)) }.unwrap();
 }
 
 pub fn gpu_transpose_2d( ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, rows: u32, cols: u32, ) {

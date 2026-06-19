@@ -13,14 +13,14 @@
 #[cfg(feature = "metal")]
 pub use crate::metal::*;
 #[cfg(feature = "metal")]
-pub use crate::metal::MetalContext as GpuContext;
+pub type GpuContext = crate::metal::MetalContext;
 
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
 pub use crate::cuda::*;
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
-pub use crate::cuda::MetalContext as GpuContext;
+pub type GpuContext = crate::cuda::MetalContext;
 
 #[cfg(all(feature = "andreos", not(feature = "metal"), not(feature = "cuda")))]
 pub use crate::andreos::*;
 #[cfg(all(feature = "andreos", not(feature = "metal"), not(feature = "cuda")))]
-pub use crate::andreos::MetalContext as GpuContext;
+pub type GpuContext = crate::andreos::MetalContext;

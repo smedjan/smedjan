@@ -10,9 +10,7 @@
 pub mod compute;
 pub mod kernels;
 
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, DevicePtr, DeviceSlice, LaunchAsync, LaunchConfig};
-use cudarc::driver::sys::CUdeviceptr;
-use std::collections::HashMap;
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
 use std::sync::Arc;
 
 /// GPU buffer type for CUDA — wraps a device memory allocation.

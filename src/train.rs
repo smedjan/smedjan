@@ -269,12 +269,23 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let mut optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
+        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         // Only restore AdamW state when the main AdamW is the live optimizer and the checkpoint
         // actually carries matching state (non-adamw checkpoints save none — see save_training_state).
+        #[cfg(feature = "metal")]
+        let optimizer = {
+            let mut optimizer = optimizer;
+            if uses_main_adamw && opt_states.len() == optimizer.params.len() {
+                optimizer.load_state(&opt_states, opt_step);
+            } else if !opt_states.is_empty() {
+                eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
+                    opt_states.len(), config.optimizer_type);
+            }
+            optimizer
+        };
+        #[cfg(not(feature = "metal"))]
         if uses_main_adamw && opt_states.len() == optimizer.params.len() {
-            #[cfg(feature = "metal")]
-            optimizer.load_state(&opt_states, opt_step);
+            eprintln!("[WARN] AdamW optimizer-state restore is not implemented for this backend — starting optimizer state fresh");
         } else if !opt_states.is_empty() {
             eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
                 opt_states.len(), config.optimizer_type);

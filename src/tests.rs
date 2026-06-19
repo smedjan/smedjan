@@ -232,23 +232,18 @@ mod suite {
         assert!(grad_a.is_some(), "Gradient for A should exist after backward");
         assert!(grad_b.is_some(), "Gradient for B should exist after backward");
 
-        // Gradients should be non-zero
         let grad_a_data = MetalContext::read_buffer(&grad_a.unwrap(), 4);
         let grad_b_data = MetalContext::read_buffer(&grad_b.unwrap(), 4);
 
-        let grad_a_norm: f32 = grad_a_data.iter().map(|x| x * x).sum();
-        let grad_b_norm: f32 = grad_b_data.iter().map(|x| x * x).sum();
+        let want_grad_a = [11.0, 15.0, 11.0, 15.0];
+        let want_grad_b = [4.0, 4.0, 6.0, 6.0];
 
-        assert!(
-            grad_a_norm > 0.0,
-            "Gradient for A should be non-zero, got L2={}",
-            grad_a_norm
-        );
-        assert!(
-            grad_b_norm > 0.0,
-            "Gradient for B should be non-zero, got L2={}",
-            grad_b_norm
-        );
+        for (i, (got, want)) in grad_a_data.iter().zip(want_grad_a).enumerate() {
+            assert!((got - want).abs() < 1e-4, "grad A[{i}] expected {want}, got {got}");
+        }
+        for (i, (got, want)) in grad_b_data.iter().zip(want_grad_b).enumerate() {
+            assert!((got - want).abs() < 1e-4, "grad B[{i}] expected {want}, got {got}");
+        }
 
         autograd::clear_tape();
     }
@@ -259,9 +254,6 @@ mod suite {
         autograd::clear_tape();
         autograd::clear_recompute_registry();
 
-        // Use 1x1 tensors to match the scalar loss gradient that backward() seeds.
-        // backward() initializes a single 1.0 scalar as the output gradient, so the
-        // output must be 1 element for the gradient to propagate correctly through add.
         let a = Tensor::from_slice(&ctx, &[3.0], vec![1, 1]).with_grad();
         let b = Tensor::from_slice(&ctx, &[7.0], vec![1, 1]).with_grad();
 
@@ -3943,18 +3935,52 @@ mod suite {
     // unchanged — a divergence flags reliance on intra-batch buffer aliasing.
     // ========================================================================
     #[cfg(feature = "bufsan")]
-    fn bufsan_train_tiny(ctx: &Arc<MetalContext>, quarantine: bool) -> Vec<f32> {
+    fn bufsan_model_config() -> ModelConfig {
+        ModelConfig::custom(48, 64, 4, 2, 2.67, 64)
+    }
+
+    #[cfg(feature = "bufsan")]
+    fn bufsan_initial_weights(ctx: &Arc<MetalContext>) -> Vec<Vec<f32>> {
+        let model = Transformer::new(ctx, bufsan_model_config());
+        model.parameters().iter().map(|p| p.to_vec()).collect()
+    }
+
+    #[cfg(feature = "bufsan")]
+    fn restore_weights(model: &Transformer, weights: &[Vec<f32>]) {
+        let params = model.parameters();
+        assert_eq!(params.len(), weights.len(), "bufsan parameter snapshot length mismatch");
+        for (param, data) in params.iter().zip(weights) {
+            assert_eq!(param.numel(), data.len(), "bufsan parameter snapshot shape mismatch");
+            let mut bytes = Vec::with_capacity(data.len() * 4);
+            for value in data {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            crate::gpu::buf_write_bytes(&param.buffer, &bytes);
+        }
+        Tensor::clear_f16_cache_recycle();
+    }
+
+    #[cfg(feature = "bufsan")]
+    fn bufsan_train_tiny(ctx: &Arc<MetalContext>, quarantine: bool, initial_weights: Option<&[Vec<f32>]>) -> Vec<f32> {
         MetalContext::clear_pool();
         MetalContext::set_pool_quarantine(quarantine);
-        let vocab = 48u32;
-        let cfg = ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64);
-        let model = Transformer::new(ctx, cfg);
+        let model = Transformer::new(ctx, bufsan_model_config());
+        if let Some(weights) = initial_weights {
+            restore_weights(&model, weights);
+        }
         let (batch, seq_len) = (1usize, 16usize);
         let tokens: Vec<u32> = (0..16).map(|i| (i * 3 % 48) as u32).collect();
         let targets: Vec<u32> = vec![5; 16];
         let params = model.parameters();
         let prefs: Vec<&Tensor> = params.to_vec();
-        let mut opt = crate::optim::Muon::new(ctx, &prefs, 0.0);
+        let force = model.force_adamw_param_ids();
+        let mut opt = crate::optim::HybridOptimizer::new(
+            ctx,
+            &prefs,
+            0.0,
+            &force,
+            crate::optim::AdamWHyper::default(),
+        );
         let mut losses = Vec::new();
         for step in 0..14 {
             let logits = model.forward(&tokens, batch, seq_len, None, false);
@@ -3963,12 +3989,13 @@ mod suite {
             autograd::backward(ctx, loss.id);
             autograd::clear_tape_keep_grads();
             crate::train::clip_gradients(ctx, &model, 1.0);
-            opt.step(1e-2 * (((step + 1) as f32) / 8.0).min(1.0));
+            opt.step(1e-3 * (((step + 1) as f32) / 8.0).min(1.0));
             autograd::zero_grads_recycle();
+            Tensor::clear_f16_cache_recycle();
         }
         autograd::clear_tape();
         autograd::zero_grads();
-        MetalContext::set_pool_quarantine(false);
+        MetalContext::set_pool_quarantine(true);
         losses
     }
 
@@ -3976,7 +4003,7 @@ mod suite {
     #[test]
     fn bufsan_training_stays_finite_under_poison() {
         let ctx = test_ctx();
-        let losses = bufsan_train_tiny(&ctx, false);
+        let losses = bufsan_train_tiny(&ctx, false, None);
         for (s, l) in losses.iter().enumerate() {
             assert!(l.is_finite(), "bufsan poison surfaced a non-finite loss at step {s}: {l} — \
                 a recycled buffer was read before being overwritten (use-after-recycle / under-dispatch)");
@@ -3988,8 +4015,9 @@ mod suite {
     #[test]
     fn bufsan_quarantine_matches_default() {
         let ctx = test_ctx();
-        let off = bufsan_train_tiny(&ctx, false);
-        let on = bufsan_train_tiny(&ctx, true);
+        let initial = bufsan_initial_weights(&ctx);
+        let off = bufsan_train_tiny(&ctx, false, Some(&initial));
+        let on = bufsan_train_tiny(&ctx, true, Some(&initial));
         let (lo, ln) = (*off.last().unwrap(), *on.last().unwrap());
         assert!(lo.is_finite() && ln.is_finite(), "non-finite final loss off={lo} on={ln}");
         let rel = (lo - ln).abs() / lo.abs().max(1.0);

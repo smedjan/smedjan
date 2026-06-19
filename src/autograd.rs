@@ -1,4 +1,4 @@
-use crate::gpu::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{compute, MetalContext};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,12 +154,12 @@ pub fn clear_tape() {
         let alias_addrs: std::collections::HashSet<usize> = entries.iter()
             .filter_map(|e| {
                 let out = crate::gpu::buf_addr(&e.output_buffer);
-                e.input_buffers.iter().any(|b| crate::gpu::buf_addr(&b) == out).then_some(out)
+                e.input_buffers.iter().any(|b| crate::gpu::buf_addr(b) == out).then_some(out)
             })
             .collect();
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
             .flat_map(|e| e.input_buffers.iter())
-            .map(|b| crate::gpu::buf_addr(&b))
+            .map(crate::gpu::buf_addr)
             .collect();
         let mut recycled = std::collections::HashSet::new();
         for entry in entries {
@@ -188,7 +188,7 @@ pub fn clear_tape_keep_grads() {
     // or the next micro-step's forward pass would overwrite the gradient via pool reuse.
     let grad_ptrs: std::collections::HashSet<usize> = GRADS.with(|grads| {
         grads.borrow().values().map(|buf| {
-            crate::gpu::buf_addr(&buf)
+            crate::gpu::buf_addr(buf)
         }).collect()
     });
 
@@ -201,7 +201,7 @@ pub fn clear_tape_keep_grads() {
         // with grad buffers and checkpoint outputs, and deduped so a shared buffer is pooled once.
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
             .flat_map(|e| e.input_buffers.iter())
-            .map(|b| crate::gpu::buf_addr(&b))
+            .map(crate::gpu::buf_addr)
             .collect();
         let mut recycled = std::collections::HashSet::new();
         let protected = |addr: usize| grad_ptrs.contains(&addr) || input_addrs.contains(&addr);
@@ -256,7 +256,7 @@ pub fn scale_grads(ctx: &Arc<MetalContext>, factor: f32) {
     GRADS.with(|grads| {
         let grads = grads.borrow();
         for (_id, grad_buf) in grads.iter() {
-            let size = crate::gpu::buf_len_bytes(&grad_buf) / 4; // f32 = 4 bytes
+            let size = crate::gpu::buf_len_bytes(grad_buf) / 4; // f32 = 4 bytes
             compute::gpu_scale(ctx, grad_buf, size as u32, factor);
         }
     });
@@ -373,18 +373,26 @@ fn accumulate_grad_shared(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &crat
     });
 }
 
-/// Run backward pass from a loss tensor. The loss should be a scalar.
+/// Run backward pass from a loss tensor. Scalar losses get a single 1.0 seed; tensor outputs are
+/// treated as `sum(output)` and receive an all-ones gradient with the same element count.
 pub fn backward(ctx: &Arc<MetalContext>, loss_id: usize) {
-    // Initialize loss gradient as 1.0
-    let ones = ctx.alloc_buffer(4);
-    compute::gpu_fill(ctx, &ones, 1, 1.0);
-    GRADS.with(|grads| grads.borrow_mut().insert(loss_id, ones));
-
     // Take ownership of the tape so it's not borrowed during backward.
     // This is critical for gradient checkpointing: backward_checkpoint calls
     // checkpoint_forward which needs to borrow TAPE. If we held a borrow here,
     // that would panic with "RefCell already borrowed".
     let tape = TAPE.with(|tape| std::mem::take(&mut *tape.borrow_mut()));
+
+    let seed_size = tape
+        .iter()
+        .rev()
+        .find(|entry| entry.output == loss_id)
+        .map(|entry| crate::gpu::buf_len_bytes(&entry.output_buffer) / 4)
+        .unwrap_or(1)
+        .max(1);
+    let ones = ctx.alloc_buffer(seed_size * 4);
+    compute::gpu_fill(ctx, &ones, seed_size as u32, 1.0);
+    GRADS.with(|grads| grads.borrow_mut().insert(loss_id, ones));
+
     {
         // Walk tape in reverse
         for entry in tape.iter().rev() {
