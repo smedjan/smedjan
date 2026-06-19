@@ -136,6 +136,18 @@ pub fn record(entry: TapeEntry) {
     }
 }
 
+fn cross_entropy_temp_input(entry: &TapeEntry, idx: usize) -> bool {
+    matches!(entry.op, Op::CrossEntropy) && entry.inputs.len() == 2 && idx == 2
+}
+
+fn cross_entropy_weight_grad(entry: &TapeEntry) -> Option<&crate::gpu::Buf> {
+    if matches!(entry.op, Op::CrossEntropy) && entry.inputs.len() == 2 {
+        entry.input_buffers.get(2)
+    } else {
+        None
+    }
+}
+
 /// Clear the tape and all stored gradients.
 pub fn clear_tape() {
     TAPE.with(|tape| {
@@ -154,15 +166,28 @@ pub fn clear_tape() {
         let alias_addrs: std::collections::HashSet<usize> = entries.iter()
             .filter_map(|e| {
                 let out = crate::gpu::buf_addr(&e.output_buffer);
-                e.input_buffers.iter().any(|b| crate::gpu::buf_addr(b) == out).then_some(out)
+                e.input_buffers.iter().enumerate()
+                    .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
+                    .any(|(_, b)| crate::gpu::buf_addr(b) == out)
+                    .then_some(out)
             })
             .collect();
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
-            .flat_map(|e| e.input_buffers.iter())
+            .flat_map(|e| {
+                e.input_buffers.iter().enumerate()
+                    .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
+                    .map(|(_, b)| b)
+            })
             .map(crate::gpu::buf_addr)
             .collect();
         let mut recycled = std::collections::HashSet::new();
         for entry in entries {
+            if let Some(weight_grad) = cross_entropy_weight_grad(&entry) {
+                let grad_addr = crate::gpu::buf_addr(weight_grad);
+                if !input_addrs.contains(&grad_addr) && recycled.insert(grad_addr) {
+                    MetalContext::recycle_buffer(weight_grad.clone());
+                }
+            }
             let out_addr = crate::gpu::buf_addr(&entry.output_buffer);
             if !alias_addrs.contains(&out_addr) && recycled.insert(out_addr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
@@ -200,7 +225,11 @@ pub fn clear_tape_keep_grads() {
         // next micro-step's forward overwrite live data (silent stale-read corruption). Combined
         // with grad buffers and checkpoint outputs, and deduped so a shared buffer is pooled once.
         let input_addrs: std::collections::HashSet<usize> = entries.iter()
-            .flat_map(|e| e.input_buffers.iter())
+            .flat_map(|e| {
+                e.input_buffers.iter().enumerate()
+                    .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
+                    .map(|(_, b)| b)
+            })
             .map(crate::gpu::buf_addr)
             .collect();
         let mut recycled = std::collections::HashSet::new();
@@ -210,6 +239,12 @@ pub fn clear_tape_keep_grads() {
             // recompute closure. Recycling them causes the recompute to read garbage data.
             let is_checkpoint = matches!(entry.op, Op::Checkpoint { .. });
 
+            if let Some(weight_grad) = cross_entropy_weight_grad(&entry) {
+                let grad_ptr = crate::gpu::buf_addr(weight_grad);
+                if !protected(grad_ptr) && recycled.insert(grad_ptr) {
+                    MetalContext::recycle_buffer(weight_grad.clone());
+                }
+            }
             let out_ptr = crate::gpu::buf_addr(&entry.output_buffer);
             if !is_checkpoint && !protected(out_ptr) && recycled.insert(out_ptr) {
                 MetalContext::recycle_buffer(entry.output_buffer);
@@ -459,6 +494,13 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
             if let Some(grad_logits) = &entry.cached {
                 let size: usize = entry.shapes[0].iter().product();
                 accumulate_grad(ctx, entry.inputs[0], grad_logits.clone(), size);
+                if entry.inputs.len() == 2 {
+                    let weight_size: usize = entry.shapes[1].iter().product();
+                    let grad_weight = entry.input_buffers.get(2)
+                        .expect("fused cross-entropy backward needs tied-weight gradient")
+                        .clone();
+                    accumulate_grad(ctx, entry.inputs[1], grad_weight, weight_size);
+                }
             }
         }
         Op::Embedding => backward_embedding(ctx, entry, out_grad),

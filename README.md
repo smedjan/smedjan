@@ -6,7 +6,7 @@ Pure Rust LLM training and inference engine. Zero Python. Zero PyTorch. Zero clo
 
 ## Why
 
-Own the stack. Every line of code, every GPU kernel, every byte of the model. No frameworks, no runtimes, no dependencies you don't control. Runs on macOS today, NVIDIA cloud tomorrow, and native on [AndreOS](https://github.com/xmaryo/andreos) when it ships.
+Own the stack. Every line of code, every GPU kernel, every byte of the model. No frameworks, no runtimes, no dependencies you don't control. Runs on macOS today and NVIDIA CUDA hosts next; AndreOS is a planned native target once its GPU backend lands.
 
 ## Architecture
 
@@ -15,18 +15,17 @@ model.rs / attention.rs     ← Transformer (RoPE, GQA, SwiGLU, weight-tied lm_h
 tensor.rs                   ← GPU tensor operations
 autograd.rs                 ← Tape-based reverse-mode autodiff
       ↓ (backend-agnostic above this line)
-metal/   cuda/   andreos/   ← GPU backends (compile-time selected)
+metal/   cuda/               ← GPU backends (compile-time selected)
 ```
 
-**Three GPU backends, one codebase:**
+**Two GPU backends, one codebase:**
 
 ```bash
 cargo build --release                                    # Metal (macOS/Apple Silicon)
 cargo build --release --features cuda --no-default-features    # CUDA (NVIDIA)
-cargo build --release --features andreos --no-default-features # AndreOS (direct HW, zero overhead)
 ```
 
-Checkpoints are portable across all backends. Train on Mac, resume on H100, deploy on AndreOS.
+Checkpoints are portable across supported backends. Train on Mac, resume on H100, and carry the same checkpoint format into future backends.
 
 ## Features
 
@@ -141,7 +140,7 @@ src/
   datapipe.rs      (480)   Quality filter, dedup, mixing
   eval.rs          (365)   Benchmark (8 categories)
   quantize.rs      (506)   Q4/Q8 quantization
-  api.rs           (115)   Rust API for AndreOS integration
+  api.rs           (115)   Rust embedding/integration API
   tests.rs        (1463)   81 tests
   gpu.rs            (16)   Backend feature gate
 
@@ -155,9 +154,6 @@ src/
     compute.rs     (207)   Dispatch functions
     mod.rs         (107)   CudaContext (cudarc)
 
-  andreos/                 AndreOS direct hardware backend
-    compute.rs     (129)   Direct dispatch (zero framework)
-    mod.rs         (183)   Unified memory, bump allocator
 ```
 
 **16,416 lines total. 81 tests. 56 commits.**

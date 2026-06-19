@@ -134,9 +134,9 @@ impl Tensor {
         MetalContext::read_buffer(&self.buffer, self.numel())
     }
 
-    /// Zero-copy read access to GPU buffer contents as a slice.
-    /// On Apple Silicon with shared memory, this is a direct pointer — no copy.
+    /// Zero-copy read access to Metal shared-memory contents as a slice.
     /// The slice is valid only while no GPU writes are pending on this buffer.
+    #[cfg(feature = "metal")]
     pub fn as_slice(&self) -> &[f32] {
         MetalContext::buffer_as_slice(&self.buffer, self.numel())
     }

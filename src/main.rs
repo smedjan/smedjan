@@ -15,8 +15,6 @@ mod mla;
 mod metal;
 #[cfg(feature = "cuda")]
 mod cuda;
-#[cfg(feature = "andreos")]
-mod andreos;
 mod distill;
 mod gpu;
 mod model;

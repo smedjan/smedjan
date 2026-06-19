@@ -4507,6 +4507,105 @@ mod suite {
         autograd::clear_tape();
     }
 
+    #[test]
+    fn fused_linear_cross_entropy_matches_standard_tied_head() {
+        let ctx = test_ctx();
+        let n_tokens = 5;
+        let d_model = 3;
+        let vocab = 7;
+        let hidden_data = [
+            0.10, -0.20, 0.30,
+            -0.40, 0.50, -0.60,
+            0.70, -0.80, 0.90,
+            -1.00, 1.10, -1.20,
+            1.30, -1.40, 1.50,
+        ];
+        let embedding_data = [
+            0.20, -0.10, 0.30,
+            -0.50, 0.40, -0.20,
+            0.10, 0.60, -0.30,
+            -0.70, 0.20, 0.50,
+            0.30, -0.40, 0.80,
+            -0.20, 0.90, -0.60,
+            0.50, -0.30, 0.10,
+        ];
+        let targets = [0u32, 3, 6, 2, 5];
+
+        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+
+        autograd::clear_tape();
+        autograd::clear_recompute_registry();
+        let hidden_std = Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
+        let embedding_std = Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
+        ctx.begin_batch();
+        let logits = hidden_std.matmul_trans_b(&embedding_std);
+        let (loss_std, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+        ctx.flush_batch();
+        let loss_std_val = loss_std.to_vec()[0];
+        ctx.begin_batch();
+        autograd::backward(&ctx, loss_std.id);
+        ctx.flush_batch();
+        let hidden_grad_std = MetalContext::read_buffer(
+            &autograd::get_grad(hidden_std.id).expect("standard hidden grad"),
+            n_tokens * d_model,
+        );
+        let embedding_grad_std = MetalContext::read_buffer(
+            &autograd::get_grad(embedding_std.id).expect("standard embedding grad"),
+            vocab * d_model,
+        );
+        autograd::clear_tape();
+        autograd::zero_grads_recycle();
+
+        let hidden_fused = Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
+        let embedding_fused = Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
+        ctx.begin_batch();
+        let (loss_fused, _) = crate::loss::fused_linear_cross_entropy(
+            &ctx,
+            &hidden_fused,
+            &embedding_fused,
+            &targets,
+            2,
+        );
+        ctx.flush_batch();
+        let loss_fused_val = loss_fused.to_vec()[0];
+        ctx.begin_batch();
+        autograd::backward(&ctx, loss_fused.id);
+        ctx.flush_batch();
+        let hidden_grad_fused = MetalContext::read_buffer(
+            &autograd::get_grad(hidden_fused.id).expect("fused hidden grad"),
+            n_tokens * d_model,
+        );
+        let embedding_grad_fused = MetalContext::read_buffer(
+            &autograd::get_grad(embedding_fused.id).expect("fused embedding grad"),
+            vocab * d_model,
+        );
+
+        let loss_diff = (loss_std_val - loss_fused_val).abs();
+        let hidden_diff = max_diff(&hidden_std.to_vec(), &hidden_fused.to_vec());
+        let hidden_grad_diff = max_diff(&hidden_grad_std, &hidden_grad_fused);
+        let embedding_grad_diff = max_diff(&embedding_grad_std, &embedding_grad_fused);
+        eprintln!(
+            "fused CE parity: loss_diff={loss_diff:.6}, hidden_diff={hidden_diff:.6}, \
+             hidden_grad_diff={hidden_grad_diff:.6}, embedding_grad_diff={embedding_grad_diff:.6}"
+        );
+
+        assert!(loss_diff < 2e-3, "fused CE loss drifted from standard path: {loss_diff}");
+        assert!(hidden_diff < 1e-6, "fused CE must not mutate hidden inputs: {hidden_diff}");
+        assert!(
+            hidden_grad_diff < 3e-3,
+            "fused CE hidden gradient drifted from standard path: {hidden_grad_diff}"
+        );
+        assert!(
+            embedding_grad_diff < 3e-3,
+            "fused CE tied embedding gradient drifted from standard path: {embedding_grad_diff}"
+        );
+
+        autograd::clear_tape();
+        autograd::zero_grads_recycle();
+    }
+
     /// Quantize/dequantize roundtrip: verify Q8 and Q4 preserve values within tolerance.
     #[test]
     fn quantize_dequantize_roundtrip() {

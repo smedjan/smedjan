@@ -3,8 +3,10 @@ use crate::autograd;
 use crate::gpu::compute::{gpu_argmax, gpu_temperature_scale};
 use crate::gpu::MetalContext;
 use crate::model::Transformer;
+use crate::tensor::Tensor;
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN};
 use rand::Rng;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Sampling configuration.
@@ -31,6 +33,17 @@ impl Default for SamplingConfig {
             typical_p: 1.0,
             no_repeat_ngram_size: 0,
         }
+    }
+}
+
+fn logits_host(tensor: &Tensor) -> Cow<'_, [f32]> {
+    #[cfg(feature = "metal")]
+    {
+        Cow::Borrowed(tensor.as_slice())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        Cow::Owned(tensor.to_vec())
     }
 }
 
@@ -131,7 +144,7 @@ pub fn generate(
 
         // Sample first token from prefill logits (last position predicts next token).
         // Zero-copy: as_slice() returns a reference to shared GPU/CPU memory.
-        let all_logits = logits.as_slice();
+        let all_logits = logits_host(&logits);
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
         let mut next_token = sample_token(last_logits, config, &[]);
 
@@ -156,7 +169,8 @@ pub fn generate(
                 // Temperature scaling on GPU, then read back for CPU sampling
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
                 // Zero-copy: shared memory on Apple Silicon means direct pointer access
-                let token_logits = &logits.as_slice()[..vocab_size];
+                let token_logits_host = logits_host(&logits);
+                let token_logits = &token_logits_host[..vocab_size];
                 sample_token_prescaled(token_logits, config, &generated)
             };
             generated.push(next_token);
@@ -221,7 +235,7 @@ pub fn generate_batch(
         ctx.begin_batch();
         let logits = model.forward(&flat, b, len, Some(&mut kv), false);
         ctx.flush_batch();
-        let all = logits.as_slice(); // [b * len, vocab]
+        let all = logits_host(&logits); // [b * len, vocab]
 
         let mut seqs: Vec<Vec<u32>> = vec![Vec::new(); b];
         let mut cur: Vec<u32> = Vec::with_capacity(b);
@@ -244,7 +258,7 @@ pub fn generate_batch(
             ctx.begin_batch();
             let logits = model.forward(&cur, b, 1, Some(&mut kv), false);
             ctx.flush_batch();
-            let all = logits.as_slice(); // [b, vocab]
+            let all = logits_host(&logits); // [b, vocab]
             for i in 0..b {
                 if done[i] {
                     continue;
@@ -472,7 +486,7 @@ pub fn generate_streaming<F>(
         let vocab_size = model.config.vocab_size as usize;
         let greedy = config.temperature < 0.01;
         // Zero-copy: shared memory on Apple Silicon means direct pointer access
-        let all_logits = logits.as_slice();
+        let all_logits = logits_host(&logits);
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
 
         let mut next_token = sample_token(last_logits, config, &[]);
@@ -497,7 +511,8 @@ pub fn generate_streaming<F>(
             } else {
                 // Temperature scaling on GPU, then zero-copy read for CPU sampling
                 gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
-                let token_logits = &logits.as_slice()[..vocab_size];
+                let token_logits_host = logits_host(&logits);
+                let token_logits = &token_logits_host[..vocab_size];
                 sample_token_prescaled(token_logits, config, &generated)
             };
         }

@@ -20,7 +20,7 @@ pub struct ModelInfo {
 /// High-level API for using AndreAI as a library.
 ///
 /// Encapsulates model loading, tokenization, and generation into a single
-/// struct suitable for embedding into other Rust projects (e.g. AndreOS).
+/// struct suitable for embedding into other Rust projects.
 pub struct AndreAI {
     ctx: Arc<MetalContext>,
     model: Transformer,
@@ -335,4 +335,3 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
 
     (tested, passed)
 }
-

@@ -604,7 +604,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Two paths: standard (compute logits, then CE) or fused (LM head + CE in chunks)
             let n_predict = config.model_config.n_predict;
 
-            let (loss_tensor, grad_logits) = if config.fused_ce && n_predict == 0 && config.teacher_checkpoint.is_none() {
+            let (loss_tensor, grad_logits, grad_buffer_elems) = if config.fused_ce && n_predict == 0 && config.teacher_checkpoint.is_none() {
                 // FusedLinearCrossEntropy: compute logits+loss in chunks, never materialize full logit tensor.
                 // Saves ~2GB peak memory. Incompatible with MTP and distillation (they need full logits).
                 let hidden = model.forward_hidden(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
@@ -615,13 +615,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     // FusedLinearCE handles matmul_trans_b internally, so pass [vocab, d_model].
                     // For factored case, fall back to standard CE (fused CE doesn't handle two-step projection yet).
                     let logits = model.apply_lm_head(&hidden);
-                    if let Some(ref ws) = loss_ws {
+                    let (loss, grad) = if let Some(ref ws) = loss_ws {
                         loss::cross_entropy_loss_with_workspace(ctx, &logits, targets, ws)
                     } else {
                         loss::cross_entropy_loss(ctx, &logits, targets)
-                    }
+                    };
+                    (loss, grad, config.batch_size * effective_seq * config.model_config.vocab_size as usize)
                 } else {
-                    loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, targets, 1024)
+                    let (loss, grad) = loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, targets, 1024);
+                    (loss, grad, config.batch_size * effective_seq * config.model_config.d_model)
                 }
             } else {
                 // Standard path: compute hidden → LM head → CE
@@ -726,7 +728,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     }
                 }
 
-                (loss_tensor, grad_logits)
+                (loss_tensor, grad_logits, config.batch_size * effective_seq * config.model_config.vocab_size as usize)
             };
 
             // Online data pruning: skip backward if loss is below threshold.
@@ -751,8 +753,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             // Scale both loss AND gradient by 1/grad_accum_steps.
             if grad_accum_steps > 1 {
-                let grad_size = (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32;
-                compute::gpu_scale(ctx, &grad_logits, grad_size, loss_scale);
+                compute::gpu_scale(ctx, &grad_logits, grad_buffer_elems as u32, loss_scale);
                 compute::gpu_scale(ctx, &loss_tensor.buffer, 1, loss_scale);
             }
 
@@ -861,8 +862,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let tokens_this_step = (config.batch_size * effective_seq * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;
 
-        // Logging + NaN detection (only at log intervals to avoid GPU→CPU sync every step)
-        if step % config.log_interval == 0 {
+        // Logging + NaN detection (at log intervals and always on the final step).
+        if step % config.log_interval == 0 || step + 1 == config.total_steps {
             // Read back the last micro-step's loss (scaled). Undo the scale for display.
             // Read from the persistent UNPOOLED readout buffer — loss_tensor.buffer may have been
             // recycled+reused within the step (the large-batch "constant 1.0" artifact). The copy
@@ -910,6 +911,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Track EMA loss and peak throughput
             if ema_loss == 0.0 { ema_loss = loss_val; }
             else { ema_loss = 0.95 * ema_loss + 0.05 * loss_val; }
+            if ema_loss < best_train_loss {
+                best_train_loss = ema_loss;
+            }
             if tokens_per_sec > peak_tok_s { peak_tok_s = tokens_per_sec; }
 
             // ETA estimation
@@ -1026,11 +1030,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, config.total_steps)?;
         eprintln!("  EMA model saved to ema_final.bin (often better than final.bin — compare with `andreai perplexity`)");
     }
-    let total_time = start_time.elapsed().as_secs();
+    let elapsed_total = start_time.elapsed();
+    let total_time = elapsed_total.as_secs();
     let total_time_str = if total_time > 3600 {
         format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
     } else { format!("{}m{}s", total_time / 60, total_time % 60) };
-    let avg_tok_s = if total_time > 0 { total_tokens as f64 / total_time as f64 } else { 0.0 };
+    let total_time_secs = elapsed_total.as_secs_f64();
+    let avg_tok_s = if total_time_secs > 0.0 { total_tokens as f64 / total_time_secs } else { 0.0 };
     let tok_per_day = avg_tok_s * 86400.0;
     eprintln!("Training complete. Final checkpoint: {}", path);
     eprintln!("=== Training Summary ===");

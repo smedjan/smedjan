@@ -369,9 +369,27 @@ pub fn gpu_batched_matmul_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &Gp
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
 
-pub fn gpu_batched_matmul_gqa_trans_b( _ctx: &Arc<MetalContext>, _a: &GpuBuffer, _b: &GpuBuffer, _c: &GpuBuffer, _d: BatchedDims, _group_size: u32, ) { unimplemented!("cuda backend: gpu_batched_matmul_gqa_trans_b not yet ported (CUDA GQA uses repeat_kv)") }
+pub fn gpu_batched_matmul_gqa_trans_b(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims, group_size: u32) {
+    assert!(group_size > 0, "GQA group_size must be positive");
+    assert_eq!(d.batch % group_size, 0, "GQA batch_heads must be divisible by group_size");
+    if group_size == 1 {
+        return gpu_batched_matmul_trans_b(ctx, a, b, c, d);
+    }
+    let expanded_b = ctx.alloc_buffer((d.batch as usize * d.n as usize * d.k as usize) * 4);
+    gpu_repeat_kv(ctx, b, &expanded_b, d.batch / group_size, group_size, d.n, d.k);
+    gpu_batched_matmul_trans_b(ctx, a, &expanded_b, c, d);
+}
 
-pub fn gpu_batched_matmul_gqa( _ctx: &Arc<MetalContext>, _a: &GpuBuffer, _b: &GpuBuffer, _c: &GpuBuffer, _d: BatchedDims, _group_size: u32, ) { unimplemented!("cuda backend: gpu_batched_matmul_gqa not yet ported (CUDA GQA uses repeat_kv)") }
+pub fn gpu_batched_matmul_gqa(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims, group_size: u32) {
+    assert!(group_size > 0, "GQA group_size must be positive");
+    assert_eq!(d.batch % group_size, 0, "GQA batch_heads must be divisible by group_size");
+    if group_size == 1 {
+        return gpu_batched_matmul(ctx, a, b, c, d);
+    }
+    let expanded_b = ctx.alloc_buffer((d.batch as usize * d.k as usize * d.n as usize) * 4);
+    gpu_repeat_kv(ctx, b, &expanded_b, d.batch / group_size, group_size, d.k, d.n);
+    gpu_batched_matmul(ctx, a, &expanded_b, c, d);
+}
 
 pub fn gpu_batched_matmul_trans_a(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, d: BatchedDims) {
     let BatchedDims { batch, m, n, k } = d;

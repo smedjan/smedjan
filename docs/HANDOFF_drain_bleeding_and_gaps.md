@@ -135,8 +135,8 @@ unverified — finite-diff it.**
   Phase A.
 - Canonical state of every prior item: `docs/HANDOFF_buffer_hazard_and_followups.md` §8
   closure table (10 audit rounds; 7 bug fixes + 3 features landed, all "need Mac verify").
-- Code reality: ~16.4K lines, 81 tests (none cover the GPU hazard class — that's Phase B),
-  Metal + CUDA + AndreOS backends; Metal is canonical.
+- Code reality at the time: ~16.4K lines, 81 tests (none cover the GPU hazard class — that's
+  Phase B), Metal + CUDA plus an unshipped AndreOS target; Metal is canonical.
 - Field alignment + what NOT to build: §7 field map (drop GaLore; MLA/hybrid/Muon/BitNet are
   the right bets).
 

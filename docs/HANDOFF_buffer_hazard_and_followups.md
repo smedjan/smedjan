@@ -292,8 +292,8 @@ is NOT in README/ROADMAP (those are clean). Treat GaLore as a TODO, not a featur
   files are reference/test paths or the inherent CPU step, not hot-path hazards.
 - **MLA absorbed-form decode** (`attention.rs:27`) and **block-sparse trainable backward**
   (`attention.rs:45`, see §3) remain the two big attention follow-ups.
-- **`andreos` backend** (`andreos/mod.rs`): placeholder types, `TODO: init from andreos-gpu` — gated
-  behind the unshipped GPU driver, as designed.
+- **AndreOS backend**: removed from the production build surface until the native GPU driver and
+  backend API are ready.
 
 ### Suggested next ROI order
 1. Verify §0 + §6 landed edits on the Mac (loss-readout real-run is the key gate).
@@ -385,7 +385,7 @@ Implemented the §7 fix. Four files, all mirroring existing `reduce_sum`/`scale_
 Why low-regression-risk: orthogonalization is scale-free, so on configs where NS already converged
 (small batch, the proven EMA-1.56 runs) the update is unchanged; only the divergent regime (σ_max > √3)
 is fixed. **Caveat:** a partially-converged NS (small `ns_steps`) is mildly input-scale-sensitive, so
-**re-check `--muon-lr-scale`** after this lands. CUDA/andreos unaffected — `optim.rs` imports
+**re-check `--muon-lr-scale`** after this lands. CUDA unaffected — `optim.rs` imports
 `crate::metal` + `objc2_metal` directly, so it is metal-only by construction (CUDA's compute module
 doesn't even have `gpu_scale_copy`); the supported build is metal.
 Verify: batch∈{16,32,64} sweep with `--optimizer muon` and `--optimizer hybrid` — should stay bounded

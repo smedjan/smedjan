@@ -161,7 +161,7 @@ impl MetalContext {
         // Drop handles deallocation
     }
 
-    /// Pool stats (placeholder — CUDA uses cudarc's allocator).
+    /// Pool stats for compatibility; CUDA allocation is delegated to cudarc.
     pub fn pool_stats() -> (usize, usize) {
         (0, 0)
     }
@@ -178,12 +178,6 @@ impl MetalContext {
     /// Block until all queued GPU work finishes. CUDA copies here are already synchronous; sync anyway.
     pub fn wait_gpu(&self) {
         self.device.synchronize().ok();
-    }
-
-    /// Metal returns a zero-copy host view of unified memory; CUDA device memory has no host slice.
-    /// Callers on CUDA must use `to_vec()` / `read_buffer` instead. Stubbed to keep the API surface.
-    pub fn buffer_as_slice(_buf: &CudaSlice<f32>, _n: usize) -> &'static [f32] {
-        unimplemented!("cuda: buffer_as_slice has no zero-copy host view — use to_vec()/read_buffer")
     }
 
     // Command batching — CUDA uses streams, no explicit batching needed.

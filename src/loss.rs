@@ -169,10 +169,11 @@ pub fn z_loss(
 /// for vocab=8192, n_tokens=65536. (Liger Kernel technique)
 ///
 /// Input: hidden states [n_tokens, d_model], embedding weights [vocab, d_model]
-/// Output: scalar loss + gradient w.r.t. hidden states [n_tokens, d_model]
+/// Output: scalar loss + gradient w.r.t. hidden states [n_tokens, d_model].
 ///
-/// The gradient w.r.t. embedding weights is NOT computed here — it flows through
-/// the autograd tape via the hidden state gradient.
+/// Also accumulates the tied LM-head embedding gradient. The autograd tape stores
+/// that buffer alongside the op so the fused path matches the standard
+/// hidden @ embedding^T loss semantics.
 pub fn fused_linear_cross_entropy(
     ctx: &Arc<MetalContext>,
     hidden: &Tensor,         // [n_tokens, d_model]
@@ -189,6 +190,8 @@ pub fn fused_linear_cross_entropy(
     // Output: gradient w.r.t. hidden states (accumulated across chunks)
     let grad_hidden = ctx.alloc_buffer(n_tokens * d_model * 4);
     compute::gpu_fill(ctx, &grad_hidden, (n_tokens * d_model) as u32, 0.0);
+    let grad_embedding = ctx.alloc_buffer(vocab * d_model * 4);
+    compute::gpu_fill(ctx, &grad_embedding, (vocab * d_model) as u32, 0.0);
 
     // Accumulate loss across chunks
     let total_loss_buf = ctx.alloc_buffer(4);
@@ -230,6 +233,9 @@ pub fn fused_linear_cross_entropy(
             &chunk_losses_buf, &chunk_grad_logits,
             c as u32, vocab as u32,
         );
+        if c != n_tokens {
+            compute::gpu_scale(ctx, &chunk_grad_logits, (c * vocab) as u32, c as f32 / n_tokens as f32);
+        }
 
         // Accumulate chunk loss into total
         let chunk_scalar = ctx.alloc_buffer(4);
@@ -243,6 +249,14 @@ pub fn fused_linear_cross_entropy(
             ctx, &chunk_grad_logits, &embedding.buffer, &grad_h_chunk,
             c as u32, d_model as u32, vocab as u32,
         );
+
+        // Tied LM-head gradient: d_embedding += d_logits^T @ hidden_chunk.
+        let grad_embedding_chunk = ctx.alloc_buffer(vocab * d_model * 4);
+        compute::gpu_matmul_trans_a(
+            ctx, &chunk_grad_logits, &h_chunk_buf, &grad_embedding_chunk,
+            c as u32, vocab as u32, d_model as u32,
+        );
+        compute::gpu_add_inplace(ctx, &grad_embedding, &grad_embedding_chunk, (vocab * d_model) as u32);
 
         // Copy chunk gradient into the full gradient buffer at the right offset.
         // Chunks are non-overlapping (each covers [start..end) of hidden states),
@@ -271,11 +285,11 @@ pub fn fused_linear_cross_entropy(
     if autograd::is_recording() {
         autograd::record(TapeEntry {
             op: Op::CrossEntropy,
-            inputs: vec![hidden.id],
+            inputs: vec![hidden.id, embedding.id],
             output: loss_id,
-            input_buffers: vec![hidden.buffer.clone()],
+            input_buffers: vec![hidden.buffer.clone(), embedding.buffer.clone(), grad_embedding.clone()],
             output_buffer: loss.buffer.clone(),
-            shapes: vec![hidden.shape.clone(), vec![1]],
+            shapes: vec![hidden.shape.clone(), embedding.shape.clone(), vec![1]],
             cached: Some(grad_hidden.clone()),
         });
     }

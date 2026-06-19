@@ -2,7 +2,6 @@
 //!
 //! `cargo build`                                          → Metal (macOS)
 //! `cargo build --features cuda --no-default-features`    → CUDA (NVIDIA)
-//! `cargo build --features andreos --no-default-features` → AndreOS (direct HW)
 //!
 //! Portable code refers to `crate::gpu::{MetalContext, GpuBuffer, Buf, compute, buf_addr,
 //! buf_len_bytes, ...}` instead of naming a backend (or objc2) directly, so one cfg switch swaps the
@@ -19,8 +18,3 @@ pub type GpuContext = crate::metal::MetalContext;
 pub use crate::cuda::*;
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
 pub type GpuContext = crate::cuda::MetalContext;
-
-#[cfg(all(feature = "andreos", not(feature = "metal"), not(feature = "cuda")))]
-pub use crate::andreos::*;
-#[cfg(all(feature = "andreos", not(feature = "metal"), not(feature = "cuda")))]
-pub type GpuContext = crate::andreos::MetalContext;
