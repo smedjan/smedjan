@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Mac GPU CI gate for andreai (Metal). Runs the §5 verification protocol, formatting
-# gates, CUDA compile parity, and the buffer-pool sanitizer suite — the GPU-correctness
-# gate that the host-only workflow previously lacked. Intended to run on an always-on
-# Apple-Silicon Mac (mini) via launchd/cron, or by hand on air. Exits non-zero with a
-# one-line summary on any failure.
+# gates, CUDA compile parity, train smokes, and the buffer-pool sanitizer suite — the
+# GPU-correctness gate that the host-only workflow previously lacked. Intended to run
+# on an always-on Apple-Silicon Mac (mini) via launchd/cron, or by hand on air. Exits
+# non-zero with a one-line summary on any failure.
 #
 #   ANDREAI_REPO      repo path        (default: $HOME/projects/andreai)
 #   ANDREAI_CI_PULL   1 = fetch+reset to origin/main before testing (default: 0 = test tree)
@@ -27,7 +27,11 @@ acquire_lock() {
   start=$(date +%s)
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+    if [[ -z "$owner" ]]; then
+      sleep 1
+      owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    fi
+    if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then
       rm -rf "$LOCK_DIR"
       continue
     fi
@@ -44,13 +48,14 @@ acquire_lock() {
   trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
+acquire_lock
+
 if [[ "$PULL" == "1" ]]; then
   git fetch --quiet origin && git reset --hard --quiet origin/main \
     || { echo "FAIL: git sync to origin/main"; exit 2; }
 fi
 HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
 echo "== andreai Mac CI @ $(ts) — $HEAD =="
-acquire_lock
 
 NAMES=(); RESULTS=()
 gate() { # name  command...
