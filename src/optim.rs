@@ -19,9 +19,10 @@ fn buf_bytes(buf: &GpuBuffer, byte_len: usize) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Write bytes into a GPU buffer (unified memory). Caller guarantees `bytes.len()` ≤ buffer size.
+/// Write bytes into a GPU buffer. Caller guarantees `bytes.len()` ≤ buffer size.
 #[cfg(not(feature = "metal"))]
 fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
+    assert_eq!(bytes.len() % 4, 0, "CUDA buffer writes require f32 bytes");
     let n = bytes.len() / 4;
     let mut f = vec![0f32; n];
     for i in 0..n {
@@ -33,6 +34,7 @@ fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
         ]);
     }
     use cudarc::driver::DevicePtr;
+    buf.device().bind_to_thread().expect("bind CUDA context");
     unsafe {
         cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f)
             .expect("htod buf_set_bytes");
@@ -248,8 +250,7 @@ impl AdamW {
         }
     }
 
-    /// Load optimizer state from checkpoint data. Sets m, v buffers and step counter.
-    #[cfg(feature = "metal")]
+    /// Load optimizer state from checkpoint data. Sets m/v buffers and the step counter.
     pub fn load_state(&mut self, states: &[(Vec<f32>, Vec<f32>)], opt_step: u32) {
         assert_eq!(
             states.len(),
@@ -260,12 +261,10 @@ impl AdamW {
         for (ps, (m_data, v_data)) in self.params.iter().zip(states.iter()) {
             assert_eq!(m_data.len(), ps.size, "m state size mismatch");
             assert_eq!(v_data.len(), ps.size, "v state size mismatch");
-            unsafe {
-                let m_ptr = ps.m.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(m_data.as_ptr(), m_ptr, ps.size);
-                let v_ptr = ps.v.contents().as_ptr() as *mut f32;
-                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_ptr, ps.size);
-            }
+            let m_bytes: Vec<u8> = m_data.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let v_bytes: Vec<u8> = v_data.iter().flat_map(|x| x.to_le_bytes()).collect();
+            buf_set_bytes(&ps.m, &m_bytes);
+            buf_set_bytes(&ps.v, &v_bytes);
         }
     }
 

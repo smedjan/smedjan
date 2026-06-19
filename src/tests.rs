@@ -5646,7 +5646,7 @@ mod suite {
             .expect("save state failed");
 
         // Load
-        let (_loaded_model, opt_states, step, _opt_step, tokens) =
+        let (loaded_model, opt_states, step, opt_step, tokens) =
             crate::checkpoint::load_training_state(&ctx, tmp_path).expect("load state failed");
         assert_eq!(step, 42);
         assert_eq!(tokens, 100000);
@@ -5660,6 +5660,32 @@ mod suite {
         }
         for (a, b) in orig_v.iter().zip(loaded_v.iter()) {
             assert!((*a - *b).abs() < 1e-6, "v mismatch: {} vs {}", a, b);
+        }
+
+        // Verify the loaded state can be applied back into a fresh AdamW optimizer.
+        let loaded_param_refs: Vec<&_> = loaded_model.parameters().into_iter().collect();
+        let mut restored = crate::optim::AdamW::new(&ctx, &loaded_param_refs, 0.01);
+        restored.load_state(&opt_states, opt_step);
+        assert_eq!(restored.step, opt_step);
+        let restored_m: Vec<f32> =
+            MetalContext::read_buffer(&restored.params[0].m, restored.params[0].size);
+        let restored_v: Vec<f32> =
+            MetalContext::read_buffer(&restored.params[0].v, restored.params[0].size);
+        for (a, b) in orig_m.iter().zip(restored_m.iter()) {
+            assert!(
+                (*a - *b).abs() < 1e-6,
+                "restored m mismatch: {} vs {}",
+                a,
+                b
+            );
+        }
+        for (a, b) in orig_v.iter().zip(restored_v.iter()) {
+            assert!(
+                (*a - *b).abs() < 1e-6,
+                "restored v mismatch: {} vs {}",
+                a,
+                b
+            );
         }
 
         std::fs::remove_file(tmp_path).ok();
