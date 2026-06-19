@@ -26,12 +26,16 @@ pub enum Op {
     Add,
     Mul,
     Softmax,
-    RmsNorm { eps: f32 },
+    RmsNorm {
+        eps: f32,
+    },
     Silu,
     Reshape,
     CrossEntropy,
     Embedding,
-    Scale { factor: f32 },
+    Scale {
+        factor: f32,
+    },
     Transpose {
         batch: usize,
         seq_len: usize,
@@ -39,15 +43,35 @@ pub enum Op {
         head_dim: usize,
         forward_dir: bool, // true = bsh→bhs, false = bhs→bsh
     },
-    RoPE { seq_len: u32, head_dim: u32, offset: u32, theta: f32 },
+    RoPE {
+        seq_len: u32,
+        head_dim: u32,
+        offset: u32,
+        theta: f32,
+    },
     /// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
     /// Backward: inverse RoPE + inverse transpose in one dispatch.
-    TransposeRoPE { batch: usize, seq_len: usize, n_heads: usize, head_dim: usize, offset: u32, theta: f32 },
-    Checkpoint { layer_idx: usize },
+    TransposeRoPE {
+        batch: usize,
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        offset: u32,
+        theta: f32,
+    },
+    Checkpoint {
+        layer_idx: usize,
+    },
     /// Slice a contiguous region from a flat buffer. offset and length in elements.
-    Slice { offset: usize, length: usize, source_size: usize },
+    Slice {
+        offset: usize,
+        length: usize,
+        source_size: usize,
+    },
     /// Concatenate multiple tensors along first dimension (used to reassemble heads).
-    ConcatParts { part_sizes: Vec<usize> },
+    ConcatParts {
+        part_sizes: Vec<usize>,
+    },
     /// Batched matrix multiply: A[b] @ B[b] for each batch element.
     /// A: [B, M, K], B: [B, K, N] → C: [B, M, N]
     BatchedMatmul,
@@ -63,32 +87,65 @@ pub enum Op {
     SiluGate,
     /// Fused residual add + RMS norm: output = rms_norm(a + b, weight, eps)
     /// inputs: [a, b, weight], cached: (a+b) buffer for backward
-    RmsNormResidual { eps: f32 },
+    RmsNormResidual {
+        eps: f32,
+    },
     /// GQA KV head expansion: repeat each KV head group_size times.
     /// Backward: sum group_size gradient blocks back into each KV head.
-    RepeatKv { n_kv_heads: usize, group_size: usize, seq_len: usize, head_dim: usize },
+    RepeatKv {
+        n_kv_heads: usize,
+        group_size: usize,
+        seq_len: usize,
+        head_dim: usize,
+    },
     /// Per-row scaling: out[r][c] = input[r][c] * scales[r]
-    ScaleRows { rows: usize, cols: usize },
+    ScaleRows {
+        rows: usize,
+        cols: usize,
+    },
     /// Column slice: extract columns [col_offset..col_offset+dst_cols) from [rows, src_cols].
     /// Backward: scatter gradient columns back into a zero-filled [rows, src_cols] buffer.
-    SliceCols { rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize },
+    SliceCols {
+        rows: usize,
+        src_cols: usize,
+        dst_cols: usize,
+        col_offset: usize,
+    },
     /// ReLU activation. Backward: grad * (input > 0).
     Relu,
     /// Elementwise exp. Backward: grad_input = grad_output * output (output = exp(input)).
     Exp,
     /// Broadcast a [cols] vector to [rows, cols]. Backward: grad_input = column-sum of grad_output
     /// (= ones[1,rows] @ grad_output).
-    BroadcastRows { rows: usize, cols: usize },
+    BroadcastRows {
+        rows: usize,
+        cols: usize,
+    },
     /// Fused scale + causal mask + softmax. Backward: softmax_backward * scale.
-    ScaledCausalSoftmax { scale: f32 },
+    ScaledCausalSoftmax {
+        scale: f32,
+    },
     /// Flash Attention: fused Q@K^T → mask → softmax → @V
     /// inputs: [Q, K, V], output: O, cached: O (for backward D computation)
-    FlashAttention { batch_heads: usize, seq_q: usize, seq_k: usize, head_dim: usize, kv_offset: u32 },
+    FlashAttention {
+        batch_heads: usize,
+        seq_q: usize,
+        seq_k: usize,
+        head_dim: usize,
+        kv_offset: u32,
+    },
     /// Block gather for subquadratic block-sparse attention: gather selected source K/V blocks
     /// into a compact [bh*nb, k_sel*block, hd] buffer. inputs: [src], cached: sel buffer (the
     /// fixed routing permutation, computed non-differentiably). Backward is a scatter-add
     /// (transpose of the gather): dSrc[bh, sel*block+w, hd] += dOut, accumulated atomically.
-    GatherBlocks { bh: u32, nb: u32, seq: u32, hd: u32, block: u32, k_sel: u32 },
+    GatherBlocks {
+        bh: u32,
+        nb: u32,
+        seq: u32,
+        hd: u32,
+        block: u32,
+        k_sel: u32,
+    },
 }
 
 /// A single entry on the autodiff tape.
@@ -96,8 +153,8 @@ pub enum Op {
 /// Max 4 shapes, each max 4 dims. Max 3 inputs/input_buffers.
 pub struct TapeEntry {
     pub op: Op,
-    pub inputs: Vec<usize>,     // TensorIds of inputs (1-3 typical)
-    pub output: usize,          // TensorId of output
+    pub inputs: Vec<usize>, // TensorIds of inputs (1-3 typical)
+    pub output: usize,      // TensorId of output
     pub input_buffers: Vec<crate::gpu::Buf>,
     pub output_buffer: crate::gpu::Buf,
     pub shapes: Vec<Vec<usize>>, // Still Vec for now — SmallVec needs a dep, fixed arrays need refactoring all callers
@@ -122,7 +179,8 @@ pub fn tape_stats() -> (usize, usize) {
     TAPE.with(|tape| {
         let tape = tape.borrow();
         let num_ops = tape.len();
-        let total_bytes: usize = tape.iter()
+        let total_bytes: usize = tape
+            .iter()
             .map(|entry| crate::gpu::buf_len_bytes(&entry.output_buffer))
             .sum();
         (num_ops, total_bytes)
@@ -163,18 +221,24 @@ pub fn clear_tape() {
         // never an op's output_buffer, so the output loop can never pool a weight. So: protect only
         // self-aliased (view) output addrs; pool every other output. `cached` (softmax probs, reduction
         // sums — never a param) keeps the conservative whole-tape-input guard.
-        let alias_addrs: std::collections::HashSet<usize> = entries.iter()
+        let alias_addrs: std::collections::HashSet<usize> = entries
+            .iter()
             .filter_map(|e| {
                 let out = crate::gpu::buf_addr(&e.output_buffer);
-                e.input_buffers.iter().enumerate()
+                e.input_buffers
+                    .iter()
+                    .enumerate()
                     .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
                     .any(|(_, b)| crate::gpu::buf_addr(b) == out)
                     .then_some(out)
             })
             .collect();
-        let input_addrs: std::collections::HashSet<usize> = entries.iter()
+        let input_addrs: std::collections::HashSet<usize> = entries
+            .iter()
             .flat_map(|e| {
-                e.input_buffers.iter().enumerate()
+                e.input_buffers
+                    .iter()
+                    .enumerate()
                     .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
                     .map(|(_, b)| b)
             })
@@ -207,15 +271,11 @@ pub fn clear_tape() {
 /// Used in gradient accumulation: after each micro-step's backward pass we free the tape
 /// to reclaim activation memory, but keep gradients so the next micro-step accumulates on top.
 pub fn clear_tape_keep_grads() {
-
     // Collect gradient buffer contents() pointers so we don't recycle shared buffers.
     // A buffer in GRADS that's also in the tape (output_buffer/cached) must NOT be recycled,
     // or the next micro-step's forward pass would overwrite the gradient via pool reuse.
-    let grad_ptrs: std::collections::HashSet<usize> = GRADS.with(|grads| {
-        grads.borrow().values().map(|buf| {
-            crate::gpu::buf_addr(buf)
-        }).collect()
-    });
+    let grad_ptrs: std::collections::HashSet<usize> =
+        GRADS.with(|grads| grads.borrow().values().map(crate::gpu::buf_addr).collect());
 
     TAPE.with(|tape| {
         // take() swaps in an empty Vec — avoids drain().collect() intermediate allocation
@@ -224,9 +284,12 @@ pub fn clear_tape_keep_grads() {
         // shares its source's buffer) is still live and must NOT be recycled — pooling it lets the
         // next micro-step's forward overwrite live data (silent stale-read corruption). Combined
         // with grad buffers and checkpoint outputs, and deduped so a shared buffer is pooled once.
-        let input_addrs: std::collections::HashSet<usize> = entries.iter()
+        let input_addrs: std::collections::HashSet<usize> = entries
+            .iter()
             .flat_map(|e| {
-                e.input_buffers.iter().enumerate()
+                e.input_buffers
+                    .iter()
+                    .enumerate()
                     .filter(|(idx, _)| !cross_entropy_temp_input(e, *idx))
                     .map(|(_, b)| b)
             })
@@ -272,7 +335,12 @@ pub fn zero_grads() {
 /// otherwise recycled buffers get reused while optimizer is still reading.
 /// Store a gradient for testing purposes (bypasses normal backward flow).
 #[cfg(test)]
-pub fn accumulate_grad_for_test(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &crate::gpu::Buf, size: usize) {
+pub fn accumulate_grad_for_test(
+    ctx: &Arc<MetalContext>,
+    tensor_id: usize,
+    grad: &crate::gpu::Buf,
+    size: usize,
+) {
     accumulate_grad(ctx, tensor_id, grad.clone(), size);
 }
 
@@ -395,7 +463,12 @@ fn accumulate_grad(ctx: &Arc<MetalContext>, tensor_id: usize, grad: crate::gpu::
 /// Like accumulate_grad but copies the buffer on first insert.
 /// Use this ONLY when the same grad buffer is passed to multiple tensor IDs
 /// (e.g. backward_add passes out_grad to both inputs).
-fn accumulate_grad_shared(ctx: &Arc<MetalContext>, tensor_id: usize, grad: &crate::gpu::Buf, size: usize) {
+fn accumulate_grad_shared(
+    ctx: &Arc<MetalContext>,
+    tensor_id: usize,
+    grad: &crate::gpu::Buf,
+    size: usize,
+) {
     GRADS.with(|grads| {
         let mut grads = grads.borrow_mut();
         if let Some(existing) = grads.get(&tensor_id) {
@@ -455,14 +528,26 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
         Op::Relu => {
             let size: usize = entry.shapes[0].iter().product();
             let grad_input = ctx.alloc_buffer(size * 4);
-            compute::gpu_relu_backward(ctx, &entry.input_buffers[0], out_grad, &grad_input, size as u32);
+            compute::gpu_relu_backward(
+                ctx,
+                &entry.input_buffers[0],
+                out_grad,
+                &grad_input,
+                size as u32,
+            );
             accumulate_grad(ctx, entry.inputs[0], grad_input, size);
         }
         Op::Exp => {
             // d/dx exp(x) = exp(x) = output;  grad_input = grad_output * output
             let size: usize = entry.shapes[0].iter().product();
             let grad_input = ctx.alloc_buffer(size * 4);
-            compute::gpu_mul(ctx, out_grad, &entry.output_buffer, &grad_input, size as u32);
+            compute::gpu_mul(
+                ctx,
+                out_grad,
+                &entry.output_buffer,
+                &grad_input,
+                size as u32,
+            );
             accumulate_grad(ctx, entry.inputs[0], grad_input, size);
         }
         Op::BroadcastRows { rows, cols } => {
@@ -470,22 +555,75 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
             let ones = ctx.alloc_buffer(*rows * 4);
             compute::gpu_fill(ctx, &ones, *rows as u32, 1.0);
             let grad_input = ctx.alloc_buffer(*cols * 4);
-            compute::gpu_matmul(ctx, &ones, out_grad, &grad_input, 1, *cols as u32, *rows as u32);
+            compute::gpu_matmul(
+                ctx,
+                &ones,
+                out_grad,
+                &grad_input,
+                1,
+                *cols as u32,
+                *rows as u32,
+            );
             accumulate_grad(ctx, entry.inputs[0], grad_input, *cols);
         }
         Op::Softmax => backward_softmax(ctx, entry, out_grad),
-        Op::ScaledCausalSoftmax { scale } => backward_scaled_causal_softmax(ctx, entry, out_grad, *scale),
-        Op::SliceCols { rows, src_cols, dst_cols, col_offset } => {
-            backward_slice_cols(ctx, entry, out_grad, *rows, *src_cols, *dst_cols, *col_offset);
+        Op::ScaledCausalSoftmax { scale } => {
+            backward_scaled_causal_softmax(ctx, entry, out_grad, *scale)
+        }
+        Op::SliceCols {
+            rows,
+            src_cols,
+            dst_cols,
+            col_offset,
+        } => {
+            backward_slice_cols(
+                ctx,
+                entry,
+                out_grad,
+                *rows,
+                *src_cols,
+                *dst_cols,
+                *col_offset,
+            );
         }
         Op::RmsNorm { eps } => backward_rms_norm(ctx, entry, out_grad, *eps),
         Op::RmsNormResidual { eps } => backward_rms_norm_residual(ctx, entry, out_grad, *eps),
-        Op::RepeatKv { n_kv_heads, group_size, seq_len, head_dim } => {
-            backward_repeat_kv(ctx, entry, out_grad, *n_kv_heads, *group_size, *seq_len, *head_dim);
+        Op::RepeatKv {
+            n_kv_heads,
+            group_size,
+            seq_len,
+            head_dim,
+        } => {
+            backward_repeat_kv(
+                ctx,
+                entry,
+                out_grad,
+                *n_kv_heads,
+                *group_size,
+                *seq_len,
+                *head_dim,
+            );
         }
         Op::ScaleRows { rows, cols } => backward_scale_rows(ctx, entry, out_grad, *rows, *cols),
-        Op::FlashAttention { batch_heads, seq_q, seq_k, head_dim, kv_offset } => {
-            backward_flash_attention(ctx, entry, out_grad, compute::FlashDims { batch_heads: *batch_heads as u32, seq_q: *seq_q as u32, seq_k: *seq_k as u32, head_dim: *head_dim as u32, kv_offset: *kv_offset });
+        Op::FlashAttention {
+            batch_heads,
+            seq_q,
+            seq_k,
+            head_dim,
+            kv_offset,
+        } => {
+            backward_flash_attention(
+                ctx,
+                entry,
+                out_grad,
+                compute::FlashDims {
+                    batch_heads: *batch_heads as u32,
+                    seq_q: *seq_q as u32,
+                    seq_k: *seq_k as u32,
+                    head_dim: *head_dim as u32,
+                    kv_offset: *kv_offset,
+                },
+            );
         }
         Op::Silu => backward_silu(ctx, entry, out_grad),
         Op::SiluGate => backward_silu_gate(ctx, entry, out_grad),
@@ -496,7 +634,9 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
                 accumulate_grad(ctx, entry.inputs[0], grad_logits.clone(), size);
                 if entry.inputs.len() == 2 {
                     let weight_size: usize = entry.shapes[1].iter().product();
-                    let grad_weight = entry.input_buffers.get(2)
+                    let grad_weight = entry
+                        .input_buffers
+                        .get(2)
                         .expect("fused cross-entropy backward needs tied-weight gradient")
                         .clone();
                     accumulate_grad(ctx, entry.inputs[1], grad_weight, weight_size);
@@ -505,28 +645,87 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
         }
         Op::Embedding => backward_embedding(ctx, entry, out_grad),
         Op::Scale { factor } => backward_scale(ctx, entry, out_grad, *factor),
-        Op::Transpose { batch, seq_len, n_heads, head_dim, forward_dir } => {
-            backward_transpose(ctx, entry, out_grad, &TransposeParams {
-                batch: *batch, seq_len: *seq_len, n_heads: *n_heads, head_dim: *head_dim, forward_dir: *forward_dir,
-            });
+        Op::Transpose {
+            batch,
+            seq_len,
+            n_heads,
+            head_dim,
+            forward_dir,
+        } => {
+            backward_transpose(
+                ctx,
+                entry,
+                out_grad,
+                &TransposeParams {
+                    batch: *batch,
+                    seq_len: *seq_len,
+                    n_heads: *n_heads,
+                    head_dim: *head_dim,
+                    forward_dir: *forward_dir,
+                },
+            );
         }
         Op::Checkpoint { layer_idx } => backward_checkpoint(ctx, entry, out_grad, *layer_idx),
-        Op::Slice { offset, length, source_size } => {
+        Op::Slice {
+            offset,
+            length,
+            source_size,
+        } => {
             backward_slice(ctx, entry, out_grad, *offset, *length, *source_size);
         }
         Op::ConcatParts { part_sizes } => backward_concat_parts(ctx, entry, out_grad, part_sizes),
-        Op::GatherBlocks { bh, nb, seq, hd, block, k_sel } => backward_gather_blocks(
-            ctx, entry, out_grad,
-            compute::GatherDims { bh: *bh, nb: *nb, seq: *seq, hd: *hd, block: *block, k_sel: *k_sel },
+        Op::GatherBlocks {
+            bh,
+            nb,
+            seq,
+            hd,
+            block,
+            k_sel,
+        } => backward_gather_blocks(
+            ctx,
+            entry,
+            out_grad,
+            compute::GatherDims {
+                bh: *bh,
+                nb: *nb,
+                seq: *seq,
+                hd: *hd,
+                block: *block,
+                k_sel: *k_sel,
+            },
         ),
         Op::BatchedMatmul => backward_batched_matmul(ctx, entry, out_grad),
         Op::BatchedMatmulTransB => backward_batched_matmul_trans_b(ctx, entry, out_grad),
         Op::BatchedMatmulTransA => backward_batched_matmul_trans_a(ctx, entry, out_grad),
-        Op::RoPE { seq_len, head_dim, offset, theta } => {
+        Op::RoPE {
+            seq_len,
+            head_dim,
+            offset,
+            theta,
+        } => {
             backward_rope(ctx, entry, out_grad, *seq_len, *head_dim, *offset, *theta);
         }
-        Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta } => {
-            backward_transpose_rope(ctx, entry, out_grad, compute::TrRopeDims { batch: *batch as u32, seq: *seq_len as u32, n_heads: *n_heads as u32, head_dim: *head_dim as u32, offset: *offset, theta: *theta });
+        Op::TransposeRoPE {
+            batch,
+            seq_len,
+            n_heads,
+            head_dim,
+            offset,
+            theta,
+        } => {
+            backward_transpose_rope(
+                ctx,
+                entry,
+                out_grad,
+                compute::TrRopeDims {
+                    batch: *batch as u32,
+                    seq: *seq_len as u32,
+                    n_heads: *n_heads as u32,
+                    head_dim: *head_dim as u32,
+                    offset: *offset,
+                    theta: *theta,
+                },
+            );
         }
     }
 }
@@ -534,7 +733,11 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
 /// Cast a float buffer to half. Used for FP16 matmul backward (large matrices)
 /// and API diagnostics. The standard FP32 matmul kernels cast internally in shared
 /// memory, making this redundant for most backward passes.
-pub fn cast_buf_f16(ctx: &Arc<MetalContext>, buf: &crate::gpu::Buf, num_elements: usize) -> crate::gpu::Buf {
+pub fn cast_buf_f16(
+    ctx: &Arc<MetalContext>,
+    buf: &crate::gpu::Buf,
+    num_elements: usize,
+) -> crate::gpu::Buf {
     let f16_buf = ctx.alloc_buffer(num_elements * 2);
     compute::gpu_cast_f32_to_f16(ctx, buf, &f16_buf, num_elements as u32);
     f16_buf
@@ -557,18 +760,38 @@ fn backward_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate:
     // Skipping the pre-cast eliminates 3 GPU dispatches + 3 buffer allocations per op.
     // dA = dC @ B^T : [M, N] @ [N, K] = [M, K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_b(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &da_buf,
+        m as u32,
+        k as u32,
+        n as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], da_buf, m * k);
 
     // dB = A^T @ dC : [K, M] @ [M, N] = [K, N]
     let db_buf = ctx.alloc_buffer(k * n * 4);
-    compute::gpu_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_a(
+        ctx,
+        &entry.input_buffers[0],
+        out_grad,
+        &db_buf,
+        m as u32,
+        k as u32,
+        n as u32,
+    );
     accumulate_grad(ctx, entry.inputs[1], db_buf, k * n);
 }
 
 /// Backward for C = A @ B where B is detached (frozen base weight).
 /// Only computes dA = dC @ B^T. No gradient for B.
-fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
+fn backward_matmul_detached_b(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+) {
     let a_shape = &entry.shapes[0];
     let b_shape = &entry.shapes[1];
     let rank_a = a_shape.len();
@@ -580,7 +803,15 @@ fn backward_matmul_detached_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
 
     // dA = dC @ B^T : [M, N] @ [N, K] = [M, K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul_trans_b(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &da_buf,
+        m as u32,
+        k as u32,
+        n as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], da_buf, m * k);
     // No dB — base weight is frozen.
 }
@@ -599,12 +830,28 @@ fn backward_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     // FP32 backward — matmul kernels cast to half internally in shared memory
     // dA = dC @ B : [M,N] @ [N,K] = [M,K]
     let da_buf = ctx.alloc_buffer(m * k * 4);
-    compute::gpu_matmul(ctx, out_grad, &entry.input_buffers[1], &da_buf, m as u32, k as u32, n as u32);
+    compute::gpu_matmul(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &da_buf,
+        m as u32,
+        k as u32,
+        n as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], da_buf, m * k);
 
     // dB = dC^T @ A : [N,M] @ [M,K] = [N,K]
     let db_buf = ctx.alloc_buffer(n * k * 4);
-    compute::gpu_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_buf, m as u32, n as u32, k as u32);
+    compute::gpu_matmul_trans_a(
+        ctx,
+        out_grad,
+        &entry.input_buffers[0],
+        &db_buf,
+        m as u32,
+        n as u32,
+        k as u32,
+    );
     accumulate_grad(ctx, entry.inputs[1], db_buf, n * k);
 }
 
@@ -634,23 +881,48 @@ fn backward_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate
     let cols = *shape.last().unwrap();
     let rows: usize = shape.iter().product::<usize>() / cols;
 
-    let softmax_out = entry.cached.as_ref().expect("softmax backward needs cached output");
+    let softmax_out = entry
+        .cached
+        .as_ref()
+        .expect("softmax backward needs cached output");
     let grad_input = ctx.alloc_buffer(rows * cols * 4);
-    compute::gpu_softmax_backward(ctx, softmax_out, out_grad, &grad_input, rows as u32, cols as u32);
+    compute::gpu_softmax_backward(
+        ctx,
+        softmax_out,
+        out_grad,
+        &grad_input,
+        rows as u32,
+        cols as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], grad_input, rows * cols);
 }
 
 /// Backward for fused scaled_causal_softmax.
 /// d(softmax(x * scale, masked))/dx = softmax_backward(d_out, cached_output) * scale
-fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, scale: f32) {
+fn backward_scaled_causal_softmax(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    scale: f32,
+) {
     let shape = &entry.shapes[0];
     let cols = *shape.last().unwrap();
     let rows: usize = shape.iter().product::<usize>() / cols;
     let size = rows * cols;
 
-    let softmax_out = entry.cached.as_ref().expect("scaled_causal_softmax backward needs cached output");
+    let softmax_out = entry
+        .cached
+        .as_ref()
+        .expect("scaled_causal_softmax backward needs cached output");
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_softmax_backward(ctx, softmax_out, out_grad, &grad_input, rows as u32, cols as u32);
+    compute::gpu_softmax_backward(
+        ctx,
+        softmax_out,
+        out_grad,
+        &grad_input,
+        rows as u32,
+        cols as u32,
+    );
     // Chain rule: pre-softmax input = raw_scores * scale, so d/d(raw_scores) = d_presoftmax * scale
     compute::gpu_scale(ctx, &grad_input, size as u32, scale);
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
@@ -659,19 +931,36 @@ fn backward_scaled_causal_softmax(ctx: &Arc<MetalContext>, entry: &TapeEntry, ou
 /// SliceCols backward: scatter gradient back to source column positions.
 /// out_grad: [rows, dst_cols] → grad_source: [rows, src_cols] (zeros with grad at col_offset)
 fn backward_slice_cols(
-    ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf,
-    rows: usize, src_cols: usize, dst_cols: usize, col_offset: usize,
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    rows: usize,
+    src_cols: usize,
+    dst_cols: usize,
+    col_offset: usize,
 ) {
     let source_size = rows * src_cols;
     let grad_source = ctx.alloc_buffer(source_size * 4);
     compute::gpu_fill(ctx, &grad_source, source_size as u32, 0.0);
     // Scatter: place out_grad [rows, dst_cols] into grad_source [rows, src_cols] at col_offset
-    compute::gpu_concat_cols(ctx, out_grad, &grad_source,
-        rows as u32, dst_cols as u32, src_cols as u32, col_offset as u32);
+    compute::gpu_concat_cols(
+        ctx,
+        out_grad,
+        &grad_source,
+        rows as u32,
+        dst_cols as u32,
+        src_cols as u32,
+        col_offset as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], grad_source, source_size);
 }
 
-fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, eps: f32) {
+fn backward_rms_norm(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    eps: f32,
+) {
     let input_shape = &entry.shapes[0];
     let cols = *input_shape.last().unwrap();
     let rows: usize = input_shape.iter().product::<usize>() / cols;
@@ -700,7 +989,12 @@ fn backward_rms_norm(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crat
 /// Backward for fused residual+RMSNorm: rms_norm(a + b, weight, eps)
 /// The cached buffer stores (a+b), which is the effective "input" to rms_norm.
 /// Gradients flow equally to both a and b.
-fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, eps: f32) {
+fn backward_rms_norm_residual(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    eps: f32,
+) {
     let input_shape = &entry.shapes[0]; // shape of a (and b)
     let cols = *input_shape.last().unwrap();
     let rows: usize = input_shape.iter().product::<usize>() / cols;
@@ -709,12 +1003,15 @@ fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
     let grad_weight = ctx.alloc_buffer(cols * 4);
 
     // The cached buffer is (a+b), which was the effective input to rms_norm
-    let sum_buf = entry.cached.as_ref().expect("RmsNormResidual requires cached (a+b) buffer");
+    let sum_buf = entry
+        .cached
+        .as_ref()
+        .expect("RmsNormResidual requires cached (a+b) buffer");
 
     compute::gpu_rms_norm_backward(
         ctx,
-        sum_buf,                    // input to rms_norm was (a+b)
-        &entry.input_buffers[2],    // weight
+        sum_buf,                 // input to rms_norm was (a+b)
+        &entry.input_buffers[2], // weight
         out_grad,
         &grad_sum,
         &grad_weight,
@@ -735,7 +1032,13 @@ fn backward_rms_norm_residual(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_gr
 fn backward_silu(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_silu_backward(ctx, &entry.input_buffers[0], out_grad, &grad_input, size as u32);
+    compute::gpu_silu_backward(
+        ctx,
+        &entry.input_buffers[0],
+        out_grad,
+        &grad_input,
+        size as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
@@ -784,8 +1087,16 @@ fn backward_embedding(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &cra
 /// Block-gather backward: scatter-add the compact gradient back into the source K/V (transpose
 /// of the gather). The routing `sel` (cached on the tape entry) is a fixed permutation; the
 /// scatter accumulates atomically because multiple query-blocks may select the same source block.
-fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, dims: compute::GatherDims) {
-    let sel = entry.cached.as_ref().expect("gather_blocks backward needs cached sel buffer");
+fn backward_gather_blocks(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    dims: compute::GatherDims,
+) {
+    let sel = entry
+        .cached
+        .as_ref()
+        .expect("gather_blocks backward needs cached sel buffer");
     let src_size = (dims.bh * dims.seq * dims.hd) as usize;
     let d_src = ctx.alloc_buffer(src_size * 4);
     // gpu_gather_blocks_backward SCATTER-ADDS (atomic_fetch_add) into d_src, so it must start zeroed
@@ -798,7 +1109,12 @@ fn backward_gather_blocks(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: 
     accumulate_grad(ctx, entry.inputs[0], d_src, src_size);
 }
 
-fn backward_scale(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, factor: f32) {
+fn backward_scale(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    factor: f32,
+) {
     // Fused: dst[i] = src[i] * factor in 1 dispatch (was copy + scale = 2)
     let size: usize = entry.shapes[0].iter().product();
     let grad_input = ctx.alloc_buffer(size * 4);
@@ -821,18 +1137,33 @@ fn backward_rope(
     let size: usize = entry.shapes[0].iter().product();
     let total_rows = entry.shapes[0][0] as u32;
     let grad_input = ctx.alloc_buffer(size * 4);
-    compute::gpu_rope_backward_copy(ctx, out_grad, &grad_input, compute::RopeDims { total_rows, seq_len, head_dim, offset, theta });
+    compute::gpu_rope_backward_copy(
+        ctx,
+        out_grad,
+        &grad_input,
+        compute::RopeDims {
+            total_rows,
+            seq_len,
+            head_dim,
+            offset,
+            theta,
+        },
+    );
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
 
 /// Fused transpose+RoPE backward: inverse RoPE + inverse transpose in one dispatch.
-fn backward_transpose_rope(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, d: compute::TrRopeDims) {
+fn backward_transpose_rope(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    d: compute::TrRopeDims,
+) {
     let size = (d.batch * d.seq * d.n_heads * d.head_dim) as usize;
     let grad_input = ctx.alloc_buffer(size * 4);
     compute::gpu_transpose_rope_backward(ctx, out_grad, &grad_input, d);
     accumulate_grad(ctx, entry.inputs[0], grad_input, size);
 }
-
 
 /// Checkpoint backward: re-run the forward pass to recover the sub-tape,
 /// inject the output gradient, walk the sub-tape in reverse, and extract
@@ -851,12 +1182,12 @@ fn backward_checkpoint(
     // Temporarily remove the recompute fn from the registry so we can call it
     // without holding a RefCell borrow (the fn itself will borrow TAPE via
     // checkpoint_forward). We put it back after calling.
-    let recompute = RECOMPUTE_REGISTRY.with(|reg| reg.borrow_mut().remove(&layer_idx))
+    let recompute = RECOMPUTE_REGISTRY
+        .with(|reg| reg.borrow_mut().remove(&layer_idx))
         .expect("missing recompute fn for checkpoint layer");
 
     // Re-run the forward pass to get the sub-tape
     let sub_tape = recompute(ctx);
-
 
     // Put the recompute fn back for potential future use (e.g., gradient accumulation)
     RECOMPUTE_REGISTRY.with(|reg| reg.borrow_mut().insert(layer_idx, recompute));
@@ -865,11 +1196,11 @@ fn backward_checkpoint(
     // (the checkpoint output tensor). Inject the output gradient for it.
     if let Some(last_sub_entry) = sub_tape.last() {
         let sub_output_id = last_sub_entry.output;
-        let output_size: usize = last_sub_entry.shapes.last()
+        let output_size: usize = last_sub_entry
+            .shapes
+            .last()
             .map(|s| s.iter().product())
-            .unwrap_or_else(|| {
-                entry.shapes.last().map(|s| s.iter().product()).unwrap_or(0)
-            });
+            .unwrap_or_else(|| entry.shapes.last().map(|s| s.iter().product()).unwrap_or(0));
         accumulate_grad(ctx, sub_output_id, out_grad.clone(), output_size);
     }
 
@@ -939,7 +1270,13 @@ fn backward_transpose(
     out_grad: &crate::gpu::Buf,
     tp: &TransposeParams,
 ) {
-    let TransposeParams { batch, seq_len, n_heads, head_dim, forward_dir } = *tp;
+    let TransposeParams {
+        batch,
+        seq_len,
+        n_heads,
+        head_dim,
+        forward_dir,
+    } = *tp;
     let size = batch * seq_len * n_heads * head_dim;
 
     let grad_buf = if forward_dir {
@@ -1004,7 +1341,11 @@ fn backward_concat_parts(
 ) {
     let total: usize = part_sizes.iter().sum();
     let expected: usize = entry.shapes.last().map(|s| s.iter().product()).unwrap_or(0);
-    assert_eq!(total, expected, "backward_concat_parts: part_sizes sum {} != output size {}", total, expected);
+    assert_eq!(
+        total, expected,
+        "backward_concat_parts: part_sizes sum {} != output size {}",
+        total, expected
+    );
     let mut offset = 0u32;
     for (i, &part_size) in part_sizes.iter().enumerate() {
         let part_grad = ctx.alloc_buffer(part_size * 4);
@@ -1028,11 +1369,33 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     // Batched backward — FP32 (small attention dims, cast overhead not worth it)
     // dA = dC @ B^T : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_trans_b(ctx, out_grad, &entry.input_buffers[1], &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
+    compute::gpu_batched_matmul_trans_b(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &da_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: k as u32,
+            k: n as u32,
+        },
+    );
 
     // dB = A^T @ dC : [B,K,M] @ [B,M,N] = [B,K,N]
     let db_total = ctx.alloc_buffer(batches * k * n * 4);
-    compute::gpu_batched_matmul_trans_a(ctx, &entry.input_buffers[0], out_grad, &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
+    compute::gpu_batched_matmul_trans_a(
+        ctx,
+        &entry.input_buffers[0],
+        out_grad,
+        &db_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        },
+    );
 
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * k * n);
@@ -1040,7 +1403,11 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
 
 /// BatchedMatmulTransB backward: C[b] = A[b] @ B[b]^T
 /// dA[b] = dC[b] @ B[b], dB[b] = dC[b]^T @ A[b]
-fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
+fn backward_batched_matmul_trans_b(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+) {
     let a_shape = &entry.shapes[0]; // [B, M, K]
     let b_shape = &entry.shapes[1]; // [B, N, K]
 
@@ -1052,17 +1419,43 @@ fn backward_batched_matmul_trans_b(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
     // Batched backward — FP32
     // dA = dC @ B : [B,M,N] @ [B,N,K] = [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul(ctx, out_grad, &entry.input_buffers[1], &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
+    compute::gpu_batched_matmul(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &da_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: k as u32,
+            k: n as u32,
+        },
+    );
 
     // dB = dC^T @ A : [B,N,M] @ [B,M,K] = [B,N,K]
     let db_total = ctx.alloc_buffer(batches * n * k * 4);
-    compute::gpu_batched_matmul_trans_a(ctx, out_grad, &entry.input_buffers[0], &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
+    compute::gpu_batched_matmul_trans_a(
+        ctx,
+        out_grad,
+        &entry.input_buffers[0],
+        &db_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: k as u32,
+            k: n as u32,
+        },
+    );
 
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * n * k);
 }
 
-fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
+fn backward_batched_matmul_trans_a(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+) {
     // C = A^T @ B where A:[B,M,K], B:[B,M,N], C:[B,K,N], dC = out_grad:[B,K,N]
     // dA = B @ dC^T : [B,M,N] @ [B,N,K] = [B,M,K]   (batched trans_b of B, dC)
     // dB = A @ dC   : [B,M,K] @ [B,K,N] = [B,M,N]   (batched matmul of A, dC)
@@ -1076,12 +1469,34 @@ fn backward_batched_matmul_trans_a(ctx: &Arc<MetalContext>, entry: &TapeEntry, o
 
     // dA = B @ dC^T : a=B[B,M,N], b=dC[B,K,N] → [B,M,K]
     let da_total = ctx.alloc_buffer(batches * m * k * 4);
-    compute::gpu_batched_matmul_trans_b(ctx, &entry.input_buffers[1], out_grad, &da_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: k as u32, k: n as u32 });
+    compute::gpu_batched_matmul_trans_b(
+        ctx,
+        &entry.input_buffers[1],
+        out_grad,
+        &da_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: k as u32,
+            k: n as u32,
+        },
+    );
     accumulate_grad(ctx, entry.inputs[0], da_total, batches * m * k);
 
     // dB = A @ dC : a=A[B,M,K], b=dC[B,K,N] → [B,M,N]
     let db_total = ctx.alloc_buffer(batches * m * n * 4);
-    compute::gpu_batched_matmul(ctx, &entry.input_buffers[0], out_grad, &db_total, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
+    compute::gpu_batched_matmul(
+        ctx,
+        &entry.input_buffers[0],
+        out_grad,
+        &db_total,
+        compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        },
+    );
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * m * n);
 }
 
@@ -1101,8 +1516,13 @@ fn backward_repeat_kv(
 
     // Single kernel: each thread sums group_size gradient blocks for one element
     compute::gpu_repeat_kv_backward(
-        ctx, out_grad, &kv_grad,
-        n_kv_heads as u32, group_size as u32, seq_len as u32, head_dim as u32,
+        ctx,
+        out_grad,
+        &kv_grad,
+        n_kv_heads as u32,
+        group_size as u32,
+        seq_len as u32,
+        head_dim as u32,
     );
 
     accumulate_grad(ctx, entry.inputs[0], kv_grad, n_kv_heads * head_block);
@@ -1111,18 +1531,44 @@ fn backward_repeat_kv(
 /// Flash Attention backward: compute dQ, dK, dV using Flash Attention backward kernel.
 /// entry.inputs: [Q_id, K_id, V_id]
 /// entry.cached: O (forward output, for D computation)
-fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf, dims: compute::FlashDims) {
-    let compute::FlashDims { batch_heads, seq_q, seq_k, head_dim, kv_offset: _ } = dims;
-    let (batch_heads, seq_q, seq_k, head_dim) = (batch_heads as usize, seq_q as usize, seq_k as usize, head_dim as usize);
+fn backward_flash_attention(
+    ctx: &Arc<MetalContext>,
+    entry: &TapeEntry,
+    out_grad: &crate::gpu::Buf,
+    dims: compute::FlashDims,
+) {
+    let compute::FlashDims {
+        batch_heads,
+        seq_q,
+        seq_k,
+        head_dim,
+        kv_offset: _,
+    } = dims;
+    let (batch_heads, seq_q, seq_k, head_dim) = (
+        batch_heads as usize,
+        seq_q as usize,
+        seq_k as usize,
+        head_dim as usize,
+    );
     let total_q_rows = batch_heads * seq_q;
     let total_k_rows = batch_heads * seq_k;
 
     // Get O from cached (saved during forward)
-    let o_buf = entry.cached.as_ref().expect("FlashAttention backward requires cached O buffer");
+    let o_buf = entry
+        .cached
+        .as_ref()
+        .expect("FlashAttention backward requires cached O buffer");
 
     // Precompute D[i] = sum_j(dO[i][j] * O[i][j])
     let d_buf = ctx.alloc_buffer(total_q_rows * 4);
-    compute::gpu_flash_attn_precompute_d(ctx, out_grad, o_buf, &d_buf, total_q_rows as u32, head_dim as u32);
+    compute::gpu_flash_attn_precompute_d(
+        ctx,
+        out_grad,
+        o_buf,
+        &d_buf,
+        total_q_rows as u32,
+        head_dim as u32,
+    );
 
     // Allocate gradient buffers
     let dq_buf = ctx.alloc_buffer(total_q_rows * head_dim * 4);
@@ -1137,9 +1583,15 @@ fn backward_flash_attention(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad
     compute::gpu_flash_attention_backward(
         ctx,
         compute::FlashBwdBufs {
-            q: &entry.input_buffers[0], k: &entry.input_buffers[1], v: &entry.input_buffers[2],
-            output: o_buf, d_out: out_grad, d_buf: &d_buf,
-            dq: &dq_buf, dk: &dk_buf, dv: &dv_buf,
+            q: &entry.input_buffers[0],
+            k: &entry.input_buffers[1],
+            v: &entry.input_buffers[2],
+            output: o_buf,
+            d_out: out_grad,
+            d_buf: &d_buf,
+            dq: &dq_buf,
+            dk: &dk_buf,
+            dv: &dv_buf,
         },
         dims,
     );
@@ -1160,11 +1612,25 @@ fn backward_scale_rows(
 ) {
     // d_input[r][c] = d_out[r][c] * scales[r]
     let d_input = ctx.alloc_buffer(rows * cols * 4);
-    compute::gpu_scale_rows(ctx, out_grad, &entry.input_buffers[1], &d_input, rows as u32, cols as u32);
+    compute::gpu_scale_rows(
+        ctx,
+        out_grad,
+        &entry.input_buffers[1],
+        &d_input,
+        rows as u32,
+        cols as u32,
+    );
     accumulate_grad(ctx, entry.inputs[0], d_input, rows * cols);
 
     // d_scales[r] = sum_c(d_out[r][c] * input[r][c]) — single GPU dispatch
     let d_scales = ctx.alloc_buffer(rows * 4);
-    compute::gpu_row_dot_reduce(ctx, out_grad, &entry.input_buffers[0], &d_scales, rows as u32, cols as u32);
+    compute::gpu_row_dot_reduce(
+        ctx,
+        out_grad,
+        &entry.input_buffers[0],
+        &d_scales,
+        rows as u32,
+        cols as u32,
+    );
     accumulate_grad(ctx, entry.inputs[1], d_scales, rows);
 }

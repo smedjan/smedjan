@@ -93,7 +93,10 @@ pub fn filter_min_p_typical(probs: &mut Vec<(usize, f32)>, min_p: f32, typical_p
         renorm(probs);
     }
     if typical_p < 1.0 && probs.len() > 1 {
-        let h: f32 = -probs.iter().map(|&(_, p)| if p > 0.0 { p * p.ln() } else { 0.0 }).sum::<f32>();
+        let h: f32 = -probs
+            .iter()
+            .map(|&(_, p)| if p > 0.0 { p * p.ln() } else { 0.0 })
+            .sum::<f32>();
         let mut ranked = probs.clone();
         ranked.sort_by(|a, b| {
             let da = ((-a.1.ln()) - h).abs();
@@ -123,8 +126,14 @@ pub fn generate(
     prompt: &str,
     config: &SamplingConfig,
 ) -> String {
-    eprintln!("Generating on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
-        ctx.device_name(), config.temperature, config.top_p, config.top_k, config.max_tokens);
+    eprintln!(
+        "Generating on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
+        ctx.device_name(),
+        config.temperature,
+        config.top_p,
+        config.top_k,
+        config.max_tokens
+    );
     autograd::no_grad(|| {
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));
@@ -167,7 +176,13 @@ pub fn generate(
                 gpu_argmax(ctx, &logits.buffer, vocab_size as u32)
             } else {
                 // Temperature scaling on GPU, then read back for CPU sampling
-                gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
+                gpu_temperature_scale(
+                    ctx,
+                    &logits.buffer,
+                    0,
+                    vocab_size as u32,
+                    config.temperature,
+                );
                 // Zero-copy: shared memory on Apple Silicon means direct pointer access
                 let token_logits_host = logits_host(&logits);
                 let token_logits = &token_logits_host[..vocab_size];
@@ -196,7 +211,10 @@ pub fn generate_batch(
     prompts: &[&str],
     config: &SamplingConfig,
 ) -> Vec<String> {
-    assert!(!prompts.is_empty(), "generate_batch needs at least one prompt");
+    assert!(
+        !prompts.is_empty(),
+        "generate_batch needs at least one prompt"
+    );
     autograd::no_grad(|| {
         let b = prompts.len();
         let encoded: Vec<Vec<u32>> = prompts
@@ -242,7 +260,11 @@ pub fn generate_batch(
         let mut done = vec![false; b];
         for (i, seq) in seqs.iter_mut().enumerate() {
             let lp = &all[(i * len + len - 1) * vocab..(i * len + len) * vocab];
-            let t = if greedy { argmax(lp) } else { sample_token(lp, config, &[]) };
+            let t = if greedy {
+                argmax(lp)
+            } else {
+                sample_token(lp, config, &[])
+            };
             seq.push(t);
             cur.push(t);
             if t == EOS_TOKEN {
@@ -264,7 +286,11 @@ pub fn generate_batch(
                     continue;
                 }
                 let lp = &all[i * vocab..(i + 1) * vocab];
-                let t = if greedy { argmax(lp) } else { sample_token(lp, config, &seqs[i]) };
+                let t = if greedy {
+                    argmax(lp)
+                } else {
+                    sample_token(lp, config, &seqs[i])
+                };
                 cur[i] = t;
                 seqs[i].push(t);
                 if t == EOS_TOKEN {
@@ -311,11 +337,8 @@ fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[
         }
     }
 
-    let mut scaled: Vec<(usize, f32)> = penalized
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (i, l))
-        .collect();
+    let mut scaled: Vec<(usize, f32)> =
+        penalized.iter().enumerate().map(|(i, &l)| (i, l)).collect();
 
     // Top-k filtering: keep only top-k logits
     if config.top_k > 0 && config.top_k < scaled.len() {
@@ -470,8 +493,14 @@ pub fn generate_streaming<F>(
 ) where
     F: FnMut(&str),
 {
-    eprintln!("Streaming on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
-        ctx.device_name(), config.temperature, config.top_p, config.top_k, config.max_tokens);
+    eprintln!(
+        "Streaming on {} (temp={}, top_p={}, top_k={}, max_tokens={})",
+        ctx.device_name(),
+        config.temperature,
+        config.top_p,
+        config.top_k,
+        config.max_tokens
+    );
     autograd::no_grad(|| {
         let mut tokens = vec![BOS_TOKEN];
         tokens.extend(tokenizer.encode(prompt));
@@ -510,7 +539,13 @@ pub fn generate_streaming<F>(
                 gpu_argmax(ctx, &logits.buffer, vocab_size as u32)
             } else {
                 // Temperature scaling on GPU, then zero-copy read for CPU sampling
-                gpu_temperature_scale(ctx, &logits.buffer, 0, vocab_size as u32, config.temperature);
+                gpu_temperature_scale(
+                    ctx,
+                    &logits.buffer,
+                    0,
+                    vocab_size as u32,
+                    config.temperature,
+                );
                 let token_logits_host = logits_host(&logits);
                 let token_logits = &token_logits_host[..vocab_size];
                 sample_token_prescaled(token_logits, config, &generated)
@@ -545,11 +580,19 @@ pub fn generate_speculative(
 
     generate_speculative_inner(
         ctx,
-        SpecModels { main: main_model, draft: draft_model, tokenizer },
+        SpecModels {
+            main: main_model,
+            draft: draft_model,
+            tokenizer,
+        },
         prompt,
         config,
         draft_tokens,
-        SpecState { generated: &mut generated, total_accepted: &mut total_accepted, total_drafted: &mut total_drafted },
+        SpecState {
+            generated: &mut generated,
+            total_accepted: &mut total_accepted,
+            total_drafted: &mut total_drafted,
+        },
         None::<fn(&str)>,
     );
 
@@ -560,7 +603,10 @@ pub fn generate_speculative(
     };
     eprintln!(
         "Speculative decoding: {}/{} drafts accepted ({:.1}%), {} tokens generated",
-        total_accepted, total_drafted, accept_rate * 100.0, generated.len()
+        total_accepted,
+        total_drafted,
+        accept_rate * 100.0,
+        generated.len()
     );
 
     // Remove EOS if present
@@ -593,7 +639,11 @@ pub fn generate_speculative_streaming<F>(
         prompt,
         config,
         draft_tokens,
-        SpecState { generated: &mut generated, total_accepted: &mut total_accepted, total_drafted: &mut total_drafted },
+        SpecState {
+            generated: &mut generated,
+            total_accepted: &mut total_accepted,
+            total_drafted: &mut total_drafted,
+        },
         Some(on_token),
     );
 
@@ -604,7 +654,10 @@ pub fn generate_speculative_streaming<F>(
     };
     eprintln!(
         "Speculative decoding: {}/{} drafts accepted ({:.1}%), {} tokens generated",
-        total_accepted, total_drafted, accept_rate * 100.0, generated.len()
+        total_accepted,
+        total_drafted,
+        accept_rate * 100.0,
+        generated.len()
     );
 }
 
@@ -635,11 +688,22 @@ fn generate_speculative_inner<F>(
 ) where
     F: FnMut(&str),
 {
-    let SpecModels { main: main_model, draft: draft_model, tokenizer } = models;
-    let SpecState { generated, total_accepted, total_drafted } = state;
+    let SpecModels {
+        main: main_model,
+        draft: draft_model,
+        tokenizer,
+    } = models;
+    let SpecState {
+        generated,
+        total_accepted,
+        total_drafted,
+    } = state;
     eprintln!(
         "Speculative decoding on {} (draft_tokens={}, temp={}, max_tokens={})",
-        ctx.device_name(), draft_tokens, config.temperature, config.max_tokens
+        ctx.device_name(),
+        draft_tokens,
+        config.temperature,
+        config.max_tokens
     );
     eprintln!(
         "Main model: {} layers, {}M params | Draft model: {} layers, {}M params",
@@ -702,9 +766,8 @@ fn generate_speculative_inner<F>(
 
             for _ in 0..n_draft {
                 ctx.begin_batch();
-                let d_logits = draft_model.forward(
-                    &[draft_input_token], 1, 1, Some(&mut draft_kv), false,
-                );
+                let d_logits =
+                    draft_model.forward(&[draft_input_token], 1, 1, Some(&mut draft_kv), false);
                 ctx.flush_batch();
 
                 let d_token = gpu_argmax(ctx, &d_logits.buffer, draft_vocab as u32);
@@ -738,9 +801,8 @@ fn generate_speculative_inner<F>(
 
             let verify_len = verify_seq.len();
             ctx.begin_batch();
-            let main_logits = main_model.forward(
-                &verify_seq, 1, verify_len, Some(&mut main_kv), false,
-            );
+            let main_logits =
+                main_model.forward(&verify_seq, 1, verify_len, Some(&mut main_kv), false);
             ctx.flush_batch();
 
             let all_logits = main_logits.to_vec();
@@ -874,7 +936,7 @@ mod ngram_tests {
     #[test]
     fn disabled_and_short_history_ban_nothing() {
         assert!(no_repeat_ngram_banned(&[1, 2, 3], 0).is_empty()); // n=0 → off
-        assert!(no_repeat_ngram_banned(&[1, 2], 3).is_empty());    // history shorter than n
+        assert!(no_repeat_ngram_banned(&[1, 2], 3).is_empty()); // history shorter than n
     }
 
     #[test]

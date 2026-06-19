@@ -284,8 +284,9 @@ is NOT in README/ROADMAP (those are clean). Treat GaLore as a TODO, not a featur
 
 ### Known follow-ups (documented in-code, by design — not bugs)
 
-- **CUDA backend** (`src/cuda/kernels.rs:554`): backward kernels are stubs ("to be completed"); ~22/89.
-  Expected — no NVIDIA hardware to verify against. Metal is the supported path.
+- **CUDA backend**: compile parity is kept green and active wrappers no longer contain
+  `unimplemented!`; runtime correctness remains NVIDIA-hardware-gated. Metal is the supported path on
+  this Mac.
 - **SSM / RWKV / linear-attention** (`ssm.rs`, `rwkv.rs`, `linear_attention.rs`): forward uses the
   **materialized** reference form; the chunked/decay-prefix O(N) form is the documented optimization
   follow-up. Recurrence semantics + selectivity are proven by tests. The `.to_vec()` calls in those
@@ -411,7 +412,8 @@ reads on `version >= 12`).
 - **Landed:** loss-readout root-cause fix, batch-LR transfer (`--lr-ref-batch`), BitNet per-column
   scale, `quantize()` panic message, **Muon Frobenius normalization**.
 - **Specced (exact code/kernels):** seq-packing forward threading (§2), block-sparse trainable backward
-  (§3), GaLore-implement-or-delete (§6/§7), v12 config fields (above).
+  (§3), v12 config fields (above). GaLore was removed from the active production surface; revisit SCALE
+  instead if a subspace optimizer becomes worth adding.
 - **Verified sound:** autograd backward math, generate sampling, hybrid per-layer topology,
   checkpoint/resume codec.
 
@@ -451,11 +453,11 @@ reads on `version >= 12`).
 | `quantize()` unreachable | **FIXED** (proper panic) |
 | Muon NS divergence (batch-32) | **FIXED** (Frobenius normalization) — re-check `--muon-lr-scale` |
 | `sliding_window` not persisted | **FIXED** (v12) |
-| GaLore advertised-not-implemented | **HONEST** now (CLI + docs); implement-or-delete is the open call |
+| GaLore advertised-not-implemented | **REMOVED from active production surface**; historical docs keep the field decision context |
 | autograd / checkpoint / DPO / eval / sampling / datapipe / JSON | **VERIFIED SOUND** |
 | Seq-packing model integration | **SPECCED** (§2) — needs Metal build to land safely |
 | Block-sparse trainable backward | ✅ **LANDED** (§3) — scatter-add kernel + `Op::GatherBlocks`, grad-checked; fixed a latent non-square `batched_matmul_trans_a` param-swap |
-| Chunked O(N) SSM/RWKV forward; MLA absorbed decode; NorMuon; simdgroup >1.29×; CUDA backward | **ENHANCEMENT follow-ups** (not bugs) — documented, hardware-gated |
+| Chunked O(N) SSM/RWKV forward; MLA absorbed decode; NorMuon; simdgroup >1.29×; CUDA runtime proof | **ENHANCEMENT follow-ups** (not bugs) — documented, hardware-gated |
 
 ### What "fully closed" means here
 Every **bug** I could identify is fixed; every **correctness-critical subsystem** is read and verified
@@ -526,5 +528,5 @@ that would complete an n-gram already present in the generated history (logit �
 | Block-sparse trainable backward | cheaper training / long ctx | ✅ LANDED (§3) — kernel + autograd op + grad-checks; model wiring deferred to #12 |
 | Chunked O(N) SSM/RWKV forward | long-context throughput | mixers materialize today |
 | MLA absorbed-form decode | faster decode | latent-cache decode already done |
-| GaLore (or SCALE) | optimizer memory | currently a panic stub; Muon+8-bit already cover the lever |
+| SCALE-style subspace optimizer | optimizer memory | optional future work; Muon+8-bit already cover the active memory lever |
 | Persistent/fused mega-kernel; simdgroup >1.29× | raw throughput | the big systems lever (RESEARCH_2026) |

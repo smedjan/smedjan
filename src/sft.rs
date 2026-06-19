@@ -1,8 +1,8 @@
 use crate::autograd;
 use crate::checkpoint;
-use crate::loss;
 use crate::gpu::compute;
 use crate::gpu::MetalContext;
+use crate::loss;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN};
@@ -47,7 +47,8 @@ impl SftDataset {
             let response_tokens = tokenizer.encode(&response);
 
             // Build full sequence: BOS + prompt_tokens + response_tokens + EOS
-            let mut tokens = Vec::with_capacity(1 + prompt_tokens.len() + response_tokens.len() + 1);
+            let mut tokens =
+                Vec::with_capacity(1 + prompt_tokens.len() + response_tokens.len() + 1);
             tokens.push(BOS_TOKEN);
             tokens.extend_from_slice(&prompt_tokens);
             let response_start = tokens.len(); // assistant response begins here
@@ -338,13 +339,24 @@ fn apply_loss_mask(
 
     // Zero out masked gradient rows entirely on GPU. No CPU roundtrip of the
     // large [positions * vocab] gradient buffer.
-    compute::gpu_gradient_mask(ctx, grad_logits, &mask_buf, total_positions as u32, vocab_size as u32);
+    compute::gpu_gradient_mask(
+        ctx,
+        grad_logits,
+        &mask_buf,
+        total_positions as u32,
+        vocab_size as u32,
+    );
 
     // Rescale unmasked rows: original CE divides by total_positions, we want
     // to divide by unmasked_count. Scale by total_positions / unmasked_count.
     if unmasked_count > 0 && unmasked_count != total_positions {
         let rescale = total_positions as f32 / unmasked_count as f32;
-        compute::gpu_scale(ctx, grad_logits, (total_positions * vocab_size) as u32, rescale);
+        compute::gpu_scale(
+            ctx,
+            grad_logits,
+            (total_positions * vocab_size) as u32,
+            rescale,
+        );
     }
 
     // Report fraction of unmasked positions for logging
@@ -356,8 +368,7 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
     eprintln!("=== AndreAI Supervised Fine-Tuning ===");
 
     // Load pre-trained checkpoint
-    let (model, pretrain_step) =
-        checkpoint::load_checkpoint(ctx, &config.checkpoint_path)?;
+    let (model, pretrain_step) = checkpoint::load_checkpoint(ctx, &config.checkpoint_path)?;
     eprintln!(
         "Loaded pre-trained model: step {}, {}M params, {} layers, d_model={}, {} heads",
         pretrain_step,
@@ -368,11 +379,9 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
     );
 
     // Load tokenizer and SFT dataset
-    let tokenizer =
-        BpeTokenizer::load(&config.tokenizer_path).expect("Failed to load tokenizer");
+    let tokenizer = BpeTokenizer::load(&config.tokenizer_path).expect("Failed to load tokenizer");
     let dataset = SftDataset::load(&config.data_path, &tokenizer)?;
-    let mut data_loader =
-        SftDataLoader::new(dataset, config.batch_size, config.seq_len);
+    let mut data_loader = SftDataLoader::new(dataset, config.batch_size, config.seq_len);
 
     eprintln!(
         "SFT: batch_size={}, seq_len={}, total_steps={}, lr={:.1e}",
@@ -391,11 +400,8 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
     let param_refs: Vec<&_> = model.parameters().into_iter().collect();
     let mut optimizer = AdamW::new(ctx, &param_refs, config.weight_decay);
 
-    let scheduler = CosineWarmupScheduler::new(
-        config.max_lr,
-        config.warmup_steps,
-        config.total_steps,
-    );
+    let scheduler =
+        CosineWarmupScheduler::new(config.max_lr, config.warmup_steps, config.total_steps);
 
     let vocab_size = model.config.vocab_size as usize;
     let mut total_tokens: u64 = 0;
@@ -419,8 +425,7 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         );
 
         // Cross-entropy loss on all positions (we mask gradients below)
-        let (loss_tensor, grad_logits) =
-            loss::cross_entropy_loss(ctx, &logits, &targets);
+        let (loss_tensor, grad_logits) = loss::cross_entropy_loss(ctx, &logits, &targets);
         ctx.flush_batch();
 
         // Apply loss mask: zero out gradients for prompt positions, rescale
@@ -573,11 +578,7 @@ pub fn generate_sft_dataset(input_path: &str, output_path: &str) -> std::io::Res
 }
 
 /// Write a single JSONL line with proper escaping.
-fn write_jsonl_line(
-    out: &mut std::fs::File,
-    prompt: &str,
-    response: &str,
-) -> std::io::Result<()> {
+fn write_jsonl_line(out: &mut std::fs::File, prompt: &str, response: &str) -> std::io::Result<()> {
     use std::io::Write;
     writeln!(
         out,
@@ -653,11 +654,17 @@ mod tests {
     fn test_extract_json_string_unicode_escape() {
         // Basic \uXXXX escape
         let json = r#"{"text": "caf\u00e9"}"#;
-        assert_eq!(extract_json_string(json, "text"), Some("caf\u{00e9}".to_string()));
+        assert_eq!(
+            extract_json_string(json, "text"),
+            Some("caf\u{00e9}".to_string())
+        );
 
         // Surrogate pair: U+1F600 (grinning face) = \uD83D\uDE00
         let json = r#"{"text": "hi \uD83D\uDE00"}"#;
-        assert_eq!(extract_json_string(json, "text"), Some("hi \u{1F600}".to_string()));
+        assert_eq!(
+            extract_json_string(json, "text"),
+            Some("hi \u{1F600}".to_string())
+        );
 
         // Malformed: incomplete hex digits
         let json = r#"{"text": "bad \u00z9"}"#;

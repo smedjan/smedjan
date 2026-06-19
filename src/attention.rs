@@ -47,10 +47,24 @@ pub enum AttnKind {
 /// trainable — it records an `Op::Reshape` passthrough, so no gradient flows through block selection
 /// and loss stays pinned at init. q/k/v: [bh, seq, hd] (expanded), seq % block == 0. Returns
 /// [bh, seq, hd].
-pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: usize, top_k: usize) -> Tensor {
-    assert_eq!(q.shape.len(), 3, "block_sparse_gather expects [bh, seq, hd]");
+pub fn block_sparse_gather_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    block: usize,
+    top_k: usize,
+) -> Tensor {
+    assert_eq!(
+        q.shape.len(),
+        3,
+        "block_sparse_gather expects [bh, seq, hd]"
+    );
     let (bh, seq, hd) = (q.shape[0], q.shape[1], q.shape[2]);
-    assert_eq!(seq % block, 0, "block_sparse_gather requires seq % block == 0");
+    assert_eq!(
+        seq % block,
+        0,
+        "block_sparse_gather requires seq % block == 0"
+    );
     let nb = seq / block;
     let k_sel = (top_k + 1).min(nb); // own block + up to top_k past; capped at nb
     let ctx = Arc::clone(&q.ctx);
@@ -72,7 +86,8 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
                 sel[base] = qb as u32; // own block
                 if qb > 0 && top_k > 0 {
                     let srow = (bh_i * nb + qb) * nb;
-                    let mut past: Vec<(usize, f32)> = (0..qb).map(|kb| (kb, block_scores[srow + kb])).collect();
+                    let mut past: Vec<(usize, f32)> =
+                        (0..qb).map(|kb| (kb, block_scores[srow + kb])).collect();
                     past.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     for (i, &(kb, _)) in past.iter().take(top_k).enumerate() {
                         sel[base + 1 + i] = kb as u32;
@@ -84,8 +99,12 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
     });
 
     let dims = compute::GatherDims {
-        bh: bh as u32, nb: nb as u32, seq: seq as u32, hd: hd as u32,
-        block: block as u32, k_sel: k_sel as u32,
+        bh: bh as u32,
+        nb: nb as u32,
+        seq: seq as u32,
+        hd: hd as u32,
+        block: block as u32,
+        k_sel: k_sel as u32,
     };
 
     // Gather + attention math are RECORDED (outside `no_grad`) so gradients flow:
@@ -98,10 +117,18 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
     let q_bnq = q.reshape(vec![bh * nb, block, hd]);
     let scale = 1.0 / (hd as f32).sqrt();
     let scores = q_bnq.batched_matmul_trans_b(&k_sel_t).scale(scale); // [bh*nb, block, sel_w]
-    // In-place causal mask sets out-of-causal/sentinel keys to -inf BEFORE softmax → ~0 weight and
-    // ~0 gradient there. Safe under autograd: softmax caches its own output for backward, and the
-    // upstream scale/matmul backwards read their inputs (q_bnq, k_sel_t), not this masked buffer.
-    compute::gpu_gather_causal_mask(&ctx, &scores.buffer, &sel_buf, (bh * nb) as u32, nb as u32, block as u32, k_sel as u32);
+                                                                      // In-place causal mask sets out-of-causal/sentinel keys to -inf BEFORE softmax → ~0 weight and
+                                                                      // ~0 gradient there. Safe under autograd: softmax caches its own output for backward, and the
+                                                                      // upstream scale/matmul backwards read their inputs (q_bnq, k_sel_t), not this masked buffer.
+    compute::gpu_gather_causal_mask(
+        &ctx,
+        &scores.buffer,
+        &sel_buf,
+        (bh * nb) as u32,
+        nb as u32,
+        block as u32,
+        k_sel as u32,
+    );
     let weights = scores.softmax();
     let out = weights.batched_matmul(&v_sel_t); // [bh*nb, block, hd]
     out.reshape(vec![bh, seq, hd])
@@ -110,9 +137,17 @@ pub fn block_sparse_gather_attention(q: &Tensor, k: &Tensor, v: &Tensor, block: 
 /// Gather selected source blocks into a compact [bh*nb, k_sel*block, hd] tensor, recording an
 /// `Op::GatherBlocks` tape entry (when recording) so the backward scatter-adds gradients back to
 /// `src`. `sel_buf` is the fixed routing permutation (computed non-differentiably by the caller).
-fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::BufU32, dims: compute::GatherDims) -> Tensor {
+fn gather_blocks_recorded(
+    src: &Tensor,
+    sel_buf: &crate::gpu::BufU32,
+    dims: compute::GatherDims,
+) -> Tensor {
     let (bh, nb, hd, block, k_sel) = (
-        dims.bh as usize, dims.nb as usize, dims.hd as usize, dims.block as usize, dims.k_sel as usize,
+        dims.bh as usize,
+        dims.nb as usize,
+        dims.hd as usize,
+        dims.block as usize,
+        dims.k_sel as usize,
     );
     let sel_w = k_sel * block;
     let out_buf = src.ctx.alloc_buffer(bh * nb * sel_w * hd * 4);
@@ -121,7 +156,12 @@ fn gather_blocks_recorded(src: &Tensor, sel_buf: &crate::gpu::BufU32, dims: comp
     if autograd::is_recording() {
         autograd::record(TapeEntry {
             op: Op::GatherBlocks {
-                bh: dims.bh, nb: dims.nb, seq: dims.seq, hd: dims.hd, block: dims.block, k_sel: dims.k_sel,
+                bh: dims.bh,
+                nb: dims.nb,
+                seq: dims.seq,
+                hd: dims.hd,
+                block: dims.block,
+                k_sel: dims.k_sel,
             },
             inputs: vec![src.id],
             output: out.id,
@@ -146,10 +186,10 @@ pub struct MultiHeadAttention {
     pub w_v: Tensor, // [d_model, kv_dim] or [d_model, rank]
     pub w_o: Tensor, // [d_model, d_model] or [d_model, rank]
     // Low-rank: W = U × V. These are the V matrices (U is stored in w_q/k/v/o above)
-    pub w_q_v: Tensor, // [rank, d_model]
-    pub w_k_v: Tensor, // [rank, kv_dim]
-    pub w_v_v: Tensor, // [rank, kv_dim]
-    pub w_o_v: Tensor, // [rank, d_model]
+    pub w_q_v: Tensor,    // [rank, d_model]
+    pub w_k_v: Tensor,    // [rank, kv_dim]
+    pub w_v_v: Tensor,    // [rank, kv_dim]
+    pub w_o_v: Tensor,    // [rank, d_model]
     pub attn_rank: usize, // 0 = full rank
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -159,14 +199,14 @@ pub struct MultiHeadAttention {
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
     pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
     pub attn_kind: AttnKind,    // Softmax (default), Linear, Ssm, or Rwkv
-    pub ssm_loga: Tensor,       // [d_model, n_heads] — SSM per-head decay-gate projection (used iff Ssm)
-    pub rwkv_w: Tensor,         // [head_dim] — RWKV per-channel decay (rate = exp(rwkv_w) > 0; used iff Rwkv)
-    pub rwkv_u: Tensor,         // [head_dim] — RWKV per-channel current-token bonus (used iff Rwkv)
-    pub mla_dc: usize,          // MLA latent dim d_c (0 = MLA off); used iff Mla
-    pub w_dkv: Tensor,          // [d_model, d_c] — MLA KV down-projection (its output is the cacheable latent)
-    pub w_uk: Tensor,           // [d_c, kv_dim] — MLA key up-projection
-    pub w_uv: Tensor,           // [d_c, kv_dim] — MLA value up-projection
-    pub block_size: usize,      // block-sparse attention block length (used iff BlockSparse)
+    pub ssm_loga: Tensor, // [d_model, n_heads] — SSM per-head decay-gate projection (used iff Ssm)
+    pub rwkv_w: Tensor, // [head_dim] — RWKV per-channel decay (rate = exp(rwkv_w) > 0; used iff Rwkv)
+    pub rwkv_u: Tensor, // [head_dim] — RWKV per-channel current-token bonus (used iff Rwkv)
+    pub mla_dc: usize,  // MLA latent dim d_c (0 = MLA off); used iff Mla
+    pub w_dkv: Tensor, // [d_model, d_c] — MLA KV down-projection (its output is the cacheable latent)
+    pub w_uk: Tensor,  // [d_c, kv_dim] — MLA key up-projection
+    pub w_uv: Tensor,  // [d_c, kv_dim] — MLA value up-projection
+    pub block_size: usize, // block-sparse attention block length (used iff BlockSparse)
     pub block_sparse_top_k: usize, // block-sparse attention: # past blocks attended per query (iff BlockSparse)
 }
 
@@ -185,17 +225,36 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new() -> Self {
-        Self { k: None, v: None, len: 0, capacity: 0, latent: None }
+        Self {
+            k: None,
+            v: None,
+            len: 0,
+            capacity: 0,
+            latent: None,
+        }
     }
 
     /// Create a pre-allocated KV cache with capacity for max_seq_len positions.
-    pub fn with_capacity(ctx: &Arc<MetalContext>, batch_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
+    pub fn with_capacity(
+        ctx: &Arc<MetalContext>,
+        batch_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+    ) -> Self {
         let total_floats = batch_heads * max_seq_len * head_dim;
         let k_buf = ctx.alloc_buffer(total_floats * 4);
         let v_buf = ctx.alloc_buffer(total_floats * 4);
         Self {
-            k: Some(Tensor::from_buffer(Arc::clone(ctx), k_buf, vec![batch_heads, max_seq_len, head_dim])),
-            v: Some(Tensor::from_buffer(Arc::clone(ctx), v_buf, vec![batch_heads, max_seq_len, head_dim])),
+            k: Some(Tensor::from_buffer(
+                Arc::clone(ctx),
+                k_buf,
+                vec![batch_heads, max_seq_len, head_dim],
+            )),
+            v: Some(Tensor::from_buffer(
+                Arc::clone(ctx),
+                v_buf,
+                vec![batch_heads, max_seq_len, head_dim],
+            )),
             len: 0,
             capacity: max_seq_len,
             latent: None,
@@ -213,16 +272,34 @@ impl KvCache {
     /// only looks at `[0..len]`. For legacy caches, we must also shrink
     /// the actual tensors.
     pub fn truncate(&mut self, new_len: usize) {
-        assert!(new_len <= self.len, "truncate: new_len {} > current len {}", new_len, self.len);
+        assert!(
+            new_len <= self.len,
+            "truncate: new_len {} > current len {}",
+            new_len,
+            self.len
+        );
         // MLA latent cache: keep the first new_len latent rows (it's the source of truth for the MLA
         // decode path, independent of the K/V buffers). Rebuild as a contiguous [batch, new_len, d_c].
         if let Some(lat) = self.latent.take() {
             if new_len == 0 {
                 self.latent = None;
             } else {
-                let (b, old, dc, lctx) = (lat.shape[0], lat.shape[1], lat.shape[2], Arc::clone(&lat.ctx));
+                let (b, old, dc, lctx) = (
+                    lat.shape[0],
+                    lat.shape[1],
+                    lat.shape[2],
+                    Arc::clone(&lat.ctx),
+                );
                 let buf = lctx.alloc_buffer(b * new_len * dc * 4);
-                compute::gpu_compact_strided_copy(&lctx, &lat.buffer, &buf, b as u32, new_len as u32, old as u32, dc as u32);
+                compute::gpu_compact_strided_copy(
+                    &lctx,
+                    &lat.buffer,
+                    &buf,
+                    b as u32,
+                    new_len as u32,
+                    old as u32,
+                    dc as u32,
+                );
                 self.latent = Some(Tensor::from_buffer(lctx, buf, vec![b, new_len, dc]));
             }
         }
@@ -249,16 +326,34 @@ impl KvCache {
 
                 // Copy [0..new_len] from old tensors (which have stride = old_len)
                 compute::gpu_compact_strided_copy(
-                    &ctx_clone, &self.k.as_ref().unwrap().buffer, &k_buf,
-                    bh as u32, new_len as u32, old_len as u32, head_dim as u32,
+                    &ctx_clone,
+                    &self.k.as_ref().unwrap().buffer,
+                    &k_buf,
+                    bh as u32,
+                    new_len as u32,
+                    old_len as u32,
+                    head_dim as u32,
                 );
                 compute::gpu_compact_strided_copy(
-                    &ctx_clone, &self.v.as_ref().unwrap().buffer, &v_buf,
-                    bh as u32, new_len as u32, old_len as u32, head_dim as u32,
+                    &ctx_clone,
+                    &self.v.as_ref().unwrap().buffer,
+                    &v_buf,
+                    bh as u32,
+                    new_len as u32,
+                    old_len as u32,
+                    head_dim as u32,
                 );
 
-                self.k = Some(Tensor::from_buffer(Arc::clone(&ctx_clone), k_buf, vec![bh, new_len, head_dim]));
-                self.v = Some(Tensor::from_buffer(ctx_clone, v_buf, vec![bh, new_len, head_dim]));
+                self.k = Some(Tensor::from_buffer(
+                    Arc::clone(&ctx_clone),
+                    k_buf,
+                    vec![bh, new_len, head_dim],
+                ));
+                self.v = Some(Tensor::from_buffer(
+                    ctx_clone,
+                    v_buf,
+                    vec![bh, new_len, head_dim],
+                ));
                 self.len = new_len;
             }
         }
@@ -266,12 +361,26 @@ impl KvCache {
 }
 
 impl MultiHeadAttention {
-    pub fn new(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32) -> Self {
+    pub fn new(
+        ctx: &Arc<MetalContext>,
+        d_model: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        rope_theta: f32,
+    ) -> Self {
         Self::new_with_rank(ctx, d_model, n_heads, n_kv_heads, rope_theta, 0)
     }
 
     /// Create attention with scaled-down random init. scale × normal init std.
-    pub fn new_scaled(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize, scale: f32) -> Self {
+    pub fn new_scaled(
+        ctx: &Arc<MetalContext>,
+        d_model: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        rope_theta: f32,
+        rank: usize,
+        scale: f32,
+    ) -> Self {
         let head_dim = d_model / n_heads;
         let kv_dim = head_dim * n_kv_heads;
         let z = || Tensor::zeros(ctx, vec![1]);
@@ -298,25 +407,54 @@ impl MultiHeadAttention {
                 Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
                 Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
                 Tensor::randn(ctx, vec![d_model, d_model], std_q),
-                z(), z(), z(), z(),
+                z(),
+                z(),
+                z(),
+                z(),
             )
         };
         Self {
-            w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
-            attn_rank: rank, n_heads, n_kv_heads, head_dim, d_model, rope_theta,
-            qk_norm_weight: Tensor::ones(ctx, vec![head_dim]), sliding_window: 0,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            w_q_v,
+            w_k_v,
+            w_v_v,
+            w_o_v,
+            attn_rank: rank,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            rope_theta,
+            qk_norm_weight: Tensor::ones(ctx, vec![head_dim]),
+            sliding_window: 0,
             attn_kind: AttnKind::Softmax,
-            ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt() * scale),
+            ssm_loga: Tensor::randn(
+                ctx,
+                vec![d_model, n_heads],
+                (1.0 / d_model as f32).sqrt() * scale,
+            ),
             rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
             mla_dc: 0,
-            w_dkv: z(), w_uk: z(), w_uv: z(),
+            w_dkv: z(),
+            w_uk: z(),
+            w_uv: z(),
             block_size: 64,
             block_sparse_top_k: 0,
         }
     }
 
-    pub fn new_with_rank(ctx: &Arc<MetalContext>, d_model: usize, n_heads: usize, n_kv_heads: usize, rope_theta: f32, rank: usize) -> Self {
+    pub fn new_with_rank(
+        ctx: &Arc<MetalContext>,
+        d_model: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        rope_theta: f32,
+        rank: usize,
+    ) -> Self {
         assert_eq!(d_model % n_heads, 0);
         assert!(n_kv_heads <= n_heads);
         assert_eq!(n_heads % n_kv_heads, 0);
@@ -330,14 +468,14 @@ impl MultiHeadAttention {
             let vq_std = (2.0 / (rank + d_model) as f32).sqrt();
             let vk_std = (2.0 / (rank + kv_dim) as f32).sqrt();
             (
-                Tensor::randn(ctx, vec![d_model, rank], u_std),      // Q_U
-                Tensor::randn(ctx, vec![d_model, rank], u_std),      // K_U
-                Tensor::randn(ctx, vec![d_model, rank], u_std),      // V_U
-                Tensor::randn(ctx, vec![d_model, rank], u_std),      // O_U
-                Tensor::randn(ctx, vec![rank, d_model], vq_std),     // Q_V
-                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),      // K_V
-                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),      // V_V
-                Tensor::randn(ctx, vec![rank, d_model], vq_std),     // O_V
+                Tensor::randn(ctx, vec![d_model, rank], u_std),  // Q_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),  // K_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),  // V_U
+                Tensor::randn(ctx, vec![d_model, rank], u_std),  // O_U
+                Tensor::randn(ctx, vec![rank, d_model], vq_std), // Q_V
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),  // K_V
+                Tensor::randn(ctx, vec![rank, kv_dim], vk_std),  // V_V
+                Tensor::randn(ctx, vec![rank, d_model], vq_std), // O_V
             )
         } else {
             let std_q = (2.0 / (d_model + d_model) as f32).sqrt();
@@ -347,23 +485,40 @@ impl MultiHeadAttention {
                 Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
                 Tensor::randn(ctx, vec![d_model, kv_dim], std_kv),
                 Tensor::randn(ctx, vec![d_model, d_model], std_q),
-                z(), z(), z(), z(),
+                z(),
+                z(),
+                z(),
+                z(),
             )
         };
 
         let qk_norm_weight = Tensor::ones(ctx, vec![head_dim]);
 
         Self {
-            w_q, w_k, w_v, w_o, w_q_v, w_k_v, w_v_v, w_o_v,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            w_q_v,
+            w_k_v,
+            w_v_v,
+            w_o_v,
             attn_rank: rank,
-            n_heads, n_kv_heads, head_dim, d_model, rope_theta,
-            qk_norm_weight, sliding_window: 0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            rope_theta,
+            qk_norm_weight,
+            sliding_window: 0,
             attn_kind: AttnKind::Softmax,
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt()),
             rwkv_w: Tensor::randn(ctx, vec![head_dim], 0.01),
             rwkv_u: Tensor::randn(ctx, vec![head_dim], 0.01),
             mla_dc: 0,
-            w_dkv: z(), w_uk: z(), w_uv: z(),
+            w_dkv: z(),
+            w_uk: z(),
+            w_uv: z(),
             block_size: 64,
             block_sparse_top_k: 0,
         }
@@ -374,7 +529,10 @@ impl MultiHeadAttention {
     /// (MLA replaces the K/V projections; combining with low-rank Q/V is unsupported here).
     pub fn enable_mla(&mut self, ctx: &Arc<MetalContext>, d_c: usize) {
         assert!(d_c > 0, "MLA latent dim must be > 0");
-        assert_eq!(self.attn_rank, 0, "MLA requires attn_rank == 0 (low-rank Q/V is unsupported with MLA)");
+        assert_eq!(
+            self.attn_rank, 0,
+            "MLA requires attn_rank == 0 (low-rank Q/V is unsupported with MLA)"
+        );
         let kv_dim = self.head_dim * self.n_kv_heads;
         let down_std = (2.0 / (self.d_model + d_c) as f32).sqrt();
         let up_std = (2.0 / (d_c + kv_dim) as f32).sqrt();
@@ -388,7 +546,10 @@ impl MultiHeadAttention {
     /// Enable block-sparse (MoBA/NSA-style) attention: each query attends to its own block + the
     /// top-k past blocks. Reuses the existing Q/K/V/O projections (no new params).
     pub fn enable_block_sparse(&mut self, top_k: usize, block_size: usize) {
-        assert!(top_k > 0 && block_size > 0, "block-sparse needs top_k>0 and block_size>0");
+        assert!(
+            top_k > 0 && block_size > 0,
+            "block-sparse needs top_k>0 and block_size>0"
+        );
         self.block_sparse_top_k = top_k;
         self.block_size = block_size;
         self.attn_kind = AttnKind::BlockSparse;
@@ -407,7 +568,9 @@ impl MultiHeadAttention {
         let x_flat = x.reshape(vec![batch * new_seq, d_model]);
 
         let q = x_flat.matmul(&self.w_q); // [batch*new_seq, n_heads*hd]
-        let c_new = x_flat.matmul(&self.w_dkv).reshape(vec![batch, new_seq, d_c]);
+        let c_new = x_flat
+            .matmul(&self.w_dkv)
+            .reshape(vec![batch, new_seq, d_c]);
 
         // Append c_new to the latent cache → c_all [batch, total, d_c].
         let old_len = cache.latent.as_ref().map_or(0, |c| c.shape[1]);
@@ -425,17 +588,44 @@ impl MultiHeadAttention {
         cache.len = total;
 
         // Transpose + RoPE: K at absolute positions 0..total, Q (new tokens) at old_len..total.
-        let q = fused_transpose_rope(&q, batch, new_seq, self.n_heads, hd, old_len as u32, self.rope_theta);
-        let k = fused_transpose_rope(&k_all, batch, total, self.n_kv_heads, hd, 0, self.rope_theta);
+        let q = fused_transpose_rope(
+            &q,
+            batch,
+            new_seq,
+            self.n_heads,
+            hd,
+            old_len as u32,
+            self.rope_theta,
+        );
+        let k = fused_transpose_rope(
+            &k_all,
+            batch,
+            total,
+            self.n_kv_heads,
+            hd,
+            0,
+            self.rope_theta,
+        );
         let v = transpose_bsh_to_bhs(&v_all, batch, total, self.n_kv_heads, hd);
-        let q = if self.d_model >= 512 { q.rms_norm(&self.qk_norm_weight, 1e-6) } else { q };
-        let k = if self.d_model >= 512 { k.rms_norm(&self.qk_norm_weight, 1e-6) } else { k };
+        let q = if self.d_model >= 512 {
+            q.rms_norm(&self.qk_norm_weight, 1e-6)
+        } else {
+            q
+        };
+        let k = if self.d_model >= 512 {
+            k.rms_norm(&self.qk_norm_weight, 1e-6)
+        } else {
+            k
+        };
 
         // GQA expand K/V heads to match Q heads.
         let group_size = self.n_heads / self.n_kv_heads;
         let bh_kv = batch * self.n_kv_heads;
         let (k, v) = if group_size > 1 {
-            (repeat_kv(&k, bh_kv, total, hd, group_size), repeat_kv(&v, bh_kv, total, hd, group_size))
+            (
+                repeat_kv(&k, bh_kv, total, hd, group_size),
+                repeat_kv(&v, bh_kv, total, hd, group_size),
+            )
         } else {
             (k, v)
         };
@@ -479,7 +669,11 @@ impl MultiHeadAttention {
             seg_ids.is_none()
                 || !matches!(
                     self.attn_kind,
-                    AttnKind::Linear | AttnKind::Ssm | AttnKind::Rwkv | AttnKind::BlockSparse | AttnKind::Mla
+                    AttnKind::Linear
+                        | AttnKind::Ssm
+                        | AttnKind::Rwkv
+                        | AttnKind::BlockSparse
+                        | AttnKind::Mla
                 ),
             "seq-packing (seg_ids) is only honored on the standard MHA/GQA dense path"
         );
@@ -533,15 +727,39 @@ impl MultiHeadAttention {
             Some(cache) => cache.cached_len() as u32,
             None => 0,
         };
-        let q = fused_transpose_rope(&q, batch, seq_len, self.n_heads, self.head_dim, offset, self.rope_theta);
-        let k = fused_transpose_rope(&k, batch, seq_len, self.n_kv_heads, self.head_dim, offset, self.rope_theta);
+        let q = fused_transpose_rope(
+            &q,
+            batch,
+            seq_len,
+            self.n_heads,
+            self.head_dim,
+            offset,
+            self.rope_theta,
+        );
+        let k = fused_transpose_rope(
+            &k,
+            batch,
+            seq_len,
+            self.n_kv_heads,
+            self.head_dim,
+            offset,
+            self.rope_theta,
+        );
         // V only needs transpose (no RoPE)
         let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
 
         // QK-norm: only at d_model≥512 where attention entropy collapse is a real risk.
         // At d<512, the overhead (~4% throughput) isn't worth it.
-        let q = if self.d_model >= 512 { q.rms_norm(&self.qk_norm_weight, 1e-6) } else { q };
-        let k = if self.d_model >= 512 { k.rms_norm(&self.qk_norm_weight, 1e-6) } else { k };
+        let q = if self.d_model >= 512 {
+            q.rms_norm(&self.qk_norm_weight, 1e-6)
+        } else {
+            q
+        };
+        let k = if self.d_model >= 512 {
+            k.rms_norm(&self.qk_norm_weight, 1e-6)
+        } else {
+            k
+        };
 
         // Handle KV cache (inference only — no tape needed)
         // Cache stores n_kv_heads, not n_heads
@@ -567,7 +785,12 @@ impl MultiHeadAttention {
         // Block-sparse needs the expanded K/V (block-mean + dense scores), so it's excluded too.
         // The strided GQA matmuls are a Metal-only kernel; CUDA falls back to the repeat_kv path.
         let use_gqa_strided = cfg!(feature = "metal")
-            && !linear && !ssm && !rwkv && !block_sparse && group_size > 1 && !autograd::is_recording();
+            && !linear
+            && !ssm
+            && !rwkv
+            && !block_sparse
+            && group_size > 1
+            && !autograd::is_recording();
 
         // For training or MHA: expand KV heads to match Q heads
         let (k_for_attn, v_for_attn) = if use_gqa_strided {
@@ -628,21 +851,40 @@ impl MultiHeadAttention {
             // on the step-level pool bypass in train.rs — a residual pooled-mode buffer aliasing in
             // the gather path makes the buffer pool corrupt its gradients; pooled-mode is a follow-up.
             if seq_q_len % self.block_size == 0 {
-                block_sparse_gather_attention(&q, &k_for_attn, &v_for_attn, self.block_size, self.block_sparse_top_k)
+                block_sparse_gather_attention(
+                    &q,
+                    &k_for_attn,
+                    &v_for_attn,
+                    self.block_size,
+                    self.block_sparse_top_k,
+                )
             } else {
                 let scale = 1.0 / (self.head_dim as f32).sqrt();
                 let block_means = k_for_attn.block_mean_keys(self.block_size); // [bh, nb, hd], no tape
-                let block_scores = q.batched_matmul_trans_b(&block_means);     // [bh, seq, nb]
+                let block_scores = q.batched_matmul_trans_b(&block_means); // [bh, seq, nb]
                 let scores = q.batched_matmul_trans_b(&k_for_attn).scale(scale); // [bh, seq, seq]
-                let masked = scores.block_sparse_mask(&block_scores, self.block_size, self.block_sparse_top_k);
+                let masked = scores.block_sparse_mask(
+                    &block_scores,
+                    self.block_size,
+                    self.block_sparse_top_k,
+                );
                 masked.softmax().batched_matmul(&v_for_attn)
             }
         } else if seq_q_len >= 2048 && !use_gqa_strided && seg_ids.is_none() {
             let attn_out_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_flash_attention_forward(
                 &q.ctx,
-                &q.buffer, &k_for_attn.buffer, &v_for_attn.buffer, &attn_out_buf,
-                compute::FlashDims { batch_heads: bh as u32, seq_q: seq_q_len as u32, seq_k: seq_k as u32, head_dim: self.head_dim as u32, kv_offset: offset },
+                &q.buffer,
+                &k_for_attn.buffer,
+                &v_for_attn.buffer,
+                &attn_out_buf,
+                compute::FlashDims {
+                    batch_heads: bh as u32,
+                    seq_q: seq_q_len as u32,
+                    seq_k: seq_k as u32,
+                    head_dim: self.head_dim as u32,
+                    kv_offset: offset,
+                },
             );
 
             let attn_out_id = autograd::next_id();
@@ -657,14 +899,26 @@ impl MultiHeadAttention {
             if autograd::is_recording() {
                 autograd::record(autograd::TapeEntry {
                     op: autograd::Op::FlashAttention {
-                        batch_heads: bh, seq_q: seq_q_len, seq_k, head_dim: self.head_dim, kv_offset: offset,
+                        batch_heads: bh,
+                        seq_q: seq_q_len,
+                        seq_k,
+                        head_dim: self.head_dim,
+                        kv_offset: offset,
                     },
                     inputs: vec![q.id, k_for_attn.id, v_for_attn.id],
                     output: attn_out_id,
-                    input_buffers: vec![q.buffer.clone(), k_for_attn.buffer.clone(), v_for_attn.buffer.clone()],
+                    input_buffers: vec![
+                        q.buffer.clone(),
+                        k_for_attn.buffer.clone(),
+                        v_for_attn.buffer.clone(),
+                    ],
                     output_buffer: attn_out_buf.clone(),
-                    shapes: vec![q.shape.clone(), k_for_attn.shape.clone(), v_for_attn.shape.clone(),
-                                 attn.shape.clone()],
+                    shapes: vec![
+                        q.shape.clone(),
+                        k_for_attn.shape.clone(),
+                        v_for_attn.shape.clone(),
+                        attn.shape.clone(),
+                    ],
                     cached: Some(attn_out_buf),
                 });
             }
@@ -674,10 +928,20 @@ impl MultiHeadAttention {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
             let scores_buf = q.ctx.alloc_buffer(bh * seq_q_len * seq_k * 4);
             compute::gpu_batched_matmul_gqa_trans_b(
-                &q.ctx, &q.buffer, &k_for_attn.buffer, &scores_buf,
-                compute::BatchedDims { batch: bh as u32, m: seq_q_len as u32, n: seq_k as u32, k: self.head_dim as u32 }, group_size as u32,
+                &q.ctx,
+                &q.buffer,
+                &k_for_attn.buffer,
+                &scores_buf,
+                compute::BatchedDims {
+                    batch: bh as u32,
+                    m: seq_q_len as u32,
+                    n: seq_k as u32,
+                    k: self.head_dim as u32,
+                },
+                group_size as u32,
             );
-            let scores = Tensor::from_buffer(Arc::clone(&q.ctx), scores_buf, vec![bh, seq_q_len, seq_k]);
+            let scores =
+                Tensor::from_buffer(Arc::clone(&q.ctx), scores_buf, vec![bh, seq_q_len, seq_k]);
             let scores = scores.scale(scale);
             let scores = if self.sliding_window > 0 {
                 scores.causal_mask_window(offset, self.sliding_window as u32)
@@ -687,10 +951,23 @@ impl MultiHeadAttention {
             let weights = scores.softmax();
             let attn_buf = q.ctx.alloc_buffer(bh * seq_q_len * self.head_dim * 4);
             compute::gpu_batched_matmul_gqa(
-                &q.ctx, &weights.buffer, &v_for_attn.buffer, &attn_buf,
-                compute::BatchedDims { batch: bh as u32, m: seq_q_len as u32, n: self.head_dim as u32, k: seq_k as u32 }, group_size as u32,
+                &q.ctx,
+                &weights.buffer,
+                &v_for_attn.buffer,
+                &attn_buf,
+                compute::BatchedDims {
+                    batch: bh as u32,
+                    m: seq_q_len as u32,
+                    n: self.head_dim as u32,
+                    k: seq_k as u32,
+                },
+                group_size as u32,
             );
-            Tensor::from_buffer(Arc::clone(&q.ctx), attn_buf, vec![bh, seq_q_len, self.head_dim])
+            Tensor::from_buffer(
+                Arc::clone(&q.ctx),
+                attn_buf,
+                vec![bh, seq_q_len, self.head_dim],
+            )
         } else {
             // Fused scale+mask+softmax: 1 dispatch instead of 3
             let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -699,7 +976,10 @@ impl MultiHeadAttention {
                 // Packed varlen (training/prefill, offset 0): causal + per-document mask keeps
                 // attention inside each packed sequence. Falls back here (not the fused kernel)
                 // because the doc mask needs the explicit [bh, seq, seq] scores.
-                scores.scale(scale).causal_doc_mask(seg, self.n_heads).softmax()
+                scores
+                    .scale(scale)
+                    .causal_doc_mask(seg, self.n_heads)
+                    .softmax()
             } else if self.sliding_window > 0 {
                 // Windowed attention can't use fused kernel — fall back to separate ops
                 let scores = scores.scale(scale);
@@ -712,7 +992,8 @@ impl MultiHeadAttention {
         };
 
         // Transpose [bh, seq, head_dim] back to [batch*seq, d_model]
-        let attn_combined = transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
+        let attn_combined =
+            transpose_bhs_to_bsh(&attn_cat, batch, seq_len, self.n_heads, self.head_dim);
 
         // Output projection
         let out = if self.attn_rank > 0 {
@@ -729,13 +1010,25 @@ impl MultiHeadAttention {
             // MLA: Q/O projections + QK-norm + the latent down/up projections. The direct w_k/w_v
             // are unused (K,V come from the latent), so they are NOT trained or checkpointed.
             return vec![
-                &self.w_q, &self.w_o, &self.qk_norm_weight,
-                &self.w_dkv, &self.w_uk, &self.w_uv,
+                &self.w_q,
+                &self.w_o,
+                &self.qk_norm_weight,
+                &self.w_dkv,
+                &self.w_uk,
+                &self.w_uv,
             ];
         }
         let mut params = if self.attn_rank > 0 {
-            vec![&self.w_q, &self.w_q_v, &self.w_k, &self.w_k_v,
-                 &self.w_v, &self.w_v_v, &self.w_o, &self.w_o_v]
+            vec![
+                &self.w_q,
+                &self.w_q_v,
+                &self.w_k,
+                &self.w_k_v,
+                &self.w_v,
+                &self.w_v_v,
+                &self.w_o,
+                &self.w_o_v,
+            ]
         } else {
             vec![&self.w_q, &self.w_k, &self.w_v, &self.w_o]
         };
@@ -769,8 +1062,17 @@ pub(crate) fn fused_transpose_rope(
     let out_buf = t.ctx.alloc_buffer(size * 4);
 
     compute::gpu_transpose_rope(
-        &t.ctx, &t.buffer, &out_buf,
-        compute::TrRopeDims { batch: batch as u32, seq: seq_len as u32, n_heads: n_heads as u32, head_dim: head_dim as u32, offset, theta },
+        &t.ctx,
+        &t.buffer,
+        &out_buf,
+        compute::TrRopeDims {
+            batch: batch as u32,
+            seq: seq_len as u32,
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            offset,
+            theta,
+        },
     );
 
     let out_id = autograd::next_id();
@@ -784,7 +1086,14 @@ pub(crate) fn fused_transpose_rope(
 
     if t.requires_grad || autograd::is_recording() {
         autograd::record(TapeEntry {
-            op: Op::TransposeRoPE { batch, seq_len, n_heads, head_dim, offset, theta },
+            op: Op::TransposeRoPE {
+                batch,
+                seq_len,
+                n_heads,
+                head_dim,
+                offset,
+                theta,
+            },
             inputs: vec![t.id],
             output: out_id,
             input_buffers: vec![t.buffer.clone()],
@@ -920,16 +1229,38 @@ fn update_kv_cache(
         let v_cache = cache.v.as_ref().expect("pre-allocated cache must have v");
         let old_len = cache.len;
         let total_len = old_len + new_len;
-        assert!(total_len <= cache.capacity, "KV cache overflow: {} + {} > {}", old_len, new_len, cache.capacity);
+        assert!(
+            total_len <= cache.capacity,
+            "KV cache overflow: {} + {} > {}",
+            old_len,
+            new_len,
+            cache.capacity
+        );
 
         // Copy new K, V into cache at offset = old_len (single batched dispatch per tensor)
         compute::gpu_strided_batch_copy(
-            &k_cache.ctx, &k_new.buffer, &k_cache.buffer,
-            compute::StridedCopyDims { bh: bh as u32, src_seq_len: new_len as u32, dst_stride: cache.capacity as u32, dst_offset: old_len as u32, dim: head_dim as u32 },
+            &k_cache.ctx,
+            &k_new.buffer,
+            &k_cache.buffer,
+            compute::StridedCopyDims {
+                bh: bh as u32,
+                src_seq_len: new_len as u32,
+                dst_stride: cache.capacity as u32,
+                dst_offset: old_len as u32,
+                dim: head_dim as u32,
+            },
         );
         compute::gpu_strided_batch_copy(
-            &v_cache.ctx, &v_new.buffer, &v_cache.buffer,
-            compute::StridedCopyDims { bh: bh as u32, src_seq_len: new_len as u32, dst_stride: cache.capacity as u32, dst_offset: old_len as u32, dim: head_dim as u32 },
+            &v_cache.ctx,
+            &v_new.buffer,
+            &v_cache.buffer,
+            compute::StridedCopyDims {
+                bh: bh as u32,
+                src_seq_len: new_len as u32,
+                dst_stride: cache.capacity as u32,
+                dst_offset: old_len as u32,
+                dim: head_dim as u32,
+            },
         );
 
         cache.len = total_len;
@@ -940,16 +1271,34 @@ fn update_kv_cache(
         let k_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
         let v_view_buf = k_cache.ctx.alloc_buffer(bh * total_len * head_dim * 4);
         compute::gpu_compact_strided_copy(
-            &k_cache.ctx, &k_cache.buffer, &k_view_buf,
-            bh as u32, total_len as u32, cache.capacity as u32, head_dim as u32,
+            &k_cache.ctx,
+            &k_cache.buffer,
+            &k_view_buf,
+            bh as u32,
+            total_len as u32,
+            cache.capacity as u32,
+            head_dim as u32,
         );
         compute::gpu_compact_strided_copy(
-            &v_cache.ctx, &v_cache.buffer, &v_view_buf,
-            bh as u32, total_len as u32, cache.capacity as u32, head_dim as u32,
+            &v_cache.ctx,
+            &v_cache.buffer,
+            &v_view_buf,
+            bh as u32,
+            total_len as u32,
+            cache.capacity as u32,
+            head_dim as u32,
         );
 
-        let k_full = Tensor::from_buffer(Arc::clone(&k_cache.ctx), k_view_buf, vec![bh, total_len, head_dim]);
-        let v_full = Tensor::from_buffer(Arc::clone(&v_cache.ctx), v_view_buf, vec![bh, total_len, head_dim]);
+        let k_full = Tensor::from_buffer(
+            Arc::clone(&k_cache.ctx),
+            k_view_buf,
+            vec![bh, total_len, head_dim],
+        );
+        let v_full = Tensor::from_buffer(
+            Arc::clone(&v_cache.ctx),
+            v_view_buf,
+            vec![bh, total_len, head_dim],
+        );
         (k_full, v_full)
     } else {
         // Legacy path: concat and reallocate (used when cache was created with new())
@@ -978,26 +1327,35 @@ fn update_kv_cache(
 
 /// Concatenate along sequence dimension: [bh, len_a, dim] + [bh, len_b, dim] → [bh, len_a+len_b, dim]
 /// GPU-resident — no CPU roundtrip via to_vec().
-fn concat_seq(
-    a: &Tensor,
-    b: &Tensor,
-    bh: usize,
-    len_a: usize,
-    len_b: usize,
-    dim: usize,
-) -> Tensor {
+fn concat_seq(a: &Tensor, b: &Tensor, bh: usize, len_a: usize, len_b: usize, dim: usize) -> Tensor {
     let total_len = len_a + len_b;
     let out_buf = a.ctx.alloc_buffer(bh * total_len * dim * 4);
 
     // Copy a's data: src [bh, len_a, dim] → dst [bh, total_len, dim] at offset 0
     compute::gpu_strided_batch_copy(
-        &a.ctx, &a.buffer, &out_buf,
-        compute::StridedCopyDims { bh: bh as u32, src_seq_len: len_a as u32, dst_stride: total_len as u32, dst_offset: 0, dim: dim as u32 },
+        &a.ctx,
+        &a.buffer,
+        &out_buf,
+        compute::StridedCopyDims {
+            bh: bh as u32,
+            src_seq_len: len_a as u32,
+            dst_stride: total_len as u32,
+            dst_offset: 0,
+            dim: dim as u32,
+        },
     );
     // Copy b's data: src [bh, len_b, dim] → dst [bh, total_len, dim] at offset len_a
     compute::gpu_strided_batch_copy(
-        &a.ctx, &b.buffer, &out_buf,
-        compute::StridedCopyDims { bh: bh as u32, src_seq_len: len_b as u32, dst_stride: total_len as u32, dst_offset: len_a as u32, dim: dim as u32 },
+        &a.ctx,
+        &b.buffer,
+        &out_buf,
+        compute::StridedCopyDims {
+            bh: bh as u32,
+            src_seq_len: len_b as u32,
+            dst_stride: total_len as u32,
+            dst_offset: len_a as u32,
+            dim: dim as u32,
+        },
     );
 
     Tensor::from_buffer(Arc::clone(&a.ctx), out_buf, vec![bh, total_len, dim])
@@ -1024,8 +1382,13 @@ pub fn repeat_kv(
     let out_buf = kv.ctx.alloc_buffer(n_heads_total * head_block * 4);
 
     compute::gpu_repeat_kv(
-        &kv.ctx, &kv.buffer, &out_buf,
-        n_kv_total as u32, group_size as u32, seq_len as u32, head_dim as u32,
+        &kv.ctx,
+        &kv.buffer,
+        &out_buf,
+        n_kv_total as u32,
+        group_size as u32,
+        seq_len as u32,
+        head_dim as u32,
     );
 
     let out_id = autograd::next_id();
@@ -1040,7 +1403,12 @@ pub fn repeat_kv(
     // Record on tape: backward sums group_size gradient blocks into each KV head
     if kv.requires_grad || autograd::is_recording() {
         autograd::record(autograd::TapeEntry {
-            op: autograd::Op::RepeatKv { n_kv_heads: n_kv_total, group_size, seq_len, head_dim },
+            op: autograd::Op::RepeatKv {
+                n_kv_heads: n_kv_total,
+                group_size,
+                seq_len,
+                head_dim,
+            },
             inputs: vec![kv.id],
             output: out_id,
             input_buffers: vec![kv.buffer.clone()],

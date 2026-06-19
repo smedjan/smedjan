@@ -12,30 +12,30 @@ pub struct ModelConfig {
     pub vocab_size: u32,
     pub d_model: usize,
     pub n_heads: usize,
-    pub n_kv_heads: usize,    // GQA: number of key/value heads (n_kv_heads <= n_heads)
+    pub n_kv_heads: usize, // GQA: number of key/value heads (n_kv_heads <= n_heads)
     pub n_layers: usize,
-    pub ffn_multiplier: f32,  // FFN hidden dim = d_model * ffn_multiplier, rounded to multiple of 256
+    pub ffn_multiplier: f32, // FFN hidden dim = d_model * ffn_multiplier, rounded to multiple of 256
     pub max_seq_len: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
     pub n_experts: usize,     // MoE: number of expert FFNs (1 = dense, >1 = MoE)
     pub top_k_experts: usize, // MoE: how many experts active per token (typically 1 or 2)
     pub mup_base_width: usize, // μP: base model width for HP transfer (0 = disabled)
-    pub bitnet: bool,          // BitNet: use ternary weights in FFN (no float multiply)
-    pub lowrank: usize,        // Low-rank training: 0=full rank, >0=rank for FFN decomposition
-    pub shared_layers: bool,   // ALBERT: share weights across all layers (1 unique layer, N iterations)
-    pub n_predict: usize,      // Multi-token prediction: 0=standard, N=predict next N+1 tokens (Meta 2024)
+    pub bitnet: bool,         // BitNet: use ternary weights in FFN (no float multiply)
+    pub lowrank: usize,       // Low-rank training: 0=full rank, >0=rank for FFN decomposition
+    pub shared_layers: bool, // ALBERT: share weights across all layers (1 unique layer, N iterations)
+    pub n_predict: usize, // Multi-token prediction: 0=standard, N=predict next N+1 tokens (Meta 2024)
     pub stochastic_depth: f32, // Layer drop rate: 0.0=off, 0.1=10% max drop rate for deepest layer
     pub sliding_window: usize, // Sliding window attention: 0=full causal, >0=window size. Saves O(n²)→O(n*w) memory.
     pub fp16_activations: bool, // Store inter-layer activations in FP16 during forward. Halves activation memory.
-    pub linear_attn: bool,     // Replace softmax attention with O(N) linear (kernel) attention in EVERY block.
+    pub linear_attn: bool, // Replace softmax attention with O(N) linear (kernel) attention in EVERY block.
     pub linear_attn_period: usize, // Hybrid topology: if >0, every Nth layer (idx+1 % N == 0) is linear, the
-                               // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
-    pub ssm: bool,             // Use the selective state-space (Mamba-2/SSD) mixer in every block.
-    pub rwkv: bool,            // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
+    // rest softmax — e.g. 4 → "3 transformer : 1 linear". 0 = use linear_attn flag.
+    pub ssm: bool,  // Use the selective state-space (Mamba-2/SSD) mixer in every block.
+    pub rwkv: bool, // Use the RWKV-style time-mix (per-channel WKV + receptance) in every block.
     pub mla_latent_dim: usize, // Multi-head Latent Attention: KV latent dim d_c (0=off). 10-50× KV-cache shrink.
     pub block_sparse_top_k: usize, // Block-sparse attention: # past blocks attended per query (0=off).
-    pub block_size: usize,     // Block-sparse attention block length (default 64).
+    pub block_size: usize,         // Block-sparse attention block length (default 64).
 }
 
 /// Mixture-of-experts spec for [`ModelConfig::custom_moe`].
@@ -70,7 +70,15 @@ impl ModelConfig {
         ffn_multiplier: f32,
         max_seq_len: usize,
     ) -> Self {
-        Self::custom_gqa(vocab_size, d_model, n_heads, n_heads, n_layers, ffn_multiplier, max_seq_len)
+        Self::custom_gqa(
+            vocab_size,
+            d_model,
+            n_heads,
+            n_heads,
+            n_layers,
+            ffn_multiplier,
+            max_seq_len,
+        )
     }
 
     /// Build a config with Grouped Query Attention.
@@ -85,9 +93,20 @@ impl ModelConfig {
         max_seq_len: usize,
     ) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model must be divisible by n_heads");
-        assert!(n_kv_heads <= n_heads, "n_kv_heads ({}) must be <= n_heads ({})", n_kv_heads, n_heads);
+        assert!(
+            n_kv_heads <= n_heads,
+            "n_kv_heads ({}) must be <= n_heads ({})",
+            n_kv_heads,
+            n_heads
+        );
         assert!(n_kv_heads > 0, "n_kv_heads must be > 0");
-        assert_eq!(n_heads % n_kv_heads, 0, "n_heads ({}) must be divisible by n_kv_heads ({})", n_heads, n_kv_heads);
+        assert_eq!(
+            n_heads % n_kv_heads,
+            0,
+            "n_heads ({}) must be divisible by n_kv_heads ({})",
+            n_heads,
+            n_kv_heads
+        );
         Self {
             vocab_size,
             d_model,
@@ -149,7 +168,12 @@ impl ModelConfig {
     /// Add a mixture-of-experts spec to a base config (e.g. one from [`Self::custom_gqa`]).
     pub fn custom_moe(mut config: ModelConfig, moe: MoeSpec) -> Self {
         assert!(moe.n_experts > 0, "n_experts must be > 0");
-        assert!(moe.top_k_experts <= moe.n_experts, "top_k ({}) must be <= n_experts ({})", moe.top_k_experts, moe.n_experts);
+        assert!(
+            moe.top_k_experts <= moe.n_experts,
+            "top_k ({}) must be <= n_experts ({})",
+            moe.top_k_experts,
+            moe.n_experts
+        );
         config.n_experts = moe.n_experts;
         config.top_k_experts = moe.top_k_experts;
         config
@@ -242,7 +266,9 @@ impl ModelConfig {
             let ff = self.d_ff();
             let n_unique = if self.shared_layers { 1 } else { self.n_layers };
             n_unique * 3 * d * ff * 4 // 3 base FFN matrices × f32
-        } else { 0 };
+        } else {
+            0
+        };
         trainable + frozen
     }
 
@@ -254,7 +280,9 @@ impl ModelConfig {
             let ff = self.d_ff();
             let n_unique = if self.shared_layers { 1 } else { self.n_layers };
             n_unique * 3 * d * ff * 4
-        } else { 0 };
+        } else {
+            0
+        };
         trainable + frozen
     }
 
@@ -263,7 +291,11 @@ impl ModelConfig {
         let gqa_info = if self.n_kv_heads == self.n_heads {
             String::new()
         } else {
-            format!(", n_kv_heads={}, group_size={}", self.n_kv_heads, self.n_heads / self.n_kv_heads)
+            format!(
+                ", n_kv_heads={}, group_size={}",
+                self.n_kv_heads,
+                self.n_heads / self.n_kv_heads
+            )
         };
         format!(
             "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
@@ -291,9 +323,9 @@ impl ModelConfig {
 
 /// Expert FFN weights for Mixture of Experts.
 pub struct ExpertFFN {
-    pub w1: Tensor,  // [d_model, d_ff] — gate projection
-    pub w2: Tensor,  // [d_ff, d_model] — down projection
-    pub w3: Tensor,  // [d_model, d_ff] — up projection
+    pub w1: Tensor, // [d_model, d_ff] — gate projection
+    pub w2: Tensor, // [d_ff, d_model] — down projection
+    pub w3: Tensor, // [d_model, d_ff] — up projection
 }
 
 /// A single transformer block (pre-norm architecture).
@@ -301,23 +333,28 @@ pub struct ExpertFFN {
 pub struct TransformerBlock {
     pub attn: MultiHeadAttention,
     // Dense FFN (used when n_experts == 1)
-    pub ffn_w1: Tensor,     // [d_model, d_ff] — gate projection
-    pub ffn_w2: Tensor,     // [d_ff, d_model] — down projection
-    pub ffn_w3: Tensor,     // [d_model, d_ff] — up projection
+    pub ffn_w1: Tensor, // [d_model, d_ff] — gate projection
+    pub ffn_w2: Tensor, // [d_ff, d_model] — down projection
+    pub ffn_w3: Tensor, // [d_model, d_ff] — up projection
     // MoE (used when n_experts > 1)
-    pub experts: Vec<ExpertFFN>,   // n_experts FFN blocks
-    pub router_weight: Tensor,     // [d_model, n_experts] — router logits
-    pub router_bias: Vec<f32>,     // [n_experts] — bias-based load balancing (DeepSeek-V3)
+    pub experts: Vec<ExpertFFN>, // n_experts FFN blocks
+    pub router_weight: Tensor,   // [d_model, n_experts] — router logits
+    pub router_bias: Vec<f32>,   // [n_experts] — bias-based load balancing (DeepSeek-V3)
     pub n_experts: usize,
     pub top_k: usize,
     pub bitnet: bool,
     // Low-rank FFN decomposition: W_effective = W_base + U × V (when lowrank > 0)
     // Base weights are frozen (not in parameters()). Only U/V are trained.
     // ReLoRA merge: W_base += U @ V, then reinit U/V for rank growth.
-    pub ffn_w1_base: Tensor, pub ffn_w2_base: Tensor, pub ffn_w3_base: Tensor,
-    pub ffn_w1_u: Tensor, pub ffn_w1_v: Tensor, // gate adapter: [d, r] × [r, ff]
-    pub ffn_w2_u: Tensor, pub ffn_w2_v: Tensor, // down adapter: [ff, r] × [r, d]
-    pub ffn_w3_u: Tensor, pub ffn_w3_v: Tensor, // up adapter:   [d, r] × [r, ff]
+    pub ffn_w1_base: Tensor,
+    pub ffn_w2_base: Tensor,
+    pub ffn_w3_base: Tensor,
+    pub ffn_w1_u: Tensor,
+    pub ffn_w1_v: Tensor, // gate adapter: [d, r] × [r, ff]
+    pub ffn_w2_u: Tensor,
+    pub ffn_w2_v: Tensor, // down adapter: [ff, r] × [r, d]
+    pub ffn_w3_u: Tensor,
+    pub ffn_w3_v: Tensor, // up adapter:   [d, r] × [r, ff]
     pub lowrank: usize,
     pub ln1_weight: Tensor, // [d_model] — attention norm
     pub ln2_weight: Tensor, // [d_model] — ffn norm
@@ -337,16 +374,20 @@ impl TransformerBlock {
         // Scale init std by layer depth for deeper models (GPT-style 1/sqrt(2*N) scaling)
         let depth_scale = if config.n_layers > 1 {
             1.0 / (1.0 + layer_idx as f32 / config.n_layers as f32).sqrt()
-        } else { 1.0 };
+        } else {
+            1.0
+        };
         let down_std = (2.0 / (ff + d) as f32).sqrt() * residual_scale * depth_scale;
 
         // Create expert FFNs for MoE (empty vec for dense)
         let experts = if config.n_experts > 1 {
-            (0..config.n_experts).map(|_| ExpertFFN {
-                w1: Tensor::randn(ctx, vec![d, ff], ff_std),
-                w2: Tensor::randn(ctx, vec![ff, d], down_std),
-                w3: Tensor::randn(ctx, vec![d, ff], ff_std),
-            }).collect()
+            (0..config.n_experts)
+                .map(|_| ExpertFFN {
+                    w1: Tensor::randn(ctx, vec![d, ff], ff_std),
+                    w2: Tensor::randn(ctx, vec![ff, d], down_std),
+                    w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -389,12 +430,20 @@ impl TransformerBlock {
             (z(), z(), z(), z(), z(), z(), z(), z(), z())
         };
 
-        let mut attn = MultiHeadAttention::new_with_rank(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank);
+        let mut attn = MultiHeadAttention::new_with_rank(
+            ctx,
+            d,
+            config.n_heads,
+            config.n_kv_heads,
+            config.rope_theta,
+            config.lowrank,
+        );
         attn.sliding_window = config.sliding_window;
         // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
-            || (config.linear_attn_period > 0 && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
+            || (config.linear_attn_period > 0
+                && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
         if config.rwkv {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
@@ -412,10 +461,15 @@ impl TransformerBlock {
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
-            ffn_w1_base: w1_base, ffn_w2_base: w2_base, ffn_w3_base: w3_base,
-            ffn_w1_u: w1u, ffn_w1_v: w1v,
-            ffn_w2_u: w2u, ffn_w2_v: w2v,
-            ffn_w3_u: w3u, ffn_w3_v: w3v,
+            ffn_w1_base: w1_base,
+            ffn_w2_base: w2_base,
+            ffn_w3_base: w3_base,
+            ffn_w1_u: w1u,
+            ffn_w1_v: w1v,
+            ffn_w2_u: w2u,
+            ffn_w2_v: w2v,
+            ffn_w3_u: w3u,
+            ffn_w3_v: w3v,
             lowrank: r,
             experts,
             router_weight,
@@ -432,7 +486,12 @@ impl TransformerBlock {
     }
 
     /// Create a block with scaled-down random init. scale × normal init std.
-    pub fn new_scaled(ctx: &Arc<MetalContext>, config: &ModelConfig, layer_idx: usize, scale: f32) -> Self {
+    pub fn new_scaled(
+        ctx: &Arc<MetalContext>,
+        config: &ModelConfig,
+        layer_idx: usize,
+        scale: f32,
+    ) -> Self {
         let d = config.d_model;
         let ff = config.d_ff();
         let r = config.lowrank;
@@ -442,7 +501,9 @@ impl TransformerBlock {
         let ff_std = (2.0 / (d + ff) as f32).sqrt() * rs;
         let depth_scale = if config.n_layers > 1 {
             1.0 / (1.0 + layer_idx as f32 / config.n_layers as f32).sqrt()
-        } else { 1.0 };
+        } else {
+            1.0
+        };
         let down_std = (2.0 / (ff + d) as f32).sqrt() * rs * depth_scale;
 
         let (w1_base, w2_base, w3_base, w1u, w1v, w2u, w2v, w3u, w3v) = if r > 0 {
@@ -452,20 +513,32 @@ impl TransformerBlock {
                 Tensor::randn(ctx, vec![d, ff], ff_std),
                 Tensor::randn(ctx, vec![ff, d], down_std),
                 Tensor::randn(ctx, vec![d, ff], ff_std),
-                Tensor::randn(ctx, vec![d, r], u_std), Tensor::zeros(ctx, vec![r, ff]),
-                Tensor::randn(ctx, vec![ff, r], d_u_std), Tensor::zeros(ctx, vec![r, d]),
-                Tensor::randn(ctx, vec![d, r], u_std), Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::randn(ctx, vec![d, r], u_std),
+                Tensor::zeros(ctx, vec![r, ff]),
+                Tensor::randn(ctx, vec![ff, r], d_u_std),
+                Tensor::zeros(ctx, vec![r, d]),
+                Tensor::randn(ctx, vec![d, r], u_std),
+                Tensor::zeros(ctx, vec![r, ff]),
             )
         } else {
             (z(), z(), z(), z(), z(), z(), z(), z(), z())
         };
 
-        let mut attn = MultiHeadAttention::new_scaled(ctx, d, config.n_heads, config.n_kv_heads, config.rope_theta, config.lowrank, scale);
+        let mut attn = MultiHeadAttention::new_scaled(
+            ctx,
+            d,
+            config.n_heads,
+            config.n_kv_heads,
+            config.rope_theta,
+            config.lowrank,
+            scale,
+        );
         attn.sliding_window = config.sliding_window;
         // Per-layer hybrid topology: a layer is linear if linear_attn is set (all layers), or it
         // falls on the linear_attn_period cadence (e.g. period 4 → every 4th layer linear).
         let layer_is_linear = config.linear_attn
-            || (config.linear_attn_period > 0 && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
+            || (config.linear_attn_period > 0
+                && (layer_idx + 1).is_multiple_of(config.linear_attn_period));
         if config.rwkv {
             attn.attn_kind = crate::attention::AttnKind::Rwkv;
         } else if config.ssm {
@@ -483,10 +556,15 @@ impl TransformerBlock {
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
             ffn_w2: Tensor::randn(ctx, vec![ff, d], down_std),
             ffn_w3: Tensor::randn(ctx, vec![d, ff], ff_std),
-            ffn_w1_base: w1_base, ffn_w2_base: w2_base, ffn_w3_base: w3_base,
-            ffn_w1_u: w1u, ffn_w1_v: w1v,
-            ffn_w2_u: w2u, ffn_w2_v: w2v,
-            ffn_w3_u: w3u, ffn_w3_v: w3v,
+            ffn_w1_base: w1_base,
+            ffn_w2_base: w2_base,
+            ffn_w3_base: w3_base,
+            ffn_w1_u: w1u,
+            ffn_w1_v: w1v,
+            ffn_w2_u: w2u,
+            ffn_w2_v: w2v,
+            ffn_w3_u: w3u,
+            ffn_w3_v: w3v,
             lowrank: r,
             experts: Vec::new(),
             router_weight: z(),
@@ -541,7 +619,8 @@ impl TransformerBlock {
             // Full block computation
             let normed = x.rms_norm(&self.ln1_weight, self.norm_eps);
             let attn_out = self.attn.forward_seg(&normed, kv_cache, seg_ids);
-            let (normed2, h) = attn_out.rms_norm_residual_with_sum(x, &self.ln2_weight, self.norm_eps);
+            let (normed2, h) =
+                attn_out.rms_norm_residual_with_sum(x, &self.ln2_weight, self.norm_eps);
             let ffn_out = if self.n_experts > 1 {
                 self.moe_ffn(&normed2, batch, seq_len, d)
             } else {
@@ -567,8 +646,12 @@ impl TransformerBlock {
         // Only active for small batches (≤8 tokens) where dispatch overhead dominates.
         // The fused norm+FFN megakernel is a hand-written Metal optimization; the CUDA
         // backend has no such kernel, so there it falls back to the primitive FFN path.
-        let use_mega = cfg!(feature = "metal") && self.lowrank == 0 && self.n_experts <= 1 && !self.bitnet
-            && d <= 256 && self.ffn_w1.shape[1] <= 1024
+        let use_mega = cfg!(feature = "metal")
+            && self.lowrank == 0
+            && self.n_experts <= 1
+            && !self.bitnet
+            && d <= 256
+            && self.ffn_w1.shape[1] <= 1024
             && batch * seq_len <= 8
             && !autograd::is_recording();
 
@@ -579,9 +662,21 @@ impl TransformerBlock {
             let out_buf = x.ctx.alloc_buffer(n_tokens * d * 4);
             let h_flat = h.reshape(vec![n_tokens, d]);
             compute::gpu_mega_ffn(
-                &x.ctx, &h_flat.buffer, &self.ln2_weight.buffer,
-                compute::FfnWeights { w1: &self.ffn_w1.buffer, w2: &self.ffn_w2.buffer, w3: &self.ffn_w3.buffer },
-                &out_buf, compute::MegaFfnDims { batch_tokens: n_tokens as u32, d_model: d as u32, d_ff: ff as u32, eps: self.norm_eps },
+                &x.ctx,
+                &h_flat.buffer,
+                &self.ln2_weight.buffer,
+                compute::FfnWeights {
+                    w1: &self.ffn_w1.buffer,
+                    w2: &self.ffn_w2.buffer,
+                    w3: &self.ffn_w3.buffer,
+                },
+                &out_buf,
+                compute::MegaFfnDims {
+                    batch_tokens: n_tokens as u32,
+                    d_model: d as u32,
+                    d_ff: ff as u32,
+                    eps: self.norm_eps,
+                },
             );
             return Tensor::from_buffer(Arc::clone(&x.ctx), out_buf, vec![batch, seq_len, d]);
         }
@@ -605,7 +700,8 @@ impl TransformerBlock {
         let x_flat = x.reshape(vec![n_tokens, d]);
 
         // Shared expert: always active for ALL tokens
-        let shared_out = self.swiglu_ffn(x, batch, seq_len, d)
+        let shared_out = self
+            .swiglu_ffn(x, batch, seq_len, d)
             .reshape(vec![n_tokens, d]);
 
         // ReMoE routing (ICLR 2025): ReLU gate instead of softmax+topk.
@@ -660,7 +756,10 @@ impl TransformerBlock {
             let u = u_base.add(&u_lora);
             (g, u)
         } else if self.bitnet {
-            (x_flat.ternary_matmul(&self.ffn_w1), x_flat.ternary_matmul(&self.ffn_w3))
+            (
+                x_flat.ternary_matmul(&self.ffn_w1),
+                x_flat.ternary_matmul(&self.ffn_w3),
+            )
         } else {
             (x_flat.matmul(&self.ffn_w1), x_flat.matmul(&self.ffn_w3))
         };
@@ -695,18 +794,28 @@ impl TransformerBlock {
 
     /// Checkpointed block forward with optional packed-sequence segment ids.
     pub fn forward_checkpointed_seg(
-        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&crate::gpu::Buf>,
+        self: &Arc<Self>,
+        x: &Tensor,
+        layer_idx: usize,
+        seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         self.forward_checkpointed_recompute_seg(x, layer_idx, seg_ids)
     }
 
     /// Recompute-based checkpointing implementation (see forward_checkpointed).
-    pub fn forward_checkpointed_recompute(self: &Arc<Self>, x: &Tensor, layer_idx: usize) -> Tensor {
+    pub fn forward_checkpointed_recompute(
+        self: &Arc<Self>,
+        x: &Tensor,
+        layer_idx: usize,
+    ) -> Tensor {
         self.forward_checkpointed_recompute_seg(x, layer_idx, None)
     }
 
     pub fn forward_checkpointed_recompute_seg(
-        self: &Arc<Self>, x: &Tensor, layer_idx: usize, seg_ids: Option<&crate::gpu::Buf>,
+        self: &Arc<Self>,
+        x: &Tensor,
+        layer_idx: usize,
+        seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         // Save the input tensor's buffer and shape — we need these for the main tape entry
         // and for the recompute closure.
@@ -716,9 +825,8 @@ impl TransformerBlock {
         let ctx = Arc::clone(&x.ctx);
 
         // Run the forward pass on a temporary sub-tape (discarded after capturing output)
-        let (output, _sub_tape) = autograd::checkpoint_forward(|| {
-            self.forward_seg(x, None, seg_ids)
-        });
+        let (output, _sub_tape) =
+            autograd::checkpoint_forward(|| self.forward_seg(x, None, seg_ids));
 
         // Record a single checkpoint op on the main tape
         let checkpoint_output_id = autograd::next_id();
@@ -727,7 +835,12 @@ impl TransformerBlock {
 
         // Copy the output buffer so the checkpoint entry owns it
         let checkpoint_output_buf = ctx.alloc_buffer(output_size * 4);
-        compute::gpu_copy(&ctx, &output.buffer, &checkpoint_output_buf, output_size as u32);
+        compute::gpu_copy(
+            &ctx,
+            &output.buffer,
+            &checkpoint_output_buf,
+            output_size as u32,
+        );
 
         autograd::record(TapeEntry {
             op: Op::Checkpoint { layer_idx },
@@ -748,23 +861,26 @@ impl TransformerBlock {
         // thread-local that could be cleared before the recompute's mask dispatches run (§2).
         let seg_owned: Option<crate::gpu::Buf> = seg_ids.cloned();
 
-        autograd::register_recompute(layer_idx, Box::new(move |recompute_ctx: &Arc<MetalContext>| {
-            // Reconstruct the input tensor from the saved buffer
-            let recompute_input = Tensor {
-                id: autograd::next_id(),
-                buffer: recompute_input_buffer.clone(),
-                shape: recompute_input_shape.clone(),
-                requires_grad: true,
-                ctx: Arc::clone(recompute_ctx),
-            };
+        autograd::register_recompute(
+            layer_idx,
+            Box::new(move |recompute_ctx: &Arc<MetalContext>| {
+                // Reconstruct the input tensor from the saved buffer
+                let recompute_input = Tensor {
+                    id: autograd::next_id(),
+                    buffer: recompute_input_buffer.clone(),
+                    shape: recompute_input_shape.clone(),
+                    requires_grad: true,
+                    ctx: Arc::clone(recompute_ctx),
+                };
 
-            // Run forward on a fresh sub-tape and return it
-            let (_recomputed_output, sub_tape) = autograd::checkpoint_forward(|| {
-                block.forward_seg(&recompute_input, None, seg_owned.as_ref())
-            });
+                // Run forward on a fresh sub-tape and return it
+                let (_recomputed_output, sub_tape) = autograd::checkpoint_forward(|| {
+                    block.forward_seg(&recompute_input, None, seg_owned.as_ref())
+                });
 
-            sub_tape
-        }));
+                sub_tape
+            }),
+        );
 
         // Return a tensor with the checkpoint output ID so the main tape is consistent
         Tensor {
@@ -782,9 +898,12 @@ impl TransformerBlock {
         if self.lowrank > 0 {
             // Low-rank: U and V matrices instead of full W
             params.extend_from_slice(&[
-                &self.ffn_w1_u, &self.ffn_w1_v,
-                &self.ffn_w2_u, &self.ffn_w2_v,
-                &self.ffn_w3_u, &self.ffn_w3_v,
+                &self.ffn_w1_u,
+                &self.ffn_w1_v,
+                &self.ffn_w2_u,
+                &self.ffn_w2_v,
+                &self.ffn_w3_u,
+                &self.ffn_w3_v,
             ]);
         } else if self.n_experts > 1 {
             params.push(&self.router_weight);
@@ -818,27 +937,50 @@ impl TransformerBlock {
     /// optimizer a fresh subspace to explore. After K merges at rank r,
     /// effective rank ≈ K × r. Returns the number of merged parameter pairs.
     pub fn relora_merge(&self, ctx: &Arc<MetalContext>, reinit_scale: f32) -> usize {
-        if self.lowrank == 0 { return 0; }
+        if self.lowrank == 0 {
+            return 0;
+        }
         let r = self.lowrank;
         let d = self.attn.d_model;
         let ff = self.ffn_w1_base.shape[1]; // d_ff
 
         // Merge gate: W1_base += U1 @ V1  ([d,r] @ [r,ff] = [d,ff])
         let w1_delta = ctx.alloc_buffer(d * ff * 4);
-        compute::gpu_matmul(ctx, &self.ffn_w1_u.buffer, &self.ffn_w1_v.buffer, &w1_delta,
-            d as u32, ff as u32, r as u32);
+        compute::gpu_matmul(
+            ctx,
+            &self.ffn_w1_u.buffer,
+            &self.ffn_w1_v.buffer,
+            &w1_delta,
+            d as u32,
+            ff as u32,
+            r as u32,
+        );
         compute::gpu_add_inplace(ctx, &self.ffn_w1_base.buffer, &w1_delta, (d * ff) as u32);
 
         // Merge down: W2_base += U2 @ V2  ([ff,r] @ [r,d] = [ff,d])
         let w2_delta = ctx.alloc_buffer(ff * d * 4);
-        compute::gpu_matmul(ctx, &self.ffn_w2_u.buffer, &self.ffn_w2_v.buffer, &w2_delta,
-            ff as u32, d as u32, r as u32);
+        compute::gpu_matmul(
+            ctx,
+            &self.ffn_w2_u.buffer,
+            &self.ffn_w2_v.buffer,
+            &w2_delta,
+            ff as u32,
+            d as u32,
+            r as u32,
+        );
         compute::gpu_add_inplace(ctx, &self.ffn_w2_base.buffer, &w2_delta, (ff * d) as u32);
 
         // Merge up: W3_base += U3 @ V3  ([d,r] @ [r,ff] = [d,ff])
         let w3_delta = ctx.alloc_buffer(d * ff * 4);
-        compute::gpu_matmul(ctx, &self.ffn_w3_u.buffer, &self.ffn_w3_v.buffer, &w3_delta,
-            d as u32, ff as u32, r as u32);
+        compute::gpu_matmul(
+            ctx,
+            &self.ffn_w3_u.buffer,
+            &self.ffn_w3_v.buffer,
+            &w3_delta,
+            d as u32,
+            ff as u32,
+            r as u32,
+        );
         compute::gpu_add_inplace(ctx, &self.ffn_w3_base.buffer, &w3_delta, (d * ff) as u32);
 
         // Reinit U with small random, V with zeros (standard LoRA init)
@@ -847,7 +989,12 @@ impl TransformerBlock {
             compute::gpu_copy(ctx, &rand.buffer, &param.buffer, param.numel() as u32);
         }
         let rand = Tensor::randn(ctx, self.ffn_w2_u.shape.clone(), reinit_scale);
-        compute::gpu_copy(ctx, &rand.buffer, &self.ffn_w2_u.buffer, self.ffn_w2_u.numel() as u32);
+        compute::gpu_copy(
+            ctx,
+            &rand.buffer,
+            &self.ffn_w2_u.buffer,
+            self.ffn_w2_u.numel() as u32,
+        );
 
         // V: zero init (so initial delta after merge = 0)
         for param in [&self.ffn_w1_v, &self.ffn_w2_v, &self.ffn_w3_v] {
@@ -861,16 +1008,16 @@ impl TransformerBlock {
 /// The full transformer model.
 pub struct Transformer {
     pub config: ModelConfig,
-    pub embedding: Tensor,           // [vocab_size, d_model] or [vocab, embed_rank] if factored
-    pub embed_proj: Tensor,          // [embed_rank, d_model] (identity/zeros when not factored)
-    pub embed_rank: usize,           // 0 = full embedding, >0 = factored
+    pub embedding: Tensor, // [vocab_size, d_model] or [vocab, embed_rank] if factored
+    pub embed_proj: Tensor, // [embed_rank, d_model] (identity/zeros when not factored)
+    pub embed_rank: usize, // 0 = full embedding, >0 = factored
     pub blocks: Vec<Arc<TransformerBlock>>,
-    pub ln_final_weight: Tensor,     // [d_model]
+    pub ln_final_weight: Tensor, // [d_model]
     /// Multi-token prediction heads: each projects d_model → d_model for future token k.
     /// Head k predicts token at position t+k+2 (head 0 is t+2, head 1 is t+3, etc.).
     /// The standard LM head (weight-tied embedding) always predicts t+1.
-    pub mtp_heads: Vec<Tensor>,      // n_predict × [d_model, d_model]
-    pub mtp_norms: Vec<Tensor>,      // n_predict × [d_model] (per-head layer norms)
+    pub mtp_heads: Vec<Tensor>, // n_predict × [d_model, d_model]
+    pub mtp_norms: Vec<Tensor>,  // n_predict × [d_model] (per-head layer norms)
     ctx: Arc<MetalContext>,
 }
 
@@ -890,16 +1037,24 @@ impl Transformer {
             )
         } else {
             let embed_std = (1.0 / d as f32).sqrt();
-            (Tensor::randn(ctx, vec![v, d], embed_std), Tensor::zeros(ctx, vec![1]))
+            (
+                Tensor::randn(ctx, vec![v, d], embed_std),
+                Tensor::zeros(ctx, vec![1]),
+            )
         };
 
         let blocks: Vec<Arc<TransformerBlock>> = if config.shared_layers {
             // ALBERT: one unique layer, shared across all positions
             let shared = Arc::new(TransformerBlock::new(ctx, &config, 0));
-            eprintln!("ALBERT mode: {} layers sharing 1 set of weights", config.n_layers);
+            eprintln!(
+                "ALBERT mode: {} layers sharing 1 set of weights",
+                config.n_layers
+            );
             (0..config.n_layers).map(|_| Arc::clone(&shared)).collect()
         } else {
-            (0..config.n_layers).map(|i| Arc::new(TransformerBlock::new(ctx, &config, i))).collect()
+            (0..config.n_layers)
+                .map(|i| Arc::new(TransformerBlock::new(ctx, &config, i)))
+                .collect()
         };
 
         let ln_final_weight = Tensor::ones(ctx, vec![d]);
@@ -915,8 +1070,11 @@ impl Transformer {
             .collect();
 
         if config.n_predict > 0 {
-            eprintln!("Multi-token prediction: {} extra heads (predict t+2..t+{})",
-                config.n_predict, config.n_predict + 1);
+            eprintln!(
+                "Multi-token prediction: {} extra heads (predict t+2..t+{})",
+                config.n_predict,
+                config.n_predict + 1
+            );
         }
 
         eprintln!(
@@ -955,7 +1113,10 @@ impl Transformer {
             )
         } else {
             let embed_std = (1.0 / d as f32).sqrt() * scale;
-            (Tensor::randn(ctx, vec![v, d], embed_std), Tensor::zeros(ctx, vec![1]))
+            (
+                Tensor::randn(ctx, vec![v, d], embed_std),
+                Tensor::zeros(ctx, vec![1]),
+            )
         };
 
         let blocks: Vec<Arc<TransformerBlock>> = (0..config.n_layers)
@@ -972,7 +1133,9 @@ impl Transformer {
 
         eprintln!(
             "Model initialized (scale={:.3}): {} layers, {}M parameters",
-            scale, config.n_layers, config.param_count() as f32 / 1e6
+            scale,
+            config.n_layers,
+            config.param_count() as f32 / 1e6
         );
 
         Self {
@@ -1024,7 +1187,11 @@ impl Transformer {
 
         // Embedding lookup (optionally factored)
         let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_dim = if self.embed_rank > 0 {
+            self.embed_rank
+        } else {
+            d
+        };
         let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
         compute::gpu_embedding_lookup(
             &self.ctx,
@@ -1043,9 +1210,16 @@ impl Transformer {
                 op: Op::Embedding,
                 inputs: vec![tokens_id, self.embedding.id],
                 output: embed_out_id,
-                input_buffers: vec![crate::gpu::u32_to_buf(tokens_buf), self.embedding.buffer.clone()],
+                input_buffers: vec![
+                    crate::gpu::u32_to_buf(tokens_buf),
+                    self.embedding.buffer.clone(),
+                ],
                 output_buffer: embed_out_buf.clone(),
-                shapes: vec![vec![n_tokens], vec![v, embed_dim], vec![n_tokens, embed_dim]],
+                shapes: vec![
+                    vec![n_tokens],
+                    vec![v, embed_dim],
+                    vec![n_tokens, embed_dim],
+                ],
                 cached: None,
             });
         }
@@ -1083,8 +1257,12 @@ impl Transformer {
                     let n_layers = self.blocks.len();
                     for (i, block) in self.blocks.iter().enumerate() {
                         // Stochastic depth: linearly increasing drop probability per layer.
-                        if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
-                            let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
+                        if autograd::is_recording()
+                            && self.config.stochastic_depth > 0.0
+                            && n_layers > 1
+                        {
+                            let drop_prob =
+                                self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
                             if rand::random::<f32>() < drop_prob {
                                 continue;
                             }
@@ -1118,23 +1296,39 @@ impl Transformer {
             h_flat.matmul_trans_b(&self.embedding)
         };
         let mup_scale = self.config.mup_output_scale();
-        if mup_scale < 1.0 { logits.scale(mup_scale) } else { logits }
+        if mup_scale < 1.0 {
+            logits.scale(mup_scale)
+        } else {
+            logits
+        }
     }
 
     /// Forward pass returning hidden states BEFORE the LM head.
     /// Used by FusedLinearCrossEntropy which handles LM head + CE in chunks.
     pub fn forward_hidden(
-        &self, tokens: &[u32], batch: usize, seq_len: usize, checkpointed: bool,
+        &self,
+        tokens: &[u32],
+        batch: usize,
+        seq_len: usize,
+        checkpointed: bool,
     ) -> Tensor {
         let d = self.config.d_model;
         let n_tokens = batch * seq_len;
 
         let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_dim = if self.embed_rank > 0 {
+            self.embed_rank
+        } else {
+            d
+        };
         let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
         compute::gpu_embedding_lookup(
-            &self.ctx, &tokens_buf, &self.embedding.buffer, &embed_out_buf,
-            n_tokens as u32, embed_dim as u32,
+            &self.ctx,
+            &tokens_buf,
+            &self.embedding.buffer,
+            &embed_out_buf,
+            n_tokens as u32,
+            embed_dim as u32,
         );
 
         let tokens_id = autograd::next_id();
@@ -1144,21 +1338,33 @@ impl Transformer {
                 op: Op::Embedding,
                 inputs: vec![tokens_id, self.embedding.id],
                 output: embed_out_id,
-                input_buffers: vec![crate::gpu::u32_to_buf(tokens_buf), self.embedding.buffer.clone()],
+                input_buffers: vec![
+                    crate::gpu::u32_to_buf(tokens_buf),
+                    self.embedding.buffer.clone(),
+                ],
                 output_buffer: embed_out_buf.clone(),
-                shapes: vec![vec![n_tokens], vec![self.config.vocab_size as usize, embed_dim], vec![n_tokens, embed_dim]],
+                shapes: vec![
+                    vec![n_tokens],
+                    vec![self.config.vocab_size as usize, embed_dim],
+                    vec![n_tokens, embed_dim],
+                ],
                 cached: None,
             });
         }
 
         let embed_tensor = Tensor {
-            id: embed_out_id, buffer: embed_out_buf,
-            shape: vec![n_tokens, embed_dim], requires_grad: true, ctx: Arc::clone(&self.ctx),
+            id: embed_out_id,
+            buffer: embed_out_buf,
+            shape: vec![n_tokens, embed_dim],
+            requires_grad: true,
+            ctx: Arc::clone(&self.ctx),
         };
 
         let h_flat = if self.embed_rank > 0 {
             embed_tensor.matmul(&self.embed_proj)
-        } else { embed_tensor };
+        } else {
+            embed_tensor
+        };
         let mut h = h_flat.reshape(vec![batch, seq_len, d]);
 
         if checkpointed {
@@ -1169,8 +1375,11 @@ impl Transformer {
             let n_layers = self.blocks.len();
             for (i, block) in self.blocks.iter().enumerate() {
                 if autograd::is_recording() && self.config.stochastic_depth > 0.0 && n_layers > 1 {
-                    let drop_prob = self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
-                    if rand::random::<f32>() < drop_prob { continue; }
+                    let drop_prob =
+                        self.config.stochastic_depth * (i as f32 / (n_layers - 1) as f32);
+                    if rand::random::<f32>() < drop_prob {
+                        continue;
+                    }
                 }
                 h = block.forward(&h, None);
                 if self.config.fp16_activations && i + 1 < n_layers {
@@ -1198,11 +1407,19 @@ impl Transformer {
 
         // Embedding lookup
         let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_dim = if self.embed_rank > 0 { self.embed_rank } else { d };
+        let embed_dim = if self.embed_rank > 0 {
+            self.embed_rank
+        } else {
+            d
+        };
         let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
         compute::gpu_embedding_lookup(
-            &self.ctx, &tokens_buf, &self.embedding.buffer, &embed_out_buf,
-            n_tokens as u32, embed_dim as u32,
+            &self.ctx,
+            &tokens_buf,
+            &self.embedding.buffer,
+            &embed_out_buf,
+            n_tokens as u32,
+            embed_dim as u32,
         );
 
         let tokens_id = autograd::next_id();
@@ -1212,21 +1429,33 @@ impl Transformer {
                 op: Op::Embedding,
                 inputs: vec![tokens_id, self.embedding.id],
                 output: embed_out_id,
-                input_buffers: vec![crate::gpu::u32_to_buf(tokens_buf), self.embedding.buffer.clone()],
+                input_buffers: vec![
+                    crate::gpu::u32_to_buf(tokens_buf),
+                    self.embedding.buffer.clone(),
+                ],
                 output_buffer: embed_out_buf.clone(),
-                shapes: vec![vec![n_tokens], vec![self.config.vocab_size as usize, embed_dim], vec![n_tokens, embed_dim]],
+                shapes: vec![
+                    vec![n_tokens],
+                    vec![self.config.vocab_size as usize, embed_dim],
+                    vec![n_tokens, embed_dim],
+                ],
                 cached: None,
             });
         }
 
         let embed_tensor = Tensor {
-            id: embed_out_id, buffer: embed_out_buf,
-            shape: vec![n_tokens, embed_dim], requires_grad: true, ctx: Arc::clone(&self.ctx),
+            id: embed_out_id,
+            buffer: embed_out_buf,
+            shape: vec![n_tokens, embed_dim],
+            requires_grad: true,
+            ctx: Arc::clone(&self.ctx),
         };
 
         let h_flat = if self.embed_rank > 0 {
             embed_tensor.matmul(&self.embed_proj)
-        } else { embed_tensor };
+        } else {
+            embed_tensor
+        };
         let mut h = h_flat.reshape(vec![batch, seq_len, d]);
 
         if checkpointed {
@@ -1234,7 +1463,9 @@ impl Transformer {
                 h = block.forward_checkpointed(&h, i);
             }
         } else {
-            for block in &self.blocks { h = block.forward(&h, None); }
+            for block in &self.blocks {
+                h = block.forward(&h, None);
+            }
         }
 
         let h = h.rms_norm(&self.ln_final_weight, self.config.norm_eps);
@@ -1242,7 +1473,8 @@ impl Transformer {
 
         // Main LM head (weight-tied embedding): predicts t+1
         let main_logits = if self.embed_rank > 0 {
-            h_flat.matmul_trans_b(&self.embed_proj.detach())
+            h_flat
+                .matmul_trans_b(&self.embed_proj.detach())
                 .matmul_trans_b(&self.embedding.detach())
         } else {
             h_flat.matmul_trans_b(&self.embedding.detach())
@@ -1254,7 +1486,8 @@ impl Transformer {
             let projected = h_flat.matmul(&self.mtp_heads[k]);
             let normed = projected.rms_norm(&self.mtp_norms[k], self.config.norm_eps);
             let logits_k = if self.embed_rank > 0 {
-                normed.matmul_trans_b(&self.embed_proj.detach())
+                normed
+                    .matmul_trans_b(&self.embed_proj.detach())
                     .matmul_trans_b(&self.embedding.detach())
             } else {
                 normed.matmul_trans_b(&self.embedding.detach())
@@ -1263,7 +1496,11 @@ impl Transformer {
         }
 
         let mup_scale = self.config.mup_output_scale();
-        let main_logits = if mup_scale < 1.0 { main_logits.scale(mup_scale) } else { main_logits };
+        let main_logits = if mup_scale < 1.0 {
+            main_logits.scale(mup_scale)
+        } else {
+            main_logits
+        };
 
         (main_logits, extra_logits)
     }
@@ -1284,8 +1521,12 @@ impl Transformer {
                 params.extend(block.parameters());
             }
         }
-        for head in &self.mtp_heads { params.push(head); }
-        for norm in &self.mtp_norms { params.push(norm); }
+        for head in &self.mtp_heads {
+            params.push(head);
+        }
+        for norm in &self.mtp_norms {
+            params.push(norm);
+        }
         params
     }
 
@@ -1366,11 +1607,19 @@ pub fn grow_model(
     let v = large_config.vocab_size as usize;
 
     assert!(sd <= ld, "small d_model ({}) must be <= large ({})", sd, ld);
-    assert!(small.config.n_layers <= large_config.n_layers, "small layers must be <= large");
-    assert_eq!(small.config.vocab_size, large_config.vocab_size, "vocab must match");
+    assert!(
+        small.config.n_layers <= large_config.n_layers,
+        "small layers must be <= large"
+    );
+    assert_eq!(
+        small.config.vocab_size, large_config.vocab_size,
+        "vocab must match"
+    );
 
-    eprintln!("Growing model: d={} → d={}, layers={} → layers={}",
-        sd, ld, small.config.n_layers, large_config.n_layers);
+    eprintln!(
+        "Growing model: d={} → d={}, layers={} → layers={}",
+        sd, ld, small.config.n_layers, large_config.n_layers
+    );
 
     // Create the large model with SMALL random init (1/100 of normal scale).
     // Small model weights are copied into the top-left corner.
@@ -1381,8 +1630,15 @@ pub fn grow_model(
     let large = Transformer::new_scaled(ctx, large_config.clone(), 0.01);
 
     // Copy embedding: [vocab, sd] → top-left of [vocab, ld]
-    copy_weight_block(ctx, &small.embedding.buffer, &large.embedding.buffer,
-        v, sd, v, ld);
+    copy_weight_block(
+        ctx,
+        &small.embedding.buffer,
+        &large.embedding.buffer,
+        v,
+        sd,
+        v,
+        ld,
+    );
 
     // Copy layer weights for shared layers
     let n_shared = small.config.n_layers.min(large_config.n_layers);
@@ -1397,22 +1653,118 @@ pub fn grow_model(
             let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
             let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
             // U matrices: [d, r]
-            copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sr, ld, lr);
-            copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, sr, ld, lr);
-            copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, sr, ld, lr);
-            copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sr, ld, lr);
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_q.buffer,
+                &lb.attn.w_q.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_k.buffer,
+                &lb.attn.w_k.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_v.buffer,
+                &lb.attn.w_v.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_o.buffer,
+                &lb.attn.w_o.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
             // V matrices: [r, d/kv_dim]
-            copy_weight_block(ctx, &sb.attn.w_q_v.buffer, &lb.attn.w_q_v.buffer, sr, sd, lr, ld);
-            copy_weight_block(ctx, &sb.attn.w_k_v.buffer, &lb.attn.w_k_v.buffer, sr, small_kv_dim, lr, large_kv_dim);
-            copy_weight_block(ctx, &sb.attn.w_v_v.buffer, &lb.attn.w_v_v.buffer, sr, small_kv_dim, lr, large_kv_dim);
-            copy_weight_block(ctx, &sb.attn.w_o_v.buffer, &lb.attn.w_o_v.buffer, sr, sd, lr, ld);
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_q_v.buffer,
+                &lb.attn.w_q_v.buffer,
+                sr,
+                sd,
+                lr,
+                ld,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_k_v.buffer,
+                &lb.attn.w_k_v.buffer,
+                sr,
+                small_kv_dim,
+                lr,
+                large_kv_dim,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_v_v.buffer,
+                &lb.attn.w_v_v.buffer,
+                sr,
+                small_kv_dim,
+                lr,
+                large_kv_dim,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_o_v.buffer,
+                &lb.attn.w_o_v.buffer,
+                sr,
+                sd,
+                lr,
+                ld,
+            );
         } else if sb.attn.attn_rank == 0 && lb.attn.attn_rank == 0 {
             let small_kv_dim = sd / small.config.n_heads * small.config.n_kv_heads;
             let large_kv_dim = ld / large_config.n_heads * large_config.n_kv_heads;
-            copy_weight_block(ctx, &sb.attn.w_q.buffer, &lb.attn.w_q.buffer, sd, sd, ld, ld);
-            copy_weight_block(ctx, &sb.attn.w_k.buffer, &lb.attn.w_k.buffer, sd, small_kv_dim, ld, large_kv_dim);
-            copy_weight_block(ctx, &sb.attn.w_v.buffer, &lb.attn.w_v.buffer, sd, small_kv_dim, ld, large_kv_dim);
-            copy_weight_block(ctx, &sb.attn.w_o.buffer, &lb.attn.w_o.buffer, sd, sd, ld, ld);
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_q.buffer,
+                &lb.attn.w_q.buffer,
+                sd,
+                sd,
+                ld,
+                ld,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_k.buffer,
+                &lb.attn.w_k.buffer,
+                sd,
+                small_kv_dim,
+                ld,
+                large_kv_dim,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_v.buffer,
+                &lb.attn.w_v.buffer,
+                sd,
+                small_kv_dim,
+                ld,
+                large_kv_dim,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.attn.w_o.buffer,
+                &lb.attn.w_o.buffer,
+                sd,
+                sd,
+                ld,
+                ld,
+            );
         }
 
         // FFN weights — handle both full-rank and lowrank cases
@@ -1423,13 +1775,61 @@ pub fn grow_model(
             let sff = small.config.d_ff();
             let lff = large_config.d_ff();
             // U matrices: [d, r] — copy top-left [min(sd,ld), min(sr,lr)]
-            copy_weight_block(ctx, &sb.ffn_w1_u.buffer, &lb.ffn_w1_u.buffer, sd, sr, ld, lr);
-            copy_weight_block(ctx, &sb.ffn_w3_u.buffer, &lb.ffn_w3_u.buffer, sd, sr, ld, lr);
-            copy_weight_block(ctx, &sb.ffn_w2_u.buffer, &lb.ffn_w2_u.buffer, sff, sr, lff, lr);
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w1_u.buffer,
+                &lb.ffn_w1_u.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w3_u.buffer,
+                &lb.ffn_w3_u.buffer,
+                sd,
+                sr,
+                ld,
+                lr,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w2_u.buffer,
+                &lb.ffn_w2_u.buffer,
+                sff,
+                sr,
+                lff,
+                lr,
+            );
             // V matrices: [r, ff/d] — copy top-left [min_r, min(sff,lff)]
-            copy_weight_block(ctx, &sb.ffn_w1_v.buffer, &lb.ffn_w1_v.buffer, sr, sff, lr, lff);
-            copy_weight_block(ctx, &sb.ffn_w3_v.buffer, &lb.ffn_w3_v.buffer, sr, sff, lr, lff);
-            copy_weight_block(ctx, &sb.ffn_w2_v.buffer, &lb.ffn_w2_v.buffer, sr, sd, lr, ld);
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w1_v.buffer,
+                &lb.ffn_w1_v.buffer,
+                sr,
+                sff,
+                lr,
+                lff,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w3_v.buffer,
+                &lb.ffn_w3_v.buffer,
+                sr,
+                sff,
+                lr,
+                lff,
+            );
+            copy_weight_block(
+                ctx,
+                &sb.ffn_w2_v.buffer,
+                &lb.ffn_w2_v.buffer,
+                sr,
+                sd,
+                lr,
+                ld,
+            );
         } else if large_config.lowrank == 0 && small.config.lowrank == 0 {
             let sff = small.config.d_ff();
             let lff = large_config.d_ff();
@@ -1440,31 +1840,76 @@ pub fn grow_model(
         // Mixed (one lowrank, one full-rank): skip FFN copy — random init is fine
 
         // Norm weights: [sd] → [ld] (copy first sd elements)
-        compute::gpu_buffer_copy(ctx, &sb.ln1_weight.buffer, &lb.ln1_weight.buffer, 0, 0, sd as u32);
-        compute::gpu_buffer_copy(ctx, &sb.ln2_weight.buffer, &lb.ln2_weight.buffer, 0, 0, sd as u32);
+        compute::gpu_buffer_copy(
+            ctx,
+            &sb.ln1_weight.buffer,
+            &lb.ln1_weight.buffer,
+            0,
+            0,
+            sd as u32,
+        );
+        compute::gpu_buffer_copy(
+            ctx,
+            &sb.ln2_weight.buffer,
+            &lb.ln2_weight.buffer,
+            0,
+            0,
+            sd as u32,
+        );
 
         // QK-norm: [head_dim] — copy if both have same or smaller head_dim
         let s_hd = sd / small.config.n_heads;
         let l_hd = ld / large_config.n_heads;
         let min_hd = s_hd.min(l_hd);
-        compute::gpu_buffer_copy(ctx, &sb.attn.qk_norm_weight.buffer, &lb.attn.qk_norm_weight.buffer, 0, 0, min_hd as u32);
+        compute::gpu_buffer_copy(
+            ctx,
+            &sb.attn.qk_norm_weight.buffer,
+            &lb.attn.qk_norm_weight.buffer,
+            0,
+            0,
+            min_hd as u32,
+        );
     }
 
     // Final norm
-    compute::gpu_buffer_copy(ctx, &small.ln_final_weight.buffer, &large.ln_final_weight.buffer, 0, 0, sd as u32);
+    compute::gpu_buffer_copy(
+        ctx,
+        &small.ln_final_weight.buffer,
+        &large.ln_final_weight.buffer,
+        0,
+        0,
+        sd as u32,
+    );
 
     // MTP heads: copy if both have same n_predict
     let min_predict = small.config.n_predict.min(large_config.n_predict);
     for k in 0..min_predict {
         // MTP projection: [d, d] → copy top-left block
-        copy_weight_block(ctx, &small.mtp_heads[k].buffer, &large.mtp_heads[k].buffer, sd, sd, ld, ld);
+        copy_weight_block(
+            ctx,
+            &small.mtp_heads[k].buffer,
+            &large.mtp_heads[k].buffer,
+            sd,
+            sd,
+            ld,
+            ld,
+        );
         // MTP norm: [d] → copy first sd elements
-        compute::gpu_buffer_copy(ctx, &small.mtp_norms[k].buffer, &large.mtp_norms[k].buffer, 0, 0, sd as u32);
+        compute::gpu_buffer_copy(
+            ctx,
+            &small.mtp_norms[k].buffer,
+            &large.mtp_norms[k].buffer,
+            0,
+            0,
+            sd as u32,
+        );
     }
 
-    eprintln!("Model grown: {}M → {}M params",
+    eprintln!(
+        "Model grown: {}M → {}M params",
         small.config.param_count() as f32 / 1e6,
-        large_config.param_count() as f32 / 1e6);
+        large_config.param_count() as f32 / 1e6
+    );
 
     large
 }
@@ -1472,17 +1917,22 @@ pub fn grow_model(
 /// Copy a weight matrix block: small [sr, sc] → top-left of large [lr, lc]
 fn copy_weight_block(
     ctx: &Arc<MetalContext>,
-    src: &GpuBuffer, dst: &GpuBuffer,
-    src_rows: usize, src_cols: usize,
-    _dst_rows: usize, dst_cols: usize,
+    src: &GpuBuffer,
+    dst: &GpuBuffer,
+    src_rows: usize,
+    src_cols: usize,
+    _dst_rows: usize,
+    dst_cols: usize,
 ) {
     // Copy row by row (src row stride ≠ dst row stride)
     for r in 0..src_rows {
         compute::gpu_buffer_copy(
-            ctx, src, dst,
-            (r * src_cols) as u32,     // src offset
-            (r * dst_cols) as u32,     // dst offset
-            src_cols as u32,           // copy length
+            ctx,
+            src,
+            dst,
+            (r * src_cols) as u32, // src offset
+            (r * dst_cols) as u32, // dst offset
+            src_cols as u32,       // copy length
         );
     }
 }

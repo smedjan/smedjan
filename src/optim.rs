@@ -25,15 +25,27 @@ fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
     let n = bytes.len() / 4;
     let mut f = vec![0f32; n];
     for i in 0..n {
-        f[i] = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+        f[i] = f32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
     }
     use cudarc::driver::DevicePtr;
-    unsafe { cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f).expect("htod buf_set_bytes"); }
+    unsafe {
+        cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f)
+            .expect("htod buf_set_bytes");
+    }
 }
 #[cfg(feature = "metal")]
 fn buf_set_bytes(buf: &GpuBuffer, bytes: &[u8]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buf.contents().as_ptr() as *mut u8,
+            bytes.len(),
+        );
     }
 }
 
@@ -51,7 +63,12 @@ pub struct AdamWHyper {
 
 impl Default for AdamWHyper {
     fn default() -> Self {
-        Self { beta1: 0.9, beta2: 0.95, eps: 1e-5, update_clip: 0.0 }
+        Self {
+            beta1: 0.9,
+            beta2: 0.95,
+            eps: 1e-5,
+            update_clip: 0.0,
+        }
     }
 }
 
@@ -74,7 +91,7 @@ pub struct ParamState {
     pub size: usize,
     pub m: crate::gpu::Buf, // first moment
     pub v: crate::gpu::Buf, // second moment
-    pub no_decay: bool, // skip weight decay for norms and embeddings
+    pub no_decay: bool,     // skip weight decay for norms and embeddings
 }
 
 impl AdamW {
@@ -196,7 +213,10 @@ impl AdamW {
 
         for ps in &self.params {
             let grad = autograd::get_grad(ps.tensor_id);
-            let grad = match grad { Some(g) => g, None => continue };
+            let grad = match grad {
+                Some(g) => g,
+                None => continue,
+            };
 
             let size = ps.size;
             // Direct pointer access to unified memory — zero copy on Apple Silicon
@@ -231,7 +251,11 @@ impl AdamW {
     /// Load optimizer state from checkpoint data. Sets m, v buffers and step counter.
     #[cfg(feature = "metal")]
     pub fn load_state(&mut self, states: &[(Vec<f32>, Vec<f32>)], opt_step: u32) {
-        assert_eq!(states.len(), self.params.len(), "Optimizer state count mismatch");
+        assert_eq!(
+            states.len(),
+            self.params.len(),
+            "Optimizer state count mismatch"
+        );
         self.step = opt_step;
         for (ps, (m_data, v_data)) in self.params.iter().zip(states.iter()) {
             assert_eq!(m_data.len(), ps.size, "m state size mismatch");
@@ -264,7 +288,11 @@ impl AdamW {
 
     /// Restore state from `save_state_blobs` (same order) + the step counter.
     pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
-        assert_eq!(blobs.len(), self.params.len() * 2, "AdamW state blob count mismatch");
+        assert_eq!(
+            blobs.len(),
+            self.params.len() * 2,
+            "AdamW state blob count mismatch"
+        );
         self.step = step;
         for (i, ps) in self.params.iter().enumerate() {
             buf_set_bytes(&ps.m, &blobs[i * 2]);
@@ -295,8 +323,8 @@ pub struct Param8State {
     pub size: usize,
     pub n_blocks: usize,
     pub no_decay: bool,
-    pub m_q: crate::gpu::Buf,    // int8 of m, `size` bytes
-    pub v_q: crate::gpu::Buf,    // int8 of √v (range-compressed), `size` bytes
+    pub m_q: crate::gpu::Buf,     // int8 of m, `size` bytes
+    pub v_q: crate::gpu::Buf,     // int8 of √v (range-compressed), `size` bytes
     pub m_scale: crate::gpu::Buf, // fp32 absmax(|m|)/127 per block, n_blocks entries
     pub v_scale: crate::gpu::Buf, // fp32 absmax(√v)/127 per block, n_blocks entries
 }
@@ -306,37 +334,45 @@ impl AdamW8bit {
         Self::new_with_config(ctx, params, weight_decay, AdamWHyper::default())
     }
 
-    pub fn new_with_config(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32, hyper: AdamWHyper) -> Self {
+    pub fn new_with_config(
+        ctx: &Arc<MetalContext>,
+        params: &[&Tensor],
+        weight_decay: f32,
+        hyper: AdamWHyper,
+    ) -> Self {
         let block = compute::ADAM8_BLOCK;
-        let param_states = params.iter().map(|t| {
-            let size = t.numel();
-            let n_blocks = size.div_ceil(block);
-            let m_q = ctx.alloc_buffer(size.max(1));        // 1 byte per int8 element
-            let v_q = ctx.alloc_buffer(size.max(1));
-            let m_scale = ctx.alloc_buffer(n_blocks * 4);   // fp32 per block
-            let v_scale = ctx.alloc_buffer(n_blocks * 4);
-            // Zero all state: int8 0 and fp32 0.0 are both all-zero bytes. Buffers may be pooled
-            // (stale), so this is required.
-            // Metal: pooled buffers may be stale → must zero. CUDA: alloc_zeros already zeroes.
-            #[cfg(feature = "metal")]
-            unsafe {
-                std::ptr::write_bytes(m_q.contents().as_ptr() as *mut u8, 0, size.max(1));
-                std::ptr::write_bytes(v_q.contents().as_ptr() as *mut u8, 0, size.max(1));
-                std::ptr::write_bytes(m_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
-                std::ptr::write_bytes(v_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
-            }
-            Param8State {
-                tensor_id: t.id,
-                buffer: t.buffer.clone(),
-                size,
-                n_blocks,
-                no_decay: t.shape.len() <= 1,
-                m_q,
-                v_q,
-                m_scale,
-                v_scale,
-            }
-        }).collect();
+        let param_states = params
+            .iter()
+            .map(|t| {
+                let size = t.numel();
+                let n_blocks = size.div_ceil(block);
+                let m_q = ctx.alloc_buffer(size.max(1)); // 1 byte per int8 element
+                let v_q = ctx.alloc_buffer(size.max(1));
+                let m_scale = ctx.alloc_buffer(n_blocks * 4); // fp32 per block
+                let v_scale = ctx.alloc_buffer(n_blocks * 4);
+                // Zero all state: int8 0 and fp32 0.0 are both all-zero bytes. Buffers may be pooled
+                // (stale), so this is required.
+                // Metal: pooled buffers may be stale → must zero. CUDA: alloc_zeros already zeroes.
+                #[cfg(feature = "metal")]
+                unsafe {
+                    std::ptr::write_bytes(m_q.contents().as_ptr() as *mut u8, 0, size.max(1));
+                    std::ptr::write_bytes(v_q.contents().as_ptr() as *mut u8, 0, size.max(1));
+                    std::ptr::write_bytes(m_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
+                    std::ptr::write_bytes(v_scale.contents().as_ptr() as *mut u8, 0, n_blocks * 4);
+                }
+                Param8State {
+                    tensor_id: t.id,
+                    buffer: t.buffer.clone(),
+                    size,
+                    n_blocks,
+                    no_decay: t.shape.len() <= 1,
+                    m_q,
+                    v_q,
+                    m_scale,
+                    v_scale,
+                }
+            })
+            .collect();
 
         Self {
             params: param_states,
@@ -352,7 +388,10 @@ impl AdamW8bit {
 
     /// Optimizer-state memory: int8 m+v + fp32 block scales. ~4× smaller than fp32 AdamW.
     pub fn memory_bytes(&self) -> usize {
-        self.params.iter().map(|ps| ps.size * 2 + ps.n_blocks * 4 * 2).sum()
+        self.params
+            .iter()
+            .map(|ps| ps.size * 2 + ps.n_blocks * 4 * 2)
+            .sum()
     }
 
     pub fn step(&mut self, lr: f32) {
@@ -405,7 +444,11 @@ impl AdamW8bit {
 
     /// Restore state from `save_state_blobs` (same order) + the step counter.
     pub fn load_state_blobs(&mut self, step: u32, blobs: &[Vec<u8>]) {
-        assert_eq!(blobs.len(), self.params.len() * 4, "8-bit AdamW state blob count mismatch");
+        assert_eq!(
+            blobs.len(),
+            self.params.len() * 4,
+            "8-bit AdamW state blob count mismatch"
+        );
         self.step = step;
         for (i, ps) in self.params.iter().enumerate() {
             buf_set_bytes(&ps.m_q, &blobs[i * 4]);
@@ -438,7 +481,12 @@ impl CosineWarmupScheduler {
         }
     }
 
-    pub fn with_restarts(max_lr: f32, warmup_steps: u32, total_steps: u32, restart_period: u32) -> Self {
+    pub fn with_restarts(
+        max_lr: f32,
+        warmup_steps: u32,
+        total_steps: u32,
+        restart_period: u32,
+    ) -> Self {
         Self {
             max_lr,
             min_lr: max_lr * 0.1,
@@ -467,7 +515,10 @@ impl CosineWarmupScheduler {
                 (decay_step as f32 / decay_total as f32).min(1.0)
             };
 
-            self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
+            self.min_lr
+                + 0.5
+                    * (self.max_lr - self.min_lr)
+                    * (1.0 + (std::f32::consts::PI * progress).cos())
         }
     }
 }
@@ -480,8 +531,8 @@ impl CosineWarmupScheduler {
 pub struct WSDScheduler {
     pub max_lr: f32,
     pub warmup_steps: u32,
-    pub stable_steps: u32,   // constant LR phase after warmup
-    pub decay_steps: u32,    // linear decay to zero after stable
+    pub stable_steps: u32, // constant LR phase after warmup
+    pub decay_steps: u32,  // linear decay to zero after stable
 }
 
 impl WSDScheduler {
@@ -491,17 +542,34 @@ impl WSDScheduler {
         let after_warmup = total_steps.saturating_sub(warmup_steps);
         let stable = (after_warmup as f32 * 0.7) as u32;
         let decay = after_warmup - stable;
-        Self { max_lr, warmup_steps, stable_steps: stable, decay_steps: decay }
+        Self {
+            max_lr,
+            warmup_steps,
+            stable_steps: stable,
+            decay_steps: decay,
+        }
     }
 
-    pub fn with_phases(max_lr: f32, warmup_steps: u32, stable_steps: u32, decay_steps: u32) -> Self {
-        Self { max_lr, warmup_steps, stable_steps, decay_steps }
+    pub fn with_phases(
+        max_lr: f32,
+        warmup_steps: u32,
+        stable_steps: u32,
+        decay_steps: u32,
+    ) -> Self {
+        Self {
+            max_lr,
+            warmup_steps,
+            stable_steps,
+            decay_steps,
+        }
     }
 
     pub fn get_lr(&self, step: u32) -> f32 {
         if step < self.warmup_steps {
             // Linear warmup
-            if self.warmup_steps == 0 { return self.max_lr; }
+            if self.warmup_steps == 0 {
+                return self.max_lr;
+            }
             self.max_lr * (step as f32 / self.warmup_steps as f32)
         } else if step < self.warmup_steps + self.stable_steps {
             // Stable plateau — constant max_lr
@@ -509,7 +577,9 @@ impl WSDScheduler {
         } else {
             // Linear decay to zero
             let decay_step = step - self.warmup_steps - self.stable_steps;
-            if self.decay_steps == 0 { return 0.0; }
+            if self.decay_steps == 0 {
+                return 0.0;
+            }
             let progress = (decay_step as f32 / self.decay_steps as f32).min(1.0);
             self.max_lr * (1.0 - progress)
         }
@@ -526,7 +596,9 @@ impl WSDScheduler {
 pub fn inverse_sqrt_lr(max_lr: f32, warmup_steps: u32, step: u32) -> f32 {
     if warmup_steps == 0 {
         // No warmup: apply inverse-sqrt decay from step 1 onward, max_lr at step 0
-        if step == 0 { return max_lr; }
+        if step == 0 {
+            return max_lr;
+        }
         max_lr / (step as f32).sqrt()
     } else if step < warmup_steps {
         // Linear warmup
@@ -539,15 +611,26 @@ pub fn inverse_sqrt_lr(max_lr: f32, warmup_steps: u32, step: u32) -> f32 {
 
 /// Trapezoidal schedule: warmup → stable → linear decay.
 /// Like WSD but with configurable decay endpoint (not necessarily zero).
-pub fn trapezoidal_lr(max_lr: f32, min_lr: f32, warmup_steps: u32, stable_steps: u32, total_steps: u32, step: u32) -> f32 {
+pub fn trapezoidal_lr(
+    max_lr: f32,
+    min_lr: f32,
+    warmup_steps: u32,
+    stable_steps: u32,
+    total_steps: u32,
+    step: u32,
+) -> f32 {
     if step < warmup_steps {
-        if warmup_steps == 0 { return max_lr; }
+        if warmup_steps == 0 {
+            return max_lr;
+        }
         min_lr + (max_lr - min_lr) * (step as f32 / warmup_steps as f32)
     } else if step < warmup_steps + stable_steps {
         max_lr
     } else {
         let decay_steps = total_steps.saturating_sub(warmup_steps + stable_steps);
-        if decay_steps == 0 { return min_lr; }
+        if decay_steps == 0 {
+            return min_lr;
+        }
         let progress = ((step - warmup_steps - stable_steps) as f32 / decay_steps as f32).min(1.0);
         max_lr + (min_lr - max_lr) * progress
     }
@@ -557,10 +640,10 @@ pub fn trapezoidal_lr(max_lr: f32, min_lr: f32, warmup_steps: u32, stable_steps:
 /// 2x faster convergence than AdamW for ~same compute.
 pub struct Sophia {
     pub params: Vec<SophiaState>,
-    pub beta1: f32,     // momentum decay (0.965)
-    pub beta2: f32,     // hessian EMA decay (0.99)
-    pub eps: f32,       // hessian floor (1e-4)
-    pub rho: f32,       // clipping threshold (1.0)
+    pub beta1: f32, // momentum decay (0.965)
+    pub beta2: f32, // hessian EMA decay (0.99)
+    pub eps: f32,   // hessian floor (1e-4)
+    pub rho: f32,   // clipping threshold (1.0)
     pub weight_decay: f32,
     pub step: u32,
     ctx: Arc<MetalContext>,
@@ -576,19 +659,33 @@ pub struct SophiaState {
 
 impl Sophia {
     pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
-        let param_states: Vec<SophiaState> = params.iter().map(|t| {
-            let size = t.numel();
-            let m = ctx.alloc_buffer(size * 4);
-            let h = ctx.alloc_buffer(size * 4);
-            compute::gpu_fill(ctx, &m, size as u32, 0.0);
-            compute::gpu_fill(ctx, &h, size as u32, 0.0);
-            SophiaState { tensor_id: t.id, buffer: t.buffer.clone(), size, m, h }
-        }).collect();
+        let param_states: Vec<SophiaState> = params
+            .iter()
+            .map(|t| {
+                let size = t.numel();
+                let m = ctx.alloc_buffer(size * 4);
+                let h = ctx.alloc_buffer(size * 4);
+                compute::gpu_fill(ctx, &m, size as u32, 0.0);
+                compute::gpu_fill(ctx, &h, size as u32, 0.0);
+                SophiaState {
+                    tensor_id: t.id,
+                    buffer: t.buffer.clone(),
+                    size,
+                    m,
+                    h,
+                }
+            })
+            .collect();
 
         Self {
             params: param_states,
-            beta1: 0.965, beta2: 0.99, eps: 1e-4, rho: 1.0,
-            weight_decay, step: 0, ctx: Arc::clone(ctx),
+            beta1: 0.965,
+            beta2: 0.99,
+            eps: 1e-4,
+            rho: 1.0,
+            weight_decay,
+            step: 0,
+            ctx: Arc::clone(ctx),
         }
     }
 
@@ -596,11 +693,26 @@ impl Sophia {
         self.step += 1;
         for ps in &self.params {
             let grad = autograd::get_grad(ps.tensor_id);
-            let grad = match grad { Some(g) => g, None => continue };
+            let grad = match grad {
+                Some(g) => g,
+                None => continue,
+            };
 
             compute::gpu_sophia_update(
-                &self.ctx, &ps.buffer, &grad, &ps.m, &ps.h,
-                ps.size as u32, compute::SophiaParams { lr, beta1: self.beta1, beta2: self.beta2, eps: self.eps, rho: self.rho, weight_decay: self.weight_decay },
+                &self.ctx,
+                &ps.buffer,
+                &grad,
+                &ps.m,
+                &ps.h,
+                ps.size as u32,
+                compute::SophiaParams {
+                    lr,
+                    beta1: self.beta1,
+                    beta2: self.beta2,
+                    eps: self.eps,
+                    rho: self.rho,
+                    weight_decay: self.weight_decay,
+                },
             );
         }
     }
@@ -617,9 +729,9 @@ impl Sophia {
 /// For non-2D params (embeddings, biases, norms): falls back to AdamW.
 pub struct Muon {
     pub params: Vec<MuonState>,
-    pub beta: f32,          // momentum decay (0.95)
+    pub beta: f32, // momentum decay (0.95)
     pub weight_decay: f32,
-    pub ns_steps: usize,    // Newton-Schulz iterations (5-7)
+    pub ns_steps: usize, // Newton-Schulz iterations (5-7)
     pub step: u32,
     /// AdamW-fallback hyperparameters for the non-2-D params (norms/biases). eps defaults to the
     /// hardened 1e-5 — the old hardcoded 1e-8 here was the same denominator-collapse bug that was
@@ -646,52 +758,69 @@ pub struct MuonState {
     pub buffer: crate::gpu::Buf,
     pub size: usize,
     pub shape: Vec<usize>,
-    pub m: crate::gpu::Buf,    // momentum buffer
-    pub is_2d: bool,               // true = Muon update, false = AdamW fallback
-    pub no_decay: bool,            // AdamW fallback: skip weight decay for 1-D norms/biases
+    pub m: crate::gpu::Buf, // momentum buffer
+    pub is_2d: bool,        // true = Muon update, false = AdamW fallback
+    pub no_decay: bool,     // AdamW fallback: skip weight decay for 1-D norms/biases
     // AdamW fallback state for non-2D params
     pub v: Option<crate::gpu::Buf>,
     // Pre-allocated Newton-Schulz workspace (avoids ~100 allocs per 2D param per step)
-    pub ns_x: Option<crate::gpu::Buf>,    // [rows, cols] — working copy
-    pub ns_xxt: Option<crate::gpu::Buf>,  // [rows, rows] — X @ X^T
+    pub ns_x: Option<crate::gpu::Buf>, // [rows, cols] — working copy
+    pub ns_xxt: Option<crate::gpu::Buf>, // [rows, rows] — X @ X^T
     pub ns_xxtx: Option<crate::gpu::Buf>, // [rows, cols] — (X @ X^T) @ X
     // NorMuon per-row state (only Some for 2-D params): the running second moment and a scratch buffer.
-    pub ns_vrow: Option<crate::gpu::Buf>,  // [rows] — EMA of per-row mean-square of the orthogonal update
+    pub ns_vrow: Option<crate::gpu::Buf>, // [rows] — EMA of per-row mean-square of the orthogonal update
     pub ns_rowss: Option<crate::gpu::Buf>, // [rows] — scratch (per-row sum-of-squares, then the scale)
 }
 
 impl Muon {
     pub fn new(ctx: &Arc<MetalContext>, params: &[&Tensor], weight_decay: f32) -> Self {
-        let param_states = params.iter().map(|t| {
-            let size = t.numel();
-            let is_2d = t.shape.len() == 2 && t.shape[0] > 1 && t.shape[1] > 1;
-            let m = ctx.alloc_buffer(size * 4);
-            compute::gpu_fill(ctx, &m, size as u32, 0.0);
-            let v = if !is_2d {
-                let v_buf = ctx.alloc_buffer(size * 4);
-                compute::gpu_fill(ctx, &v_buf, size as u32, 0.0);
-                Some(v_buf)
-            } else { None };
-            // Pre-allocate NS workspace for 2D params (+ NorMuon per-row buffers, used only when enabled).
-            let (ns_x, ns_xxt, ns_xxtx, ns_vrow, ns_rowss) = if is_2d {
-                let rows = t.shape[0];
-                let cols = t.shape[1];
-                let vrow = ctx.alloc_buffer(rows * 4);
-                compute::gpu_fill(ctx, &vrow, rows as u32, 0.0); // second moment starts at 0
-                (
-                    Some(ctx.alloc_buffer(rows * cols * 4)),
-                    Some(ctx.alloc_buffer(rows * rows * 4)),
-                    Some(ctx.alloc_buffer(rows * cols * 4)),
-                    Some(vrow),
-                    Some(ctx.alloc_buffer(rows * 4)),
-                )
-            } else { (None, None, None, None, None) };
-            MuonState {
-                tensor_id: t.id, buffer: t.buffer.clone(), size,
-                shape: t.shape.clone(), m, is_2d, no_decay: t.shape.len() <= 1, v,
-                ns_x, ns_xxt, ns_xxtx, ns_vrow, ns_rowss,
-            }
-        }).collect();
+        let param_states = params
+            .iter()
+            .map(|t| {
+                let size = t.numel();
+                let is_2d = t.shape.len() == 2 && t.shape[0] > 1 && t.shape[1] > 1;
+                let m = ctx.alloc_buffer(size * 4);
+                compute::gpu_fill(ctx, &m, size as u32, 0.0);
+                let v = if !is_2d {
+                    let v_buf = ctx.alloc_buffer(size * 4);
+                    compute::gpu_fill(ctx, &v_buf, size as u32, 0.0);
+                    Some(v_buf)
+                } else {
+                    None
+                };
+                // Pre-allocate NS workspace for 2D params (+ NorMuon per-row buffers, used only when enabled).
+                let (ns_x, ns_xxt, ns_xxtx, ns_vrow, ns_rowss) = if is_2d {
+                    let rows = t.shape[0];
+                    let cols = t.shape[1];
+                    let vrow = ctx.alloc_buffer(rows * 4);
+                    compute::gpu_fill(ctx, &vrow, rows as u32, 0.0); // second moment starts at 0
+                    (
+                        Some(ctx.alloc_buffer(rows * cols * 4)),
+                        Some(ctx.alloc_buffer(rows * rows * 4)),
+                        Some(ctx.alloc_buffer(rows * cols * 4)),
+                        Some(vrow),
+                        Some(ctx.alloc_buffer(rows * 4)),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
+                MuonState {
+                    tensor_id: t.id,
+                    buffer: t.buffer.clone(),
+                    size,
+                    shape: t.shape.clone(),
+                    m,
+                    is_2d,
+                    no_decay: t.shape.len() <= 1,
+                    v,
+                    ns_x,
+                    ns_xxt,
+                    ns_xxtx,
+                    ns_vrow,
+                    ns_rowss,
+                }
+            })
+            .collect();
 
         Self {
             params: param_states,
@@ -731,7 +860,10 @@ impl Muon {
 
         for ps in &self.params {
             let grad = autograd::get_grad(ps.tensor_id);
-            let grad = match grad { Some(g) => g, None => continue };
+            let grad = match grad {
+                Some(g) => g,
+                None => continue,
+            };
 
             if ps.is_2d {
                 // Muon update: momentum + Newton-Schulz orthogonalization
@@ -767,10 +899,8 @@ impl Muon {
                 let b = -0.5f32;
 
                 for _ns in 0..self.ns_steps {
-                    compute::gpu_matmul_trans_b(&self.ctx, x_buf, x_buf, xxt_buf,
-                        rows, rows, cols);
-                    compute::gpu_matmul(&self.ctx, xxt_buf, x_buf, xxtx_buf,
-                        rows, cols, rows);
+                    compute::gpu_matmul_trans_b(&self.ctx, x_buf, x_buf, xxt_buf, rows, rows, cols);
+                    compute::gpu_matmul(&self.ctx, xxt_buf, x_buf, xxtx_buf, rows, cols, rows);
                     // X = a*X + b*(X@X^T@X) — fused with axpy: scale X, then axpy
                     compute::gpu_scale(&self.ctx, x_buf, size, a);
                     compute::gpu_axpy(&self.ctx, x_buf, xxtx_buf, size, b);
@@ -781,16 +911,23 @@ impl Muon {
                 // Muon). Off by default (plain Muon). Reuses existing kernels — no new optimizer state
                 // on disk (ns_vrow is in-memory, re-warms after resume).
                 if self.normalized {
-                    let vrow = ps.ns_vrow.as_ref().unwrap();   // [rows] running second moment
+                    let vrow = ps.ns_vrow.as_ref().unwrap(); // [rows] running second moment
                     let rowss = ps.ns_rowss.as_ref().unwrap(); // [rows] scratch
-                    // r[i] = mean_j X[i,j]^2  (per-row mean-square of the orthogonal update)
+                                                               // r[i] = mean_j X[i,j]^2  (per-row mean-square of the orthogonal update)
                     compute::gpu_row_dot_reduce(&self.ctx, x_buf, x_buf, rowss, rows, cols);
                     compute::gpu_scale(&self.ctx, rowss, rows, 1.0 / cols as f32);
                     // v[i] = beta2*v[i] + (1-beta2)*r[i]
                     compute::gpu_ema_update(&self.ctx, vrow, rowss, rows, self.norm_beta2);
                     // scale[i] = 1 / (sqrt(v[i] / (1 - beta2^t)) + eps)  — bias-corrected; written into rowss
                     let bias_correction = 1.0 / (1.0 - self.norm_beta2.powi(self.step as i32));
-                    compute::gpu_inv_sqrt_bc(&self.ctx, vrow, rowss, rows, bias_correction, self.norm_eps);
+                    compute::gpu_inv_sqrt_bc(
+                        &self.ctx,
+                        vrow,
+                        rowss,
+                        rows,
+                        bias_correction,
+                        self.norm_eps,
+                    );
                     // X[i,j] *= scale[i]  (in-place: each thread reads+writes its own element)
                     compute::gpu_scale_rows(&self.ctx, x_buf, rowss, x_buf, rows, cols);
                 }
@@ -820,7 +957,11 @@ impl Muon {
                 // standalone AdamW exactly (the old path hardcoded eps=1e-8 + decayed norms).
                 let v_buf = ps.v.as_ref().unwrap();
                 compute::gpu_adamw_update(
-                    &self.ctx, &ps.buffer, &grad, &ps.m, v_buf,
+                    &self.ctx,
+                    &ps.buffer,
+                    &grad,
+                    &ps.m,
+                    v_buf,
                     ps.size as u32,
                     &compute::AdamWHyperparams {
                         lr,
@@ -908,7 +1049,12 @@ impl HybridOptimizer {
         let mut muon = Muon::new(ctx, &muon_params, weight_decay);
         muon.adamw_hyper = hyper; // keep the (unused-here) fallback consistent if a degenerate sneaks in
         let adamw = AdamW::new_with_config(ctx, &adamw_params, weight_decay, hyper);
-        Self { muon, adamw, muon_lr_scale: 1.0, adamw_lr_scale: 1.0 }
+        Self {
+            muon,
+            adamw,
+            muon_lr_scale: 1.0,
+            adamw_lr_scale: 1.0,
+        }
     }
 
     /// Set the per-group LR multipliers (Muon group, AdamW group) on the base lr.

@@ -3,28 +3,28 @@ pub mod api;
 mod attention;
 mod autograd;
 mod checkpoint;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod data;
 mod datapipe;
+mod distill;
 mod dpo;
 mod eval;
 mod generate;
+mod gpu;
 mod linear_attention;
 mod loss;
-mod mla;
 #[cfg(feature = "metal")]
 mod metal;
-#[cfg(feature = "cuda")]
-mod cuda;
-mod distill;
-mod gpu;
+mod mla;
 mod model;
 mod optim;
-mod rwkv;
 pub mod quantize;
-mod tensor;
-mod tokenizer;
+mod rwkv;
 mod sft;
 mod ssm;
+mod tensor;
+mod tokenizer;
 mod train;
 
 #[cfg(test)]
@@ -42,212 +42,212 @@ struct Cli {
 /// Arguments for the `train` subcommand (boxed in `Commands::Train` to keep the enum small).
 #[derive(clap::Args)]
 struct TrainArgs {
-        #[arg(long)]
-        dataset: String,
-        #[arg(long)]
-        tokenizer: String,
-        /// Preset: tiny, small, medium, large, max — or "custom" with --dim/--layers/--heads/--ffn-mult
-        #[arg(long, default_value = "small")]
-        size: String,
-        /// Custom: embedding dimension (requires --size custom)
-        #[arg(long)]
-        dim: Option<usize>,
-        /// Custom: number of transformer layers
-        #[arg(long)]
-        layers: Option<usize>,
-        /// Custom: number of attention heads
-        #[arg(long)]
-        heads: Option<usize>,
-        /// Custom: FFN hidden size multiplier (d_ff = dim * ffn_mult)
-        #[arg(long)]
-        ffn_mult: Option<f32>,
-        /// Custom: number of key/value heads for Grouped Query Attention (defaults to --heads)
-        #[arg(long)]
-        kv_heads: Option<usize>,
-        /// MoE: number of expert FFNs (1 = dense). Default: 1
-        #[arg(long, default_value = "1")]
-        n_experts: usize,
-        /// MoE: top-K experts per token. Default: 1
-        #[arg(long, default_value = "1")]
-        top_k_experts: usize,
-        /// Custom: maximum sequence length
-        #[arg(long)]
-        max_seq: Option<usize>,
-        #[arg(long, default_value = "32")]
-        batch_size: usize,
-        #[arg(long, default_value = "256")]
-        seq_len: usize,
-        #[arg(long, default_value = "50000")]
-        steps: u32,
-        #[arg(long, default_value = "3e-4")]
-        lr: f32,
-        #[arg(long, default_value = "2000")]
-        warmup: u32,
-        #[arg(long, default_value = "checkpoints")]
-        checkpoint_dir: String,
-        /// Enable gradient checkpointing (trades 2x compute for ~60% less activation memory)
-        #[arg(long, default_value = "false")]
-        gradient_checkpointing: bool,
-        /// Knowledge distillation: path to teacher model checkpoint
-        #[arg(long)]
-        teacher_checkpoint: Option<String>,
-        /// Distillation temperature (softens distributions, higher = softer). Default: 4.0
-        #[arg(long, default_value = "4.0")]
-        distill_temperature: f32,
-        /// Distillation alpha: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5
-        #[arg(long, default_value = "0.5")]
-        distill_alpha: f32,
-        /// Gradient accumulation steps. Effective batch = batch_size * grad_accum. Default: 1
-        #[arg(long, default_value = "1")]
-        grad_accum: u32,
-        /// Resume training from a saved training state file
-        #[arg(long)]
-        resume: Option<String>,
-        /// Validation dataset path (eval every checkpoint_interval steps)
-        #[arg(long)]
-        val_dataset: Option<String>,
-        /// Dropout rate (0.0 = no dropout). Default: 0.0
-        #[arg(long, default_value = "0.0")]
-        dropout: f32,
-        /// LR warm restart period (steps). 0 = standard cosine. Default: 0
-        #[arg(long, default_value = "0")]
-        lr_restart: u32,
-        /// μP base width for hyperparameter transfer. 0 = disabled. Default: 0
-        #[arg(long, default_value = "0")]
-        mup_base: usize,
-        /// BitNet: use ternary weights in FFN (no float multiply). Default: false
-        #[arg(long)]
-        bitnet: bool,
-        /// MLA: Multi-head Latent Attention KV latent dim d_c. 0=off. e.g. 64 → 10-50× KV-cache shrink.
-        #[arg(long, default_value = "0")]
-        mla_latent_dim: usize,
-        /// Block-sparse (MoBA/NSA) attention: # past blocks each query attends. 0=off. e.g. 8.
-        #[arg(long, default_value = "0")]
-        block_sparse_top_k: usize,
-        /// Block-sparse attention block length. Default 64.
-        #[arg(long, default_value = "64")]
-        block_size: usize,
-        /// Selective state-space (Mamba-2/SSD) mixer in every block instead of attention. O(N) sequence mixing.
-        #[arg(long)]
-        ssm: bool,
-        /// RWKV-style time-mix (per-channel WKV + receptance) in every block instead of attention. O(N).
-        /// Takes precedence over --ssm if both are set. EXPERIMENTAL: the materialised wkv path does not
-        /// currently converge (loss stays flat even at short seq, token-shift omitted) — wired for
-        /// development, not production. --ssm and --linear-attn do train.
-        #[arg(long)]
-        rwkv: bool,
-        /// Linear (kernel) O(N) attention in every block instead of softmax attention.
-        #[arg(long)]
-        linear_attn: bool,
-        /// Hybrid mixer cadence: every Nth layer is linear attention, the rest softmax. 0=off.
-        /// e.g. 4 → "3 softmax : 1 linear". Ignored when --ssm/--rwkv/--linear-attn replace every block.
-        #[arg(long, default_value = "0")]
-        linear_attn_period: usize,
-        /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
-        #[arg(long, default_value = "0")]
-        lowrank: usize,
-        /// ALBERT: share weights across all layers (1 unique layer, N iterations)
-        #[arg(long)]
-        shared_layers: bool,
-        /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
-        #[arg(long, default_value = "0.0")]
-        prune_threshold: f32,
-        /// Speculative pretraining: reference model checkpoint. Skip batches it already knows.
-        #[arg(long)]
-        reference_model: Option<String>,
-        /// Speculative threshold: skip if reference loss < this value. Default: 7.0
-        #[arg(long, default_value = "7.0")]
-        speculative_threshold: f32,
-        /// Optimizer: "adamw", "sophia", "muon", "hybrid" (Muon for 2-D matrices + AdamW for
-        /// embeddings/head/routers/norms — the canonical Muon recipe), or "adamw-8bit" (block-wise
-        /// int8 moments, ~4× less optimizer memory). Default: adamw
-        #[arg(long, default_value = "adamw")]
-        optimizer: String,
-        /// AdamW first-moment decay (beta1). Default: 0.9
-        #[arg(long, default_value = "0.9")]
-        adamw_beta1: f32,
-        /// AdamW second-moment decay (beta2). Default: 0.95 (short memory, pairs with eps=1e-5)
-        #[arg(long, default_value = "0.95")]
-        adamw_beta2: f32,
-        /// AdamW epsilon (update-denominator floor). Default: 1e-5 (the hardened value)
-        #[arg(long, default_value = "0.00001")]
-        adamw_eps: f32,
-        /// Per-element clip on the normalized AdamW update m̂/(√v̂+ε). 0=off. Try 10 to catch spikes.
-        #[arg(long, default_value = "0.0")]
-        update_clip: f32,
-        /// Clip gradients per-tensor (each to max_grad_norm) instead of by global norm.
-        #[arg(long)]
-        per_tensor_clip: bool,
-        /// Hybrid optimizer: LR multiplier for the Muon (hidden-matrix) group. Default 1.0.
-        #[arg(long, default_value = "1.0")]
-        muon_lr_scale: f32,
-        /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
-        #[arg(long, default_value = "1.0")]
-        adamw_lr_scale: f32,
-        /// Disable the hardware simdgroup MMA matmul (ON by default; bit-identical, ~+31% training).
-        /// Use only to fall back to scalar-MAC kernels or to enable --bf16-matmul.
-        #[arg(long = "no-simdgroup-matmul")]
-        no_simdgroup_matmul: bool,
-        /// Route the default matmul through bf16: fp32 RANGE (no fp16 ±65504 clamp) but only ~7-bit
-        /// mantissa (vs fp16's 10). Use ONLY when fp16 overflows (NaN at large activations) — its
-        /// coarser precision DESTABILIZES otherwise (verified: diverged to ~475 on a real run where
-        /// fp16 reached 1.56). For range AND precision use the fp32/simdgroup matmul paths.
-        #[arg(long)]
-        bf16_matmul: bool,
-        /// Batch-size LR transfer reference batch. 0=off (use --lr as-is). When set, --lr is the LR tuned
-        /// at THIS batch size and is scaled to the actual --batch-size by the √batch rule. Orthogonal to
-        /// μP. For Muon, drop --muon-lr-scale as batch rises instead (see #6).
-        #[arg(long, default_value = "0")]
-        lr_ref_batch: usize,
-        /// NorMuon: per-neuron (per-row) second-moment normalization of the Muon/hybrid orthogonalized
-        /// update (~+11% over Muon). Only affects --optimizer muon / hybrid. Default false.
-        #[arg(long)]
-        normuon: bool,
-        /// Cautious optimizer (Liang et al. 2024): mask Muon/hybrid orthogonalized-update components
-        /// that disagree in sign with the gradient, then renormalize. Near-free convergence gain.
-        /// Only affects `--optimizer muon` / `hybrid`. Composes with --normuon. Default false.
-        #[arg(long)]
-        cautious: bool,
-        /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
-        #[arg(long, default_value = "0")]
-        n_predict: usize,
-        /// Curriculum learning: ramp seq_len from short→full over first 25% of training
-        #[arg(long)]
-        curriculum: bool,
-        /// Z-loss coefficient: penalize large logits. 0=off, 1e-4=recommended for MoE
-        #[arg(long, default_value = "0.0")]
-        z_loss: f32,
-        /// Stochastic depth: layer drop rate. 0=off, 0.1=recommended for deep models
-        #[arg(long, default_value = "0.0")]
-        stochastic_depth: f32,
-        /// Sliding window attention size. 0=full causal, 1024=attend last 1024 tokens
-        #[arg(long, default_value = "0")]
-        sliding_window: usize,
-        /// FP16 activation compression between layers. Halves inter-layer memory.
-        #[arg(long)]
-        fp16_activations: bool,
-        /// LR schedule: "cosine" (default) or "wsd" (warmup-stable-decay, 5-10% better)
-        #[arg(long, default_value = "cosine")]
-        lr_schedule: String,
-        /// Self-distillation EMA decay. 0=off, 0.999=recommended. EMA teacher improves sample efficiency.
-        #[arg(long, default_value = "0.0")]
-        ema_decay: f32,
-        /// Anti-PGD noise scale. 0=off, 0.01=recommended. Anticorrelated noise for flatter minima.
-        #[arg(long, default_value = "0.0")]
-        noise_scale: f32,
-        /// ReLoRA merge interval. 0=off, 5000=recommended. Merge lowrank weights for rank growth.
-        #[arg(long, default_value = "0")]
-        relora_interval: u32,
-        /// Fused linear+cross-entropy: compute logits in chunks, save ~2GB peak memory
-        #[arg(long)]
-        fused_ce: bool,
-        /// Progressive layer freezing fraction. 0=off, 0.5=freeze bottom 50% gradually.
-        #[arg(long, default_value = "0.0")]
-        freeze_fraction: f32,
-        /// Load pretrained model checkpoint (weights only, fresh optimizer).
-        /// For progressive training: grow a small model, then continue training larger.
-        #[arg(long)]
-        pretrained: Option<String>,
+    #[arg(long)]
+    dataset: String,
+    #[arg(long)]
+    tokenizer: String,
+    /// Preset: tiny, small, medium, large, max — or "custom" with --dim/--layers/--heads/--ffn-mult
+    #[arg(long, default_value = "small")]
+    size: String,
+    /// Custom: embedding dimension (requires --size custom)
+    #[arg(long)]
+    dim: Option<usize>,
+    /// Custom: number of transformer layers
+    #[arg(long)]
+    layers: Option<usize>,
+    /// Custom: number of attention heads
+    #[arg(long)]
+    heads: Option<usize>,
+    /// Custom: FFN hidden size multiplier (d_ff = dim * ffn_mult)
+    #[arg(long)]
+    ffn_mult: Option<f32>,
+    /// Custom: number of key/value heads for Grouped Query Attention (defaults to --heads)
+    #[arg(long)]
+    kv_heads: Option<usize>,
+    /// MoE: number of expert FFNs (1 = dense). Default: 1
+    #[arg(long, default_value = "1")]
+    n_experts: usize,
+    /// MoE: top-K experts per token. Default: 1
+    #[arg(long, default_value = "1")]
+    top_k_experts: usize,
+    /// Custom: maximum sequence length
+    #[arg(long)]
+    max_seq: Option<usize>,
+    #[arg(long, default_value = "32")]
+    batch_size: usize,
+    #[arg(long, default_value = "256")]
+    seq_len: usize,
+    #[arg(long, default_value = "50000")]
+    steps: u32,
+    #[arg(long, default_value = "3e-4")]
+    lr: f32,
+    #[arg(long, default_value = "2000")]
+    warmup: u32,
+    #[arg(long, default_value = "checkpoints")]
+    checkpoint_dir: String,
+    /// Enable gradient checkpointing (trades 2x compute for ~60% less activation memory)
+    #[arg(long, default_value = "false")]
+    gradient_checkpointing: bool,
+    /// Knowledge distillation: path to teacher model checkpoint
+    #[arg(long)]
+    teacher_checkpoint: Option<String>,
+    /// Distillation temperature (softens distributions, higher = softer). Default: 4.0
+    #[arg(long, default_value = "4.0")]
+    distill_temperature: f32,
+    /// Distillation alpha: loss = alpha * T^2 * KL + (1-alpha) * CE. Default: 0.5
+    #[arg(long, default_value = "0.5")]
+    distill_alpha: f32,
+    /// Gradient accumulation steps. Effective batch = batch_size * grad_accum. Default: 1
+    #[arg(long, default_value = "1")]
+    grad_accum: u32,
+    /// Resume training from a saved training state file
+    #[arg(long)]
+    resume: Option<String>,
+    /// Validation dataset path (eval every checkpoint_interval steps)
+    #[arg(long)]
+    val_dataset: Option<String>,
+    /// Dropout rate (0.0 = no dropout). Default: 0.0
+    #[arg(long, default_value = "0.0")]
+    dropout: f32,
+    /// LR warm restart period (steps). 0 = standard cosine. Default: 0
+    #[arg(long, default_value = "0")]
+    lr_restart: u32,
+    /// μP base width for hyperparameter transfer. 0 = disabled. Default: 0
+    #[arg(long, default_value = "0")]
+    mup_base: usize,
+    /// BitNet: use ternary weights in FFN (no float multiply). Default: false
+    #[arg(long)]
+    bitnet: bool,
+    /// MLA: Multi-head Latent Attention KV latent dim d_c. 0=off. e.g. 64 → 10-50× KV-cache shrink.
+    #[arg(long, default_value = "0")]
+    mla_latent_dim: usize,
+    /// Block-sparse (MoBA/NSA) attention: # past blocks each query attends. 0=off. e.g. 8.
+    #[arg(long, default_value = "0")]
+    block_sparse_top_k: usize,
+    /// Block-sparse attention block length. Default 64.
+    #[arg(long, default_value = "64")]
+    block_size: usize,
+    /// Selective state-space (Mamba-2/SSD) mixer in every block instead of attention. O(N) sequence mixing.
+    #[arg(long)]
+    ssm: bool,
+    /// RWKV-style time-mix (per-channel WKV + receptance) in every block instead of attention. O(N).
+    /// Takes precedence over --ssm if both are set. EXPERIMENTAL: the materialised wkv path does not
+    /// currently converge (loss stays flat even at short seq, token-shift omitted) — wired for
+    /// development, not production. --ssm and --linear-attn do train.
+    #[arg(long)]
+    rwkv: bool,
+    /// Linear (kernel) O(N) attention in every block instead of softmax attention.
+    #[arg(long)]
+    linear_attn: bool,
+    /// Hybrid mixer cadence: every Nth layer is linear attention, the rest softmax. 0=off.
+    /// e.g. 4 → "3 softmax : 1 linear". Ignored when --ssm/--rwkv/--linear-attn replace every block.
+    #[arg(long, default_value = "0")]
+    linear_attn_period: usize,
+    /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
+    #[arg(long, default_value = "0")]
+    lowrank: usize,
+    /// ALBERT: share weights across all layers (1 unique layer, N iterations)
+    #[arg(long)]
+    shared_layers: bool,
+    /// Data pruning: skip batches where loss < threshold. 0.0=disabled. Try 8.0 after warmup.
+    #[arg(long, default_value = "0.0")]
+    prune_threshold: f32,
+    /// Speculative pretraining: reference model checkpoint. Skip batches it already knows.
+    #[arg(long)]
+    reference_model: Option<String>,
+    /// Speculative threshold: skip if reference loss < this value. Default: 7.0
+    #[arg(long, default_value = "7.0")]
+    speculative_threshold: f32,
+    /// Optimizer: "adamw", "sophia", "muon", "hybrid" (Muon for 2-D matrices + AdamW for
+    /// embeddings/head/routers/norms — the canonical Muon recipe), or "adamw-8bit" (block-wise
+    /// int8 moments, ~4× less optimizer memory). Default: adamw
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
+    /// AdamW first-moment decay (beta1). Default: 0.9
+    #[arg(long, default_value = "0.9")]
+    adamw_beta1: f32,
+    /// AdamW second-moment decay (beta2). Default: 0.95 (short memory, pairs with eps=1e-5)
+    #[arg(long, default_value = "0.95")]
+    adamw_beta2: f32,
+    /// AdamW epsilon (update-denominator floor). Default: 1e-5 (the hardened value)
+    #[arg(long, default_value = "0.00001")]
+    adamw_eps: f32,
+    /// Per-element clip on the normalized AdamW update m̂/(√v̂+ε). 0=off. Try 10 to catch spikes.
+    #[arg(long, default_value = "0.0")]
+    update_clip: f32,
+    /// Clip gradients per-tensor (each to max_grad_norm) instead of by global norm.
+    #[arg(long)]
+    per_tensor_clip: bool,
+    /// Hybrid optimizer: LR multiplier for the Muon (hidden-matrix) group. Default 1.0.
+    #[arg(long, default_value = "1.0")]
+    muon_lr_scale: f32,
+    /// Hybrid optimizer: LR multiplier for the AdamW (embeddings/head/norms) group. Default 1.0.
+    #[arg(long, default_value = "1.0")]
+    adamw_lr_scale: f32,
+    /// Disable the hardware simdgroup MMA matmul (ON by default; bit-identical, ~+31% training).
+    /// Use only to fall back to scalar-MAC kernels or to enable --bf16-matmul.
+    #[arg(long = "no-simdgroup-matmul")]
+    no_simdgroup_matmul: bool,
+    /// Route the default matmul through bf16: fp32 RANGE (no fp16 ±65504 clamp) but only ~7-bit
+    /// mantissa (vs fp16's 10). Use ONLY when fp16 overflows (NaN at large activations) — its
+    /// coarser precision DESTABILIZES otherwise (verified: diverged to ~475 on a real run where
+    /// fp16 reached 1.56). For range AND precision use the fp32/simdgroup matmul paths.
+    #[arg(long)]
+    bf16_matmul: bool,
+    /// Batch-size LR transfer reference batch. 0=off (use --lr as-is). When set, --lr is the LR tuned
+    /// at THIS batch size and is scaled to the actual --batch-size by the √batch rule. Orthogonal to
+    /// μP. For Muon, drop --muon-lr-scale as batch rises instead (see #6).
+    #[arg(long, default_value = "0")]
+    lr_ref_batch: usize,
+    /// NorMuon: per-neuron (per-row) second-moment normalization of the Muon/hybrid orthogonalized
+    /// update (~+11% over Muon). Only affects --optimizer muon / hybrid. Default false.
+    #[arg(long)]
+    normuon: bool,
+    /// Cautious optimizer (Liang et al. 2024): mask Muon/hybrid orthogonalized-update components
+    /// that disagree in sign with the gradient, then renormalize. Near-free convergence gain.
+    /// Only affects `--optimizer muon` / `hybrid`. Composes with --normuon. Default false.
+    #[arg(long)]
+    cautious: bool,
+    /// Multi-token prediction: number of extra heads (0=standard, 4=recommended). 4x sample efficiency.
+    #[arg(long, default_value = "0")]
+    n_predict: usize,
+    /// Curriculum learning: ramp seq_len from short→full over first 25% of training
+    #[arg(long)]
+    curriculum: bool,
+    /// Z-loss coefficient: penalize large logits. 0=off, 1e-4=recommended for MoE
+    #[arg(long, default_value = "0.0")]
+    z_loss: f32,
+    /// Stochastic depth: layer drop rate. 0=off, 0.1=recommended for deep models
+    #[arg(long, default_value = "0.0")]
+    stochastic_depth: f32,
+    /// Sliding window attention size. 0=full causal, 1024=attend last 1024 tokens
+    #[arg(long, default_value = "0")]
+    sliding_window: usize,
+    /// FP16 activation compression between layers. Halves inter-layer memory.
+    #[arg(long)]
+    fp16_activations: bool,
+    /// LR schedule: "cosine" (default) or "wsd" (warmup-stable-decay, 5-10% better)
+    #[arg(long, default_value = "cosine")]
+    lr_schedule: String,
+    /// Self-distillation EMA decay. 0=off, 0.999=recommended. EMA teacher improves sample efficiency.
+    #[arg(long, default_value = "0.0")]
+    ema_decay: f32,
+    /// Anti-PGD noise scale. 0=off, 0.01=recommended. Anticorrelated noise for flatter minima.
+    #[arg(long, default_value = "0.0")]
+    noise_scale: f32,
+    /// ReLoRA merge interval. 0=off, 5000=recommended. Merge lowrank weights for rank growth.
+    #[arg(long, default_value = "0")]
+    relora_interval: u32,
+    /// Fused linear+cross-entropy: compute logits in chunks, save ~2GB peak memory
+    #[arg(long)]
+    fused_ce: bool,
+    /// Progressive layer freezing fraction. 0=off, 0.5=freeze bottom 50% gradually.
+    #[arg(long, default_value = "0.0")]
+    freeze_fraction: f32,
+    /// Load pretrained model checkpoint (weights only, fresh optimizer).
+    /// For progressive training: grow a small model, then continue training larger.
+    #[arg(long)]
+    pretrained: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -646,7 +646,8 @@ fn main() {
             output,
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let n = data::prepare_dataset(&input, &tok, &output).expect("Failed to prepare dataset");
+            let n =
+                data::prepare_dataset(&input, &tok, &output).expect("Failed to prepare dataset");
 
             // Demonstrate batch padding utility: encode a sample and pad to fixed length
             let sample_text = std::fs::read_to_string(&input)
@@ -655,7 +656,11 @@ fn main() {
             if !sample_text.is_empty() {
                 let sample_tokens = tok.encode(&sample_text);
                 let padded = data::pad_sequences(std::slice::from_ref(&sample_tokens), 64);
-                eprintln!("Sample: {} tokens → {} padded to len 64", sample_tokens.len(), padded.len());
+                eprintln!(
+                    "Sample: {} tokens → {} padded to len 64",
+                    sample_tokens.len(),
+                    padded.len()
+                );
             }
 
             eprintln!("Dataset ready: {} tokens", n);
@@ -663,72 +668,72 @@ fn main() {
 
         Commands::Train(args) => {
             let TrainArgs {
-            dataset,
-            tokenizer: tok_path,
-            size,
-            dim,
-            layers,
-            heads,
-            ffn_mult,
-            kv_heads,
-            n_experts,
-            top_k_experts,
-            max_seq,
-            batch_size,
-            seq_len,
-            steps,
-            lr,
-            warmup,
-            checkpoint_dir,
-            gradient_checkpointing,
-            teacher_checkpoint,
-            distill_temperature,
-            distill_alpha,
-            grad_accum,
-            resume,
-            val_dataset,
-            dropout,
-            lr_restart,
-            mup_base,
-            bitnet,
-            mla_latent_dim,
-            block_sparse_top_k,
-            block_size,
-            ssm,
-            rwkv,
-            linear_attn,
-            linear_attn_period,
-            lowrank,
-            shared_layers,
-            prune_threshold,
-            reference_model,
-            speculative_threshold,
-            optimizer,
-            n_predict,
-            curriculum,
-            z_loss,
-            stochastic_depth,
-            sliding_window,
-            fp16_activations,
-            lr_schedule,
-            ema_decay,
-            noise_scale,
-            relora_interval,
-            fused_ce,
-            freeze_fraction,
-            pretrained,
-            adamw_beta1,
-            adamw_beta2,
-            adamw_eps,
-            update_clip,
-            per_tensor_clip,
-            muon_lr_scale,
-            adamw_lr_scale,
-            no_simdgroup_matmul,
-            bf16_matmul,
-            lr_ref_batch,
-            normuon,
-            cautious,
+                dataset,
+                tokenizer: tok_path,
+                size,
+                dim,
+                layers,
+                heads,
+                ffn_mult,
+                kv_heads,
+                n_experts,
+                top_k_experts,
+                max_seq,
+                batch_size,
+                seq_len,
+                steps,
+                lr,
+                warmup,
+                checkpoint_dir,
+                gradient_checkpointing,
+                teacher_checkpoint,
+                distill_temperature,
+                distill_alpha,
+                grad_accum,
+                resume,
+                val_dataset,
+                dropout,
+                lr_restart,
+                mup_base,
+                bitnet,
+                mla_latent_dim,
+                block_sparse_top_k,
+                block_size,
+                ssm,
+                rwkv,
+                linear_attn,
+                linear_attn_period,
+                lowrank,
+                shared_layers,
+                prune_threshold,
+                reference_model,
+                speculative_threshold,
+                optimizer,
+                n_predict,
+                curriculum,
+                z_loss,
+                stochastic_depth,
+                sliding_window,
+                fp16_activations,
+                lr_schedule,
+                ema_decay,
+                noise_scale,
+                relora_interval,
+                fused_ce,
+                freeze_fraction,
+                pretrained,
+                adamw_beta1,
+                adamw_beta2,
+                adamw_eps,
+                update_clip,
+                per_tensor_clip,
+                muon_lr_scale,
+                adamw_lr_scale,
+                no_simdgroup_matmul,
+                bf16_matmul,
+                lr_ref_batch,
+                normuon,
+                cautious,
             } = *args;
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             tok.print_stats();
@@ -855,7 +860,8 @@ fn main() {
         } => {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             let (model, step) = if ckpt_path.ends_with(".qbin") {
-                quantize::load_quantized(&ctx, &ckpt_path).expect("Failed to load quantized checkpoint")
+                quantize::load_quantized(&ctx, &ckpt_path)
+                    .expect("Failed to load quantized checkpoint")
             } else {
                 checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint")
             };
@@ -880,9 +886,8 @@ fn main() {
                     println!("[{}] => {}", p, o);
                 }
             } else if speculative {
-                let draft_ckpt = draft_checkpoint.expect(
-                    "--draft-checkpoint is required when --speculative is set"
-                );
+                let draft_ckpt = draft_checkpoint
+                    .expect("--draft-checkpoint is required when --speculative is set");
                 let (draft_model, draft_step) = if draft_ckpt.ends_with(".qbin") {
                     quantize::load_quantized(&ctx, &draft_ckpt)
                         .expect("Failed to load quantized draft checkpoint")
@@ -902,8 +907,14 @@ fn main() {
                     print!("{}", prompt);
                     generate::generate_speculative_streaming(
                         &ctx,
-                        generate::SpecModels { main: &model, draft: &draft_model, tokenizer: &tok },
-                        &prompt, &config, draft_tokens,
+                        generate::SpecModels {
+                            main: &model,
+                            draft: &draft_model,
+                            tokenizer: &tok,
+                        },
+                        &prompt,
+                        &config,
+                        draft_tokens,
                         |token_str| {
                             print!("{}", token_str);
                             use std::io::Write;
@@ -913,7 +924,13 @@ fn main() {
                     println!();
                 } else {
                     let output = generate::generate_speculative(
-                        &ctx, &model, &draft_model, &tok, &prompt, &config, draft_tokens,
+                        &ctx,
+                        &model,
+                        &draft_model,
+                        &tok,
+                        &prompt,
+                        &config,
+                        draft_tokens,
                     );
                     println!("{}{}", prompt, output);
                 }
@@ -943,20 +960,34 @@ fn main() {
             println!("  Vocab size: {}", c.vocab_size);
             println!("  d_model: {}", c.d_model);
             println!("  n_heads: {}", c.n_heads);
-            println!("  n_kv_heads: {} (group_size={})", c.n_kv_heads, c.n_heads / c.n_kv_heads);
+            println!(
+                "  n_kv_heads: {} (group_size={})",
+                c.n_kv_heads,
+                c.n_heads / c.n_kv_heads
+            );
             println!("  n_layers: {}", c.n_layers);
             println!("  d_ff: {}", c.d_ff());
             println!("  ffn_multiplier: {}", c.ffn_multiplier);
             println!("  max_seq_len: {}", c.max_seq_len);
             println!("  RoPE theta: {}", c.rope_theta);
-            println!("  Training RAM: {:.0} MB", c.training_memory_bytes() as f64 / (1024.0 * 1024.0));
-            println!("  Inference RAM: {:.0} MB", c.inference_memory_bytes() as f64 / (1024.0 * 1024.0));
+            println!(
+                "  Training RAM: {:.0} MB",
+                c.training_memory_bytes() as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "  Inference RAM: {:.0} MB",
+                c.inference_memory_bytes() as f64 / (1024.0 * 1024.0)
+            );
 
             // GPU diagnostic — verify all kernel variants (Metal-only parity harness)
             #[cfg(feature = "metal")]
             {
                 let (n_tested, all_ok) = api::gpu_diagnostic(&ctx);
-                println!("  GPU kernels: {} tested, {}", n_tested, if all_ok { "all passed" } else { "FAILURES" });
+                println!(
+                    "  GPU kernels: {} tested, {}",
+                    n_tested,
+                    if all_ok { "all passed" } else { "FAILURES" }
+                );
             }
         }
 
@@ -991,21 +1022,39 @@ fn main() {
             println!("Or use --size custom with --dim --layers --heads --kv-heads --ffn-mult --max-seq for any arbitrary config.");
         }
 
-        Commands::Perplexity { checkpoint, tokenizer, text, file } => {
+        Commands::Perplexity {
+            checkpoint,
+            tokenizer,
+            text,
+            file,
+        } => {
             let tok = tokenizer::BpeTokenizer::load(&tokenizer).expect("Failed to load tokenizer");
             let (model, step) = if checkpoint.ends_with(".qbin") {
-                quantize::load_quantized(&ctx, &checkpoint).expect("Failed to load quantized checkpoint")
+                quantize::load_quantized(&ctx, &checkpoint)
+                    .expect("Failed to load quantized checkpoint")
             } else {
                 checkpoint::load_checkpoint(&ctx, &checkpoint).expect("Failed to load checkpoint")
             };
             let corpus = match file {
-                Some(f) => String::from_utf8_lossy(&std::fs::read(&f).expect("Failed to read --file")).into_owned(),
+                Some(f) => {
+                    String::from_utf8_lossy(&std::fs::read(&f).expect("Failed to read --file"))
+                        .into_owned()
+                }
                 None => text,
             };
             let tokens = tok.encode(&corpus);
-            assert!(tokens.len() >= 2, "need >= 2 tokens to score perplexity (got {})", tokens.len());
+            assert!(
+                tokens.len() >= 2,
+                "need >= 2 tokens to score perplexity (got {})",
+                tokens.len()
+            );
             let ppl = eval::perplexity(&ctx, &model, &tokens);
-            println!("Perplexity: {:.3} over {} tokens (model step {})", ppl, tokens.len(), step);
+            println!(
+                "Perplexity: {:.3} over {} tokens (model step {})",
+                ppl,
+                tokens.len(),
+                step
+            );
         }
 
         Commands::ImportBpe { merges, output } => {
@@ -1070,7 +1119,10 @@ fn main() {
                         1.0
                     };
                     datapipe::DataSource {
-                        name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        name: path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
                         path,
                         weight,
                         upsample: 1,
@@ -1081,10 +1133,14 @@ fn main() {
             let mix = datapipe::DataMix { sources };
             eprintln!("Data mix: {} sources", mix.sources.len());
             for src in &mix.sources {
-                eprintln!("  {} — weight {:.2}, upsample {}x", src.name, src.weight, src.upsample);
+                eprintln!(
+                    "  {} — weight {:.2}, upsample {}x",
+                    src.name, src.weight, src.upsample
+                );
             }
 
-            let shard_pairs: Vec<(std::path::PathBuf, f32)> = mix.sources
+            let shard_pairs: Vec<(std::path::PathBuf, f32)> = mix
+                .sources
                 .iter()
                 .map(|s| (s.path.clone(), s.weight * s.upsample as f32))
                 .collect();
@@ -1095,8 +1151,8 @@ fn main() {
         }
 
         Commands::Hash { file } => {
-            let hash = datapipe::sha256_file(std::path::Path::new(&file))
-                .expect("Failed to hash file");
+            let hash =
+                datapipe::sha256_file(std::path::Path::new(&file)).expect("Failed to hash file");
             println!("{}", hash);
         }
 
@@ -1107,17 +1163,27 @@ fn main() {
             let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
             let (model, step) =
                 checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
-            eprintln!("Evaluating model at step {} ({:.1}M params)", step, model.config.param_count() as f64 / 1e6);
+            eprintln!(
+                "Evaluating model at step {} ({:.1}M params)",
+                step,
+                model.config.param_count() as f64 / 1e6
+            );
 
             let examples = eval::builtin_eval_set();
             eprintln!("Running {} evaluation examples...", examples.len());
 
             // Verify tensor batch utilities (zeros, full, with_grad, slice_flat, concat_flat)
-            let sample_seqs: Vec<Vec<f32>> = examples.iter().take(4)
+            let sample_seqs: Vec<Vec<f32>> = examples
+                .iter()
+                .take(4)
                 .map(|e| e.prompt.bytes().map(|b| b as f32).collect())
                 .collect();
             let batch_tensor = eval::build_padded_batch(&ctx, &sample_seqs, 32);
-            eprintln!("Batch tensor check: {:?} ({} elements)", batch_tensor.shape, batch_tensor.numel());
+            eprintln!(
+                "Batch tensor check: {:?} ({} elements)",
+                batch_tensor.shape,
+                batch_tensor.numel()
+            );
 
             let results = eval::evaluate(&ctx, &model, &tok, &examples);
             results.print_report();
@@ -1146,8 +1212,8 @@ fn main() {
         }
 
         Commands::SftPrepare { input, output } => {
-            let count = sft::generate_sft_dataset(&input, &output)
-                .expect("SFT data preparation failed");
+            let count =
+                sft::generate_sft_dataset(&input, &output).expect("SFT data preparation failed");
             println!("Generated {} instruction-response pairs", count);
         }
 
@@ -1156,8 +1222,7 @@ fn main() {
             output,
             bits,
         } => {
-            quantize::quantize_checkpoint(&ckpt_path, &output, bits)
-                .expect("Quantization failed");
+            quantize::quantize_checkpoint(&ckpt_path, &output, bits).expect("Quantization failed");
         }
 
         Commands::ExportGguf {
@@ -1165,29 +1230,38 @@ fn main() {
             output,
             quant,
         } => {
-            let (model, step) = checkpoint::load_checkpoint(&ctx, &ckpt_path)
-                .expect("Failed to load checkpoint");
-            eprintln!("Loaded checkpoint: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
-            quantize::export_gguf(&model, &output, &quant)
-                .expect("GGUF export failed");
+            let (model, step) =
+                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            eprintln!(
+                "Loaded checkpoint: step {}, {}M params",
+                step,
+                model.config.param_count() as f32 / 1e6
+            );
+            quantize::export_gguf(&model, &output, &quant).expect("GGUF export failed");
         }
 
         Commands::ExportSafetensors {
             checkpoint: ckpt_path,
             output,
         } => {
-            let (model, step) = checkpoint::load_checkpoint(&ctx, &ckpt_path)
-                .expect("Failed to load checkpoint");
-            eprintln!("Loaded: step {}, {}M params", step, model.config.param_count() as f32 / 1e6);
-            quantize::export_safetensors(&model, &output)
-                .expect("Safetensors export failed");
+            let (model, step) =
+                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            eprintln!(
+                "Loaded: step {}, {}M params",
+                step,
+                model.config.param_count() as f32 / 1e6
+            );
+            quantize::export_safetensors(&model, &output).expect("Safetensors export failed");
         }
 
         Commands::Merge {
             checkpoints,
             output,
         } => {
-            assert!(checkpoints.len() >= 2, "Need at least 2 checkpoints to merge");
+            assert!(
+                checkpoints.len() >= 2,
+                "Need at least 2 checkpoints to merge"
+            );
             eprintln!("Merging {} checkpoints...", checkpoints.len());
 
             // Load first checkpoint as base
@@ -1203,11 +1277,20 @@ fn main() {
                     .unwrap_or_else(|_| panic!("Failed to load checkpoint: {}", ckpt_path));
                 eprintln!("  + {} (step {})", ckpt_path, other_step);
                 let other_params = other_model.parameters();
-                assert_eq!(base_params.len(), other_params.len(), "Checkpoint param count mismatch");
+                assert_eq!(
+                    base_params.len(),
+                    other_params.len(),
+                    "Checkpoint param count mismatch"
+                );
 
                 // Accumulate: base += other
                 for (bp, op) in base_params.iter().zip(other_params.iter()) {
-                    crate::gpu::compute::gpu_add_inplace(&ctx, &bp.buffer, &op.buffer, bp.numel() as u32);
+                    crate::gpu::compute::gpu_add_inplace(
+                        &ctx,
+                        &bp.buffer,
+                        &op.buffer,
+                        bp.numel() as u32,
+                    );
                 }
             }
 
@@ -1219,9 +1302,14 @@ fn main() {
             // Save merged checkpoint
             checkpoint::save_checkpoint(&output, &base_model, base_step)
                 .expect("Failed to save merged checkpoint");
-            eprintln!("Merged {} checkpoints → {} ({:.1} MB)",
-                checkpoints.len(), output,
-                std::fs::metadata(&output).map(|m| m.len() as f32 / 1e6).unwrap_or(0.0));
+            eprintln!(
+                "Merged {} checkpoints → {} ({:.1} MB)",
+                checkpoints.len(),
+                output,
+                std::fs::metadata(&output)
+                    .map(|m| m.len() as f32 / 1e6)
+                    .unwrap_or(0.0)
+            );
         }
 
         Commands::Dpo {
@@ -1236,9 +1324,8 @@ fn main() {
             warmup,
             output_dir,
         } => {
-            let mut config = dpo::DpoConfig::default_dpo(
-                &ckpt_path, &ref_checkpoint, &tok_path, &dataset,
-            );
+            let mut config =
+                dpo::DpoConfig::default_dpo(&ckpt_path, &ref_checkpoint, &tok_path, &dataset);
             config.beta = beta;
             config.learning_rate = lr;
             config.max_seq_len = max_seq_len;
@@ -1261,19 +1348,31 @@ fn main() {
         }
 
         Commands::Distill {
-            api_url, api_key, model, output, n_samples, max_tokens,
+            api_url,
+            api_key,
+            model,
+            output,
+            n_samples,
+            max_tokens,
         } => {
             let config = distill::DistillConfig {
-                api_url, api_key, model, output_path: output,
-                n_samples, max_tokens, temperature: 0.7,
+                api_url,
+                api_key,
+                model,
+                output_path: output,
+                n_samples,
+                max_tokens,
+                temperature: 0.7,
             };
-            let count = distill::generate_training_data(&config)
-                .expect("Data generation failed");
+            let count = distill::generate_training_data(&config).expect("Data generation failed");
             println!("Generated {} training pairs", count);
         }
 
         Commands::Dedup {
-            input, output, threshold, min_quality,
+            input,
+            output,
+            threshold,
+            min_quality,
         } => {
             let docs: Vec<String> = std::fs::read_to_string(&input)
                 .expect("Failed to read input")
@@ -1285,13 +1384,21 @@ fn main() {
 
             // Quality filter
             let quality_keep = datapipe::quality_filter_batch(&docs, min_quality);
-            eprintln!("After quality filter (>{}): {} docs", min_quality, quality_keep.len());
+            eprintln!(
+                "After quality filter (>{}): {} docs",
+                min_quality,
+                quality_keep.len()
+            );
 
             let quality_docs: Vec<String> = quality_keep.iter().map(|&i| docs[i].clone()).collect();
 
             // MinHash dedup
             let dedup_keep = datapipe::minhash_dedup(&quality_docs, threshold, 128);
-            eprintln!("After dedup (thresh={}): {} docs", threshold, dedup_keep.len());
+            eprintln!(
+                "After dedup (thresh={}): {} docs",
+                threshold,
+                dedup_keep.len()
+            );
 
             let mut out = std::fs::File::create(&output).expect("Failed to create output");
             for &i in &dedup_keep {
@@ -1302,7 +1409,13 @@ fn main() {
         }
 
         Commands::Bench {
-            size, batch_size, seq_len, lowrank, warmup, iters, simdgroup_matmul,
+            size,
+            batch_size,
+            seq_len,
+            lowrank,
+            warmup,
+            iters,
+            simdgroup_matmul,
         } => {
             use std::time::Instant;
 
@@ -1312,7 +1425,10 @@ fn main() {
                 "small" => model::ModelConfig::small(vocab),
                 "medium" => model::ModelConfig::medium(vocab),
                 "large" => model::ModelConfig::large(vocab),
-                _ => { eprintln!("Unknown size: {}. Use tiny/small/medium/large", size); return; }
+                _ => {
+                    eprintln!("Unknown size: {}. Use tiny/small/medium/large", size);
+                    return;
+                }
             };
             config.lowrank = lowrank;
             config.max_seq_len = seq_len;
@@ -1320,18 +1436,42 @@ fn main() {
             let ff = config.d_ff();
             let n_layers = config.n_layers;
             let params = config.param_count();
-            let fused_eligible = config.n_experts <= 1 && !config.bitnet
-                && d <= 256 && ff <= 1024;
+            let fused_eligible = config.n_experts <= 1 && !config.bitnet && d <= 256 && ff <= 1024;
 
             eprintln!("=== AndreAI Benchmark ===");
-            eprintln!("Model: {}M params, d={}, ff={}, {}L, {}H, lowrank={}",
-                params as f64 / 1e6, d, ff, n_layers, config.n_heads, lowrank);
-            eprintln!("Batch: {}, Seq: {}, Tokens/step: {}",
-                batch_size, seq_len, batch_size * seq_len);
-            eprintln!("Fused kernels: {}", if fused_eligible { "ACTIVE (inference)" } else { "disabled" });
+            eprintln!(
+                "Model: {}M params, d={}, ff={}, {}L, {}H, lowrank={}",
+                params as f64 / 1e6,
+                d,
+                ff,
+                n_layers,
+                config.n_heads,
+                lowrank
+            );
+            eprintln!(
+                "Batch: {}, Seq: {}, Tokens/step: {}",
+                batch_size,
+                seq_len,
+                batch_size * seq_len
+            );
+            eprintln!(
+                "Fused kernels: {}",
+                if fused_eligible {
+                    "ACTIVE (inference)"
+                } else {
+                    "disabled"
+                }
+            );
             eprintln!("Warmup: {}, Timed iters: {}", warmup, iters);
             crate::gpu::compute::set_simdgroup_matmul(simdgroup_matmul);
-            eprintln!("Matmul path: {}", if simdgroup_matmul { "hardware simdgroup MMA" } else { "scalar-MAC tiled" });
+            eprintln!(
+                "Matmul path: {}",
+                if simdgroup_matmul {
+                    "hardware simdgroup MMA"
+                } else {
+                    "scalar-MAC tiled"
+                }
+            );
             eprintln!();
 
             let model = model::Transformer::new(&ctx, config.clone());
@@ -1365,8 +1505,10 @@ fn main() {
                 let ms_per_step = elapsed * 1000.0 / iters as f64;
                 let dispatches_per_step = dispatches / iters;
                 let us_per_dispatch = ms_per_step * 1000.0 / dispatches_per_step as f64;
-                eprintln!("  {:.0} tok/s | {:.2} ms/step | {} dispatches/step | {:.0} μs/dispatch",
-                    tok_s, ms_per_step, dispatches_per_step, us_per_dispatch);
+                eprintln!(
+                    "  {:.0} tok/s | {:.2} ms/step | {} dispatches/step | {:.0} μs/dispatch",
+                    tok_s, ms_per_step, dispatches_per_step, us_per_dispatch
+                );
             });
 
             // --- 2. Inference Decode (single-token, KV cache) ---
@@ -1378,7 +1520,9 @@ fn main() {
                 // since cache capacity == config.max_seq_len (set to --seq-len above).
                 let decode_budget = warmup + iters;
                 let prefill_len = (seq_len.saturating_sub(decode_budget)).max(1);
-                let prompt: Vec<u32> = (0..prefill_len).map(|i| (i as u32 * 7 + 13) % vocab).collect();
+                let prompt: Vec<u32> = (0..prefill_len)
+                    .map(|i| (i as u32 * 7 + 13) % vocab)
+                    .collect();
                 ctx.begin_batch();
                 let _logits = model.forward(&prompt, 1, prefill_len, Some(&mut kv_caches), false);
                 ctx.flush_batch();
@@ -1402,8 +1546,10 @@ fn main() {
                 let elapsed = start.elapsed().as_secs_f64();
                 let tok_s = iters as f64 / elapsed;
                 let ms_per_token = elapsed * 1000.0 / iters as f64;
-                eprintln!("  {:.0} tok/s | {:.2} ms/token | {:.1}s total ({} tokens)",
-                    tok_s, ms_per_token, elapsed, iters);
+                eprintln!(
+                    "  {:.0} tok/s | {:.2} ms/token | {:.1}s total ({} tokens)",
+                    tok_s, ms_per_token, elapsed, iters
+                );
             });
 
             // --- 3. Training Forward+Backward (single batch — matches real training loop) ---
@@ -1439,9 +1585,15 @@ fn main() {
                 let total_tokens = iters * batch_size * seq_len;
                 let tok_s = total_tokens as f64 / elapsed;
                 let ms_per_step = elapsed * 1000.0 / iters as f64;
-                eprintln!("  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
-                    tok_s, ms_per_step, elapsed, iters);
-                eprintln!("  Tape: {} ops, {:.1} MB activations", tape_ops, tape_mem as f64 / 1e6);
+                eprintln!(
+                    "  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
+                    tok_s, ms_per_step, elapsed, iters
+                );
+                eprintln!(
+                    "  Tape: {} ops, {:.1} MB activations",
+                    tape_ops,
+                    tape_mem as f64 / 1e6
+                );
             }
 
             // --- 4. Training Forward+Backward with Gradient Checkpointing ---
@@ -1480,9 +1632,15 @@ fn main() {
                 let total_tokens = iters * batch_size * seq_len;
                 let tok_s = total_tokens as f64 / elapsed;
                 let ms_per_step = elapsed * 1000.0 / iters as f64;
-                eprintln!("  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
-                    tok_s, ms_per_step, elapsed, iters);
-                eprintln!("  Tape: {} ops, {:.1} MB activations (checkpointed)", tape_ops, tape_mem as f64 / 1e6);
+                eprintln!(
+                    "  {:.0} tok/s | {:.2} ms/step | {:.1}s total ({} iters)",
+                    tok_s, ms_per_step, elapsed, iters
+                );
+                eprintln!(
+                    "  Tape: {} ops, {:.1} MB activations (checkpointed)",
+                    tape_ops,
+                    tape_mem as f64 / 1e6
+                );
             }
 
             // --- 5. Forward-only vs Backward-only breakdown ---
@@ -1542,44 +1700,75 @@ fn main() {
             eprintln!();
             eprintln!("--- Memory ---");
             let param_bytes = params * 4;
-            eprintln!("  Model params: {:.1} MB ({:.2}M params × 4 bytes)",
-                param_bytes as f64 / 1e6, params as f64 / 1e6);
-            eprintln!("  Estimated training RAM: {:.0} MB", config.training_memory_bytes() as f64 / 1e6);
-            eprintln!("  Estimated inference RAM: {:.0} MB", config.inference_memory_bytes() as f64 / 1e6);
+            eprintln!(
+                "  Model params: {:.1} MB ({:.2}M params × 4 bytes)",
+                param_bytes as f64 / 1e6,
+                params as f64 / 1e6
+            );
+            eprintln!(
+                "  Estimated training RAM: {:.0} MB",
+                config.training_memory_bytes() as f64 / 1e6
+            );
+            eprintln!(
+                "  Estimated inference RAM: {:.0} MB",
+                config.inference_memory_bytes() as f64 / 1e6
+            );
             let (pool_hits, pool_misses) = crate::gpu::MetalContext::pool_stats();
             let pool_total = pool_hits + pool_misses;
-            eprintln!("  Buffer pool: {}/{} hits ({:.0}% reuse), {} new allocs",
-                pool_hits, pool_total,
-                if pool_total > 0 { pool_hits as f64 / pool_total as f64 * 100.0 } else { 0.0 },
-                pool_misses);
+            eprintln!(
+                "  Buffer pool: {}/{} hits ({:.0}% reuse), {} new allocs",
+                pool_hits,
+                pool_total,
+                if pool_total > 0 {
+                    pool_hits as f64 / pool_total as f64 * 100.0
+                } else {
+                    0.0
+                },
+                pool_misses
+            );
 
             // --- 8. Roofline Analysis ---
             eprintln!();
             eprintln!("--- Roofline Analysis ---");
             let mem_bw_gbs = 68.25; // M1 memory bandwidth
             let flops_tflops = 2.6; // M1 FP32 TFLOPS
-            // Per forward pass: roughly 2 * params * batch * seq FLOPs (matmul dominated)
+                                    // Per forward pass: roughly 2 * params * batch * seq FLOPs (matmul dominated)
             let fwd_flops = 2.0 * params as f64 * (batch_size * seq_len) as f64;
-            let fwd_bytes = params as f64 * 4.0 + (batch_size * seq_len) as f64 * d as f64 * 4.0 * n_layers as f64 * 2.0;
+            let fwd_bytes = params as f64 * 4.0
+                + (batch_size * seq_len) as f64 * d as f64 * 4.0 * n_layers as f64 * 2.0;
             let arithmetic_intensity = fwd_flops / fwd_bytes;
             let compute_bound_ms = fwd_flops / (flops_tflops * 1e9); // TFLOPS → ms
             let mem_bound_ms = fwd_bytes / (mem_bw_gbs * 1e6); // GB/s → ms
             let roofline_ms = compute_bound_ms.max(mem_bound_ms);
-            eprintln!("  Arithmetic intensity: {:.1} FLOP/byte", arithmetic_intensity);
+            eprintln!(
+                "  Arithmetic intensity: {:.1} FLOP/byte",
+                arithmetic_intensity
+            );
             eprintln!("  Compute-bound floor: {:.2} ms", compute_bound_ms);
             eprintln!("  Memory-bound floor:  {:.2} ms", mem_bound_ms);
-            eprintln!("  Roofline (forward):  {:.2} ms ({:.0} tok/s theoretical)",
-                roofline_ms, (batch_size * seq_len) as f64 / (roofline_ms / 1000.0));
+            eprintln!(
+                "  Roofline (forward):  {:.2} ms ({:.0} tok/s theoretical)",
+                roofline_ms,
+                (batch_size * seq_len) as f64 / (roofline_ms / 1000.0)
+            );
         }
 
         Commands::Grow {
-            checkpoint, output, dim, layers, heads,
+            checkpoint,
+            output,
+            dim,
+            layers,
+            heads,
         } => {
             let (small_model, step) = checkpoint::load_checkpoint(&ctx, &checkpoint)
                 .expect("Failed to load small checkpoint");
             let large_config = model::ModelConfig::custom(
-                small_model.config.vocab_size, dim, heads, layers,
-                small_model.config.ffn_multiplier, small_model.config.max_seq_len,
+                small_model.config.vocab_size,
+                dim,
+                heads,
+                layers,
+                small_model.config.ffn_multiplier,
+                small_model.config.max_seq_len,
             );
             let grown = model::grow_model(&ctx, &small_model, large_config);
             checkpoint::save_checkpoint(&output, &grown, step)

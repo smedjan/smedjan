@@ -5,9 +5,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice,
-    MTLLibrary, MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -189,14 +189,24 @@ pub fn buf_len_bytes(b: &Buf) -> usize {
 #[inline]
 pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
     use objc2_metal::MTLBuffer;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents().as_ptr() as *mut u8, bytes.len()); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buf.contents().as_ptr() as *mut u8,
+            bytes.len(),
+        );
+    }
 }
 
 /// On Metal, buffers are untyped so the u32/f32 handles are the same — identity conversions.
 #[inline]
-pub fn u32_to_buf(b: BufU32) -> Buf { b }
+pub fn u32_to_buf(b: BufU32) -> Buf {
+    b
+}
 #[inline]
-pub fn buf_as_u32(b: &Buf) -> BufU32 { b.clone() }
+pub fn buf_as_u32(b: &Buf) -> BufU32 {
+    b.clone()
+}
 
 /// Active command batch for kernel fusion. Accumulates multiple kernel dispatches
 /// into a single command buffer, then commits and waits once.
@@ -229,7 +239,9 @@ unsafe impl Sync for MetalContext {}
 impl MetalContext {
     pub fn new() -> Arc<Self> {
         let device = MTLCreateSystemDefaultDevice().expect("No Metal device found");
-        let queue = device.newCommandQueue().expect("Failed to create command queue");
+        let queue = device
+            .newCommandQueue()
+            .expect("Failed to create command queue");
 
         let mut pipelines = HashMap::new();
 
@@ -239,11 +251,26 @@ impl MetalContext {
             ("matmul_tiled_bf16", shaders::MATMUL_TILED_BF16),
             ("matmul_simdgroup", shaders::MATMUL_SIMDGROUP),
             ("matmul_simdgroup_f16", shaders::MATMUL_SIMDGROUP_F16),
-            ("batched_matmul_simdgroup", shaders::BATCHED_MATMUL_SIMDGROUP),
-            ("batched_matmul_simdgroup_trans_b", shaders::BATCHED_MATMUL_SIMDGROUP_TRANS_B),
-            ("batched_matmul_simdgroup_trans_a", shaders::BATCHED_MATMUL_SIMDGROUP_TRANS_A),
-            ("matmul_simdgroup_trans_b", shaders::MATMUL_SIMDGROUP_TRANS_B),
-            ("matmul_simdgroup_trans_a", shaders::MATMUL_SIMDGROUP_TRANS_A),
+            (
+                "batched_matmul_simdgroup",
+                shaders::BATCHED_MATMUL_SIMDGROUP,
+            ),
+            (
+                "batched_matmul_simdgroup_trans_b",
+                shaders::BATCHED_MATMUL_SIMDGROUP_TRANS_B,
+            ),
+            (
+                "batched_matmul_simdgroup_trans_a",
+                shaders::BATCHED_MATMUL_SIMDGROUP_TRANS_A,
+            ),
+            (
+                "matmul_simdgroup_trans_b",
+                shaders::MATMUL_SIMDGROUP_TRANS_B,
+            ),
+            (
+                "matmul_simdgroup_trans_a",
+                shaders::MATMUL_SIMDGROUP_TRANS_A,
+            ),
             ("matmul_tiled_trans_b", shaders::MATMUL_TILED_TRANS_B),
             ("softmax", shaders::SOFTMAX),
             ("rms_norm", shaders::RMS_NORM),
@@ -291,8 +318,14 @@ impl MetalContext {
             ("strided_batch_copy", shaders::STRIDED_BATCH_COPY),
             ("compact_strided_copy", shaders::COMPACT_STRIDED_COPY),
             ("batched_matmul_tiled", shaders::BATCHED_MATMUL_TILED),
-            ("batched_matmul_tiled_trans_b", shaders::BATCHED_MATMUL_TILED_TRANS_B),
-            ("batched_matmul_tiled_trans_a", shaders::BATCHED_MATMUL_TILED_TRANS_A),
+            (
+                "batched_matmul_tiled_trans_b",
+                shaders::BATCHED_MATMUL_TILED_TRANS_B,
+            ),
+            (
+                "batched_matmul_tiled_trans_a",
+                shaders::BATCHED_MATMUL_TILED_TRANS_A,
+            ),
             ("kl_divergence", shaders::KL_DIVERGENCE),
             ("flash_attention_forward", shaders::FLASH_ATTENTION_FORWARD),
             ("flash_attn_precompute_d", shaders::FLASH_ATTENTION_BACKWARD),
@@ -305,15 +338,30 @@ impl MetalContext {
             ("ternary_absmean", shaders::TERNARY_QUANTIZE),
             ("ternary_pack", shaders::TERNARY_QUANTIZE),
             ("moe_gather", shaders::MOE_GATHER),
-            ("flash_attention_backward", shaders::FLASH_ATTENTION_BACKWARD),
+            (
+                "flash_attention_backward",
+                shaders::FLASH_ATTENTION_BACKWARD,
+            ),
             ("cast_f32_to_f16", shaders::CAST_F32_TO_F16),
             ("cast_f16_to_f32", shaders::CAST_F16_TO_F32),
             ("matmul_tiled_f16", shaders::MATMUL_TILED_F16),
-            ("matmul_tiled_trans_b_f16", shaders::MATMUL_TILED_TRANS_B_F16),
+            (
+                "matmul_tiled_trans_b_f16",
+                shaders::MATMUL_TILED_TRANS_B_F16,
+            ),
             ("matmul_trans_a_tiled_f16", shaders::MATMUL_TRANS_A_F16),
-            ("batched_matmul_tiled_f16", shaders::BATCHED_MATMUL_TILED_F16),
-            ("batched_matmul_tiled_trans_b_f16", shaders::BATCHED_MATMUL_TILED_TRANS_B_F16),
-            ("batched_matmul_tiled_trans_a_f16", shaders::BATCHED_MATMUL_TILED_TRANS_A_F16),
+            (
+                "batched_matmul_tiled_f16",
+                shaders::BATCHED_MATMUL_TILED_F16,
+            ),
+            (
+                "batched_matmul_tiled_trans_b_f16",
+                shaders::BATCHED_MATMUL_TILED_TRANS_B_F16,
+            ),
+            (
+                "batched_matmul_tiled_trans_a_f16",
+                shaders::BATCHED_MATMUL_TILED_TRANS_A_F16,
+            ),
             ("repeat_kv", shaders::REPEAT_KV),
             ("repeat_kv_backward", shaders::REPEAT_KV_BACKWARD),
             ("scaled_causal_softmax", shaders::SCALED_CAUSAL_SOFTMAX),
@@ -334,7 +382,10 @@ impl MetalContext {
             ("logsumexp", shaders::LOGSUMEXP),
             ("concat_cols", shaders::CONCAT_COLS),
             ("slice_cols", shaders::SLICE_COLS),
-            ("batched_matmul_gqa_trans_b", shaders::BATCHED_MATMUL_GQA_TRANS_B),
+            (
+                "batched_matmul_gqa_trans_b",
+                shaders::BATCHED_MATMUL_GQA_TRANS_B,
+            ),
             ("batched_matmul_gqa", shaders::BATCHED_MATMUL_GQA),
             ("mega_ffn", shaders::MEGA_FFN),
         ];
@@ -346,16 +397,12 @@ impl MetalContext {
 
             let library = device
                 .newLibraryWithSource_options_error(&ns_source, Some(&compile_options))
-                .unwrap_or_else(|e| {
-                    panic!("Failed to compile shader '{}': {}", kernel_name, e)
-                });
+                .unwrap_or_else(|e| panic!("Failed to compile shader '{}': {}", kernel_name, e));
 
             let ns_name = NSString::from_str(kernel_name);
             let function = library
                 .newFunctionWithName(&ns_name)
-                .unwrap_or_else(|| {
-                    panic!("Failed to get function '{}' from library", kernel_name)
-                });
+                .unwrap_or_else(|| panic!("Failed to get function '{}' from library", kernel_name));
 
             let pipeline = device
                 .newComputePipelineStateWithFunction_error(&function)
@@ -391,7 +438,8 @@ impl MetalContext {
         // Debug: track allocation sizes on first step
         ALLOC_SIZE_LOG.with(|log| {
             let mut l = log.borrow_mut();
-            if l.0 { // logging enabled
+            if l.0 {
+                // logging enabled
                 *l.1.entry(size_bytes).or_insert(0) += 1;
             }
         });
@@ -415,15 +463,21 @@ impl MetalContext {
                         let pick = RECYCLE_GEN.with(|rg| {
                             let rg = rg.borrow();
                             list.iter().position(|b| {
-                                rg.get(&buf_contents_addr(b)).copied().is_none_or(|g| g < cur)
+                                rg.get(&buf_contents_addr(b))
+                                    .copied()
+                                    .is_none_or(|g| g < cur)
                             })
                         });
                         return match pick {
                             Some(i) => {
                                 let buf = list.remove(i);
-                                RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                                RECYCLE_GEN.with(|rg| {
+                                    rg.borrow_mut().remove(&buf_contents_addr(&buf));
+                                });
                                 #[cfg(feature = "bufsan")]
-                                POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                                POISONED_POOL_ADDRS.with(|p| {
+                                    p.borrow_mut().remove(&buf_contents_addr(&buf));
+                                });
                                 POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                                 Some(buf)
                             }
@@ -431,9 +485,13 @@ impl MetalContext {
                         };
                     }
                     if let Some(buf) = list.pop() {
-                        RECYCLE_GEN.with(|rg| { rg.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                        RECYCLE_GEN.with(|rg| {
+                            rg.borrow_mut().remove(&buf_contents_addr(&buf));
+                        });
                         #[cfg(feature = "bufsan")]
-                        POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&buf_contents_addr(&buf)); });
+                        POISONED_POOL_ADDRS.with(|p| {
+                            p.borrow_mut().remove(&buf_contents_addr(&buf));
+                        });
                         POOL_STATS.with(|s| s.borrow_mut().0 += 1);
                         return Some(buf);
                     }
@@ -446,10 +504,7 @@ impl MetalContext {
         } else {
             POOL_STATS.with(|s| s.borrow_mut().1 += 1);
             self.device
-                .newBufferWithLength_options(
-                    size_bytes,
-                    MTLResourceOptions::StorageModeShared,
-                )
+                .newBufferWithLength_options(size_bytes, MTLResourceOptions::StorageModeShared)
                 .expect("Failed to allocate Metal buffer")
         };
         // This buffer's contents are about to be written fresh. Its address may previously have
@@ -489,7 +544,9 @@ impl MetalContext {
                     rg.borrow_mut().insert(addr, gen);
                 });
                 #[cfg(feature = "bufsan")]
-                POISONED_POOL_ADDRS.with(|p| { p.borrow_mut().remove(&addr); });
+                POISONED_POOL_ADDRS.with(|p| {
+                    p.borrow_mut().remove(&addr);
+                });
                 list.push(buf);
             }
         });
@@ -516,7 +573,12 @@ impl MetalContext {
             let mut sizes: Vec<_> = l.1.iter().collect();
             sizes.sort_by(|a, b| b.1.cmp(a.1));
             let total: usize = sizes.iter().map(|(_, c)| **c).sum();
-            eprintln!("[ALLOC LOG] {} — {} unique sizes, {} total allocs:", label, sizes.len(), total);
+            eprintln!(
+                "[ALLOC LOG] {} — {} unique sizes, {} total allocs:",
+                label,
+                sizes.len(),
+                total
+            );
             for (size, count) in sizes.iter().take(20) {
                 eprintln!("  {:>10} bytes × {:>4}", size, count);
             }
@@ -720,9 +782,18 @@ impl MetalContext {
                     did = true;
                 }
             }
-            let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
-            let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
-            *b = Some(CommandBatch { cmd, encoder, dispatch_count: 0 });
+            let cmd = self
+                .queue
+                .commandBuffer()
+                .expect("Failed to create command buffer");
+            let encoder = cmd
+                .computeCommandEncoder()
+                .expect("Failed to create encoder");
+            *b = Some(CommandBatch {
+                cmd,
+                encoder,
+                dispatch_count: 0,
+            });
             did
         });
         if flushed {
@@ -795,7 +866,9 @@ impl MetalContext {
         use_dispatch_threads: bool,
         bind: impl FnOnce(&GpuComputeEncoder),
     ) {
-        let pipeline = self.pipelines.get(pipeline_name)
+        let pipeline = self
+            .pipelines
+            .get(pipeline_name)
             .unwrap_or_else(|| panic!("Unknown pipeline: {}", pipeline_name));
 
         let completed_sync_dispatch = ACTIVE_BATCH.with(|batch| {
@@ -805,16 +878,23 @@ impl MetalContext {
                 cb.encoder.setComputePipelineState(pipeline);
                 bind(&cb.encoder);
                 if use_dispatch_threads {
-                    cb.encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+                    cb.encoder
+                        .dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
                 } else {
-                    cb.encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+                    cb.encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
                 }
                 cb.dispatch_count += 1;
                 false
             } else {
                 // Unbatched path: one-off command buffer with sync wait
-                let cmd = self.queue.commandBuffer().expect("Failed to create command buffer");
-                let encoder = cmd.computeCommandEncoder().expect("Failed to create encoder");
+                let cmd = self
+                    .queue
+                    .commandBuffer()
+                    .expect("Failed to create command buffer");
+                let encoder = cmd
+                    .computeCommandEncoder()
+                    .expect("Failed to create encoder");
                 encoder.setComputePipelineState(pipeline);
                 bind(&encoder);
                 if use_dispatch_threads {

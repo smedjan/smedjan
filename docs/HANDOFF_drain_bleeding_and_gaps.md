@@ -20,9 +20,9 @@ tunnel). Land linearly on `main` (andreai is NOT under the redofy/hugin squash-o
    in a full training run (the 81-test suite provably can't see the buffer-hazard / numeric
    class — see the loss-readout and BitNet-per-column bugs). Convert "only a real run
    catches it" → "CI catches it."
-3. **Phase C — close the bounded gaps** (each already specced): seq-packing, block-sparse
-   trainable backward, delete GaLore, then throughput (chunked SSM/RWKV, MLA absorbed,
-   Flash Attention), then CUDA backward.
+3. **Phase C — close the bounded gaps** (each already specced): seq-packing and the remaining
+   throughput work (chunked RWKV, MLA absorbed form, fused kernels), then CUDA runtime proof on
+   NVIDIA hardware.
 
 Do **not** turn this into a treadmill: chasing every new paper or rebuilding the
 data/eval/distributed ecosystem is a standing tax, not a gap you close. The architectural
@@ -94,12 +94,12 @@ Land order (ROI, from §6/§7 of the buffer-hazard handoff):
 |---|---|---|
 | **Seq-packing model integration** | `HANDOFF_buffer_hazard…` §2 | Op-level packing exists; model-integration reverted once (buffer hazard). Re-land **behind Phase B's sanitizer**. |
 | **Block-sparse trainable backward** | §3 | ✅ LANDED — scatter-add kernel + `Op::GatherBlocks`, grad-checked; fixed a latent non-square `batched_matmul_trans_a` param-swap. |
-| **Delete GaLore** | §6 / §7 #2 | Dead code that panics at `--galore-rank>0`; field moved to SCALE (arXiv 2506.16659). Remove code + any stale claim, or target SCALE — do **not** build GaLore. |
+| **Delete GaLore** | §6 / §7 #2 | Active production surface no longer exposes GaLore; keep historical context only, or target SCALE if a subspace method is revisited. |
 | **Chunked O(N) SSM forward** | §7 #4 | ✅ **LANDED** — `ssm_decayed_numerator_chunked` (Mamba-2/SSD), wired into `ssm()` for seq≥256 (largest of {64,32} dividing seq). Intra-chunk = the materialised primitive per chunk; inter-chunk = `o=g·(q@S_p)` with state `S=Λ@KV` — a chunk-level decay matrix applied as ONE batched `[nc,nc]@[nc,hd²]`, **no sequential scan**. Decay factorisation `g_t·Λ(p',p)·h_j = exp(A_t−A_j)` verified algebraically + `ssm_chunked_matches_materialized` (forward, every chunk size) + `ssm_chunked_grad_matches_materialized` (backward q/k/v/loga). RWKV chunking still open — design done, gated on one missing primitive (see RWKV row). **Non-bug noted:** loga position 0 has a STRUCTURALLY-ZERO gradient (uniform shift of A, cancels from every `A_t−A_j`) — a finite-diff there is fp-noise×1/2ε and spuriously "fails"; verify SSM loga grads by analytic-equivalence, not central differences. |
 | **Chunked O(N) RWKV (wkv) forward** | §7 #4 | Existing `wkv` backward now VERIFIED (`gradcheck_wkv` — sound, fp16-precision on the exp-sensitive w/u params; widen rel-tol to 12% there, k/v at 5%). The materialised `wkv` is O(seq²) (the `lower_tri @ (exp(t·w)·p)` cumsum) AND overflow-unstable for long seq (absolute `exp(±t·w)`, clamp-papered). Chunked design (DERIVED, stable): `wkv_t = intra[p,a] + exp(−a·w)·R_p`, where intra = the verified `wkv` applied per chunk (stable since within-chunk positions <C), and the cross-chunk state is the relative-decay scan `R_{p+1}=γ·R_p+KV_p` (γ=exp(−C·w)≤1, KV_p=Σ_b exp(−(C−1−b)w)·p_{p,b}). Verify against `cpu_wkv` (stable, any seq). **BLOCKER — needs ONE new differentiable primitive:** assembling the per-chunk results back into the bh-outer `[bh,seq,hd]` layout requires a differentiable seq-concat OR a general 3D axis-swap transpose. `concat_seq` exists but does NOT record a tape entry (inference-only); `concat_flat` is dim-0 only (gives chunk-outer `p·bh+b`, wrong interleave). Add a grad-checked `transpose_last2`/`concat_dim1`, then the chunked composition is pure existing-ops. RWKV decay is per-channel (not per-position like SSM), so SSM's batched `Λ@KV` trick does not transfer. |
 | **MLA absorbed-form decode** | §7 #3 | **NOT a contained refactor — needs an architecture change.** `mla_cached_forward` applies `fused_transpose_rope` to BOTH q and the reconstructed k (attention.rs:426-427), so RoPE sits between q and k. The absorbed identity `scores=(q·W_ukᵀ)·cᵀ` and `out=(softmax·c)·W_uv` only holds WITHOUT RoPE on that path. Doing it requires DeepSeek **decoupled RoPE**: split the head into a small rope sub-dim (separate shared K_rope) + a nope sub-dim that carries the absorbed latent — new projections, changed cache layout, **changed checkpoint format, and a convergence run** (not just decode-equivalence). Surface as an arch decision; do not blind-land. |
 | **Flash Attention** | `ROADMAP.md` Phase 1 | Tiled fwd+bwd kernels existed but were UNVERIFIED (only a constructability test). ✅ Now grad-checked + dense-equivalence tested — which caught & fixed a **partial-last-q-block** bug: out-of-range query threads returned before the cooperative K/V tile load, leaving `K/V_shared` unloaded → wrong out+grad for any seq_q not a multiple of 32 with >1 q-block (fwd+bwd both fixed). CUDA port still pending. |
-| **CUDA backward stubs** | closure table | Metal is the source of truth; CUDA backward is incomplete. Only if CUDA targets matter. |
+| **CUDA runtime proof** | closure table | Metal is the source of truth; CUDA compiles but runtime correctness is NVIDIA-hardware-gated. Only if CUDA targets matter. |
 
 Each needs Metal hardware to implement + verify — by design these were **specced, not
 blind-written**, so they land fast once you're on the Mac with the harness in place.
@@ -135,7 +135,7 @@ unverified — finite-diff it.**
   Phase A.
 - Canonical state of every prior item: `docs/HANDOFF_buffer_hazard_and_followups.md` §8
   closure table (10 audit rounds; 7 bug fixes + 3 features landed, all "need Mac verify").
-- Code reality at the time: ~16.4K lines, 81 tests (none cover the GPU hazard class — that's
+- Code reality at the time: ~16.4K lines, 81 tests (none covered the GPU hazard class then —
   Phase B), Metal + CUDA plus an unshipped AndreOS target; Metal is canonical.
 - Field alignment + what NOT to build: §7 field map (drop GaLore; MLA/hybrid/Muon/BitNet are
   the right bets).

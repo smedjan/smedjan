@@ -67,7 +67,9 @@ mod suite {
             //      [9, 10, 11, 12]]  shape [3, 4]
             let b = Tensor::from_slice(
                 &ctx,
-                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
                 vec![3, 4],
             );
 
@@ -122,11 +124,7 @@ mod suite {
         let ctx = test_ctx();
         autograd::no_grad(|| {
             // 2 rows x 4 cols — each row should sum to ~1.0 after softmax
-            let a = Tensor::from_slice(
-                &ctx,
-                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                vec![2, 4],
-            );
+            let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 4]);
             let s = a.softmax();
             let result = s.to_vec();
             assert_eq!(result.len(), 8);
@@ -229,8 +227,14 @@ mod suite {
         let grad_a = autograd::get_grad(a.id);
         let grad_b = autograd::get_grad(b.id);
 
-        assert!(grad_a.is_some(), "Gradient for A should exist after backward");
-        assert!(grad_b.is_some(), "Gradient for B should exist after backward");
+        assert!(
+            grad_a.is_some(),
+            "Gradient for A should exist after backward"
+        );
+        assert!(
+            grad_b.is_some(),
+            "Gradient for B should exist after backward"
+        );
 
         let grad_a_data = MetalContext::read_buffer(&grad_a.unwrap(), 4);
         let grad_b_data = MetalContext::read_buffer(&grad_b.unwrap(), 4);
@@ -239,10 +243,16 @@ mod suite {
         let want_grad_b = [4.0, 4.0, 6.0, 6.0];
 
         for (i, (got, want)) in grad_a_data.iter().zip(want_grad_a).enumerate() {
-            assert!((got - want).abs() < 1e-4, "grad A[{i}] expected {want}, got {got}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "grad A[{i}] expected {want}, got {got}"
+            );
         }
         for (i, (got, want)) in grad_b_data.iter().zip(want_grad_b).enumerate() {
-            assert!((got - want).abs() < 1e-4, "grad B[{i}] expected {want}, got {got}");
+            assert!(
+                (got - want).abs() < 1e-4,
+                "grad B[{i}] expected {want}, got {got}"
+            );
         }
 
         autograd::clear_tape();
@@ -264,8 +274,14 @@ mod suite {
         let grad_a = autograd::get_grad(a.id);
         let grad_b = autograd::get_grad(b.id);
 
-        assert!(grad_a.is_some(), "Gradient for A should exist after add backward");
-        assert!(grad_b.is_some(), "Gradient for B should exist after add backward");
+        assert!(
+            grad_a.is_some(),
+            "Gradient for A should exist after add backward"
+        );
+        assert!(
+            grad_b.is_some(),
+            "Gradient for B should exist after add backward"
+        );
 
         // For scalar addition, both gradients should be 1.0 (pass-through from upstream)
         let grad_a_data = MetalContext::read_buffer(&grad_a.unwrap(), 1);
@@ -336,7 +352,10 @@ mod suite {
         let encoded = tok.encode(text);
         let decoded = tok.decode(&encoded);
 
-        assert_eq!(decoded, text, "Encode/decode roundtrip should preserve text");
+        assert_eq!(
+            decoded, text,
+            "Encode/decode roundtrip should preserve text"
+        );
     }
 
     #[test]
@@ -357,8 +376,16 @@ mod suite {
         assert_eq!(tok.inverse_vocab.len(), 261);
         assert_eq!(tok.merges.len(), 2);
         // The merges apply during encoding.
-        assert_eq!(tok.encode("ab").len(), 1, "a+b merge should collapse to one token");
-        assert_eq!(tok.encode("aba").len(), 1, "ab+a merge should collapse to one token");
+        assert_eq!(
+            tok.encode("ab").len(),
+            1,
+            "a+b merge should collapse to one token"
+        );
+        assert_eq!(
+            tok.encode("aba").len(),
+            1,
+            "ab+a merge should collapse to one token"
+        );
         assert_eq!(tok.encode("ba").len(), 2, "no b+a merge is defined");
         // Decode roundtrips through the imported vocab.
         assert_eq!(tok.decode(&tok.encode("aba")), "aba");
@@ -426,7 +453,10 @@ mod suite {
                 vocab_size
             );
         }
-        assert!(!encoded.is_empty(), "Encoding should produce at least one token");
+        assert!(
+            !encoded.is_empty(),
+            "Encoding should produce at least one token"
+        );
     }
 
     // =========================================================================
@@ -438,8 +468,7 @@ mod suite {
         // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         let hash = datapipe::sha256(b"hello");
         assert_eq!(
-            hash,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
             "SHA-256 of 'hello' mismatch"
         );
     }
@@ -449,8 +478,7 @@ mod suite {
         // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         let hash = datapipe::sha256(b"");
         assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "SHA-256 of empty string mismatch"
         );
     }
@@ -461,8 +489,7 @@ mod suite {
         // = d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592
         let hash = datapipe::sha256(b"The quick brown fox jumps over the lazy dog");
         assert_eq!(
-            hash,
-            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+            hash, "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
             "SHA-256 of fox sentence mismatch"
         );
     }
@@ -515,11 +542,14 @@ mod suite {
         let ctx = test_ctx();
         let u = ctx.buffer_from_slice(&[1.0f32, -2.0, 3.0, -4.0]); // candidate update
         let g = ctx.buffer_from_slice(&[1.0f32, 5.0, -1.0, -4.0]); // gradient
-        // agree: idx0 (1·1>0), idx3 (-4·-4>0); disagree: idx1 (-2·5<0), idx2 (3·-1<0)
+                                                                   // agree: idx0 (1·1>0), idx3 (-4·-4>0); disagree: idx1 (-2·5<0), idx2 (3·-1<0)
         let keep = ctx.alloc_buffer(4 * 4);
         compute::gpu_cautious_mask(&ctx, &u, &g, &keep, 4);
         assert_eq!(MetalContext::read_buffer(&u, 4), vec![1.0, 0.0, 0.0, -4.0]);
-        assert_eq!(MetalContext::read_buffer(&keep, 4), vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            MetalContext::read_buffer(&keep, 4),
+            vec![1.0, 0.0, 0.0, 1.0]
+        );
 
         // Renorm: scale = size/(kept+1) = 4/(2+1) = 4/3; zeroed entries stay zero.
         let sum = ctx.alloc_buffer(4);
@@ -541,7 +571,11 @@ mod suite {
     fn model_config_tiny_param_count() {
         let cfg = ModelConfig::tiny(8192);
         let params = cfg.param_count();
-        assert!(params > 0, "Tiny model should have >0 params, got {}", params);
+        assert!(
+            params > 0,
+            "Tiny model should have >0 params, got {}",
+            params
+        );
         assert!(
             params < 10_000_000,
             "Tiny model should have <10M params, got {}",
@@ -644,7 +678,10 @@ mod suite {
 
     #[test]
     fn datapipe_quality_filter_rejects_short() {
-        assert!(!datapipe::quality_filter("too short"), "Should reject short text");
+        assert!(
+            !datapipe::quality_filter("too short"),
+            "Should reject short text"
+        );
     }
 
     #[test]
@@ -697,7 +734,9 @@ mod suite {
             assert!(
                 err < 0.06,
                 "Q8 error too large: orig={}, recovered={}, err={}",
-                orig, rec, err,
+                orig,
+                rec,
+                err,
             );
         }
     }
@@ -715,7 +754,9 @@ mod suite {
             assert!(
                 err < 0.25,
                 "Q4 error too large: orig={}, recovered={}, err={}",
-                orig, rec, err,
+                orig,
+                rec,
+                err,
             );
         }
     }
@@ -736,7 +777,9 @@ mod suite {
             assert!(
                 err < 0.15,
                 "Q4 nibble packing error at index {}: expected ~{}, got {}",
-                i, expected, got,
+                i,
+                expected,
+                got,
             );
         }
     }
@@ -769,7 +812,10 @@ mod suite {
         let corpus = b"hello world test data";
         let tok = BpeTokenizer::train(corpus, 280);
         let encoded = tok.encode("");
-        assert!(encoded.is_empty(), "Empty string should encode to empty vec");
+        assert!(
+            encoded.is_empty(),
+            "Empty string should encode to empty vec"
+        );
     }
 
     #[test]
@@ -808,7 +854,10 @@ mod suite {
         let encoded = tok.encode(&long_text);
         let decoded = tok.decode(&encoded);
 
-        assert_eq!(decoded, long_text, "Chunked encoding should roundtrip correctly");
+        assert_eq!(
+            decoded, long_text,
+            "Chunked encoding should roundtrip correctly"
+        );
     }
 
     // =========================================================================
@@ -877,22 +926,34 @@ mod suite {
     #[test]
     fn tensor_batched_matmul_trans_a_backward() {
         let ctx = test_ctx();
-        let a = Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]).with_grad();
-        let b = Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 3, 2]).with_grad();
+        let a =
+            Tensor::from_slice(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 2]).with_grad();
+        let b =
+            Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 3, 2]).with_grad();
         let c = a.batched_matmul_trans_a(&b); // [1, 2, 2]
-        // loss = sum(C) → dC = ones[2,2]
+                                              // loss = sum(C) → dC = ones[2,2]
         let flat = c.reshape(vec![1, 4]);
         let ones = Tensor::ones(&ctx, vec![4, 1]);
         let loss = flat.matmul(&ones); // [1,1]
         autograd::backward(&ctx, loss.id);
 
         // dA[m,k] = Σ_n B[m,n]  → [[1,1],[1,1],[2,2]]
-        let ga = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(a.id).unwrap(), vec![1, 3, 2]).to_vec();
+        let ga = Tensor::from_buffer(
+            Arc::clone(&ctx),
+            autograd::get_grad(a.id).unwrap(),
+            vec![1, 3, 2],
+        )
+        .to_vec();
         for (got, want) in ga.iter().zip([1.0, 1.0, 1.0, 1.0, 2.0, 2.0]) {
             assert!((got - want).abs() < 1e-2, "dA got {got} want {want}");
         }
         // dB[m,n] = Σ_k A[m,k]  → [[3,3],[7,7],[11,11]]
-        let gb = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(b.id).unwrap(), vec![1, 3, 2]).to_vec();
+        let gb = Tensor::from_buffer(
+            Arc::clone(&ctx),
+            autograd::get_grad(b.id).unwrap(),
+            vec![1, 3, 2],
+        )
+        .to_vec();
         for (got, want) in gb.iter().zip([3.0, 3.0, 7.0, 7.0, 11.0, 11.0]) {
             assert!((got - want).abs() < 1e-2, "dB got {got} want {want}");
         }
@@ -907,7 +968,9 @@ mod suite {
         let ctx = test_ctx();
         autograd::no_grad(|| {
             let n = 64usize;
-            let identity: Vec<f32> = (0..n * n).map(|i| if i / n == i % n { 1.0 } else { 0.0 }).collect();
+            let identity: Vec<f32> = (0..n * n)
+                .map(|i| if i / n == i % n { 1.0 } else { 0.0 })
+                .collect();
             let id = Tensor::from_slice(&ctx, &identity, vec![n, n]);
 
             // A = all 2.0; matmul caches fp16(A) keyed by A's buffer address.
@@ -922,8 +985,16 @@ mod suite {
             let rb = b.matmul(&id).to_vec(); // B @ I = B
 
             // Must reflect the NEW data (3.0), not A's stale cached fp16 (2.0).
-            assert!((rb[0] - 3.0).abs() < 0.05, "stale fp16 cache hit: got {} expected ~3.0", rb[0]);
-            assert!((rb[n * n - 1] - 3.0).abs() < 0.05, "stale fp16 cache hit at end: got {}", rb[n * n - 1]);
+            assert!(
+                (rb[0] - 3.0).abs() < 0.05,
+                "stale fp16 cache hit: got {} expected ~3.0",
+                rb[0]
+            );
+            assert!(
+                (rb[n * n - 1] - 3.0).abs() < 0.05,
+                "stale fp16 cache hit at end: got {}",
+                rb[n * n - 1]
+            );
         });
     }
 
@@ -939,12 +1010,19 @@ mod suite {
             bv[0] = 1.0;
             let bt = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
             let r = at.matmul_bf16(&bt).to_vec()[0];
-            assert!((r - big).abs() < big * 0.02, "bf16 must preserve 1e5 (range): got {r}");
+            assert!(
+                (r - big).abs() < big * 0.02,
+                "bf16 must preserve 1e5 (range): got {r}"
+            );
 
             // 2) Precision: matches a CPU fp32 reference to ~bf16 tolerance (not exact).
             let (m, k, n) = (24usize, 40usize, 24usize);
-            let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29).collect();
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29)
+                .collect();
             let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
             let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
             let got = at.matmul_bf16(&bt).to_vec();
@@ -960,7 +1038,10 @@ mod suite {
             }
             // bf16 has only ~7-8 mantissa bits, so accumulated relative error over k=40 is several %
             // (here ~6%) — far looser than fp32 but the trade for fp32 range at half the bandwidth.
-            assert!(max_rel < 1e-1, "bf16 matmul should be ~bf16-accurate: max_rel={max_rel}");
+            assert!(
+                max_rel < 1e-1,
+                "bf16 matmul should be ~bf16-accurate: max_rel={max_rel}"
+            );
             eprintln!("bf16 matmul: max relative error vs fp32 = {max_rel:.3e}");
         });
     }
@@ -972,8 +1053,12 @@ mod suite {
         autograd::no_grad(|| {
             // 1) Precision: matches a CPU fp32 reference tightly (the fp16 path needs ~1e-2 tolerance).
             let (m, k, n) = (40usize, 50usize, 48usize);
-            let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29).collect();
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.37)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.29)
+                .collect();
             let at = Tensor::from_slice(&ctx, &a, vec![m, k]);
             let bt = Tensor::from_slice(&ctx, &b, vec![k, n]);
             let precise = at.matmul_precise(&bt).to_vec();
@@ -987,8 +1072,15 @@ mod suite {
                     cpu[i * n + j] = s;
                 }
             }
-            let max_rel = precise.iter().zip(&cpu).map(|(p, c)| (p - c).abs() / (1.0 + c.abs())).fold(0.0f32, f32::max);
-            assert!(max_rel < 1e-4, "fp32 matmul precision: max_rel={max_rel} (should be ≪ fp16)");
+            let max_rel = precise
+                .iter()
+                .zip(&cpu)
+                .map(|(p, c)| (p - c).abs() / (1.0 + c.abs()))
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_rel < 1e-4,
+                "fp32 matmul precision: max_rel={max_rel} (should be ≪ fp16)"
+            );
 
             // 2) Range: a value above the fp16 max (65504) is preserved; the fp16 path corrupts it.
             let big = 1.0e5f32;
@@ -997,9 +1089,15 @@ mod suite {
             bv[0] = 1.0; // selects A[0]
             let bt2 = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
             let r = at2.matmul_precise(&bt2).to_vec()[0];
-            assert!((r - big).abs() < big * 1e-3, "fp32 must preserve 1e5: got {r}");
+            assert!(
+                (r - big).abs() < big * 1e-3,
+                "fp32 must preserve 1e5: got {r}"
+            );
             let rf16 = at2.matmul(&bt2).to_vec()[0];
-            assert!((rf16 - big).abs() > big * 0.1, "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}");
+            assert!(
+                (rf16 - big).abs() > big * 0.1,
+                "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}"
+            );
         });
     }
 
@@ -1013,16 +1111,23 @@ mod suite {
         let ov = out.to_vec();
         for r in 0..4 {
             for c in 0..3 {
-                assert!((ov[r * 3 + c] - want[c]).abs() < 1e-5, "broadcast fwd r{r}c{c}");
+                assert!(
+                    (ov[r * 3 + c] - want[c]).abs() < 1e-5,
+                    "broadcast fwd r{r}c{c}"
+                );
             }
         }
         // loss = sum(out) → grad_v[c] = Σ_rows 1 = 4 (the row count).
         let ones = Tensor::ones(&ctx, vec![12, 1]);
         let loss = out.reshape(vec![1, 12]).matmul(&ones);
         autograd::backward(&ctx, loss.id);
-        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(v.id).unwrap(), vec![3]).to_vec();
+        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(v.id).unwrap(), vec![3])
+            .to_vec();
         for (c, &gc) in g.iter().enumerate() {
-            assert!((gc - 4.0).abs() < 0.05, "broadcast bwd (column-sum) col {c}: got {gc}");
+            assert!(
+                (gc - 4.0).abs() < 0.05,
+                "broadcast bwd (column-sum) col {c}: got {gc}"
+            );
         }
         autograd::zero_grads();
     }
@@ -1032,7 +1137,12 @@ mod suite {
         let ctx = test_ctx();
         let x = Tensor::from_slice(&ctx, &[0.0, 1.0, -1.0, 2.0], vec![4]).with_grad();
         let y = x.exp();
-        let want = [1.0f32, std::f32::consts::E, 1.0 / std::f32::consts::E, (2.0f32).exp()];
+        let want = [
+            1.0f32,
+            std::f32::consts::E,
+            1.0 / std::f32::consts::E,
+            (2.0f32).exp(),
+        ];
         for (got, w) in y.to_vec().iter().zip(want) {
             assert!((got - w).abs() < 1e-3, "exp fwd got {got} want {w}");
         }
@@ -1040,7 +1150,8 @@ mod suite {
         let ones = Tensor::ones(&ctx, vec![4, 1]);
         let loss = y.reshape(vec![1, 4]).matmul(&ones);
         autograd::backward(&ctx, loss.id);
-        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(x.id).unwrap(), vec![4]).to_vec();
+        let g = Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(x.id).unwrap(), vec![4])
+            .to_vec();
         for (got, w) in g.iter().zip(want) {
             assert!((got - w).abs() < 1e-2, "exp bwd got {got} want {w}");
         }
@@ -1107,8 +1218,18 @@ mod suite {
         let lr_mid = sched.get_lr(500);
         let lr_end = sched.get_lr(999);
 
-        assert!(lr_warmup > lr_mid, "LR should decrease after warmup: {} > {}", lr_warmup, lr_mid);
-        assert!(lr_mid > lr_end, "LR should continue decreasing: {} > {}", lr_mid, lr_end);
+        assert!(
+            lr_warmup > lr_mid,
+            "LR should decrease after warmup: {} > {}",
+            lr_warmup,
+            lr_mid
+        );
+        assert!(
+            lr_mid > lr_end,
+            "LR should continue decreasing: {} > {}",
+            lr_mid,
+            lr_end
+        );
         assert!(lr_end > 0.0, "LR should always be positive: {}", lr_end);
     }
 
@@ -1189,11 +1310,8 @@ mod suite {
             let targets: Vec<u32> = (0..batch).map(|i| (i % vocab) as u32).collect();
 
             let (loss, _grad) = crate::loss::distillation_loss(
-                &ctx,
-                &student,
-                &teacher,
-                4.0,  // temperature
-                1.0,  // alpha=1.0 means pure KL (no CE component)
+                &ctx, &student, &teacher, 4.0, // temperature
+                1.0, // alpha=1.0 means pure KL (no CE component)
                 &targets,
             );
 
@@ -1224,11 +1342,7 @@ mod suite {
             let targets: Vec<u32> = (0..batch).map(|i| (i % vocab) as u32).collect();
 
             let (loss, _grad) = crate::loss::distillation_loss(
-                &ctx,
-                &student,
-                &teacher,
-                4.0,
-                1.0,  // pure KL
+                &ctx, &student, &teacher, 4.0, 1.0, // pure KL
                 &targets,
             );
 
@@ -1279,14 +1393,8 @@ mod suite {
             );
 
             // Mixed (alpha=0.5)
-            let (mixed_loss, _) = crate::loss::distillation_loss(
-                &ctx,
-                &student,
-                &teacher,
-                4.0,
-                0.5,
-                &targets,
-            );
+            let (mixed_loss, _) =
+                crate::loss::distillation_loss(&ctx, &student, &teacher, 4.0, 0.5, &targets);
 
             let kl_val = kl_loss.to_vec()[0];
             let ce_val = ce_loss.to_vec()[0];
@@ -1300,7 +1408,11 @@ mod suite {
             assert!(
                 diff < 0.1,
                 "Mixed loss {} should be ~0.5*KL({}) + 0.5*CE({}) = {}, diff={}",
-                mixed_val, kl_val, ce_val, expected, diff
+                mixed_val,
+                kl_val,
+                ce_val,
+                expected,
+                diff
             );
         });
     }
@@ -1447,18 +1559,30 @@ mod suite {
         autograd::backward(&ctx, c.id);
 
         // Gradients should exist
-        assert!(autograd::get_grad(a.id).is_some(), "grad(a) should exist before clear");
+        assert!(
+            autograd::get_grad(a.id).is_some(),
+            "grad(a) should exist before clear"
+        );
 
         // Clear tape but keep grads
         autograd::clear_tape_keep_grads();
 
         // Tape should be empty
         let (tape_ops, _) = autograd::tape_stats();
-        assert_eq!(tape_ops, 0, "Tape should be empty after clear_tape_keep_grads");
+        assert_eq!(
+            tape_ops, 0,
+            "Tape should be empty after clear_tape_keep_grads"
+        );
 
         // Gradients should still exist
-        assert!(autograd::get_grad(a.id).is_some(), "grad(a) should survive clear_tape_keep_grads");
-        assert!(autograd::get_grad(b.id).is_some(), "grad(b) should survive clear_tape_keep_grads");
+        assert!(
+            autograd::get_grad(a.id).is_some(),
+            "grad(a) should survive clear_tape_keep_grads"
+        );
+        assert!(
+            autograd::get_grad(b.id).is_some(),
+            "grad(b) should survive clear_tape_keep_grads"
+        );
 
         // Cleanup
         autograd::clear_tape();
@@ -1485,8 +1609,14 @@ mod suite {
         autograd::zero_grads();
 
         // Gradients should be gone
-        assert!(autograd::get_grad(a.id).is_none(), "grad(a) should be cleared by zero_grads");
-        assert!(autograd::get_grad(b.id).is_none(), "grad(b) should be cleared by zero_grads");
+        assert!(
+            autograd::get_grad(a.id).is_none(),
+            "grad(a) should be cleared by zero_grads"
+        );
+        assert!(
+            autograd::get_grad(b.id).is_none(),
+            "grad(b) should be cleared by zero_grads"
+        );
 
         // Cleanup
         autograd::clear_tape();
@@ -1506,8 +1636,10 @@ mod suite {
             ModelConfig::large(1000),
         ];
         for cfg in &configs {
-            assert_eq!(cfg.n_kv_heads, cfg.n_heads,
-                "Preset config should default to MHA (n_kv_heads == n_heads)");
+            assert_eq!(
+                cfg.n_kv_heads, cfg.n_heads,
+                "Preset config should default to MHA (n_kv_heads == n_heads)"
+            );
         }
     }
 
@@ -1526,9 +1658,12 @@ mod suite {
         let mha = ModelConfig::custom(1000, 64, 4, 2, 2.0, 128);
         let gqa = ModelConfig::custom_gqa(1000, 64, 4, 2, 2, 2.0, 128);
         // GQA with n_kv_heads=2 has fewer params due to smaller K/V projections
-        assert!(gqa.param_count() < mha.param_count(),
+        assert!(
+            gqa.param_count() < mha.param_count(),
             "GQA ({}) should have fewer params than MHA ({})",
-            gqa.param_count(), mha.param_count());
+            gqa.param_count(),
+            mha.param_count()
+        );
     }
 
     #[test]
@@ -1598,7 +1733,11 @@ mod suite {
 
             let data = logits2.to_vec();
             for v in &data {
-                assert!(v.is_finite(), "GQA KV cache logit should be finite, got {}", v);
+                assert!(
+                    v.is_finite(),
+                    "GQA KV cache logit should be finite, got {}",
+                    v
+                );
             }
         });
     }
@@ -1622,7 +1761,13 @@ mod suite {
         let result = MetalContext::read_buffer(&f32_buf, data.len());
         for (i, (&orig, &back)) in data.iter().zip(result.iter()).enumerate() {
             let tol = orig.abs() * 0.01 + 1e-3; // half has ~0.1% relative error
-            assert!((orig - back).abs() < tol, "FP16 roundtrip mismatch at {}: {} vs {}", i, orig, back);
+            assert!(
+                (orig - back).abs() < tol,
+                "FP16 roundtrip mismatch at {}: {} vs {}",
+                i,
+                orig,
+                back
+            );
         }
     }
 
@@ -1630,14 +1775,29 @@ mod suite {
     fn fp16_batched_matmul_correctness() {
         let ctx = MetalContext::new();
         // [2, 2, 3] @ [2, 3, 2] = [2, 2, 2]
-        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-        let b = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let a = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let b = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let a_buf = ctx.buffer_from_slice(&a);
         let b_buf = ctx.buffer_from_slice(&b);
 
         // FP32 reference
         let c_ref = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul(&ctx, &a_buf, &b_buf, &c_ref, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
+        compute::gpu_batched_matmul(
+            &ctx,
+            &a_buf,
+            &b_buf,
+            &c_ref,
+            compute::BatchedDims {
+                batch: 2,
+                m: 2,
+                n: 2,
+                k: 3,
+            },
+        );
         let ref_result = MetalContext::read_buffer(&c_ref, 8);
 
         // FP16 path
@@ -1646,21 +1806,59 @@ mod suite {
         compute::gpu_cast_f32_to_f16(&ctx, &a_buf, &a_f16, a.len() as u32);
         compute::gpu_cast_f32_to_f16(&ctx, &b_buf, &b_f16, b.len() as u32);
         let c_f16 = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul_f16(&ctx, &a_f16, &b_f16, &c_f16, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
+        compute::gpu_batched_matmul_f16(
+            &ctx,
+            &a_f16,
+            &b_f16,
+            &c_f16,
+            compute::BatchedDims {
+                batch: 2,
+                m: 2,
+                n: 2,
+                k: 3,
+            },
+        );
         let f16_result = MetalContext::read_buffer(&c_f16, 8);
 
         for i in 0..8 {
-            assert!((ref_result[i] - f16_result[i]).abs() < 1.0,
-                "Batched FP16 mismatch at {}: {} vs {}", i, ref_result[i], f16_result[i]);
+            assert!(
+                (ref_result[i] - f16_result[i]).abs() < 1.0,
+                "Batched FP16 mismatch at {}: {} vs {}",
+                i,
+                ref_result[i],
+                f16_result[i]
+            );
         }
 
         // Also test batched trans_b and trans_a via the FP16 functions
         let c_tb = ctx.alloc_buffer(2 * 2 * 2 * 4);
-        compute::gpu_batched_matmul_trans_b_f16(&ctx, &a_f16, &b_f16, &c_tb, compute::BatchedDims { batch: 2, m: 2, n: 3, k: 3 });
+        compute::gpu_batched_matmul_trans_b_f16(
+            &ctx,
+            &a_f16,
+            &b_f16,
+            &c_tb,
+            compute::BatchedDims {
+                batch: 2,
+                m: 2,
+                n: 3,
+                k: 3,
+            },
+        );
         let _ = MetalContext::read_buffer(&c_tb, 8); // just verify no crash
 
         let c_ta = ctx.alloc_buffer(2 * 3 * 2 * 4);
-        compute::gpu_batched_matmul_trans_a_f16(&ctx, &a_f16, &b_f16, &c_ta, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 3 });
+        compute::gpu_batched_matmul_trans_a_f16(
+            &ctx,
+            &a_f16,
+            &b_f16,
+            &c_ta,
+            compute::BatchedDims {
+                batch: 2,
+                m: 2,
+                n: 2,
+                k: 3,
+            },
+        );
         let _ = MetalContext::read_buffer(&c_ta, 12); // just verify no crash
     }
 
@@ -1692,7 +1890,9 @@ mod suite {
         let n_tokens = 4;
         let d = 3;
         // Input: [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
-        let input = ctx.buffer_from_slice(&[1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,9.0, 10.0,11.0,12.0]);
+        let input = ctx.buffer_from_slice(&[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]);
 
         // Gather tokens 1 and 3
         let indices = ctx.buffer_from_u32_slice(&[1, 3]);
@@ -1716,7 +1916,11 @@ mod suite {
     fn flash_attention_op_variant_exists() {
         // Verify FlashAttention Op variant is constructable (used in inference path)
         let _op = crate::autograd::Op::FlashAttention {
-            batch_heads: 4, seq_q: 8, seq_k: 8, head_dim: 16, kv_offset: 0,
+            batch_heads: 4,
+            seq_q: 8,
+            seq_k: 8,
+            head_dim: 16,
+            kv_offset: 0,
         };
     }
 
@@ -1726,17 +1930,40 @@ mod suite {
     fn flash_fwd_recorded(ctx: &Arc<MetalContext>, q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
         let (bh, seq, hd) = (q.shape[0], q.shape[1], q.shape[2]);
         let out_buf = ctx.alloc_buffer(bh * seq * hd * 4);
-        compute::gpu_flash_attention_forward(ctx, &q.buffer, &k.buffer, &v.buffer, &out_buf,
-            compute::FlashDims { batch_heads: bh as u32, seq_q: seq as u32, seq_k: seq as u32, head_dim: hd as u32, kv_offset: 0 });
+        compute::gpu_flash_attention_forward(
+            ctx,
+            &q.buffer,
+            &k.buffer,
+            &v.buffer,
+            &out_buf,
+            compute::FlashDims {
+                batch_heads: bh as u32,
+                seq_q: seq as u32,
+                seq_k: seq as u32,
+                head_dim: hd as u32,
+                kv_offset: 0,
+            },
+        );
         let out = Tensor::from_buffer(Arc::clone(ctx), out_buf.clone(), vec![bh, seq, hd]);
         if autograd::is_recording() {
             autograd::record(autograd::TapeEntry {
-                op: autograd::Op::FlashAttention { batch_heads: bh, seq_q: seq, seq_k: seq, head_dim: hd, kv_offset: 0 },
+                op: autograd::Op::FlashAttention {
+                    batch_heads: bh,
+                    seq_q: seq,
+                    seq_k: seq,
+                    head_dim: hd,
+                    kv_offset: 0,
+                },
                 inputs: vec![q.id, k.id, v.id],
                 output: out.id,
                 input_buffers: vec![q.buffer.clone(), k.buffer.clone(), v.buffer.clone()],
                 output_buffer: out_buf.clone(),
-                shapes: vec![q.shape.clone(), k.shape.clone(), v.shape.clone(), out.shape.clone()],
+                shapes: vec![
+                    q.shape.clone(),
+                    k.shape.clone(),
+                    v.shape.clone(),
+                    out.shape.clone(),
+                ],
                 cached: Some(out_buf),
             });
         }
@@ -1750,7 +1977,11 @@ mod suite {
         let ctx = test_ctx();
         autograd::no_grad(|| {
             let (bh, seq, hd) = (2usize, 40usize, 16usize);
-            let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05).collect::<Vec<f32>>();
+            let gen = |s: usize| {
+                (0..bh * seq * hd)
+                    .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05)
+                    .collect::<Vec<f32>>()
+            };
             let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
             let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
             let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
@@ -1769,9 +2000,22 @@ mod suite {
             };
             let (kf, vf) = (fp16_round(&k), fp16_round(&v));
             let scale = 1.0 / (hd as f32).sqrt();
-            let dense = q.batched_matmul_trans_b(&kf).scale(scale).causal_mask(0).softmax().batched_matmul(&vf).to_vec();
-            let md = flash.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            assert!(flash.iter().all(|x| x.is_finite()), "flash output must be finite");
+            let dense = q
+                .batched_matmul_trans_b(&kf)
+                .scale(scale)
+                .causal_mask(0)
+                .softmax()
+                .batched_matmul(&vf)
+                .to_vec();
+            let md = flash
+                .iter()
+                .zip(&dense)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                flash.iter().all(|x| x.is_finite()),
+                "flash output must be finite"
+            );
             assert!(md < 6e-3, "flash vs fp16-K/V dense causal max_abs_diff={md:.5} (kernel math, fp16 rep removed)");
         });
     }
@@ -1786,16 +2030,36 @@ mod suite {
         autograd::no_grad(|| {
             for &seq in &[31usize, 32, 33, 40, 47, 64, 65] {
                 let (bh, hd) = (1usize, 16usize);
-                let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05).collect::<Vec<f32>>();
+                let gen = |s: usize| {
+                    (0..bh * seq * hd)
+                        .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05)
+                        .collect::<Vec<f32>>()
+                };
                 let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
                 let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
                 let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
                 let flash = flash_fwd_recorded(&ctx, &q, &k, &v).to_vec();
                 let scale = 1.0 / (hd as f32).sqrt();
-                let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
-                let md = flash.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                assert!(flash.iter().all(|x| x.is_finite()), "seq={seq}: flash output must be finite");
-                assert!(md < 2e-3, "seq={seq}: flash vs dense max_abs_diff={md:.5} (partial-block regression)");
+                let dense = q
+                    .batched_matmul_trans_b(&k)
+                    .scale(scale)
+                    .causal_mask(0)
+                    .softmax()
+                    .batched_matmul(&v)
+                    .to_vec();
+                let md = flash
+                    .iter()
+                    .zip(&dense)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    flash.iter().all(|x| x.is_finite()),
+                    "seq={seq}: flash output must be finite"
+                );
+                assert!(
+                    md < 2e-3,
+                    "seq={seq}: flash vs dense max_abs_diff={md:.5} (partial-block regression)"
+                );
             }
         });
     }
@@ -1808,10 +2072,19 @@ mod suite {
         let ctx = test_ctx();
         let (bh, seq, hd) = (2usize, 40usize, 16usize);
         let n = bh * seq * hd;
-        grad_check(&ctx,
-            &[(gc_vec(n, 0), vec![bh, seq, hd]), (gc_vec(n, 7), vec![bh, seq, hd]), (gc_vec(n, 19), vec![bh, seq, hd])],
+        grad_check(
+            &ctx,
+            &[
+                (gc_vec(n, 0), vec![bh, seq, hd]),
+                (gc_vec(n, 7), vec![bh, seq, hd]),
+                (gc_vec(n, 19), vec![bh, seq, hd]),
+            ],
             &|t| flash_fwd_recorded(&ctx, &t[0], &t[1], &t[2]),
-            GC_EPS, GC_ABS, GC_REL, "flash_attention");
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "flash_attention",
+        );
     }
 
     #[test]
@@ -1825,7 +2098,13 @@ mod suite {
         compute::gpu_cast_f16_to_f32(&ctx, &f16_buf, &back_buf, data.len() as u32);
         let result = MetalContext::read_buffer(&back_buf, data.len());
         for (i, (&orig, &back)) in data.iter().zip(result.iter()).enumerate() {
-            assert!((orig - back).abs() < 0.01, "fp16 reverse cast mismatch at {}: {} vs {}", i, orig, back);
+            assert!(
+                (orig - back).abs() < 0.01,
+                "fp16 reverse cast mismatch at {}: {} vs {}",
+                i,
+                orig,
+                back
+            );
         }
     }
 
@@ -1835,9 +2114,11 @@ mod suite {
     #[test]
     fn relu_activation_zeros_negatives() {
         let ctx = MetalContext::new();
-        let input = Tensor::from_buffer(Arc::clone(&ctx),
+        let input = Tensor::from_buffer(
+            Arc::clone(&ctx),
             ctx.buffer_from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0, 3.0]),
-            vec![6]);
+            vec![6],
+        );
         let output = input.relu();
         let vals = output.to_vec();
         assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
@@ -1847,24 +2128,40 @@ mod suite {
     #[test]
     fn relu_backward_passes_positive_gradients() {
         let ctx = MetalContext::new();
-        let x = Tensor::from_buffer(Arc::clone(&ctx),
+        let x = Tensor::from_buffer(
+            Arc::clone(&ctx),
             ctx.buffer_from_slice(&[-1.0f32, 2.0, -3.0, 4.0]),
-            vec![1, 4]);
+            vec![1, 4],
+        );
         let y = x.relu(); // [0, 2, 0, 4]
-        // Use matmul with ones to create a sum → scalar-like loss
-        let ones = Tensor::from_buffer(Arc::clone(&ctx),
+                          // Use matmul with ones to create a sum → scalar-like loss
+        let ones = Tensor::from_buffer(
+            Arc::clone(&ctx),
             ctx.buffer_from_slice(&[1.0f32, 1.0, 1.0, 1.0]),
-            vec![4, 1]);
+            vec![4, 1],
+        );
         let loss = y.matmul(&ones); // [1, 1] = sum of relu outputs = 6.0
         autograd::backward(&ctx, loss.id);
         let grad = autograd::get_grad(x.id).expect("should have gradient");
         let grad_vals = MetalContext::read_buffer(&grad, 4);
         // relu backward: grad = upstream * (input > 0)
         // upstream from matmul backward is ones, so grad = [0, 1, 0, 1]
-        assert!(grad_vals[0].abs() < 0.01, "negative input should have 0 gradient");
-        assert!(grad_vals[1] > 0.5, "positive input should have positive gradient");
-        assert!(grad_vals[2].abs() < 0.01, "negative input should have 0 gradient");
-        assert!(grad_vals[3] > 0.5, "positive input should have positive gradient");
+        assert!(
+            grad_vals[0].abs() < 0.01,
+            "negative input should have 0 gradient"
+        );
+        assert!(
+            grad_vals[1] > 0.5,
+            "positive input should have positive gradient"
+        );
+        assert!(
+            grad_vals[2].abs() < 0.01,
+            "negative input should have 0 gradient"
+        );
+        assert!(
+            grad_vals[3] > 0.5,
+            "positive input should have positive gradient"
+        );
         autograd::clear_tape();
     }
 
@@ -1925,9 +2222,11 @@ mod suite {
     fn slice_cols_extracts_correct_columns() {
         let ctx = MetalContext::new();
         // [2, 4] matrix: [[1,2,3,4], [5,6,7,8]]
-        let src = Tensor::from_buffer(Arc::clone(&ctx),
+        let src = Tensor::from_buffer(
+            Arc::clone(&ctx),
             ctx.buffer_from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
-            vec![2, 4]);
+            vec![2, 4],
+        );
         // Slice cols [1..3] → [[2,3], [6,7]]
         let sliced = src.slice_cols(1, 2);
         let vals = sliced.to_vec();
@@ -1954,7 +2253,9 @@ mod suite {
 
         // Weight should have changed
         let new_vals = w.to_vec();
-        let changed = new_vals.iter().any(|&v| (v - 1.0).abs() > 0.001 || v.abs() > 0.001);
+        let changed = new_vals
+            .iter()
+            .any(|&v| (v - 1.0).abs() > 0.001 || v.abs() > 0.001);
         assert!(changed, "Muon should modify weights");
         autograd::clear_tape();
     }
@@ -1970,22 +2271,50 @@ mod suite {
         let prefs: Vec<&Tensor> = params.to_vec();
         let force = model.force_adamw_param_ids();
         let h = crate::optim::HybridOptimizer::new(
-            &ctx, &prefs, 0.1, &force, crate::optim::AdamWHyper::default(),
+            &ctx,
+            &prefs,
+            0.1,
+            &force,
+            crate::optim::AdamWHyper::default(),
         );
-        let muon_ids: std::collections::HashSet<usize> = h.muon.params.iter().map(|p| p.tensor_id).collect();
-        let adamw_ids: std::collections::HashSet<usize> = h.adamw.params.iter().map(|p| p.tensor_id).collect();
+        let muon_ids: std::collections::HashSet<usize> =
+            h.muon.params.iter().map(|p| p.tensor_id).collect();
+        let adamw_ids: std::collections::HashSet<usize> =
+            h.adamw.params.iter().map(|p| p.tensor_id).collect();
 
         // Embedding (2-D, weight-tied head) → AdamW, never Muon.
-        assert!(adamw_ids.contains(&model.embedding.id), "embedding must be on AdamW");
-        assert!(!muon_ids.contains(&model.embedding.id), "embedding must NOT be orthogonalized by Muon");
+        assert!(
+            adamw_ids.contains(&model.embedding.id),
+            "embedding must be on AdamW"
+        );
+        assert!(
+            !muon_ids.contains(&model.embedding.id),
+            "embedding must NOT be orthogonalized by Muon"
+        );
         // A hidden attention projection (2-D matrix) → Muon.
-        assert!(muon_ids.contains(&model.blocks[0].attn.w_q.id), "hidden attn matrix must use Muon");
+        assert!(
+            muon_ids.contains(&model.blocks[0].attn.w_q.id),
+            "hidden attn matrix must use Muon"
+        );
         // 1-D final norm → AdamW.
-        assert!(adamw_ids.contains(&model.ln_final_weight.id), "1-D norm must be on AdamW");
+        assert!(
+            adamw_ids.contains(&model.ln_final_weight.id),
+            "1-D norm must be on AdamW"
+        );
         // Partition is exact + disjoint.
-        assert_eq!(muon_ids.len() + adamw_ids.len(), prefs.len(), "every param routed exactly once");
-        assert!(muon_ids.is_disjoint(&adamw_ids), "a param cannot be on both optimizers");
-        assert!(!muon_ids.is_empty(), "there are hidden 2-D matrices to give to Muon");
+        assert_eq!(
+            muon_ids.len() + adamw_ids.len(),
+            prefs.len(),
+            "every param routed exactly once"
+        );
+        assert!(
+            muon_ids.is_disjoint(&adamw_ids),
+            "a param cannot be on both optimizers"
+        );
+        assert!(
+            !muon_ids.is_empty(),
+            "there are hidden 2-D matrices to give to Muon"
+        );
     }
 
     /// END-TO-END STABILITY of the Muon+AdamW hybrid via the unified `Optimizer::Hybrid` dispatch
@@ -2011,7 +2340,11 @@ mod suite {
         let prefs: Vec<&Tensor> = params.to_vec();
         let force = model.force_adamw_param_ids();
         let mut opt = crate::optim::Optimizer::Hybrid(crate::optim::HybridOptimizer::new(
-            &ctx, &prefs, 0.0, &force, crate::optim::AdamWHyper::default(),
+            &ctx,
+            &prefs,
+            0.0,
+            &force,
+            crate::optim::AdamWHyper::default(),
         ));
         let mut max_loss = 0.0f32;
         for step in 0..150 {
@@ -2028,7 +2361,10 @@ mod suite {
             autograd::zero_grads_recycle();
         }
         eprintln!("hybrid stability: max loss {max_loss:.2}");
-        assert!(max_loss < 30.0, "Muon+AdamW hybrid loss blew up (max {max_loss})");
+        assert!(
+            max_loss < 30.0,
+            "Muon+AdamW hybrid loss blew up (max {max_loss})"
+        );
     }
 
     /// AdamW update clipping bounds the per-element step at the source. A collapsed second moment
@@ -2041,8 +2377,15 @@ mod suite {
         let run = |clip: f32| -> f32 {
             let w = Tensor::zeros(&ctx, vec![4, 4]);
             let mut opt = crate::optim::AdamW::new_with_config(
-                &ctx, &[&w], 0.0,
-                crate::optim::AdamWHyper { beta1: 0.9, beta2: 0.95, eps: 1e-5, update_clip: clip },
+                &ctx,
+                &[&w],
+                0.0,
+                crate::optim::AdamWHyper {
+                    beta1: 0.9,
+                    beta2: 0.95,
+                    eps: 1e-5,
+                    update_clip: clip,
+                },
             );
             // Pre-seed a collapsed v and a large m → the spike regime.
             compute::gpu_fill(&ctx, &opt.params[0].m, 16, 10.0);
@@ -2058,8 +2401,14 @@ mod suite {
         let clipped = run(0.5);
         let unclipped = run(0.0);
         eprintln!("update_clip: clipped |Δ|={clipped:.6}, unclipped |Δ|={unclipped:.1}");
-        assert!(clipped <= 0.01, "clipped step must be bounded ~lr·clip, got {clipped}");
-        assert!(unclipped > 1.0, "unclipped spike update should be large, got {unclipped}");
+        assert!(
+            clipped <= 0.01,
+            "clipped step must be bounded ~lr·clip, got {clipped}"
+        );
+        assert!(
+            unclipped > 1.0,
+            "unclipped spike update should be large, got {unclipped}"
+        );
     }
 
     /// Block-sparse routing correctness: when top_k ≥ (#past blocks), every causal block is
@@ -2071,7 +2420,9 @@ mod suite {
         let nb = seq.div_ceil(bsz);
         let scale = 1.0 / (hd as f32).sqrt();
         let gen = |salt: usize| -> Vec<f32> {
-            (0..seq * hd).map(|i| (((i * 5 + salt * 11) % 13) as f32 - 6.0) * 0.1).collect()
+            (0..seq * hd)
+                .map(|i| (((i * 5 + salt * 11) % 13) as f32 - 6.0) * 0.1)
+                .collect()
         };
         let q = Tensor::from_slice(&ctx, &gen(1), vec![1, seq, hd]);
         let k = Tensor::from_slice(&ctx, &gen(2), vec![1, seq, hd]);
@@ -2079,14 +2430,31 @@ mod suite {
         // Block-sparse with top_k = nb (≥ any query's past-block count) → selects all causal blocks.
         let bm = k.block_mean_keys(bsz);
         let bs = q.batched_matmul_trans_b(&bm);
-        let sparse = q.batched_matmul_trans_b(&k).scale(scale)
-            .block_sparse_mask(&bs, bsz, nb).softmax().batched_matmul(&v).to_vec();
+        let sparse = q
+            .batched_matmul_trans_b(&k)
+            .scale(scale)
+            .block_sparse_mask(&bs, bsz, nb)
+            .softmax()
+            .batched_matmul(&v)
+            .to_vec();
         // Dense causal.
-        let dense = q.batched_matmul_trans_b(&k).scale(scale)
-            .causal_mask(0).softmax().batched_matmul(&v).to_vec();
-        let max_diff = sparse.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let dense = q
+            .batched_matmul_trans_b(&k)
+            .scale(scale)
+            .causal_mask(0)
+            .softmax()
+            .batched_matmul(&v)
+            .to_vec();
+        let max_diff = sparse
+            .iter()
+            .zip(&dense)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("block-sparse (full) vs dense: max_diff={max_diff:.6}");
-        assert!(max_diff < 1e-4, "block-sparse with full top_k must equal dense causal: {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "block-sparse with full top_k must equal dense causal: {max_diff}"
+        );
         autograd::clear_tape();
     }
 
@@ -2097,9 +2465,13 @@ mod suite {
         let ctx = test_ctx();
         let (seq, bsz, nb) = (12usize, 4usize, 3usize);
         let scores = Tensor::zeros(&ctx, vec![1, seq, seq]); // 0 = unmasked baseline
-        // Block scores per query position; q=8 (block 2): block0 high, block1 low.
+                                                             // Block scores per query position; q=8 (block 2): block0 high, block1 low.
         let mut bs = vec![0.0f32; seq * nb];
-        for q in 0..seq { bs[q * nb] = 5.0; bs[q * nb + 1] = 1.0; bs[q * nb + 2] = 0.0; }
+        for q in 0..seq {
+            bs[q * nb] = 5.0;
+            bs[q * nb + 1] = 1.0;
+            bs[q * nb + 2] = 0.0;
+        }
         let block_scores = Tensor::from_slice(&ctx, &bs, vec![1, seq, nb]);
         let m = scores.block_sparse_mask(&block_scores, bsz, 1).to_vec();
         let at = |q: usize, k: usize| m[q * seq + k];
@@ -2107,10 +2479,23 @@ mod suite {
         //   block 0 (k 0..3) = top-1 past → visible (0.0)
         //   block 1 (k 4..7) = not selected → -inf
         //   own block 2: k=8 visible (causal), k=9..11 future → -inf
-        for k in 0..4 { assert_eq!(at(8, k), 0.0, "selected past block must be visible at k={k}"); }
-        for k in 4..8 { assert!(at(8, k).is_infinite(), "unselected block must be masked at k={k}"); }
+        for k in 0..4 {
+            assert_eq!(
+                at(8, k),
+                0.0,
+                "selected past block must be visible at k={k}"
+            );
+        }
+        for k in 4..8 {
+            assert!(
+                at(8, k).is_infinite(),
+                "unselected block must be masked at k={k}"
+            );
+        }
         assert_eq!(at(8, 8), 0.0, "own-block causal position must be visible");
-        for k in 9..12 { assert!(at(8, k).is_infinite(), "future must be masked at k={k}"); }
+        for k in 9..12 {
+            assert!(at(8, k).is_infinite(), "future must be masked at k={k}");
+        }
         autograd::clear_tape();
     }
 
@@ -2121,18 +2506,36 @@ mod suite {
     fn block_sparse_gather_matches_dense_when_full() {
         let ctx = test_ctx();
         let (bh, seq, hd, block) = (2usize, 16usize, 8usize, 4usize); // nb=4
-        let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1).collect::<Vec<f32>>();
+        let gen = |s: usize| {
+            (0..bh * seq * hd)
+                .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1)
+                .collect::<Vec<f32>>()
+        };
         let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
         let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
         let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
         // top_k=3 → k_sel=4=nb → all causal blocks selected → dense causal attention.
-        let gathered = crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3).to_vec();
+        let gathered =
+            crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3).to_vec();
         let scale = 1.0 / (hd as f32).sqrt();
-        let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
-        let max_diff = gathered.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let dense = q
+            .batched_matmul_trans_b(&k)
+            .scale(scale)
+            .causal_mask(0)
+            .softmax()
+            .batched_matmul(&v)
+            .to_vec();
+        let max_diff = gathered
+            .iter()
+            .zip(&dense)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("gather(full) vs dense causal: max_diff={max_diff:.6}");
         assert!(gathered.iter().all(|x| x.is_finite()));
-        assert!(max_diff < 1e-4, "gather with full top_k must equal dense causal: {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "gather with full top_k must equal dense causal: {max_diff}"
+        );
         autograd::clear_tape();
     }
 
@@ -2142,17 +2545,39 @@ mod suite {
     fn block_sparse_gather_is_sparse() {
         let ctx = test_ctx();
         let (bh, seq, hd, block) = (1usize, 32usize, 8usize, 4usize); // nb=8
-        let gen = |s: usize| (0..bh * seq * hd).map(|i| (((i * 3 + s * 5) % 19) as f32 - 9.0) * 0.1).collect::<Vec<f32>>();
+        let gen = |s: usize| {
+            (0..bh * seq * hd)
+                .map(|i| (((i * 3 + s * 5) % 19) as f32 - 9.0) * 0.1)
+                .collect::<Vec<f32>>()
+        };
         let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
         let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
         let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
         let sparse = crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 1).to_vec(); // own + 1 past of up to 7
         let scale = 1.0 / (hd as f32).sqrt();
-        let dense = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v).to_vec();
-        let max_diff = sparse.iter().zip(&dense).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        eprintln!("gather(top_k=1) vs dense: max_diff={max_diff:.4} (expect >0 — genuinely sparse)");
-        assert!(sparse.iter().all(|x| x.is_finite()), "sparse gather must be finite");
-        assert!(max_diff > 1e-3, "top_k=1 must differ from dense (it drops most blocks): {max_diff}");
+        let dense = q
+            .batched_matmul_trans_b(&k)
+            .scale(scale)
+            .causal_mask(0)
+            .softmax()
+            .batched_matmul(&v)
+            .to_vec();
+        let max_diff = sparse
+            .iter()
+            .zip(&dense)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "gather(top_k=1) vs dense: max_diff={max_diff:.4} (expect >0 — genuinely sparse)"
+        );
+        assert!(
+            sparse.iter().all(|x| x.is_finite()),
+            "sparse gather must be finite"
+        );
+        assert!(
+            max_diff > 1e-3,
+            "top_k=1 must differ from dense (it drops most blocks): {max_diff}"
+        );
     }
 
     /// Finite-difference grad-check of the TRAINABLE block-sparse gather path (q, k, v all tracked).
@@ -2168,9 +2593,16 @@ mod suite {
         let n = 2 * 8 * 4;
         grad_check(
             &ctx,
-            &[(gc_vec(n, 0), vec![2, 8, 4]), (gc_vec(n, 13), vec![2, 8, 4]), (gc_vec(n, 29), vec![2, 8, 4])],
+            &[
+                (gc_vec(n, 0), vec![2, 8, 4]),
+                (gc_vec(n, 13), vec![2, 8, 4]),
+                (gc_vec(n, 29), vec![2, 8, 4]),
+            ],
             &|t| crate::attention::block_sparse_gather_attention(&t[0], &t[1], &t[2], 2, 3),
-            GC_EPS, GC_ABS, GC_REL, "block_sparse_gather_attention",
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "block_sparse_gather_attention",
         );
     }
 
@@ -2199,7 +2631,11 @@ mod suite {
             let k = Tensor::from_slice(&ctx, &kd, vec![bh, seq, hd]).with_grad();
             let v = Tensor::from_slice(&ctx, &vd, vec![bh, seq, hd]).with_grad();
             let out = if dense {
-                q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax().batched_matmul(&v)
+                q.batched_matmul_trans_b(&k)
+                    .scale(scale)
+                    .causal_mask(0)
+                    .softmax()
+                    .batched_matmul(&v)
             } else {
                 crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3)
             };
@@ -2208,15 +2644,26 @@ mod suite {
             let seed_t = Tensor::from_slice(&ctx, &seed, vec![m, 1]);
             let loss = out.reshape(vec![1, m]).matmul(&seed_t);
             autograd::backward(&ctx, loss.id);
-            let fetch = |id: usize| Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(id).unwrap(), vec![n]).to_vec();
+            let fetch = |id: usize| {
+                Tensor::from_buffer(Arc::clone(&ctx), autograd::get_grad(id).unwrap(), vec![n])
+                    .to_vec()
+            };
             (fetch(q.id), fetch(k.id), fetch(v.id))
         };
         let (dq, dk, dv) = grads(true);
         let (gq, gk, gv) = grads(false);
-        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
         for (name, d, g) in [("q", &dq, &gq), ("k", &dk, &gk), ("v", &dv, &gv)] {
             let md = max_diff(d, g);
-            assert!(md < 2e-3, "{name}-grad gather vs dense max_abs_diff={md:.6} (must reduce to dense)");
+            assert!(
+                md < 2e-3,
+                "{name}-grad gather vs dense max_abs_diff={md:.6} (must reduce to dense)"
+            );
         }
         autograd::clear_tape();
     }
@@ -2229,7 +2676,14 @@ mod suite {
     #[test]
     fn gather_blocks_backward_scatter_add_direct() {
         let ctx = test_ctx();
-        let dims = compute::GatherDims { bh: 1, nb: 2, seq: 4, hd: 1, block: 2, k_sel: 2 };
+        let dims = compute::GatherDims {
+            bh: 1,
+            nb: 2,
+            seq: 4,
+            hd: 1,
+            block: 2,
+            k_sel: 2,
+        };
         let sel = ctx.buffer_from_u32_slice(&[0u32, 2, 1, 0]);
         // d_out [bh*nb=2, sel_w=4, hd=1]; the 99.0 entries are the sentinel slots — must be ignored.
         let d_out = ctx.buffer_from_slice(&[1.0f32, 2.0, 99.0, 99.0, 3.0, 4.0, 5.0, 6.0]);
@@ -2239,7 +2693,10 @@ mod suite {
         // src row0 = out[0]+out[6] = 1+5 = 6; row1 = out[1]+out[7] = 2+6 = 8; row2 = out[4] = 3; row3 = out[5] = 4.
         let expect = [6.0f32, 8.0, 3.0, 4.0];
         for (i, (&g, &e)) in got.iter().zip(&expect).enumerate() {
-            assert!((g - e).abs() < 1e-5, "d_src[{i}] = {g} (expected {e}); sentinel/accumulation handling wrong");
+            assert!(
+                (g - e).abs() < 1e-5,
+                "d_src[{i}] = {g} (expected {e}); sentinel/accumulation handling wrong"
+            );
         }
     }
 
@@ -2254,17 +2711,40 @@ mod suite {
         let r = |s: usize| Tensor::randn(&ctx, vec![bh, seq, hd], 0.1 + s as f32 * 0.0);
         let (q, k, v) = (r(1), r(2), r(3));
         let scale = 1.0 / (hd as f32).sqrt();
-        let dense = || { let s = q.batched_matmul_trans_b(&k).scale(scale).causal_mask(0).softmax(); s.batched_matmul(&v); };
-        let sparse = || { crate::attention::block_sparse_gather_attention(&q, &k, &v, block, top_k); };
-        for _ in 0..3 { dense(); sparse(); }
+        let dense = || {
+            let s = q
+                .batched_matmul_trans_b(&k)
+                .scale(scale)
+                .causal_mask(0)
+                .softmax();
+            s.batched_matmul(&v);
+        };
+        let sparse = || {
+            crate::attention::block_sparse_gather_attention(&q, &k, &v, block, top_k);
+        };
+        for _ in 0..3 {
+            dense();
+            sparse();
+        }
         let iters = 20;
-        let t0 = Instant::now(); for _ in 0..iters { dense(); } let td = t0.elapsed().as_secs_f64() / iters as f64;
-        let t1 = Instant::now(); for _ in 0..iters { sparse(); } let ts = t1.elapsed().as_secs_f64() / iters as f64;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            dense();
+        }
+        let td = t0.elapsed().as_secs_f64() / iters as f64;
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            sparse();
+        }
+        let ts = t1.elapsed().as_secs_f64() / iters as f64;
         let dense_flops = 2.0 * (bh * seq * seq * hd) as f64; // Q@K^T scores
         let sparse_flops = 2.0 * (bh * seq * (top_k + 1) * block * hd) as f64;
         eprintln!("block-sparse gather seq={seq} block={block} top_k={top_k}: dense {td:.4}s, sparse {ts:.4}s, speedup {:.2}x; score-FLOPs {:.0}M vs {:.0}M ({:.2}× fewer)",
             td / ts, dense_flops / 1e6, sparse_flops / 1e6, dense_flops / sparse_flops);
-        assert!(ts < td, "gather block-sparse ({ts:.4}s) should beat dense ({td:.4}s) at seq={seq}");
+        assert!(
+            ts < td,
+            "gather block-sparse ({ts:.4}s) should beat dense ({td:.4}s) at seq={seq}"
+        );
     }
 
     /// End-to-end: a model with `AttnKind::BlockSparse` in every block forwards to finite logits,
@@ -2276,9 +2756,16 @@ mod suite {
     fn block_sparse_model_trains_stably() {
         let ctx = test_ctx();
         let vocab = 48u32;
-        let cfg = ModelConfig { block_sparse_top_k: 1, block_size: 4, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let cfg = ModelConfig {
+            block_sparse_top_k: 1,
+            block_size: 4,
+            ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64)
+        };
         let model = Transformer::new(&ctx, cfg);
-        assert_eq!(model.blocks[0].attn.attn_kind, crate::attention::AttnKind::BlockSparse);
+        assert_eq!(
+            model.blocks[0].attn.attn_kind,
+            crate::attention::AttnKind::BlockSparse
+        );
         let (batch, seq_len) = (1usize, 16usize);
         let tokens: Vec<u32> = (0..16).map(|i| (i * 3 % 48) as u32).collect();
         let targets: Vec<u32> = vec![5; 16];
@@ -2291,18 +2778,34 @@ mod suite {
             let logits = model.forward(&tokens, batch, seq_len, None, false);
             if step == 0 {
                 assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
-                assert!(logits.to_vec().iter().all(|x| x.is_finite()), "block-sparse forward non-finite");
+                assert!(
+                    logits.to_vec().iter().all(|x| x.is_finite()),
+                    "block-sparse forward non-finite"
+                );
             }
             let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
             let lv = loss.to_vec()[0];
-            assert!(lv.is_finite(), "block-sparse loss non-finite at step {step}");
-            if step == 0 { first = lv; }
+            assert!(
+                lv.is_finite(),
+                "block-sparse loss non-finite at step {step}"
+            );
+            if step == 0 {
+                first = lv;
+            }
             last = lv;
             autograd::backward(&ctx, loss.id);
             if step == 0 {
                 let g = autograd::get_grad(wq_id).expect("no gradient reached block-sparse w_q");
-                let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone()).to_vec();
-                assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on block-sparse w_q");
+                let gv = Tensor::from_buffer(
+                    Arc::clone(&ctx),
+                    g,
+                    model.blocks[0].attn.w_q.shape.clone(),
+                )
+                .to_vec();
+                assert!(
+                    gv.iter().all(|x| x.is_finite()),
+                    "non-finite grad on block-sparse w_q"
+                );
             }
             autograd::clear_tape_keep_grads();
             crate::train::clip_gradients(&ctx, &model, 1.0);
@@ -2311,7 +2814,10 @@ mod suite {
             autograd::zero_grads_recycle();
         }
         eprintln!("block-sparse model: loss {first:.3} -> {last:.3}");
-        assert!(last.is_finite() && last < 30.0, "block-sparse training must stay finite + bounded (got {first:.3}->{last:.3})");
+        assert!(
+            last.is_finite() && last < 30.0,
+            "block-sparse training must stay finite + bounded (got {first:.3}->{last:.3})"
+        );
         autograd::clear_tape();
         autograd::zero_grads();
     }
@@ -2337,12 +2843,22 @@ mod suite {
         let weight = ctx.buffer_from_slice(&vec![1.0f32; cols]);
         // Alternating grad_output: nearly orthogonal to the (uniform) collapsed row, so the inv_rms³
         // correction term doesn't cancel the inv_rms term — the explosion is exposed, not hidden.
-        let go: Vec<f32> = (0..cols).map(|c| if c % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let go: Vec<f32> = (0..cols)
+            .map(|c| if c % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let grad_output = ctx.buffer_from_slice(&go);
         let gi = ctx.alloc_buffer(cols * 4);
         let gw = ctx.alloc_buffer(cols * 4);
-        let p = compute::RmsNormBackwardParams { rows: 1, cols: cols as u32, eps: 1e-10 };
-        let max_abs = |buf: &_| MetalContext::read_buffer(buf, cols).iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let p = compute::RmsNormBackwardParams {
+            rows: 1,
+            cols: cols as u32,
+            eps: 1e-10,
+        };
+        let max_abs = |buf: &_| {
+            MetalContext::read_buffer(buf, cols)
+                .iter()
+                .fold(0.0f32, |m, &v| m.max(v.abs()))
+        };
 
         let prev = compute::set_rmsnorm_clamp(false);
         compute::gpu_rms_norm_backward(&ctx, &input, &weight, &grad_output, &gi, &gw, &p);
@@ -2353,8 +2869,14 @@ mod suite {
         compute::set_rmsnorm_clamp(prev);
 
         eprintln!("RMSNorm collapsed-row backward: unclamped max|grad|={unclamped:.1}, clamped max|grad|={clamped:.1}");
-        assert!(unclamped > 1.0e3, "collapsed row should explode without the clamp, got {unclamped}");
-        assert!(clamped.is_finite() && clamped <= 1.0e3, "clamp must bound the degenerate backward, got {clamped}");
+        assert!(
+            unclamped > 1.0e3,
+            "collapsed row should explode without the clamp, got {unclamped}"
+        );
+        assert!(
+            clamped.is_finite() && clamped <= 1.0e3,
+            "clamp must bound the degenerate backward, got {clamped}"
+        );
     }
 
     /// Investigates the handoff's open question: is beta2=0.999 making loss WORSE a "third subtle
@@ -2371,8 +2893,15 @@ mod suite {
         let run = |beta2: f32| -> (f32, f32, bool) {
             let w = Tensor::zeros(&ctx, vec![n]);
             let mut opt = crate::optim::AdamW::new_with_config(
-                &ctx, &[&w], 0.0,
-                crate::optim::AdamWHyper { beta1: 0.9, beta2, eps: 1e-5, update_clip: 0.0 },
+                &ctx,
+                &[&w],
+                0.0,
+                crate::optim::AdamWHyper {
+                    beta1: 0.9,
+                    beta2,
+                    eps: 1e-5,
+                    update_clip: 0.0,
+                },
             );
             let small = ctx.buffer_from_slice(&vec![0.01f32; n]);
             let big = ctx.buffer_from_slice(&vec![1.0f32; n]); // 100× jump
@@ -2396,7 +2925,9 @@ mod suite {
                 let g = ctx.buffer_from_slice(&[1.0f32; 64]);
                 autograd::accumulate_grad_for_test(&ctx, w.id, &g, n);
                 opt.step(0.01);
-                if w.to_vec().iter().any(|x| !x.is_finite()) { all_finite = false; }
+                if w.to_vec().iter().any(|x| !x.is_finite()) {
+                    all_finite = false;
+                }
             }
             let total = w.to_vec()[0].abs();
             let _ = small;
@@ -2406,10 +2937,18 @@ mod suite {
         let (jump95, total95, fin95) = run(0.95);
         let (jump999, total999, fin999) = run(0.999);
         eprintln!("beta2=0.95:  jump-step Δ={jump95:.5}, total |w|={total95:.4}, finite={fin95}");
-        eprintln!("beta2=0.999: jump-step Δ={jump999:.5}, total |w|={total999:.4}, finite={fin999}");
+        eprintln!(
+            "beta2=0.999: jump-step Δ={jump999:.5}, total |w|={total999:.4}, finite={fin999}"
+        );
         // The key finding: NO bug — both stay finite and bounded across the non-stationary jump.
-        assert!(fin95 && fin999, "AdamW went non-finite — that WOULD be a bug");
-        assert!(total95 < 100.0 && total999 < 100.0, "AdamW must stay bounded (no explosion)");
+        assert!(
+            fin95 && fin999,
+            "AdamW went non-finite — that WOULD be a bug"
+        );
+        assert!(
+            total95 < 100.0 && total999 < 100.0,
+            "AdamW must stay bounded (no explosion)"
+        );
         // The mechanism: beta2=0.999 overshoots harder on the jump (lagging v → under-sized denom).
         assert!(jump999 >= jump95, "beta2=0.999 should overshoot ≥ beta2=0.95 on the gradient jump (jump999={jump999}, jump95={jump95})");
     }
@@ -2423,13 +2962,18 @@ mod suite {
         let ctx = test_ctx();
         let g = Tensor::ones(&ctx, vec![8]);
         let mut muon = crate::optim::Muon::new(&ctx, &[&g], 0.5);
-        assert_eq!(muon.adamw_hyper.eps, 1e-5, "Muon AdamW-fallback must use the hardened eps (1e-5)");
+        assert_eq!(
+            muon.adamw_hyper.eps, 1e-5,
+            "Muon AdamW-fallback must use the hardened eps (1e-5)"
+        );
         let zero = ctx.buffer_from_slice(&[0.0f32; 8]);
         autograd::accumulate_grad_for_test(&ctx, g.id, &zero, 8);
         muon.step(0.1);
         let v = g.to_vec();
-        assert!(v.iter().all(|&x| (x - 1.0).abs() < 1e-3),
-            "1-D norm weight was decayed despite no_decay: {v:?}");
+        assert!(
+            v.iter().all(|&x| (x - 1.0).abs() < 1e-3),
+            "1-D norm weight was decayed despite no_decay: {v:?}"
+        );
         autograd::clear_tape();
         autograd::zero_grads();
     }
@@ -2456,7 +3000,11 @@ mod suite {
         let mut muon2 = crate::optim::Muon::new(&ctx, &[&w2d, &w1d], 0.0);
         muon2.load_state_blobs(muon.step, &blobs);
         assert_eq!(muon2.step, muon.step);
-        assert_eq!(muon2.save_state_blobs(), blobs, "Muon state must round-trip byte-identically");
+        assert_eq!(
+            muon2.save_state_blobs(),
+            blobs,
+            "Muon state must round-trip byte-identically"
+        );
 
         // 8-bit AdamW: int8 m_q/v_q + fp32 scales.
         let wq = Tensor::randn(&ctx, vec![300], 0.3);
@@ -2470,14 +3018,24 @@ mod suite {
         let qb = q8.save_state_blobs();
         let mut q8b = crate::optim::AdamW8bit::new(&ctx, &[&wq], 0.0);
         q8b.load_state_blobs(q8.step, &qb);
-        assert_eq!(q8b.save_state_blobs(), qb, "8-bit state must round-trip byte-identically");
+        assert_eq!(
+            q8b.save_state_blobs(),
+            qb,
+            "8-bit state must round-trip byte-identically"
+        );
 
         // Hybrid: Muon (2-D) + AdamW (embeddings/norms) sub-state.
         let model = Transformer::new(&ctx, ModelConfig::custom(48, 64, 4, 2, 2.67, 64));
         let params = model.parameters();
         let prefs: Vec<&Tensor> = params.to_vec();
         let force = model.force_adamw_param_ids();
-        let mut hyb = crate::optim::HybridOptimizer::new(&ctx, &prefs, 0.0, &force, crate::optim::AdamWHyper::default());
+        let mut hyb = crate::optim::HybridOptimizer::new(
+            &ctx,
+            &prefs,
+            0.0,
+            &force,
+            crate::optim::AdamWHyper::default(),
+        );
         // one real backward so grads exist for all params
         let toks: Vec<u32> = (0..8).collect();
         let logits = model.forward(&toks, 1, 8, None, false);
@@ -2486,9 +3044,19 @@ mod suite {
         autograd::clear_tape_keep_grads();
         hyb.step(0.01);
         let hb = hyb.save_state_blobs();
-        let mut hyb2 = crate::optim::HybridOptimizer::new(&ctx, &prefs, 0.0, &force, crate::optim::AdamWHyper::default());
+        let mut hyb2 = crate::optim::HybridOptimizer::new(
+            &ctx,
+            &prefs,
+            0.0,
+            &force,
+            crate::optim::AdamWHyper::default(),
+        );
         hyb2.load_state_blobs(hyb.adamw.step, &hb);
-        assert_eq!(hyb2.save_state_blobs(), hb, "Hybrid state must round-trip byte-identically");
+        assert_eq!(
+            hyb2.save_state_blobs(),
+            hb,
+            "Hybrid state must round-trip byte-identically"
+        );
         autograd::clear_tape();
         autograd::zero_grads();
     }
@@ -2515,13 +3083,31 @@ mod suite {
         crate::train::clip_gradients_per_tensor(&ctx, &model, 1.0);
 
         let big_after = crate::tensor::Tensor::from_buffer(
-            Arc::clone(&ctx), autograd::get_grad(big_id).unwrap(), vec![big_n]).to_vec();
+            Arc::clone(&ctx),
+            autograd::get_grad(big_id).unwrap(),
+            vec![big_n],
+        )
+        .to_vec();
         let small_after = crate::tensor::Tensor::from_buffer(
-            Arc::clone(&ctx), autograd::get_grad(small_id).unwrap(), vec![small_n]).to_vec();
+            Arc::clone(&ctx),
+            autograd::get_grad(small_id).unwrap(),
+            vec![small_n],
+        )
+        .to_vec();
         let big_norm: f32 = big_after.iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!("per-tensor clip: big_norm after = {big_norm:.4}, small[0] = {}", small_after[0]);
-        assert!((big_norm - 1.0).abs() < 0.05, "exploded tensor must be clipped to max_norm=1, got {big_norm}");
-        assert!((small_after[0] - 0.001).abs() < 1e-6, "healthy small-grad tensor must be untouched, got {}", small_after[0]);
+        eprintln!(
+            "per-tensor clip: big_norm after = {big_norm:.4}, small[0] = {}",
+            small_after[0]
+        );
+        assert!(
+            (big_norm - 1.0).abs() < 0.05,
+            "exploded tensor must be clipped to max_norm=1, got {big_norm}"
+        );
+        assert!(
+            (small_after[0] - 0.001).abs() < 1e-6,
+            "healthy small-grad tensor must be untouched, got {}",
+            small_after[0]
+        );
         autograd::clear_tape();
         autograd::zero_grads();
     }
@@ -2539,17 +3125,27 @@ mod suite {
             let b = Tensor::randn(&ctx, vec![k, n], 0.5);
             let out_sg = ctx.alloc_buffer(m * n * 4);
             let out_ref = ctx.alloc_buffer(m * n * 4);
-            compute::gpu_matmul_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32);
-            compute::gpu_matmul_fp32(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_simdgroup(
+                &ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32,
+            );
+            compute::gpu_matmul_fp32(
+                &ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32,
+            );
             let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
             let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
             let mut max_diff = 0.0f32;
             for i in 0..sg.len() {
-                assert!(sg[i].is_finite(), "simdgroup matmul produced non-finite at {i} for {m}x{k}x{n}");
+                assert!(
+                    sg[i].is_finite(),
+                    "simdgroup matmul produced non-finite at {i} for {m}x{k}x{n}"
+                );
                 max_diff = max_diff.max((sg[i] - rf[i]).abs());
             }
             eprintln!("simdgroup vs fp32 [{m}x{k}x{n}]: max_diff={max_diff:.6}");
-            assert!(max_diff < 1e-3, "simdgroup matmul disagrees with fp32 ({m}x{k}x{n}): max_diff={max_diff}");
+            assert!(
+                max_diff < 1e-3,
+                "simdgroup matmul disagrees with fp32 ({m}x{k}x{n}): max_diff={max_diff}"
+            );
         }
     }
 
@@ -2566,14 +3162,23 @@ mod suite {
             let b16 = b.cast_to_f16();
             let out_sg = ctx.alloc_buffer(m * n * 4);
             let out_ref = ctx.alloc_buffer(m * n * 4);
-            compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out_sg, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_simdgroup_f16(
+                &ctx, &a16, &b16, &out_sg, m as u32, n as u32, k as u32,
+            );
             compute::gpu_matmul_f16(&ctx, &a16, &b16, &out_ref, m as u32, n as u32, k as u32);
             let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
             let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
-            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let max_diff = sg
+                .iter()
+                .zip(&rf)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             eprintln!("simdgroup_f16 vs f16 [{m}x{k}x{n}]: max_diff={max_diff:.5}");
             assert!(sg.iter().all(|x| x.is_finite()));
-            assert!(max_diff < 2e-2, "simdgroup_f16 disagrees with f16 ({m}x{k}x{n}): {max_diff}");
+            assert!(
+                max_diff < 2e-2,
+                "simdgroup_f16 disagrees with f16 ({m}x{k}x{n}): {max_diff}"
+            );
         }
     }
 
@@ -2590,14 +3195,28 @@ mod suite {
             let b = Tensor::randn(&ctx, vec![n, k], 0.3);
             let out_sg = ctx.alloc_buffer(m * n * 4);
             let out_ref = ctx.alloc_buffer(m * n * 4);
-            compute::gpu_matmul_trans_b_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32);
-            compute::gpu_matmul_trans_b(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32);
+            compute::gpu_matmul_trans_b_simdgroup(
+                &ctx, &a.buffer, &b.buffer, &out_sg, m as u32, n as u32, k as u32,
+            );
+            compute::gpu_matmul_trans_b(
+                &ctx, &a.buffer, &b.buffer, &out_ref, m as u32, n as u32, k as u32,
+            );
             let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![m, n]).to_vec();
             let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![m, n]).to_vec();
-            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let max_diff = sg
+                .iter()
+                .zip(&rf)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             eprintln!("simdgroup_trans_b vs scalar [{m}x{k}x{n}]: max_diff={max_diff:.5}");
-            assert!(sg.iter().all(|x| x.is_finite()), "trans_b simdgroup non-finite ({m}x{n}x{k})");
-            assert!(max_diff < 2e-2, "trans_b simdgroup disagrees ({m}x{n}x{k}): {max_diff}");
+            assert!(
+                sg.iter().all(|x| x.is_finite()),
+                "trans_b simdgroup non-finite ({m}x{n}x{k})"
+            );
+            assert!(
+                max_diff < 2e-2,
+                "trans_b simdgroup disagrees ({m}x{n}x{k}): {max_diff}"
+            );
         }
         compute::set_simdgroup_matmul(prev);
     }
@@ -2613,14 +3232,28 @@ mod suite {
             let b = Tensor::randn(&ctx, vec![m, n], 0.3);
             let out_sg = ctx.alloc_buffer(k * n * 4);
             let out_ref = ctx.alloc_buffer(k * n * 4);
-            compute::gpu_matmul_trans_a_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, m as u32, k as u32, n as u32);
-            compute::gpu_matmul_trans_a(&ctx, &a.buffer, &b.buffer, &out_ref, m as u32, k as u32, n as u32);
+            compute::gpu_matmul_trans_a_simdgroup(
+                &ctx, &a.buffer, &b.buffer, &out_sg, m as u32, k as u32, n as u32,
+            );
+            compute::gpu_matmul_trans_a(
+                &ctx, &a.buffer, &b.buffer, &out_ref, m as u32, k as u32, n as u32,
+            );
             let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![k, n]).to_vec();
             let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![k, n]).to_vec();
-            let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let max_diff = sg
+                .iter()
+                .zip(&rf)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
             eprintln!("simdgroup_trans_a vs scalar [{m}x{k}x{n}]: max_diff={max_diff:.5}");
-            assert!(sg.iter().all(|x| x.is_finite()), "trans_a simdgroup non-finite");
-            assert!(max_diff < 2e-2, "trans_a simdgroup disagrees ({m}x{k}x{n}): {max_diff}");
+            assert!(
+                sg.iter().all(|x| x.is_finite()),
+                "trans_a simdgroup non-finite"
+            );
+            assert!(
+                max_diff < 2e-2,
+                "trans_a simdgroup disagrees ({m}x{k}x{n}): {max_diff}"
+            );
         }
         compute::set_simdgroup_matmul(prev);
     }
@@ -2656,12 +3289,18 @@ mod suite {
         let (ga_on, gb_on) = run(true);
 
         let rel = |x: &[f32], y: &[f32]| -> f32 {
-            x.iter().zip(y).map(|(p, q)| (p - q).abs() / (1.0 + p.abs())).fold(0.0f32, f32::max)
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs() / (1.0 + p.abs()))
+                .fold(0.0f32, f32::max)
         };
         let da = rel(&ga_off, &ga_on);
         let db = rel(&gb_off, &gb_on);
         eprintln!("backward MMA vs scalar: dA rel={da:.5}, dB rel={db:.5}");
-        assert!(ga_on.iter().all(|x| x.is_finite()) && gb_on.iter().all(|x| x.is_finite()), "MMA grads non-finite");
+        assert!(
+            ga_on.iter().all(|x| x.is_finite()) && gb_on.iter().all(|x| x.is_finite()),
+            "MMA grads non-finite"
+        );
         assert!(da < 5e-2, "dA gradient mismatch scalar vs MMA: {da}");
         assert!(db < 5e-2, "dB gradient mismatch scalar vs MMA: {db}");
     }
@@ -2678,15 +3317,32 @@ mod suite {
         let b = Tensor::randn(&ctx, vec![batch, m, n], 0.3); // [batch, M, N]
         let out_sg = ctx.alloc_buffer(batch * k * n * 4);
         let out_ref = ctx.alloc_buffer(batch * k * n * 4);
-        let dims = compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 };
+        let dims = compute::BatchedDims {
+            batch: batch as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
         compute::gpu_batched_matmul_trans_a_simdgroup(&ctx, &a.buffer, &b.buffer, &out_sg, dims);
         compute::gpu_batched_matmul_trans_a(&ctx, &a.buffer, &b.buffer, &out_ref, dims);
         let sg = Tensor::from_buffer(Arc::clone(&ctx), out_sg, vec![batch, k, n]).to_vec();
         let rf = Tensor::from_buffer(Arc::clone(&ctx), out_ref, vec![batch, k, n]).to_vec();
-        let max_diff = sg.iter().zip(&rf).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!("batched simdgroup_trans_a vs scalar [b{batch} {m}x{k}x{n}]: max_diff={max_diff:.5}");
-        assert!(sg.iter().all(|x| x.is_finite()), "batched trans_a simdgroup non-finite");
-        assert!(max_diff < 2e-2, "batched trans_a simdgroup disagrees: {max_diff}");
+        let max_diff = sg
+            .iter()
+            .zip(&rf)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "batched simdgroup_trans_a vs scalar [b{batch} {m}x{k}x{n}]: max_diff={max_diff:.5}"
+        );
+        assert!(
+            sg.iter().all(|x| x.is_finite()),
+            "batched trans_a simdgroup non-finite"
+        );
+        assert!(
+            max_diff < 2e-2,
+            "batched trans_a simdgroup disagrees: {max_diff}"
+        );
         compute::set_simdgroup_matmul(prev);
     }
 
@@ -2712,8 +3368,14 @@ mod suite {
             compute::set_bf16_matmul(prev); // restore
 
             eprintln!("matmul 1e5: fp16={r_f16}, bf16={r_bf16}");
-            assert!((r_bf16 - big).abs() < big * 5e-3, "bf16 must preserve 1e5: got {r_bf16}");
-            assert!((r_f16 - big).abs() > big * 0.1, "fp16 path should corrupt 1e5 (overflow/clamp): got {r_f16}");
+            assert!(
+                (r_bf16 - big).abs() < big * 5e-3,
+                "bf16 must preserve 1e5: got {r_bf16}"
+            );
+            assert!(
+                (r_f16 - big).abs() > big * 0.1,
+                "fp16 path should corrupt 1e5 (overflow/clamp): got {r_f16}"
+            );
 
             // Normal range: bf16-on vs fp16 default agree to bf16 precision.
             let x = Tensor::randn(&ctx, vec![48, 40], 0.4);
@@ -2722,9 +3384,16 @@ mod suite {
             compute::set_bf16_matmul(true);
             let on = x.matmul(&y).to_vec();
             compute::set_bf16_matmul(false);
-            let max_rel = off.iter().zip(&on).map(|(p, q)| (p - q).abs() / (1.0 + p.abs())).fold(0.0f32, f32::max);
+            let max_rel = off
+                .iter()
+                .zip(&on)
+                .map(|(p, q)| (p - q).abs() / (1.0 + p.abs()))
+                .fold(0.0f32, f32::max);
             eprintln!("bf16 vs fp16 normal-range max_rel={max_rel:.4}");
-            assert!(on.iter().all(|v| v.is_finite()) && max_rel < 0.05, "bf16 normal-range mismatch: {max_rel}");
+            assert!(
+                on.iter().all(|v| v.is_finite()) && max_rel < 0.05,
+                "bf16 normal-range mismatch: {max_rel}"
+            );
         });
     }
 
@@ -2744,8 +3413,16 @@ mod suite {
         let mm_on = a.batched_matmul(&b).to_vec();
         let tb_on = a.batched_matmul_trans_b(&bt).to_vec();
         compute::set_simdgroup_matmul(prev);
-        let d_mm = mm_off.iter().zip(&mm_on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let d_tb = tb_off.iter().zip(&tb_on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let d_mm = mm_off
+            .iter()
+            .zip(&mm_on)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let d_tb = tb_off
+            .iter()
+            .zip(&tb_on)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("batched simdgroup: matmul max_diff={d_mm:.5}, trans_b max_diff={d_tb:.5}");
         assert!(mm_on.iter().all(|x| x.is_finite()) && tb_on.iter().all(|x| x.is_finite()));
         assert!(d_mm < 2e-2, "batched simdgroup matmul mismatch: {d_mm}");
@@ -2766,10 +3443,17 @@ mod suite {
         assert!(compute::simdgroup_matmul_enabled());
         let on = a.matmul(&b).to_vec();
         compute::set_simdgroup_matmul(prev); // restore
-        let max_diff = off.iter().zip(&on).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = off
+            .iter()
+            .zip(&on)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("matmul flag off-vs-on max_diff={max_diff:.5}");
         assert!(on.iter().all(|x| x.is_finite()));
-        assert!(max_diff < 2e-2, "simdgroup flag path diverged from default matmul: {max_diff}");
+        assert!(
+            max_diff < 2e-2,
+            "simdgroup flag path diverged from default matmul: {max_diff}"
+        );
     }
 
     /// Benchmark (serial, ignored): the hardware simdgroup MMA must be FASTER than the hand-rolled
@@ -2790,18 +3474,29 @@ mod suite {
         let flops = 2.0 * (s as f64).powi(3);
         let iters = 50;
         // Warmup + time hand-rolled f16.
-        for _ in 0..5 { compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        for _ in 0..5 {
+            compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32);
+        }
         let t0 = Instant::now();
-        for _ in 0..iters { compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        for _ in 0..iters {
+            compute::gpu_matmul_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32);
+        }
         let hand = t0.elapsed().as_secs_f64() / iters as f64;
         // Warmup + time simdgroup f16.
-        for _ in 0..5 { compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        for _ in 0..5 {
+            compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32);
+        }
         let t1 = Instant::now();
-        for _ in 0..iters { compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32); }
+        for _ in 0..iters {
+            compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32);
+        }
         let sg = t1.elapsed().as_secs_f64() / iters as f64;
         eprintln!("matmul {s}^3: hand-rolled f16 = {:.1} GFLOP/s ({:.3} ms), simdgroup f16 = {:.1} GFLOP/s ({:.3} ms), speedup = {:.2}x",
             flops / hand / 1e9, hand * 1e3, flops / sg / 1e9, sg * 1e3, hand / sg);
-        assert!(sg < hand, "simdgroup MMA ({sg:.4}s) should beat hand-rolled f16 ({hand:.4}s)");
+        assert!(
+            sg < hand,
+            "simdgroup MMA ({sg:.4}s) should beat hand-rolled f16 ({hand:.4}s)"
+        );
     }
 
     /// 8-bit AdamW must use ~4× less optimizer memory than fp32 AdamW on a real model: the moments
@@ -2815,9 +3510,15 @@ mod suite {
         let fp32 = crate::optim::AdamW::new(&ctx, &prefs, 0.0);
         let q8 = crate::optim::AdamW8bit::new(&ctx, &prefs, 0.0);
         let ratio = fp32.memory_bytes() as f32 / q8.memory_bytes() as f32;
-        eprintln!("optimizer memory: fp32={} B, 8-bit={} B, ratio={ratio:.2}×",
-            fp32.memory_bytes(), q8.memory_bytes());
-        assert!(ratio > 3.5, "8-bit optimizer should be ~4× smaller, got {ratio:.2}×");
+        eprintln!(
+            "optimizer memory: fp32={} B, 8-bit={} B, ratio={ratio:.2}×",
+            fp32.memory_bytes(),
+            q8.memory_bytes()
+        );
+        assert!(
+            ratio > 3.5,
+            "8-bit optimizer should be ~4× smaller, got {ratio:.2}×"
+        );
     }
 
     /// 8-bit AdamW must follow nearly the SAME trajectory as fp32 AdamW (block-wise int8 quant adds
@@ -2828,7 +3529,9 @@ mod suite {
         let ctx = test_ctx();
         let n = 256usize;
         let init: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
-        let g: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.1 + 0.01).collect();
+        let g: Vec<f32> = (0..n)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1 + 0.01)
+            .collect();
         let w_fp = Tensor::from_slice(&ctx, &init, vec![n]);
         let w_q = Tensor::from_slice(&ctx, &init, vec![n]);
         // shape.len()==1 → no_decay; pass wd=0 anyway so the two paths are identical except quant.
@@ -2846,11 +3549,25 @@ mod suite {
         }
         let a = w_fp.to_vec();
         let b = w_q.to_vec();
-        let max_diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let moved = a.iter().zip(&init).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let moved = a
+            .iter()
+            .zip(&init)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("8-bit vs fp32 after 30 steps: max_diff={max_diff:.5}, fp32 moved={moved:.4}");
-        assert!(moved > 0.1, "fp32 reference must move substantially (sanity), moved={moved}");
-        assert!(max_diff < 0.02, "8-bit AdamW diverged from fp32: max_diff={max_diff}");
+        assert!(
+            moved > 0.1,
+            "fp32 reference must move substantially (sanity), moved={moved}"
+        );
+        assert!(
+            max_diff < 0.02,
+            "8-bit AdamW diverged from fp32: max_diff={max_diff}"
+        );
         autograd::zero_grads();
     }
 
@@ -2868,7 +3585,8 @@ mod suite {
         let targets: Vec<u32> = vec![5; 8 * 12];
         let params = model.parameters();
         let prefs: Vec<&Tensor> = params.to_vec();
-        let mut opt = crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(&ctx, &prefs, 0.0));
+        let mut opt =
+            crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(&ctx, &prefs, 0.0));
         let mut max_loss = 0.0f32;
         for step in 0..150 {
             let logits = model.forward(&tokens, batch, seq_len, None, false);
@@ -2905,11 +3623,20 @@ mod suite {
         // K must equal c @ w_uk numerically (sanity that mla_kv really up-projects the latent).
         let k_ref = c.matmul(&w_uk).to_vec();
         let k_got = k.to_vec();
-        let max_diff = k_ref.iter().zip(&k_got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = k_ref
+            .iter()
+            .zip(&k_got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-4, "K must be c@W_uk: max_diff={max_diff}");
         let (std_kv, mla_kv, shrink) = crate::mla::cache_footprint(kv_dim, d_c);
-        eprintln!("MLA cache/token: standard={std_kv} floats, MLA={mla_kv} floats, shrink={shrink:.0}×");
-        assert!(shrink >= 8.0, "MLA cache must be ≥8× smaller, got {shrink:.1}×");
+        eprintln!(
+            "MLA cache/token: standard={std_kv} floats, MLA={mla_kv} floats, shrink={shrink:.0}×"
+        );
+        assert!(
+            shrink >= 8.0,
+            "MLA cache must be ≥8× smaller, got {shrink:.1}×"
+        );
         autograd::clear_tape();
     }
 
@@ -2922,7 +3649,10 @@ mod suite {
     fn mla_latent_decode_matches_full() {
         let ctx = test_ctx();
         let vocab = 48u32;
-        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let cfg = ModelConfig {
+            mla_latent_dim: 16,
+            ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64)
+        };
         let model = Transformer::new(&ctx, cfg);
         let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
         let seq = tokens.len();
@@ -2930,30 +3660,65 @@ mod suite {
         let mut caches = model.init_kv_caches();
         let mut inc: Vec<f32> = Vec::new();
         for t in 0..seq {
-            let lt = model.forward(&tokens[t..t + 1], 1, 1, Some(&mut caches), false).to_vec();
+            let lt = model
+                .forward(&tokens[t..t + 1], 1, 1, Some(&mut caches), false)
+                .to_vec();
             inc.extend_from_slice(&lt);
         }
-        let max_diff = full.iter().zip(&inc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = full
+            .iter()
+            .zip(&inc)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         // Functional decode-correctness = same predicted token per position (the codebase's own
         // decode tests use argmax agreement; raw logits carry fp16 noise, amplified by MLA's extra
         // reconstruction matmuls). Compare argmax(full[t]) vs argmax(inc[t]).
         let vw = vocab as usize;
-        let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) }).0;
+        let argmax = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
+        };
         let mut agree = 0usize;
         for t in 0..seq {
-            if argmax(&full[t * vw..(t + 1) * vw]) == argmax(&inc[t * vw..(t + 1) * vw]) { agree += 1; }
+            if argmax(&full[t * vw..(t + 1) * vw]) == argmax(&inc[t * vw..(t + 1) * vw]) {
+                agree += 1;
+            }
         }
         eprintln!("MLA incremental-decode vs full-prefill: max logit_diff={max_diff:.4}, argmax agree {agree}/{seq}");
-        assert!(inc.iter().all(|x| x.is_finite()), "MLA incremental decode produced non-finite logits");
+        assert!(
+            inc.iter().all(|x| x.is_finite()),
+            "MLA incremental decode produced non-finite logits"
+        );
         // Bounded tracking (parallel-robust): incremental must closely track full — a broken latent
         // cache gives huge diffs or NaN, fp16/contention noise stays small. (Exact argmax 8/8 with
         // diff ~0.07 is verified serially; under cargo's parallel GPU contention an argmax can flip,
         // so the parallel assertion is the bounded-diff one.)
-        assert!(max_diff < 0.5, "MLA latent-cache decode diverged from full prefill: max_diff={max_diff}");
-        assert!(agree >= seq - 1, "MLA decode should match full on nearly all positions (agree {agree}/{seq})");
+        assert!(
+            max_diff < 0.5,
+            "MLA latent-cache decode diverged from full prefill: max_diff={max_diff}"
+        );
+        assert!(
+            agree >= seq - 1,
+            "MLA decode should match full on nearly all positions (agree {agree}/{seq})"
+        );
         // Cache holds the latent c [batch, seq, d_c=16], NOT K/V (kv_dim=64 → 2×64=128 floats/token).
-        let lat = caches[0].latent.as_ref().expect("MLA decode must populate the latent cache");
-        assert_eq!(lat.shape, vec![1, seq, 16], "latent cache must be [batch, seq, d_c]");
+        let lat = caches[0]
+            .latent
+            .as_ref()
+            .expect("MLA decode must populate the latent cache");
+        assert_eq!(
+            lat.shape,
+            vec![1, seq, 16],
+            "latent cache must be [batch, seq, d_c]"
+        );
         autograd::clear_tape();
     }
 
@@ -2963,15 +3728,27 @@ mod suite {
     #[test]
     fn mla_parameters_route_through_latent() {
         let ctx = test_ctx();
-        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(48, 64, 4, 4, 2.67, 64) };
+        let cfg = ModelConfig {
+            mla_latent_dim: 16,
+            ..ModelConfig::custom(48, 64, 4, 4, 2.67, 64)
+        };
         let model = Transformer::new(&ctx, cfg);
         let attn = &model.blocks[0].attn;
         assert_eq!(attn.attn_kind, crate::attention::AttnKind::Mla);
-        let ids: std::collections::HashSet<usize> = attn.parameters().iter().map(|p| p.id).collect();
-        assert!(ids.contains(&attn.w_dkv.id), "W_dkv must be a trained param");
-        assert!(ids.contains(&attn.w_uk.id) && ids.contains(&attn.w_uv.id), "W_uk/W_uv must be trained");
-        assert!(!ids.contains(&attn.w_k.id) && !ids.contains(&attn.w_v.id),
-            "MLA must NOT train the unused direct K/V projections");
+        let ids: std::collections::HashSet<usize> =
+            attn.parameters().iter().map(|p| p.id).collect();
+        assert!(
+            ids.contains(&attn.w_dkv.id),
+            "W_dkv must be a trained param"
+        );
+        assert!(
+            ids.contains(&attn.w_uk.id) && ids.contains(&attn.w_uv.id),
+            "W_uk/W_uv must be trained"
+        );
+        assert!(
+            !ids.contains(&attn.w_k.id) && !ids.contains(&attn.w_v.id),
+            "MLA must NOT train the unused direct K/V projections"
+        );
     }
 
     /// End-to-end MLA integration: a model with `AttnKind::Mla` in every block must forward to finite
@@ -2981,7 +3758,10 @@ mod suite {
     fn mla_model_trains_stably() {
         let ctx = test_ctx();
         let vocab = 48u32;
-        let cfg = ModelConfig { mla_latent_dim: 16, ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64) };
+        let cfg = ModelConfig {
+            mla_latent_dim: 16,
+            ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64)
+        };
         let model = Transformer::new(&ctx, cfg);
         let (batch, seq_len) = (1usize, 8usize);
         let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
@@ -2997,18 +3777,32 @@ mod suite {
             if step == 0 {
                 let lg = logits.to_vec();
                 assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
-                assert!(lg.iter().all(|x| x.is_finite()), "MLA forward produced non-finite logits");
+                assert!(
+                    lg.iter().all(|x| x.is_finite()),
+                    "MLA forward produced non-finite logits"
+                );
             }
             let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
             let lv = loss.to_vec()[0];
             assert!(lv.is_finite(), "MLA loss non-finite at step {step}: {lv}");
-            if step == 0 { first = lv; }
+            if step == 0 {
+                first = lv;
+            }
             last = lv;
             autograd::backward(&ctx, loss.id);
             if step == 0 {
-                let g = autograd::get_grad(w_dkv_id).expect("no gradient reached the MLA W_dkv latent projection");
-                let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_dkv.shape.clone()).to_vec();
-                assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on MLA W_dkv");
+                let g = autograd::get_grad(w_dkv_id)
+                    .expect("no gradient reached the MLA W_dkv latent projection");
+                let gv = Tensor::from_buffer(
+                    Arc::clone(&ctx),
+                    g,
+                    model.blocks[0].attn.w_dkv.shape.clone(),
+                )
+                .to_vec();
+                assert!(
+                    gv.iter().all(|x| x.is_finite()),
+                    "non-finite grad on MLA W_dkv"
+                );
             }
             autograd::clear_tape_keep_grads();
             crate::train::clip_gradients(&ctx, &model, 1.0);
@@ -3033,7 +3827,10 @@ mod suite {
         assert_eq!(rows[0].tokens, vec![1, 2, 3, 4, 5, 0]);
         assert_eq!(rows[0].seg_ids, vec![0, 0, 0, 1, 1, PACK_PAD_SEG]);
         assert_eq!(rows[1].tokens, vec![6, 7, 8, 9, 0, 0]);
-        assert_eq!(rows[1].seg_ids, vec![0, 0, 0, 0, PACK_PAD_SEG, PACK_PAD_SEG]);
+        assert_eq!(
+            rows[1].seg_ids,
+            vec![0, 0, 0, 0, PACK_PAD_SEG, PACK_PAD_SEG]
+        );
         // Over-long sequence is truncated to max_len.
         let trunc = pack_sequences(&[vec![1, 2, 3, 4, 5, 6, 7, 8]], 4, 0);
         assert_eq!(trunc[0].tokens, vec![1, 2, 3, 4]);
@@ -3050,7 +3847,10 @@ mod suite {
         let at = |q: usize, k: usize| m[q * 4 + k];
         // q=0 (seg0): sees k=0; future k=1,2,3 masked.
         assert_eq!(at(0, 0), 0.0);
-        assert!(at(0, 1).is_infinite() && at(0, 1) < 0.0, "future must be -inf");
+        assert!(
+            at(0, 1).is_infinite() && at(0, 1) < 0.0,
+            "future must be -inf"
+        );
         // q=2 (seg1): k=0,1 are PAST but cross-segment → masked; k=2 same-seg causal → 0; k=3 future.
         assert!(at(2, 0).is_infinite(), "cross-segment past must be masked");
         assert!(at(2, 1).is_infinite(), "cross-segment past must be masked");
@@ -3075,7 +3875,9 @@ mod suite {
         let scale = 1.0 / (hd as f32).sqrt();
         // Deterministic q,k,v for the packed [1, seq, hd].
         let gen = |salt: usize| -> Vec<f32> {
-            (0..seq * hd).map(|i| (((i * 7 + salt * 13) % 17) as f32 - 8.0) * 0.1).collect()
+            (0..seq * hd)
+                .map(|i| (((i * 7 + salt * 13) % 17) as f32 - 8.0) * 0.1)
+                .collect()
         };
         let (qd, kd, vd) = (gen(1), gen(2), gen(3));
         let seg = crate::gpu::u32_to_buf(ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1]));
@@ -3085,7 +3887,11 @@ mod suite {
         let k = Tensor::from_slice(&ctx, &kd, vec![1, seq, hd]);
         let v = Tensor::from_slice(&ctx, &vd, vec![1, seq, hd]);
         let scores = q.batched_matmul_trans_b(&k).scale(scale);
-        let out_packed = scores.causal_doc_mask(&seg, 1).softmax().batched_matmul(&v).to_vec();
+        let out_packed = scores
+            .causal_doc_mask(&seg, 1)
+            .softmax()
+            .batched_matmul(&v)
+            .to_vec();
 
         // Separate run for segment 0 (its own causal attention).
         let run_seg = |off: usize, len: usize| -> Vec<f32> {
@@ -3099,11 +3905,25 @@ mod suite {
         let out0 = run_seg(0, l0);
         let out1 = run_seg(l0, l1);
 
-        let d0 = out_packed[0..l0 * hd].iter().zip(&out0).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let d1 = out_packed[l0 * hd..seq * hd].iter().zip(&out1).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let d0 = out_packed[0..l0 * hd]
+            .iter()
+            .zip(&out0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let d1 = out_packed[l0 * hd..seq * hd]
+            .iter()
+            .zip(&out1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("packed-vs-separate: seg0 max_diff={d0:.5}, seg1 max_diff={d1:.5}");
-        assert!(d0 < 2e-3, "packed segment 0 leaked / differs from separate: {d0}");
-        assert!(d1 < 2e-3, "packed segment 1 leaked / differs from separate: {d1}");
+        assert!(
+            d0 < 2e-3,
+            "packed segment 0 leaked / differs from separate: {d0}"
+        );
+        assert!(
+            d1 < 2e-3,
+            "packed segment 1 leaked / differs from separate: {d1}"
+        );
         autograd::clear_tape();
     }
 
@@ -3127,15 +3947,25 @@ mod suite {
             let out = model.forward_seg(toks, 1, seq, None, false, seg).to_vec(); // [seq, vocab]
             autograd::clear_tape();
             let vc = vocab as usize;
-            docb.iter().flat_map(|&p| out[p * vc..(p + 1) * vc].to_vec()).collect::<Vec<f32>>()
+            docb.iter()
+                .flat_map(|&p| out[p * vc..(p + 1) * vc].to_vec())
+                .collect::<Vec<f32>>()
         };
-        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
 
         let row1 = [1u32, 2, 3, 4, 5, 6, 7]; // docA=[1,2,3]
         let row2 = [9u32, 8, 2, 4, 5, 6, 7]; // docA'=[9,8,2] — different; docB=[4,5,6,7] unchanged
 
         // (1) Masked: docB logits must NOT move when docA changes (zero cross-document leakage).
-        let masked = max_diff(&docb_logits(&row1, Some(&seg_buf)), &docb_logits(&row2, Some(&seg_buf)));
+        let masked = max_diff(
+            &docb_logits(&row1, Some(&seg_buf)),
+            &docb_logits(&row2, Some(&seg_buf)),
+        );
         assert!(masked < 2e-3, "seq-packing leaked: docB logits changed with docA under the per-doc mask (max diff {masked})");
 
         // (2) Negative control: WITHOUT the mask, docB attends across the row, so changing docA DOES
@@ -3179,9 +4009,21 @@ mod suite {
         // Mega-kernel path: single dispatch
         let out_buf = ctx.alloc_buffer(n_tokens * d * 4);
         compute::gpu_mega_ffn(
-            &ctx, &x.buffer, &norm_w.buffer,
-            compute::FfnWeights { w1: &w1.buffer, w2: &w2.buffer, w3: &w3.buffer },
-            &out_buf, compute::MegaFfnDims { batch_tokens: n_tokens as u32, d_model: d as u32, d_ff: ff as u32, eps },
+            &ctx,
+            &x.buffer,
+            &norm_w.buffer,
+            compute::FfnWeights {
+                w1: &w1.buffer,
+                w2: &w2.buffer,
+                w3: &w3.buffer,
+            },
+            &out_buf,
+            compute::MegaFfnDims {
+                batch_tokens: n_tokens as u32,
+                d_model: d as u32,
+                d_ff: ff as u32,
+                eps,
+            },
         );
         let mega_out = Tensor::from_buffer(Arc::clone(&ctx), out_buf, vec![n_tokens, d]);
         let mega_vals = mega_out.to_vec();
@@ -3195,36 +4037,49 @@ mod suite {
             sum_abs_diff += diff as f64;
         }
         let avg_diff = sum_abs_diff / standard_vals.len() as f64;
-        eprintln!("mega_ffn vs standard: max_diff={:.6}, avg_diff={:.8}", max_diff, avg_diff);
+        eprintln!(
+            "mega_ffn vs standard: max_diff={:.6}, avg_diff={:.8}",
+            max_diff, avg_diff
+        );
 
         // Allow some tolerance — the fused kernel computes norm inline which may differ slightly
         assert!(max_diff < 0.01, "mega_ffn max_diff too large: {}", max_diff);
-        assert!(avg_diff < 0.001, "mega_ffn avg_diff too large: {}", avg_diff);
+        assert!(
+            avg_diff < 0.001,
+            "mega_ffn avg_diff too large: {}",
+            avg_diff
+        );
     }
-
 
     /// Gradient checkpointing must produce the SAME parameter gradients as the standard forward:
     /// the recompute reproduces the original forward exactly (this is what makes it correct to
     /// trade compute for activation memory). The fp16-cache + buffer-recycling + pool-bypass fixes
     /// are what make this hold — before them the recomputed embedding gradient was ~sign-flipped.
     ///
-    /// `#[ignore]`d only because it needs `--test-threads=1`: this is an EXACT std-vs-recompute
-    /// comparison and the codebase's GPU layer is single-threaded by design (see metal/mod.rs).
-    /// Under cargo's default parallel runner, concurrent GPU activity from other tests corrupts the
-    /// comparison; it passes deterministically when serial. Run:
-    /// `cargo test gradient_checkpointing -- --ignored` (or the whole suite with `--test-threads=1`).
+    /// This is an EXACT std-vs-recompute comparison. Run GPU tests with
+    /// `--test-threads=1`; the codebase's GPU layer is single-threaded by design
+    /// (see metal/mod.rs), and the CI gate enforces serial test execution.
     #[test]
-    #[ignore = "requires --test-threads=1: GPU layer is single-threaded; parallel runs corrupt the exact comparison"]
     fn gradient_checkpointing_matches_standard() {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 32);
         let model = Transformer::new(&ctx, cfg);
         let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
         let targets: Vec<u32> = vec![5; 8];
-        let pinfo: Vec<(usize, usize)> = model.parameters().iter().map(|p| (p.id, p.numel())).collect();
+        let pinfo: Vec<(usize, usize)> = model
+            .parameters()
+            .iter()
+            .map(|p| (p.id, p.numel()))
+            .collect();
         let grab = |pinfo: &[(usize, usize)]| -> Vec<Vec<f32>> {
-            pinfo.iter().map(|&(id, n)| autograd::get_grad(id)
-                .map(|g| Tensor::from_buffer(Arc::clone(&ctx), g, vec![n]).to_vec()).unwrap_or_default()).collect()
+            pinfo
+                .iter()
+                .map(|&(id, n)| {
+                    autograd::get_grad(id)
+                        .map(|g| Tensor::from_buffer(Arc::clone(&ctx), g, vec![n]).to_vec())
+                        .unwrap_or_default()
+                })
+                .collect()
         };
 
         // Standard backward.
@@ -3240,8 +4095,15 @@ mod suite {
         // Checkpointed backward (same weights).
         let lt2 = model.forward(&tokens, 1, 8, None, true);
         let logits_ck = lt2.to_vec();
-        let ldiff = logits_std.iter().zip(&logits_ck).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(ldiff < 1e-3, "checkpointed forward must reproduce the standard forward: {ldiff}");
+        let ldiff = logits_std
+            .iter()
+            .zip(&logits_ck)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            ldiff < 1e-3,
+            "checkpointed forward must reproduce the standard forward: {ldiff}"
+        );
         let (loss2, _) = crate::loss::cross_entropy_loss(&ctx, &lt2, &targets);
         autograd::backward(&ctx, loss2.id);
         let ck_grads = grab(&pinfo);
@@ -3253,8 +4115,15 @@ mod suite {
             // Tolerance relative to the parameter's gradient SCALE (fp16-level absolute noise from
             // the multi-layer recompute, not per-element relative which blows up near zero).
             let scale = s.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(0.05);
-            let md = s.iter().zip(c).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            assert!(md <= 1e-2 * scale, "param {i}: max grad diff {md} > 1% of scale {scale}");
+            let md = s
+                .iter()
+                .zip(c)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                md <= 1e-2 * scale,
+                "param {i}: max grad diff {md} > 1% of scale {scale}"
+            );
         }
     }
 
@@ -3274,19 +4143,34 @@ mod suite {
         crate::checkpoint::save_checkpoint(tmp_path, &model, 42).expect("save failed");
 
         // Load
-        let (loaded_model, loaded_step) = crate::checkpoint::load_checkpoint(&ctx, tmp_path)
-            .expect("load failed");
+        let (loaded_model, loaded_step) =
+            crate::checkpoint::load_checkpoint(&ctx, tmp_path).expect("load failed");
         assert_eq!(loaded_step, 42);
         assert_eq!(loaded_model.config.d_model, config.d_model);
         assert_eq!(loaded_model.config.n_layers, config.n_layers);
 
         // Compare weights
-        let loaded_params: Vec<Vec<f32>> = loaded_model.parameters().iter().map(|p| p.to_vec()).collect();
-        assert_eq!(orig_params.len(), loaded_params.len(), "param count mismatch");
+        let loaded_params: Vec<Vec<f32>> = loaded_model
+            .parameters()
+            .iter()
+            .map(|p| p.to_vec())
+            .collect();
+        assert_eq!(
+            orig_params.len(),
+            loaded_params.len(),
+            "param count mismatch"
+        );
         for (i, (orig, loaded)) in orig_params.iter().zip(loaded_params.iter()).enumerate() {
             assert_eq!(orig.len(), loaded.len(), "tensor {} size mismatch", i);
             for (j, (a, b)) in orig.iter().zip(loaded.iter()).enumerate() {
-                assert!((*a - *b).abs() < 1e-6, "tensor {} element {} mismatch: {} vs {}", i, j, a, b);
+                assert!(
+                    (*a - *b).abs() < 1e-6,
+                    "tensor {} element {} mismatch: {} vs {}",
+                    i,
+                    j,
+                    a,
+                    b
+                );
             }
         }
 
@@ -3327,7 +4211,10 @@ mod suite {
             autograd::zero_grads_recycle();
         }
         eprintln!("AdamW stability: max loss {max_loss:.2}");
-        assert!(max_loss < 30.0, "AdamW loss blew up (max {max_loss}) — the RMSNorm-backward instability regressed");
+        assert!(
+            max_loss < 30.0,
+            "AdamW loss blew up (max {max_loss}) — the RMSNorm-backward instability regressed"
+        );
     }
 
     /// END-TO-END CONVERGENCE: the full forward → cross-entropy → backward → clip → optimizer loop
@@ -3371,7 +4258,10 @@ mod suite {
                 let logits = model.forward(&tokens, batch, seq_len, None, false);
                 let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
                 let lv = loss.to_vec()[0];
-                assert!(lv.is_finite(), "loss non-finite at attempt {attempt} step {step}: {lv}");
+                assert!(
+                    lv.is_finite(),
+                    "loss non-finite at attempt {attempt} step {step}: {lv}"
+                );
                 if step == 0 {
                     first = lv;
                 }
@@ -3393,8 +4283,11 @@ mod suite {
             }
         }
         // From ~uniform (ln 32 ≈ 3.47) the loss must collapse to < 0.5 on at least one init.
-        assert!(converged, "the forward→backward→optimizer loop did NOT converge on ANY of 5 inits \
-            (best final loss {best:.3}) — training is broken, not just slow");
+        assert!(
+            converged,
+            "the forward→backward→optimizer loop did NOT converge on ANY of 5 inits \
+            (best final loss {best:.3}) — training is broken, not just slow"
+        );
     }
 
     /// Perplexity = exp(mean per-token NLL). A fresh, ~uniform model over `vocab` tokens scores
@@ -3407,8 +4300,14 @@ mod suite {
         let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0, 9, 2, 8, 1];
         let ppl = crate::eval::perplexity(&ctx, &model, &tokens);
         eprintln!("fresh-model perplexity = {ppl:.2} (vocab={vocab})");
-        assert!(ppl.is_finite() && ppl >= 1.0, "perplexity must be finite and >= 1: {ppl}");
-        assert!(ppl <= vocab as f32 * 8.0, "fresh-model perplexity implausibly high: {ppl}");
+        assert!(
+            ppl.is_finite() && ppl >= 1.0,
+            "perplexity must be finite and >= 1: {ppl}"
+        );
+        assert!(
+            ppl <= vocab as f32 * 8.0,
+            "fresh-model perplexity implausibly high: {ppl}"
+        );
     }
 
     /// min-p (relative floor) and locally-typical filtering trim a known distribution correctly.
@@ -3418,17 +4317,30 @@ mod suite {
         // min_p = 0.3, max_p = 0.5 → threshold 0.15; token 3 (0.05) dropped, rest renormalized.
         let mut probs = vec![(0usize, 0.5f32), (1, 0.3), (2, 0.15), (3, 0.05)];
         filter_min_p_typical(&mut probs, 0.3, 1.0);
-        assert!(probs.iter().all(|&(i, _)| i != 3), "min-p must drop the sub-threshold token");
+        assert!(
+            probs.iter().all(|&(i, _)| i != 3),
+            "min-p must drop the sub-threshold token"
+        );
         assert_eq!(probs.len(), 3);
         let sum: f32 = probs.iter().map(|x| x.1).sum();
-        assert!((sum - 1.0).abs() < 1e-5, "min-p must renormalize, sum={sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "min-p must renormalize, sum={sum}"
+        );
 
         // typical_p keeps the lowest-surprisal-vs-entropy mass (here the 0.7+0.2 head) and renorms.
         let mut p2 = vec![(0usize, 0.7f32), (1, 0.2), (2, 0.07), (3, 0.03)];
         filter_min_p_typical(&mut p2, 0.0, 0.9);
-        assert!(p2.len() < 4 && !p2.is_empty(), "typical must trim the set: {}", p2.len());
+        assert!(
+            p2.len() < 4 && !p2.is_empty(),
+            "typical must trim the set: {}",
+            p2.len()
+        );
         let s2: f32 = p2.iter().map(|x| x.1).sum();
-        assert!((s2 - 1.0).abs() < 1e-5, "typical must renormalize, sum={s2}");
+        assert!(
+            (s2 - 1.0).abs() < 1e-5,
+            "typical must renormalize, sum={s2}"
+        );
 
         // both disabled → unchanged
         let mut p3 = vec![(0usize, 0.6f32), (1, 0.4)];
@@ -3465,12 +4377,22 @@ mod suite {
         const LANE_TOL: f32 = 1e-3;
         const CROSS_TOL: f32 = 0.05;
         let max_abs_diff = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
         let argmax = |s: &[f32]| {
-            s.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                if x > bv { (i, x) } else { (bi, bv) }
-            }).0
+            s.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv {
+                        (i, x)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
         };
 
         // Build a B-identical prefill batch exactly as generate_batch does (BOS + encoded prompt).
@@ -3496,15 +4418,28 @@ mod suite {
             let lane = |i: usize| &batched[(i * len + len - 1) * v..(i * len + len) * v];
             let single_last = &single[(len - 1) * v..len * v];
 
-            assert!(max_abs_diff(lane(0), lane(1)) < LANE_TOL, "identical prefill lanes diverged");
-            assert!(max_abs_diff(lane(1), lane(2)) < LANE_TOL, "identical prefill lanes diverged");
-            assert!(max_abs_diff(lane(0), single_last) < CROSS_TOL, "batched prefill ≠ single-seq");
+            assert!(
+                max_abs_diff(lane(0), lane(1)) < LANE_TOL,
+                "identical prefill lanes diverged"
+            );
+            assert!(
+                max_abs_diff(lane(1), lane(2)) < LANE_TOL,
+                "identical prefill lanes diverged"
+            );
+            assert!(
+                max_abs_diff(lane(0), single_last) < CROSS_TOL,
+                "batched prefill ≠ single-seq"
+            );
 
             // Decisive first token: well-separated argmax → identical everywhere.
             let t0 = argmax(lane(0));
             assert_eq!(t0, argmax(lane(1)), "lanes disagree on the first token");
             assert_eq!(t0, argmax(lane(2)));
-            assert_eq!(t0, argmax(single_last), "batched first token ≠ single-seq greedy");
+            assert_eq!(
+                t0,
+                argmax(single_last),
+                "batched first token ≠ single-seq greedy"
+            );
 
             // ---- Stage B: one batched preallocated-KV-cache decode step vs a no-cache full forward. ----
             let mut kv_b = model.init_kv_caches_preallocated(b);
@@ -3529,12 +4464,21 @@ mod suite {
             let glane = |i: usize| &gt[(i * len2 + len2 - 1) * v..(i * len2 + len2) * v];
             let dl = |i: usize| &dec_b[i * v..(i + 1) * v];
 
-            assert!(max_abs_diff(dl(0), dl(1)) < LANE_TOL, "identical decode lanes diverged");
-            assert!(max_abs_diff(dl(1), dl(2)) < LANE_TOL, "identical decode lanes diverged");
+            assert!(
+                max_abs_diff(dl(0), dl(1)) < LANE_TOL,
+                "identical decode lanes diverged"
+            );
+            assert!(
+                max_abs_diff(dl(1), dl(2)) < LANE_TOL,
+                "identical decode lanes diverged"
+            );
             // Every lane's cached decode must reproduce the no-cache ground truth.
             for i in 0..b {
                 let c = max_abs_diff(dl(i), glane(i));
-                assert!(c < CROSS_TOL, "cached decode lane {i} ≠ no-cache ground truth: {c}");
+                assert!(
+                    c < CROSS_TOL,
+                    "cached decode lane {i} ≠ no-cache ground truth: {c}"
+                );
             }
         });
     }
@@ -3556,13 +4500,21 @@ mod suite {
         let in_len = batch * seq * n_heads * head_dim; // input [batch*seq, n_heads*head_dim]
         let out_len = bh * seq * head_dim; // output [bh, seq, head_dim]
         let dims = compute::TrRopeDims {
-            batch: batch as u32, seq: seq as u32, n_heads: n_heads as u32,
-            head_dim: head_dim as u32, offset, theta,
+            batch: batch as u32,
+            seq: seq as u32,
+            n_heads: n_heads as u32,
+            head_dim: head_dim as u32,
+            offset,
+            theta,
         };
 
         // Deterministic pseudo-random inputs (no thread_rng → reproducible).
-        let inp: Vec<f32> = (0..in_len).map(|i| ((i * 37 + 11) % 23) as f32 * 0.1 - 1.1).collect();
-        let grad_out: Vec<f32> = (0..out_len).map(|i| ((i * 19 + 5) % 17) as f32 * 0.1 - 0.8).collect();
+        let inp: Vec<f32> = (0..in_len)
+            .map(|i| ((i * 37 + 11) % 23) as f32 * 0.1 - 1.1)
+            .collect();
+        let grad_out: Vec<f32> = (0..out_len)
+            .map(|i| ((i * 19 + 5) % 17) as f32 * 0.1 - 0.8)
+            .collect();
 
         let forward = |data: &[f32]| -> Vec<f32> {
             let in_buf = ctx.buffer_from_slice(data);
@@ -3587,15 +4539,22 @@ mod suite {
                         let freq = 1.0 / theta.powf(2.0 * pair / head_dim as f32);
                         let angle = (s as f32 + offset as f32) * freq;
                         let (sin, cos) = angle.sin_cos();
-                        let expect = if d % 2 == 0 { val * cos - val_pair * sin } else { val_pair * sin + val * cos };
+                        let expect = if d % 2 == 0 {
+                            val * cos - val_pair * sin
+                        } else {
+                            val_pair * sin + val * cos
+                        };
                         let got = out[((b * n_heads + h) * seq + s) * head_dim + d];
                         max_fwd_err = max_fwd_err.max((expect - got).abs());
                     }
                 }
             }
         }
-        assert!(max_fwd_err < 1e-4, "transpose_rope forward mismatch vs hand-computed RoPE: {max_fwd_err} \
-            (a too-small dispatch leaves output elements stale → large error)");
+        assert!(
+            max_fwd_err < 1e-4,
+            "transpose_rope forward mismatch vs hand-computed RoPE: {max_fwd_err} \
+            (a too-small dispatch leaves output elements stale → large error)"
+        );
 
         // (2) Backward vs central finite differences of L = Σ(rope(in)·grad_out).
         let grad_buf = {
@@ -3605,7 +4564,13 @@ mod suite {
             ctx.wait_gpu();
             MetalContext::read_buffer(&gi, in_len)
         };
-        let loss = |data: &[f32]| -> f32 { forward(data).iter().zip(&grad_out).map(|(o, g)| o * g).sum() };
+        let loss = |data: &[f32]| -> f32 {
+            forward(data)
+                .iter()
+                .zip(&grad_out)
+                .map(|(o, g)| o * g)
+                .sum()
+        };
         let eps = 1e-2f32;
         let mut max_grad_err = 0.0f32;
         for &i in &[0usize, 1, 5, 7, 13, 23, in_len - 1] {
@@ -3616,7 +4581,10 @@ mod suite {
             let fd = (loss(&up) - loss(&dn)) / (2.0 * eps);
             max_grad_err = max_grad_err.max((fd - grad_buf[i]).abs());
         }
-        assert!(max_grad_err < 1e-2, "transpose_rope backward disagrees with finite differences: {max_grad_err}");
+        assert!(
+            max_grad_err < 1e-2,
+            "transpose_rope backward disagrees with finite differences: {max_grad_err}"
+        );
     }
 
     // ========================================================================
@@ -3681,8 +4649,9 @@ mod suite {
             .iter()
             .zip(inputs)
             .map(|(&id, (d, _))| {
-                let g = autograd::get_grad(id)
-                    .unwrap_or_else(|| panic!("grad_check {name}: no gradient reached input id {id}"));
+                let g = autograd::get_grad(id).unwrap_or_else(|| {
+                    panic!("grad_check {name}: no gradient reached input id {id}")
+                });
                 Tensor::from_buffer(Arc::clone(ctx), g, vec![d.len()]).to_vec()
             })
             .collect();
@@ -3743,15 +4712,29 @@ mod suite {
     #[test]
     fn gradcheck_matmul() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 5), vec![3, 2])],
-            &|t| t[0].matmul(&t[1]), GC_EPS, GC_ABS, GC_REL, "matmul");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 5), vec![3, 2])],
+            &|t| t[0].matmul(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "matmul",
+        );
     }
 
     #[test]
     fn gradcheck_matmul_trans_b() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 1), vec![2, 3]), (gc_vec(6, 9), vec![2, 3])],
-            &|t| t[0].matmul_trans_b(&t[1]), GC_EPS, GC_ABS, GC_REL, "matmul_trans_b");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 1), vec![2, 3]), (gc_vec(6, 9), vec![2, 3])],
+            &|t| t[0].matmul_trans_b(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "matmul_trans_b",
+        );
     }
 
     #[test]
@@ -3759,45 +4742,93 @@ mod suite {
         let ctx = test_ctx();
         // B=1, M=2 (≠ N=8), K=4 — the gather path's score matmul shape (block×sel_w). Standard
         // attention always has M==N==seq, so this M≠N case is otherwise untested.
-        grad_check(&ctx, &[(gc_vec(8, 0), vec![1, 2, 4]), (gc_vec(32, 5), vec![1, 8, 4])],
-            &|t| t[0].batched_matmul_trans_b(&t[1]), GC_EPS, GC_ABS, GC_REL, "batched_matmul_trans_b_nonsquare");
+        grad_check(
+            &ctx,
+            &[
+                (gc_vec(8, 0), vec![1, 2, 4]),
+                (gc_vec(32, 5), vec![1, 8, 4]),
+            ],
+            &|t| t[0].batched_matmul_trans_b(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "batched_matmul_trans_b_nonsquare",
+        );
     }
 
     #[test]
     fn gradcheck_batched_matmul_nonsquare() {
         let ctx = test_ctx();
         // B=1, M=2, K=8, N=4 — the gather path's weights@vsel shape (block×sel_w @ sel_w×hd).
-        grad_check(&ctx, &[(gc_vec(16, 0), vec![1, 2, 8]), (gc_vec(32, 5), vec![1, 8, 4])],
-            &|t| t[0].batched_matmul(&t[1]), GC_EPS, GC_ABS, GC_REL, "batched_matmul_nonsquare");
+        grad_check(
+            &ctx,
+            &[
+                (gc_vec(16, 0), vec![1, 2, 8]),
+                (gc_vec(32, 5), vec![1, 8, 4]),
+            ],
+            &|t| t[0].batched_matmul(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "batched_matmul_nonsquare",
+        );
     }
 
     #[test]
     fn gradcheck_add() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 3), vec![2, 3])],
-            &|t| t[0].add(&t[1]), GC_EPS, GC_ABS, GC_REL, "add");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 3), vec![2, 3])],
+            &|t| t[0].add(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "add",
+        );
     }
 
     #[test]
     fn gradcheck_mul() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 2), vec![2, 3]), (gc_vec(6, 7), vec![2, 3])],
-            &|t| t[0].mul(&t[1]), GC_EPS, GC_ABS, GC_REL, "mul");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 2), vec![2, 3]), (gc_vec(6, 7), vec![2, 3])],
+            &|t| t[0].mul(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "mul",
+        );
     }
 
     #[test]
     fn gradcheck_softmax() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 4), vec![2, 3])],
-            &|t| t[0].softmax(), GC_EPS, GC_ABS, GC_REL, "softmax");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 4), vec![2, 3])],
+            &|t| t[0].softmax(),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "softmax",
+        );
     }
 
     #[test]
     fn gradcheck_rms_norm() {
         let ctx = test_ctx();
         // x [2,4], weight [4]
-        grad_check(&ctx, &[(gc_vec(8, 0), vec![2, 4]), (gc_vec(4, 13), vec![4])],
-            &|t| t[0].rms_norm(&t[1], 1e-5), GC_EPS, GC_ABS, GC_REL, "rms_norm");
+        grad_check(
+            &ctx,
+            &[(gc_vec(8, 0), vec![2, 4]), (gc_vec(4, 13), vec![4])],
+            &|t| t[0].rms_norm(&t[1], 1e-5),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "rms_norm",
+        );
     }
 
     // ---- Custom/fused backward kernels that previously had NO finite-diff grad-check (the
@@ -3808,33 +4839,64 @@ mod suite {
         let ctx = test_ctx();
         // Fused scale + causal mask + softmax over [bh, seq, seq]. Masked (upper-tri) score grads must
         // be ~0 both analytically and numerically. This is the standard non-flash attention path.
-        grad_check(&ctx, &[(gc_vec(16, 2), vec![1, 4, 4])],
-            &|t| t[0].scaled_causal_softmax(0.5, 0), GC_EPS, GC_ABS, GC_REL, "scaled_causal_softmax");
+        grad_check(
+            &ctx,
+            &[(gc_vec(16, 2), vec![1, 4, 4])],
+            &|t| t[0].scaled_causal_softmax(0.5, 0),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "scaled_causal_softmax",
+        );
     }
 
     #[test]
     fn gradcheck_apply_rope() {
         let ctx = test_ctx();
         // RoPE rotation over [batch_heads, seq, head_dim] (head_dim even). Backward = inverse rotation.
-        grad_check(&ctx, &[(gc_vec(2 * 8 * 4, 0), vec![2, 8, 4])],
-            &|t| t[0].apply_rope(0, 10000.0), GC_EPS, GC_ABS, GC_REL, "apply_rope");
+        grad_check(
+            &ctx,
+            &[(gc_vec(2 * 8 * 4, 0), vec![2, 8, 4])],
+            &|t| t[0].apply_rope(0, 10000.0),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "apply_rope",
+        );
     }
 
     #[test]
     fn gradcheck_rms_norm_residual() {
         let ctx = test_ctx();
         // Fused residual-add + RMS norm: rms_norm(x + residual, weight). Inputs: x, residual, weight.
-        grad_check(&ctx,
-            &[(gc_vec(8, 0), vec![2, 4]), (gc_vec(8, 9), vec![2, 4]), (gc_vec(4, 21), vec![4])],
-            &|t| t[0].rms_norm_residual(&t[1], &t[2], 1e-5), GC_EPS, GC_ABS, GC_REL, "rms_norm_residual");
+        grad_check(
+            &ctx,
+            &[
+                (gc_vec(8, 0), vec![2, 4]),
+                (gc_vec(8, 9), vec![2, 4]),
+                (gc_vec(4, 21), vec![4]),
+            ],
+            &|t| t[0].rms_norm_residual(&t[1], &t[2], 1e-5),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "rms_norm_residual",
+        );
     }
 
     #[test]
     fn gradcheck_scale_rows() {
         let ctx = test_ctx();
         // Per-row scaling: out[r][c] = x[r][c] * scales[r]. Inputs: x [rows, cols], scales [rows].
-        grad_check(&ctx, &[(gc_vec(12, 0), vec![3, 4]), (gc_vec(3, 17), vec![3])],
-            &|t| t[0].scale_rows(&t[1]), GC_EPS, GC_ABS, GC_REL, "scale_rows");
+        grad_check(
+            &ctx,
+            &[(gc_vec(12, 0), vec![3, 4]), (gc_vec(3, 17), vec![3])],
+            &|t| t[0].scale_rows(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "scale_rows",
+        );
     }
 
     #[test]
@@ -3842,8 +4904,15 @@ mod suite {
         let ctx = test_ctx();
         // GQA KV expansion: each of n_kv heads repeated group_size times. Backward = sum the
         // group_size gradient blocks back into each KV head. kv [n_kv=2, seq=4, hd=3], group=2.
-        grad_check(&ctx, &[(gc_vec(2 * 4 * 3, 0), vec![2, 4, 3])],
-            &|t| crate::attention::repeat_kv(&t[0], 2, 4, 3, 2), GC_EPS, GC_ABS, GC_REL, "repeat_kv");
+        grad_check(
+            &ctx,
+            &[(gc_vec(2 * 4 * 3, 0), vec![2, 4, 3])],
+            &|t| crate::attention::repeat_kv(&t[0], 2, 4, 3, 2),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "repeat_kv",
+        );
     }
 
     #[test]
@@ -3851,8 +4920,15 @@ mod suite {
         let ctx = test_ctx();
         // Head transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]. batch=1,
         // seq=4, n_heads=2, head_dim=4 → input [4, 8]. Backward = inverse permutation.
-        grad_check(&ctx, &[(gc_vec(4 * 8, 0), vec![4, 8])],
-            &|t| crate::attention::transpose_bsh_to_bhs(&t[0], 1, 4, 2, 4), GC_EPS, GC_ABS, GC_REL, "transpose_bsh_to_bhs");
+        grad_check(
+            &ctx,
+            &[(gc_vec(4 * 8, 0), vec![4, 8])],
+            &|t| crate::attention::transpose_bsh_to_bhs(&t[0], 1, 4, 2, 4),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "transpose_bsh_to_bhs",
+        );
     }
 
     #[test]
@@ -3861,8 +4937,15 @@ mod suite {
         // Fused head-transpose + RoPE (distinct kernel from apply_rope; runs in every attention fwd).
         // [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + rotation. Backward = inverse
         // RoPE + inverse transpose in one dispatch. batch=1, seq=4, n_heads=2, head_dim=4.
-        grad_check(&ctx, &[(gc_vec(4 * 8, 0), vec![4, 8])],
-            &|t| crate::attention::fused_transpose_rope(&t[0], 1, 4, 2, 4, 0, 10000.0), GC_EPS, GC_ABS, GC_REL, "fused_transpose_rope");
+        grad_check(
+            &ctx,
+            &[(gc_vec(4 * 8, 0), vec![4, 8])],
+            &|t| crate::attention::fused_transpose_rope(&t[0], 1, 4, 2, 4, 0, 10000.0),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "fused_transpose_rope",
+        );
     }
 
     // NOTE: the chunked SSM backward is verified by `ssm::chunked_grad::ssm_chunked_grad_matches_materialized`
@@ -3875,8 +4958,15 @@ mod suite {
         let ctx = test_ctx();
         // Reverse head transpose (attention-output path): [batch*n_heads, seq, head_dim] →
         // [batch*seq, n_heads*head_dim]. batch=1, n_heads=2, seq=4, head_dim=4 → input [2,4,4].
-        grad_check(&ctx, &[(gc_vec(2 * 4 * 4, 0), vec![2, 4, 4])],
-            &|t| crate::attention::transpose_bhs_to_bsh(&t[0], 1, 4, 2, 4), GC_EPS, GC_ABS, GC_REL, "transpose_bhs_to_bsh");
+        grad_check(
+            &ctx,
+            &[(gc_vec(2 * 4 * 4, 0), vec![2, 4, 4])],
+            &|t| crate::attention::transpose_bhs_to_bsh(&t[0], 1, 4, 2, 4),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "transpose_bhs_to_bsh",
+        );
     }
 
     /// RWKV WKV time-mixing: per-channel decayed-cumsum + bonus. Inputs k,v [bh,seq,hd], decay-rate
@@ -3892,39 +4982,77 @@ mod suite {
         let (bh, seq, hd) = (2usize, 5usize, 4usize);
         let w = vec![0.9f32, 1.0, 1.1, 0.8]; // ≈ exp(rwkv_w) ≈ 1 (the real decay), ±eps stays > 0
         let u = vec![0.1f32, -0.2, 0.15, -0.05];
-        grad_check(&ctx,
-            &[(gc_vec(bh * seq * hd, 0), vec![bh, seq, hd]), (gc_vec(bh * seq * hd, 11), vec![bh, seq, hd]),
-              (w, vec![hd]), (u, vec![hd])],
-            &|t| crate::rwkv::wkv(&t[0], &t[1], &t[2], &t[3]), GC_EPS, GC_ABS, GC_REL, "wkv");
+        grad_check(
+            &ctx,
+            &[
+                (gc_vec(bh * seq * hd, 0), vec![bh, seq, hd]),
+                (gc_vec(bh * seq * hd, 11), vec![bh, seq, hd]),
+                (w, vec![hd]),
+                (u, vec![hd]),
+            ],
+            &|t| crate::rwkv::wkv(&t[0], &t[1], &t[2], &t[3]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "wkv",
+        );
     }
 
     #[test]
     fn gradcheck_slice_cols() {
         let ctx = test_ctx();
         // x [2,4] → columns [1,3)
-        grad_check(&ctx, &[(gc_vec(8, 6), vec![2, 4])],
-            &|t| t[0].slice_cols(1, 2), GC_EPS, GC_ABS, GC_REL, "slice_cols");
+        grad_check(
+            &ctx,
+            &[(gc_vec(8, 6), vec![2, 4])],
+            &|t| t[0].slice_cols(1, 2),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "slice_cols",
+        );
     }
 
     #[test]
     fn gradcheck_silu() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 1), vec![2, 3])],
-            &|t| t[0].silu(), GC_EPS, GC_ABS, GC_REL, "silu");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 1), vec![2, 3])],
+            &|t| t[0].silu(),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "silu",
+        );
     }
 
     #[test]
     fn gradcheck_silu_gate() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 8), vec![2, 3])],
-            &|t| t[0].silu_gate(&t[1]), GC_EPS, GC_ABS, GC_REL, "silu_gate");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 0), vec![2, 3]), (gc_vec(6, 8), vec![2, 3])],
+            &|t| t[0].silu_gate(&t[1]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "silu_gate",
+        );
     }
 
     #[test]
     fn gradcheck_scale() {
         let ctx = test_ctx();
-        grad_check(&ctx, &[(gc_vec(6, 3), vec![2, 3])],
-            &|t| t[0].scale(0.7), GC_EPS, GC_ABS, GC_REL, "scale");
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 3), vec![2, 3])],
+            &|t| t[0].scale(0.7),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "scale",
+        );
     }
 
     // ========================================================================
@@ -3948,9 +5076,17 @@ mod suite {
     #[cfg(feature = "bufsan")]
     fn restore_weights(model: &Transformer, weights: &[Vec<f32>]) {
         let params = model.parameters();
-        assert_eq!(params.len(), weights.len(), "bufsan parameter snapshot length mismatch");
+        assert_eq!(
+            params.len(),
+            weights.len(),
+            "bufsan parameter snapshot length mismatch"
+        );
         for (param, data) in params.iter().zip(weights) {
-            assert_eq!(param.numel(), data.len(), "bufsan parameter snapshot shape mismatch");
+            assert_eq!(
+                param.numel(),
+                data.len(),
+                "bufsan parameter snapshot shape mismatch"
+            );
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for value in data {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -3961,7 +5097,11 @@ mod suite {
     }
 
     #[cfg(feature = "bufsan")]
-    fn bufsan_train_tiny(ctx: &Arc<MetalContext>, quarantine: bool, initial_weights: Option<&[Vec<f32>]>) -> Vec<f32> {
+    fn bufsan_train_tiny(
+        ctx: &Arc<MetalContext>,
+        quarantine: bool,
+        initial_weights: Option<&[Vec<f32>]>,
+    ) -> Vec<f32> {
         MetalContext::clear_pool();
         MetalContext::set_pool_quarantine(quarantine);
         let model = Transformer::new(ctx, bufsan_model_config());
@@ -4008,7 +5148,10 @@ mod suite {
             assert!(l.is_finite(), "bufsan poison surfaced a non-finite loss at step {s}: {l} — \
                 a recycled buffer was read before being overwritten (use-after-recycle / under-dispatch)");
         }
-        assert!(*losses.last().unwrap() < 30.0, "bufsan run diverged: {losses:?}");
+        assert!(
+            *losses.last().unwrap() < 30.0,
+            "bufsan run diverged: {losses:?}"
+        );
     }
 
     #[cfg(feature = "bufsan")]
@@ -4019,7 +5162,10 @@ mod suite {
         let off = bufsan_train_tiny(&ctx, false, Some(&initial));
         let on = bufsan_train_tiny(&ctx, true, Some(&initial));
         let (lo, ln) = (*off.last().unwrap(), *on.last().unwrap());
-        assert!(lo.is_finite() && ln.is_finite(), "non-finite final loss off={lo} on={ln}");
+        assert!(
+            lo.is_finite() && ln.is_finite(),
+            "non-finite final loss off={lo} on={ln}"
+        );
         let rel = (lo - ln).abs() / lo.abs().max(1.0);
         assert!(
             rel < 0.20,
@@ -4079,7 +5225,10 @@ mod suite {
         o
     }
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     }
 
     #[test]
@@ -4160,14 +5309,19 @@ mod suite {
         let packed = ctx.alloc_buffer(packed_rows * n * 4);
         compute::gpu_ternary_pack(&ctx, &wt.buffer, &absmean, &packed, k as u32, n as u32);
         let raw = ctx.alloc_buffer(m * n * 4);
-        compute::gpu_ternary_matmul(&ctx, &xt.buffer, &packed, &raw, m as u32, n as u32, k as u32);
+        compute::gpu_ternary_matmul(
+            &ctx, &xt.buffer, &packed, &raw, m as u32, n as u32, k as u32,
+        );
         ctx.wait_gpu();
         let absmean_v = MetalContext::read_buffer(&absmean, n);
         let raw_v = MetalContext::read_buffer(&raw, m * n);
 
         let spread = absmean_v.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             - absmean_v.iter().copied().fold(f32::INFINITY, f32::min);
-        assert!(spread > 1e-3, "test setup: per-column absmean must differ, got {absmean_v:?}");
+        assert!(
+            spread > 1e-3,
+            "test setup: per-column absmean must differ, got {absmean_v:?}"
+        );
 
         let mut want = vec![0.0f32; m * n];
         for i in 0..m {
@@ -4228,7 +5382,10 @@ mod suite {
             if step == 0 {
                 let lg = logits.to_vec();
                 assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
-                assert!(lg.iter().all(|x| x.is_finite()), "linear-attn forward produced non-finite logits");
+                assert!(
+                    lg.iter().all(|x| x.is_finite()),
+                    "linear-attn forward produced non-finite logits"
+                );
             }
             let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
             let lv = loss.to_vec()[0];
@@ -4242,9 +5399,18 @@ mod suite {
                 // The linear-attention path must be differentiated end-to-end: w_q receives a
                 // finite gradient. (Non-zero magnitude is proven on the isolated core by the
                 // linear_attention::gradient_flows unit test; raw init grads here are ~1e-8.)
-                let g = autograd::get_grad(wq_id).expect("no gradient reached the linear-attention w_q");
-                let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone()).to_vec();
-                assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on linear-attention w_q");
+                let g = autograd::get_grad(wq_id)
+                    .expect("no gradient reached the linear-attention w_q");
+                let gv = Tensor::from_buffer(
+                    Arc::clone(&ctx),
+                    g,
+                    model.blocks[0].attn.w_q.shape.clone(),
+                )
+                .to_vec();
+                assert!(
+                    gv.iter().all(|x| x.is_finite()),
+                    "non-finite grad on linear-attention w_q"
+                );
             }
             autograd::clear_tape_keep_grads();
             // Gradient clipping + LR warmup — the same stabilisers the real training loop uses
@@ -4279,20 +5445,34 @@ mod suite {
         let targets: Vec<u32> = vec![5; 8];
         let logits = model.forward(&tokens, 1, 8, None, false);
         assert_eq!(logits.shape, vec![8, 48]);
-        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "SSM forward non-finite");
+        assert!(
+            logits.to_vec().iter().all(|x| x.is_finite()),
+            "SSM forward non-finite"
+        );
         let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
         assert!(loss.to_vec()[0].is_finite(), "SSM loss non-finite");
         autograd::backward(&ctx, loss.id);
         // The selective decay gate is differentiated end-to-end.
         let g = autograd::get_grad(model.blocks[0].attn.ssm_loga.id).expect("no grad for ssm_loga");
-        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.ssm_loga.shape.clone()).to_vec();
-        assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on ssm_loga");
+        let gv = Tensor::from_buffer(
+            Arc::clone(&ctx),
+            g,
+            model.blocks[0].attn.ssm_loga.shape.clone(),
+        )
+        .to_vec();
+        assert!(
+            gv.iter().all(|x| x.is_finite()),
+            "non-finite grad on ssm_loga"
+        );
         autograd::zero_grads();
 
         let tmp = "/tmp/andreai_ssm_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 9).expect("save failed");
         let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
-        assert!(loaded.config.ssm, "ssm flag lost across checkpoint roundtrip");
+        assert!(
+            loaded.config.ssm,
+            "ssm flag lost across checkpoint roundtrip"
+        );
         assert_eq!(loaded.blocks[0].attn.attn_kind, AttnKind::Ssm);
         std::fs::remove_file(tmp).ok();
     }
@@ -4314,24 +5494,41 @@ mod suite {
         let targets: Vec<u32> = vec![5; 8];
         let logits = model.forward(&tokens, 1, 8, None, false);
         assert_eq!(logits.shape, vec![8, 48]);
-        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "RWKV forward non-finite");
+        assert!(
+            logits.to_vec().iter().all(|x| x.is_finite()),
+            "RWKV forward non-finite"
+        );
         let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
         assert!(loss.to_vec()[0].is_finite(), "RWKV loss non-finite");
         autograd::backward(&ctx, loss.id);
         for (name, id, shape) in [
-            ("rwkv_w", model.blocks[0].attn.rwkv_w.id, model.blocks[0].attn.rwkv_w.shape.clone()),
-            ("rwkv_u", model.blocks[0].attn.rwkv_u.id, model.blocks[0].attn.rwkv_u.shape.clone()),
+            (
+                "rwkv_w",
+                model.blocks[0].attn.rwkv_w.id,
+                model.blocks[0].attn.rwkv_w.shape.clone(),
+            ),
+            (
+                "rwkv_u",
+                model.blocks[0].attn.rwkv_u.id,
+                model.blocks[0].attn.rwkv_u.shape.clone(),
+            ),
         ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, shape).to_vec();
-            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on {name}");
+            assert!(
+                gv.iter().all(|x| x.is_finite()),
+                "non-finite grad on {name}"
+            );
         }
         autograd::zero_grads();
 
         let tmp = "/tmp/andreai_rwkv_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 11).expect("save failed");
         let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
-        assert!(loaded.config.rwkv, "rwkv flag lost across checkpoint roundtrip");
+        assert!(
+            loaded.config.rwkv,
+            "rwkv flag lost across checkpoint roundtrip"
+        );
         assert_eq!(loaded.blocks[0].attn.attn_kind, AttnKind::Rwkv);
         std::fs::remove_file(tmp).ok();
     }
@@ -4356,15 +5553,26 @@ mod suite {
         let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
         let targets: Vec<u32> = vec![5; 8];
         let logits = model.forward(&tokens, 1, 8, None, false);
-        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "hybrid forward non-finite");
+        assert!(
+            logits.to_vec().iter().all(|x| x.is_finite()),
+            "hybrid forward non-finite"
+        );
         let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
         assert!(loss.to_vec()[0].is_finite(), "hybrid loss non-finite");
         autograd::backward(&ctx, loss.id);
         // A softmax layer (0) and a linear layer (1) both receive finite gradients.
-        for (li, id) in [(0usize, model.blocks[0].attn.w_q.id), (1usize, model.blocks[1].attn.w_q.id)] {
+        for (li, id) in [
+            (0usize, model.blocks[0].attn.w_q.id),
+            (1usize, model.blocks[1].attn.w_q.id),
+        ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for layer {li} w_q"));
-            let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[li].attn.w_q.shape.clone()).to_vec();
-            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad in layer {li}");
+            let gv =
+                Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[li].attn.w_q.shape.clone())
+                    .to_vec();
+            assert!(
+                gv.iter().all(|x| x.is_finite()),
+                "non-finite grad in layer {li}"
+            );
         }
         autograd::zero_grads();
 
@@ -4391,9 +5599,15 @@ mod suite {
         crate::checkpoint::save_checkpoint(tmp, &model, 7).expect("save failed");
         let (loaded, step) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert_eq!(step, 7);
-        assert!(loaded.config.linear_attn, "linear_attn flag lost across checkpoint roundtrip");
+        assert!(
+            loaded.config.linear_attn,
+            "linear_attn flag lost across checkpoint roundtrip"
+        );
         // The reloaded block must actually be in Linear mode.
-        assert_eq!(loaded.blocks[0].attn.attn_kind, crate::attention::AttnKind::Linear);
+        assert_eq!(
+            loaded.blocks[0].attn.attn_kind,
+            crate::attention::AttnKind::Linear
+        );
         std::fs::remove_file(tmp).ok();
     }
 
@@ -4410,14 +5624,21 @@ mod suite {
         // Do a fake optimizer step to populate m/v buffers
         let fake_grad = ctx.alloc_buffer(param_refs[0].numel() * 4);
         crate::gpu::compute::gpu_fill(&ctx, &fake_grad, param_refs[0].numel() as u32, 0.01);
-        autograd::accumulate_grad_for_test(&ctx, param_refs[0].id, &fake_grad, param_refs[0].numel());
+        autograd::accumulate_grad_for_test(
+            &ctx,
+            param_refs[0].id,
+            &fake_grad,
+            param_refs[0].numel(),
+        );
         ctx.begin_batch();
         optimizer.step(1e-4);
         ctx.flush_batch();
 
         // Capture optimizer m/v for first param
-        let orig_m: Vec<f32> = MetalContext::read_buffer(&optimizer.params[0].m, optimizer.params[0].size);
-        let orig_v: Vec<f32> = MetalContext::read_buffer(&optimizer.params[0].v, optimizer.params[0].size);
+        let orig_m: Vec<f32> =
+            MetalContext::read_buffer(&optimizer.params[0].m, optimizer.params[0].size);
+        let orig_v: Vec<f32> =
+            MetalContext::read_buffer(&optimizer.params[0].v, optimizer.params[0].size);
 
         // Save
         let tmp_path = "/tmp/andreai_test_state.bin";
@@ -4490,7 +5711,8 @@ mod suite {
                 minus[idx] -= eps;
                 let minus_logits = Tensor::from_slice(&ctx, &minus, vec![batch, vocab]);
                 ctx.begin_batch();
-                let (minus_loss, _) = crate::loss::cross_entropy_loss(&ctx, &minus_logits, &targets);
+                let (minus_loss, _) =
+                    crate::loss::cross_entropy_loss(&ctx, &minus_logits, &targets);
                 ctx.flush_batch();
                 let lm = minus_loss.to_vec()[0];
 
@@ -4502,8 +5724,15 @@ mod suite {
             }
         }
 
-        eprintln!("CE grad check: max_diff={:.6}, loss={:.4}, checked={}", max_diff, loss_val, checked);
-        assert!(max_diff < 1e-3, "CE gradient too far from numerical: max_diff={}", max_diff);
+        eprintln!(
+            "CE grad check: max_diff={:.6}, loss={:.4}, checked={}",
+            max_diff, loss_val, checked
+        );
+        assert!(
+            max_diff < 1e-3,
+            "CE gradient too far from numerical: max_diff={}",
+            max_diff
+        );
         autograd::clear_tape();
     }
 
@@ -4514,31 +5743,28 @@ mod suite {
         let d_model = 3;
         let vocab = 7;
         let hidden_data = [
-            0.10, -0.20, 0.30,
-            -0.40, 0.50, -0.60,
-            0.70, -0.80, 0.90,
-            -1.00, 1.10, -1.20,
-            1.30, -1.40, 1.50,
+            0.10, -0.20, 0.30, -0.40, 0.50, -0.60, 0.70, -0.80, 0.90, -1.00, 1.10, -1.20, 1.30,
+            -1.40, 1.50,
         ];
         let embedding_data = [
-            0.20, -0.10, 0.30,
-            -0.50, 0.40, -0.20,
-            0.10, 0.60, -0.30,
-            -0.70, 0.20, 0.50,
-            0.30, -0.40, 0.80,
-            -0.20, 0.90, -0.60,
-            0.50, -0.30, 0.10,
+            0.20, -0.10, 0.30, -0.50, 0.40, -0.20, 0.10, 0.60, -0.30, -0.70, 0.20, 0.50, 0.30,
+            -0.40, 0.80, -0.20, 0.90, -0.60, 0.50, -0.30, 0.10,
         ];
         let targets = [0u32, 3, 6, 2, 5];
 
         let max_diff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
 
         autograd::clear_tape();
         autograd::clear_recompute_registry();
-        let hidden_std = Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
-        let embedding_std = Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
+        let hidden_std =
+            Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
+        let embedding_std =
+            Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
         ctx.begin_batch();
         let logits = hidden_std.matmul_trans_b(&embedding_std);
         let (loss_std, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
@@ -4558,8 +5784,10 @@ mod suite {
         autograd::clear_tape();
         autograd::zero_grads_recycle();
 
-        let hidden_fused = Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
-        let embedding_fused = Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
+        let hidden_fused =
+            Tensor::from_slice(&ctx, &hidden_data, vec![n_tokens, d_model]).with_grad();
+        let embedding_fused =
+            Tensor::from_slice(&ctx, &embedding_data, vec![vocab, d_model]).with_grad();
         ctx.begin_batch();
         let (loss_fused, _) = crate::loss::fused_linear_cross_entropy(
             &ctx,
@@ -4591,8 +5819,14 @@ mod suite {
              hidden_grad_diff={hidden_grad_diff:.6}, embedding_grad_diff={embedding_grad_diff:.6}"
         );
 
-        assert!(loss_diff < 2e-3, "fused CE loss drifted from standard path: {loss_diff}");
-        assert!(hidden_diff < 1e-6, "fused CE must not mutate hidden inputs: {hidden_diff}");
+        assert!(
+            loss_diff < 2e-3,
+            "fused CE loss drifted from standard path: {loss_diff}"
+        );
+        assert!(
+            hidden_diff < 1e-6,
+            "fused CE must not mutate hidden inputs: {hidden_diff}"
+        );
         assert!(
             hidden_grad_diff < 3e-3,
             "fused CE hidden gradient drifted from standard path: {hidden_grad_diff}"
@@ -4616,19 +5850,33 @@ mod suite {
         let q8 = crate::quantize::quantize(&data, &shape, 8, 32);
         let deq8 = crate::quantize::dequantize(&q8);
         assert_eq!(deq8.len(), data.len());
-        let q8_max_err: f32 = data.iter().zip(deq8.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let q8_max_err: f32 = data
+            .iter()
+            .zip(deq8.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("Q8 max error: {:.6}", q8_max_err);
-        assert!(q8_max_err < 0.05, "Q8 roundtrip error too large: {}", q8_max_err);
+        assert!(
+            q8_max_err < 0.05,
+            "Q8 roundtrip error too large: {}",
+            q8_max_err
+        );
 
         // Q4 roundtrip (lower precision expected)
         let q4 = crate::quantize::quantize(&data, &shape, 4, 32);
         let deq4 = crate::quantize::dequantize(&q4);
         assert_eq!(deq4.len(), data.len());
-        let q4_max_err: f32 = data.iter().zip(deq4.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let q4_max_err: f32 = data
+            .iter()
+            .zip(deq4.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("Q4 max error: {:.6}", q4_max_err);
-        assert!(q4_max_err < 0.5, "Q4 roundtrip error too large: {}", q4_max_err);
+        assert!(
+            q4_max_err < 0.5,
+            "Q4 roundtrip error too large: {}",
+            q4_max_err
+        );
     }
 
     /// AdamW optimizer: verify one step changes weights in the right direction.
@@ -4652,7 +5900,12 @@ mod suite {
         let updated = param.to_vec();
         // Positive gradient → params should decrease
         for (o, u) in orig.iter().zip(updated.iter()) {
-            assert!(u < o, "param should decrease with positive gradient: {} -> {}", o, u);
+            assert!(
+                u < o,
+                "param should decrease with positive gradient: {} -> {}",
+                o,
+                u
+            );
         }
 
         autograd::zero_grads_recycle();
@@ -4660,12 +5913,9 @@ mod suite {
     }
 
     /// Matmul backward: verify dA matches numerical gradients.
-    /// NOTE: Flaky due to Metal FP16 non-determinism — the forward matmul uses
-    /// FP16 shared memory with rounding that varies between kernel invocations.
-    /// The CE gradient check and mega_ffn_backward tests cover matmul backward
-    /// correctness through more controlled paths.
+    /// Uses a tolerance wide enough for the FP16 forward path while still catching
+    /// broken backward indexing or accumulation.
     #[test]
-    #[ignore] // Metal FP16 non-determinism causes >1.0 error on small matrices
     fn matmul_backward_gradient_check() {
         let ctx = test_ctx();
         let m = 4;
@@ -4731,11 +5981,18 @@ mod suite {
             max_diff = max_diff.max(diff);
         }
 
-        eprintln!("Matmul backward: max_diff_a={:.6}, loss={:.4}", max_diff, loss_val);
+        eprintln!(
+            "Matmul backward: max_diff_a={:.6}, loss={:.4}",
+            max_diff, loss_val
+        );
         // Tolerance accounts for FP16 non-determinism in Metal matmul (mixed precision).
         // Metal's FP16 shared memory rounding varies between kernel invocations, causing
         // ~0.3 max absolute error between analytical and numerical gradients.
-        assert!(max_diff < 1.0, "Matmul dA gradient too far from numerical: {}", max_diff);
+        assert!(
+            max_diff < 1.0,
+            "Matmul dA gradient too far from numerical: {}",
+            max_diff
+        );
 
         autograd::clear_tape();
     }

@@ -38,8 +38,8 @@ impl Sha256 {
     fn new() -> Self {
         Self {
             state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buffer: Vec::new(),
             total_len: 0,
@@ -60,12 +60,20 @@ impl Sha256 {
     fn process_block(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i*4], block[i*4+1], block[i*4+2], block[i*4+3]]);
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
-            let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
-            let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
-            w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
@@ -73,13 +81,23 @@ impl Sha256 {
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
 
-            h = g; g = f; f = e; e = d.wrapping_add(temp1);
-            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
         }
 
         self.state[0] = self.state[0].wrapping_add(a);
@@ -109,9 +127,7 @@ impl Sha256 {
         }
 
         // Output
-        self.state.iter()
-            .map(|s| format!("{:08x}", s))
-            .collect()
+        self.state.iter().map(|s| format!("{:08x}", s)).collect()
     }
 }
 
@@ -122,7 +138,9 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut buf = [0u8; 65536];
     loop {
         let n = file.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize())
@@ -155,7 +173,8 @@ pub fn quality_filter(text: &str) -> bool {
     }
 
     // Must have some sentence structure (not just data)
-    let has_punctuation = text.contains('.') || text.contains('?') || text.contains('!') || text.contains(':');
+    let has_punctuation =
+        text.contains('.') || text.contains('?') || text.contains('!') || text.contains(':');
     let has_newlines = text.contains('\n');
     if !has_punctuation && !has_newlines {
         return false;
@@ -214,7 +233,11 @@ pub fn exact_dedup(documents: &[String]) -> Vec<usize> {
 
     let removed = documents.len() - unique_indices.len();
     if removed > 0 {
-        eprintln!("Exact dedup: removed {} duplicates ({:.1}%)", removed, removed as f64 / documents.len() as f64 * 100.0);
+        eprintln!(
+            "Exact dedup: removed {} duplicates ({:.1}%)",
+            removed,
+            removed as f64 / documents.len() as f64 * 100.0
+        );
     }
 
     unique_indices
@@ -252,7 +275,11 @@ pub fn near_dedup(documents: &[String], threshold: f64) -> Vec<usize> {
 
     let removed = documents.len() - unique_indices.len();
     if removed > 0 {
-        eprintln!("Near dedup: removed {} near-duplicates ({:.1}%)", removed, removed as f64 / documents.len() as f64 * 100.0);
+        eprintln!(
+            "Near dedup: removed {} near-duplicates ({:.1}%)",
+            removed,
+            removed as f64 / documents.len() as f64 * 100.0
+        );
     }
 
     unique_indices
@@ -309,7 +336,10 @@ pub fn pack_sequences(seqs: &[Vec<u32>], max_len: usize, pad: u32) -> Vec<Packed
             tokens.push(pad);
             seg_ids.push(PACK_PAD_SEG);
         }
-        rows.push(PackedRow { tokens: std::mem::take(tokens), seg_ids: std::mem::take(seg_ids) });
+        rows.push(PackedRow {
+            tokens: std::mem::take(tokens),
+            seg_ids: std::mem::take(seg_ids),
+        });
     };
 
     for seq in seqs {
@@ -340,8 +370,8 @@ pub struct DataMix {
 pub struct DataSource {
     pub name: String,
     pub path: PathBuf,
-    pub weight: f32,      // sampling weight (higher = more frequent)
-    pub upsample: usize,  // repeat count (1 = single pass)
+    pub weight: f32,     // sampling weight (higher = more frequent)
+    pub upsample: usize, // repeat count (1 = single pass)
 }
 
 /// Process a raw text file through the full cleaning pipeline:
@@ -381,10 +411,7 @@ pub fn process_source(
     let after_quality = filtered.len();
 
     // Normalize
-    let normalized: Vec<String> = filtered
-        .into_iter()
-        .map(|d| normalize_text(&d))
-        .collect();
+    let normalized: Vec<String> = filtered.into_iter().map(|d| normalize_text(&d)).collect();
 
     // Exact dedup
     let unique_idx = exact_dedup(&normalized);
@@ -392,7 +419,10 @@ pub fn process_source(
 
     // Near dedup
     let near_unique_idx = near_dedup(&deduped, 0.8);
-    let final_docs: Vec<String> = near_unique_idx.iter().map(|&i| deduped[i].clone()).collect();
+    let final_docs: Vec<String> = near_unique_idx
+        .iter()
+        .map(|&i| deduped[i].clone())
+        .collect();
     let final_count = final_docs.len();
 
     // Tokenize all documents
@@ -456,13 +486,22 @@ pub fn mix_shards(
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        eprintln!("  {} — {} tokens, weight {:.2}", path.display(), tokens.len(), weight);
+        eprintln!(
+            "  {} — {} tokens, weight {:.2}",
+            path.display(),
+            tokens.len(),
+            weight
+        );
         shards.push((tokens, *weight));
     }
 
     // Normalize weights
     let total_weight: f32 = shards.iter().map(|(_, w)| w).sum();
-    assert!(total_weight > 0.0, "Data mixing weights must sum to > 0 (got {})", total_weight);
+    assert!(
+        total_weight > 0.0,
+        "Data mixing weights must sum to > 0 (got {})",
+        total_weight
+    );
 
     // Compute how many tokens to take from each shard
     let total_tokens: usize = shards.iter().map(|(t, _)| t.len()).sum();
@@ -503,7 +542,11 @@ pub fn mix_shards(
     let hash_path = output_path.with_extension("sha256");
     std::fs::write(&hash_path, &hash)?;
 
-    eprintln!("Mixed dataset: {} tokens, hash: {}", output.len(), &hash[..16]);
+    eprintln!(
+        "Mixed dataset: {} tokens, hash: {}",
+        output.len(),
+        &hash[..16]
+    );
     Ok(output.len())
 }
 
@@ -523,7 +566,13 @@ pub fn record_provenance(
     writeln!(
         file,
         r#"{{"source":"{}","url":"{}","license":"{}","input_bytes":{},"input_docs":{},"output_tokens":{},"sha256":"{}"}}"#,
-        source_name, source_url, license, stats.input_bytes, stats.input_docs, stats.output_tokens, stats.sha256
+        source_name,
+        source_url,
+        license,
+        stats.input_bytes,
+        stats.input_docs,
+        stats.output_tokens,
+        stats.sha256
     )?;
 
     Ok(())
@@ -544,7 +593,9 @@ pub fn minhash_signature(text: &str, num_hashes: usize, shingle_size: usize) -> 
     // Generate shingles (n-grams of characters)
     let chars: Vec<char> = text.chars().collect();
     if chars.len() < shingle_size {
-        return MinHashSignature { hashes: vec![u64::MAX; num_hashes] };
+        return MinHashSignature {
+            hashes: vec![u64::MAX; num_hashes],
+        };
     }
 
     let mut min_hashes = vec![u64::MAX; num_hashes];
@@ -555,7 +606,8 @@ pub fn minhash_signature(text: &str, num_hashes: usize, shingle_size: usize) -> 
 
         for (h, min_hash) in min_hashes.iter_mut().enumerate().take(num_hashes) {
             // Use different hash functions by XORing with seed
-            let hash = base_hash.wrapping_mul(6364136223846793005u64.wrapping_add(h as u64 * 1442695040888963407));
+            let hash = base_hash
+                .wrapping_mul(6364136223846793005u64.wrapping_add(h as u64 * 1442695040888963407));
             if hash < *min_hash {
                 *min_hash = hash;
             }
@@ -568,7 +620,12 @@ pub fn minhash_signature(text: &str, num_hashes: usize, shingle_size: usize) -> 
 /// Jaccard similarity estimate from MinHash signatures.
 pub fn minhash_similarity(a: &MinHashSignature, b: &MinHashSignature) -> f32 {
     assert_eq!(a.hashes.len(), b.hashes.len());
-    let matches = a.hashes.iter().zip(&b.hashes).filter(|(a, b)| a == b).count();
+    let matches = a
+        .hashes
+        .iter()
+        .zip(&b.hashes)
+        .filter(|(a, b)| a == b)
+        .count();
     matches as f32 / a.hashes.len() as f32
 }
 
@@ -585,7 +642,8 @@ fn fnv_hash(data: &[u8]) -> u64 {
 /// Deduplicate documents using MinHash. Returns indices of documents to KEEP.
 /// threshold: Jaccard similarity above which documents are considered duplicates (e.g. 0.8)
 pub fn minhash_dedup(documents: &[String], threshold: f32, num_hashes: usize) -> Vec<usize> {
-    let signatures: Vec<MinHashSignature> = documents.iter()
+    let signatures: Vec<MinHashSignature> = documents
+        .iter()
         .map(|doc| minhash_signature(doc, num_hashes, 5))
         .collect();
 
@@ -593,7 +651,9 @@ pub fn minhash_dedup(documents: &[String], threshold: f32, num_hashes: usize) ->
     let mut kept_sigs: Vec<&MinHashSignature> = Vec::new();
 
     for (i, sig) in signatures.iter().enumerate() {
-        let is_dup = kept_sigs.iter().any(|kept| minhash_similarity(sig, kept) > threshold);
+        let is_dup = kept_sigs
+            .iter()
+            .any(|kept| minhash_similarity(sig, kept) > threshold);
         if !is_dup {
             keep.push(i);
             kept_sigs.push(sig);
@@ -607,35 +667,57 @@ pub fn minhash_dedup(documents: &[String], threshold: f32, num_hashes: usize) ->
 /// Returns 0.0 (garbage) to 1.0 (high quality).
 pub fn quality_score(text: &str) -> f32 {
     let len = text.len();
-    if len < 50 { return 0.0; }   // too short
-    if len > 100_000 { return 0.3; } // suspiciously long
+    if len < 50 {
+        return 0.0;
+    } // too short
+    if len > 100_000 {
+        return 0.3;
+    } // suspiciously long
 
     let mut score = 0.5f32;
 
     // Proportion of alphabetic characters (vs special chars, numbers)
-    let alpha_ratio = text.chars().filter(|c| c.is_alphabetic() || c.is_whitespace()).count() as f32 / len as f32;
-    if alpha_ratio > 0.7 { score += 0.2; }
-    if alpha_ratio < 0.4 { score -= 0.3; }
+    let alpha_ratio = text
+        .chars()
+        .filter(|c| c.is_alphabetic() || c.is_whitespace())
+        .count() as f32
+        / len as f32;
+    if alpha_ratio > 0.7 {
+        score += 0.2;
+    }
+    if alpha_ratio < 0.4 {
+        score -= 0.3;
+    }
 
     // Average word length (gibberish tends to have very long "words")
     let words: Vec<&str> = text.split_whitespace().collect();
     if !words.is_empty() {
         let avg_word_len = words.iter().map(|w| w.len()).sum::<usize>() as f32 / words.len() as f32;
-        if avg_word_len > 2.0 && avg_word_len < 15.0 { score += 0.1; }
-        if avg_word_len > 30.0 { score -= 0.3; }
+        if avg_word_len > 2.0 && avg_word_len < 15.0 {
+            score += 0.1;
+        }
+        if avg_word_len > 30.0 {
+            score -= 0.3;
+        }
     }
 
     // Sentence structure (has periods, not all caps)
-    if text.contains(". ") || text.contains(".\n") { score += 0.1; }
+    if text.contains(". ") || text.contains(".\n") {
+        score += 0.1;
+    }
     let caps_ratio = text.chars().filter(|c| c.is_uppercase()).count() as f32 / len.max(1) as f32;
-    if caps_ratio > 0.5 { score -= 0.2; } // mostly CAPS = low quality
+    if caps_ratio > 0.5 {
+        score -= 0.2;
+    } // mostly CAPS = low quality
 
     // Repetition check (same line repeated)
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() > 3 {
         let unique_lines: HashSet<&str> = lines.iter().copied().collect();
         let unique_ratio = unique_lines.len() as f32 / lines.len() as f32;
-        if unique_ratio < 0.5 { score -= 0.3; } // very repetitive
+        if unique_ratio < 0.5 {
+            score -= 0.3;
+        } // very repetitive
     }
 
     score.clamp(0.0, 1.0)
@@ -643,7 +725,9 @@ pub fn quality_score(text: &str) -> f32 {
 
 /// Filter documents by quality threshold.
 pub fn quality_filter_batch(documents: &[String], min_quality: f32) -> Vec<usize> {
-    documents.iter().enumerate()
+    documents
+        .iter()
+        .enumerate()
         .filter(|(_, doc)| quality_score(doc) >= min_quality)
         .map(|(i, _)| i)
         .collect()

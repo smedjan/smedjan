@@ -44,10 +44,18 @@ pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
     let n = bytes.len() / 4;
     let mut f = vec![0f32; n];
     for i in 0..n {
-        f[i] = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+        f[i] = f32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
     }
     buf.device().bind_to_thread().expect("bind CUDA context");
-    unsafe { cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f).expect("htod buf_write_bytes"); }
+    unsafe {
+        cudarc::driver::result::memcpy_htod_sync(*buf.device_ptr(), &f)
+            .expect("htod buf_write_bytes");
+    }
 }
 
 /// Reinterpret a u32 buffer handle as a Buf (f32) for storage in the untyped tape Vec<Buf>.
@@ -77,7 +85,8 @@ impl MetalContext {
 
         // Compile all kernels to PTX. nvrtc needs the toolkit include dir for <cuda_fp16.h> etc.;
         // derive it from CUDA_PATH (set at build/run time) with a sane fallback.
-        let cuda_inc = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".into()) + "/include";
+        let cuda_inc =
+            std::env::var("CUDA_PATH").unwrap_or_else(|_| "/usr/local/cuda".into()) + "/include";
         let opts = cudarc::nvrtc::CompileOptions {
             include_paths: vec![cuda_inc],
             // line info lets compute-sanitizer name the faulting kernel + source line.
@@ -86,7 +95,8 @@ impl MetalContext {
         };
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(kernels::ALL_KERNELS, opts)
             .expect("Failed to compile CUDA kernels");
-        device.load_ptx(ptx, "andreai", &kernels::KERNEL_NAMES)
+        device
+            .load_ptx(ptx, "andreai", &kernels::KERNEL_NAMES)
             .expect("Failed to load CUDA kernels");
 
         Arc::new(Self { device })
@@ -95,31 +105,45 @@ impl MetalContext {
     /// Allocate a GPU buffer (device memory).
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
-        Arc::new(self.device.alloc_zeros::<f32>(n_floats)
-            .expect("Failed to allocate CUDA buffer"))
+        Arc::new(
+            self.device
+                .alloc_zeros::<f32>(n_floats)
+                .expect("Failed to allocate CUDA buffer"),
+        )
     }
 
     /// Create buffer from f32 slice (host→device copy).
     pub fn buffer_from_slice(&self, data: &[f32]) -> Buf {
-        Arc::new(self.device.htod_sync_copy(data)
-            .expect("Failed to copy to device"))
+        Arc::new(
+            self.device
+                .htod_sync_copy(data)
+                .expect("Failed to copy to device"),
+        )
     }
 
     /// Create buffer from u32 slice.
     pub fn buffer_from_u32_slice(&self, data: &[u32]) -> BufU32 {
-        Arc::new(self.device.htod_sync_copy(data)
-            .expect("Failed to copy u32 to device"))
+        Arc::new(
+            self.device
+                .htod_sync_copy(data)
+                .expect("Failed to copy u32 to device"),
+        )
     }
 
     /// Allocate a zeroed u32 device buffer of `count` elements.
     pub fn alloc_buffer_u32(&self, count: usize) -> BufU32 {
-        Arc::new(self.device.alloc_zeros::<u32>(count).expect("Failed to allocate u32 CUDA buffer"))
+        Arc::new(
+            self.device
+                .alloc_zeros::<u32>(count)
+                .expect("Failed to allocate u32 CUDA buffer"),
+        )
     }
 
     /// Read f32 data from device buffer.
     pub fn read_buffer(buf: &CudaSlice<f32>, count: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; count];
-        buf.device().dtoh_sync_copy_into(buf, &mut result)
+        buf.device()
+            .dtoh_sync_copy_into(buf, &mut result)
             .expect("Failed to copy from device");
         result
     }
@@ -127,7 +151,8 @@ impl MetalContext {
     /// Read u32 data from device buffer.
     pub fn read_buffer_u32(buf: &CudaSlice<u32>, count: usize) -> Vec<u32> {
         let mut result = vec![0u32; count];
-        buf.device().dtoh_sync_copy_into(buf, &mut result)
+        buf.device()
+            .dtoh_sync_copy_into(buf, &mut result)
             .expect("Failed to copy u32 from device");
         result
     }
@@ -135,8 +160,12 @@ impl MetalContext {
     /// Overwrite an existing u32 device buffer with host data (htod into the live allocation).
     /// Mirrors Metal's unified-memory in-place write; here a low-level synchronous htod memcpy.
     pub fn write_u32_to_buffer(buf: &CudaSlice<u32>, data: &[u32]) {
-        assert!(buf.len() >= data.len(),
-            "write_u32_to_buffer: dst {} < src {} elems", buf.len(), data.len());
+        assert!(
+            buf.len() >= data.len(),
+            "write_u32_to_buffer: dst {} < src {} elems",
+            buf.len(),
+            data.len()
+        );
         // Raw driver memcpy requires the device's primary context current on this thread;
         // the safe htod_* wrappers bind it, result::* does not. Bind before copying.
         buf.device().bind_to_thread().expect("bind CUDA context");
@@ -172,7 +201,9 @@ impl MetalContext {
 
     /// Read a device buffer into a host slice (dtoh). Mirrors Metal's read_buffer_into.
     pub fn read_buffer_into(buf: &CudaSlice<f32>, dst: &mut [f32]) {
-        buf.device().dtoh_sync_copy_into(buf, dst).expect("dtoh_sync_copy_into");
+        buf.device()
+            .dtoh_sync_copy_into(buf, dst)
+            .expect("dtoh_sync_copy_into");
     }
 
     /// Block until all queued GPU work finishes. CUDA copies here are already synchronous; sync anyway.
@@ -183,9 +214,15 @@ impl MetalContext {
     // Command batching — CUDA uses streams, no explicit batching needed.
     // These are no-ops for API compatibility with Metal backend.
     pub fn begin_batch(&self) {}
-    pub fn flush_batch(&self) -> usize { 0 }
-    pub fn flush_batch_async(&self) -> usize { 0 }
-    pub fn batch_active() -> bool { false }
+    pub fn flush_batch(&self) -> usize {
+        0
+    }
+    pub fn flush_batch_async(&self) -> usize {
+        0
+    }
+    pub fn batch_active() -> bool {
+        false
+    }
 
     // Auto-flush is a no-op on CUDA
     fn auto_flush_batch() {}
@@ -195,8 +232,12 @@ impl MetalContext {
 /// Mirrors metal's RAII PoolBypassGuard so shared checkpoint-recompute code compiles unchanged.
 pub struct PoolBypassGuard;
 impl PoolBypassGuard {
-    pub fn new() -> Self { PoolBypassGuard }
+    pub fn new() -> Self {
+        PoolBypassGuard
+    }
 }
 impl Default for PoolBypassGuard {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

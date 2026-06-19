@@ -27,7 +27,6 @@
 //! This avoids needing a GPU division/reciprocal kernel and is a standard stabiliser
 //! for linear-attention / SSM token mixers (cf. RetNet's post-mix GroupNorm).
 
-
 use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
@@ -141,7 +140,10 @@ pub fn chunked(q: &Tensor, k: &Tensor, v: &Tensor, chunk: usize) -> Tensor {
     let bh = q.shape[0];
     let seq = q.shape[1];
     let hd = q.shape[2];
-    assert!(chunk > 0 && seq.is_multiple_of(chunk), "seq {seq} must be divisible by chunk {chunk}");
+    assert!(
+        chunk > 0 && seq.is_multiple_of(chunk),
+        "seq {seq} must be divisible by chunk {chunk}"
+    );
     let nc = seq / chunk;
 
     let qf = feature_map(q);
@@ -195,7 +197,14 @@ mod tests {
 
     /// CPU ground truth for the masked numerator: φ(x)=rms_norm(relu(x)+1) over hd, causal sum.
     /// q,k,v laid out [bh, seq, hd] row-major. Mirrors the GPU feature_map exactly.
-    fn cpu_masked_reference(q: &[f32], k: &[f32], v: &[f32], bh: usize, seq: usize, hd: usize) -> Vec<f32> {
+    fn cpu_masked_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        bh: usize,
+        seq: usize,
+        hd: usize,
+    ) -> Vec<f32> {
         let phi = |x: f32| x.max(0.0) + 1.0;
         // φ then RMS-norm over the head dim, per (b, position).
         let normfeat = |src: &[f32]| -> Vec<f32> {
@@ -239,9 +248,15 @@ mod tests {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 4usize, 3usize);
         // Deterministic, mixed-sign inputs.
-        let q: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3).collect();
-        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.25).collect();
-        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.5).collect();
+        let q: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3)
+            .collect();
+        let k: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let v: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.5)
+            .collect();
 
         let got = autograd::no_grad(|| {
             let qt = Tensor::from_slice(&ctx, &q, vec![bh, seq, hd]);
@@ -265,9 +280,15 @@ mod tests {
     fn output_is_causal() {
         let ctx = ctx();
         let (bh, seq, hd) = (1usize, 5usize, 2usize);
-        let q: Vec<f32> = (0..bh * seq * hd).map(|i| ((i % 5) as f32 - 2.0) * 0.4).collect();
-        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i % 3) as f32 - 1.0) * 0.6).collect();
-        let mut v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i % 4) as f32 - 1.5) * 0.5).collect();
+        let q: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.4)
+            .collect();
+        let k: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i % 3) as f32 - 1.0) * 0.6)
+            .collect();
+        let mut v: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i % 4) as f32 - 1.5) * 0.5)
+            .collect();
 
         let out_a = autograd::no_grad(|| {
             let qt = Tensor::from_slice(&ctx, &q, vec![bh, seq, hd]);
@@ -306,9 +327,15 @@ mod tests {
     fn chunked_matches_masked_reference() {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 12usize, 4usize);
-        let q: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3).collect();
-        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.25).collect();
-        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.5).collect();
+        let q: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3)
+            .collect();
+        let k: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let v: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.5)
+            .collect();
 
         autograd::no_grad(|| {
             let qt = Tensor::from_slice(&ctx, &q, vec![bh, seq, hd]);
@@ -335,14 +362,16 @@ mod tests {
         let (bh, seq, hd) = (1usize, 3usize, 4usize);
         let n = bh * seq * hd;
         let mk = |scale: f32, off: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i * 9 % 17) as f32 - 8.0) * scale + off).collect()
+            (0..n)
+                .map(|i| ((i * 9 % 17) as f32 - 8.0) * scale + off)
+                .collect()
         };
         let qt = Tensor::from_slice(&ctx, &mk(0.2, 0.1), vec![bh, seq, hd]).with_grad();
         let kt = Tensor::from_slice(&ctx, &mk(0.15, -0.1), vec![bh, seq, hd]).with_grad();
         let vt = Tensor::from_slice(&ctx, &mk(0.3, 0.0), vec![bh, seq, hd]).with_grad();
 
         let out = linear_attention(&qt, &kt, &vt); // [bh, seq, hd]
-        // Reduce to a scalar loss that exercises the full linear-attention backward path.
+                                                   // Reduce to a scalar loss that exercises the full linear-attention backward path.
         let flat = out.reshape(vec![1, n]);
         let ones = Tensor::ones(&ctx, vec![n, 1]);
         let loss = flat.matmul(&ones); // [1, 1]
@@ -351,8 +380,14 @@ mod tests {
         for (name, id) in [("q", qt.id), ("k", kt.id), ("v", vt.id)] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![bh, seq, hd]).to_vec();
-            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad for {name}");
-            assert!(gv.iter().any(|x| x.abs() > 1e-6), "all-zero grad for {name}");
+            assert!(
+                gv.iter().all(|x| x.is_finite()),
+                "non-finite grad for {name}"
+            );
+            assert!(
+                gv.iter().any(|x| x.abs() > 1e-6),
+                "all-zero grad for {name}"
+            );
         }
         autograd::zero_grads();
     }

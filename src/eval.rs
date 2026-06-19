@@ -34,12 +34,16 @@ pub struct EvalOutput {
 
 impl EvalResults {
     pub fn exact_match_rate(&self) -> f64 {
-        if self.total == 0 { return 0.0; }
+        if self.total == 0 {
+            return 0.0;
+        }
         self.exact_matches as f64 / self.total as f64
     }
 
     pub fn partial_match_rate(&self) -> f64 {
-        if self.total == 0 { return 0.0; }
+        if self.total == 0 {
+            return 0.0;
+        }
         self.partial_matches as f64 / self.total as f64
     }
 
@@ -63,7 +67,11 @@ impl EvalResults {
         // Per-category breakdown
         println!("Per-category results:");
         for (cat, correct, total) in &self.category_scores {
-            let pct = if *total > 0 { *correct as f64 / *total as f64 * 100.0 } else { 0.0 };
+            let pct = if *total > 0 {
+                *correct as f64 / *total as f64 * 100.0
+            } else {
+                0.0
+            };
             println!("  {:>20}: {}/{} ({:.1}%)", cat, correct, total, pct);
         }
         println!();
@@ -72,7 +80,13 @@ impl EvalResults {
         // Show individual results with exact/partial match status
         println!("Per-example results (first 20):");
         for (i, e) in self.examples.iter().take(20).enumerate() {
-            let status = if e.exact_match { "EXACT" } else if e.partial_match { "PARTIAL" } else { "MISS" };
+            let status = if e.exact_match {
+                "EXACT"
+            } else if e.partial_match {
+                "PARTIAL"
+            } else {
+                "MISS"
+            };
             println!(
                 "  {:>3}. [{}] prompt: \"{}\" → \"{}\"",
                 i + 1,
@@ -83,7 +97,8 @@ impl EvalResults {
         }
         println!();
 
-        let failures: Vec<&EvalOutput> = self.examples.iter().filter(|e| !e.partial_match).collect();
+        let failures: Vec<&EvalOutput> =
+            self.examples.iter().filter(|e| !e.partial_match).collect();
         if !failures.is_empty() {
             println!("Failed examples (first 10):");
             for (i, f) in failures.iter().take(10).enumerate() {
@@ -163,11 +178,19 @@ pub fn evaluate(
         let exact = is_exact_match(&generated, &example.expected);
         let partial = is_partial_match(&generated, &example.expected);
 
-        if exact { exact_matches += 1; }
-        if partial { partial_matches += 1; }
+        if exact {
+            exact_matches += 1;
+        }
+        if partial {
+            partial_matches += 1;
+        }
 
-        let entry = category_map.entry(example.category.clone()).or_insert((0, 0));
-        if partial { entry.0 += 1; }
+        let entry = category_map
+            .entry(example.category.clone())
+            .or_insert((0, 0));
+        if partial {
+            entry.0 += 1;
+        }
         entry.1 += 1;
 
         if (i + 1) % 10 == 0 || i == examples.len() - 1 {

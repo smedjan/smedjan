@@ -103,7 +103,10 @@ pub fn quantize(data: &[f32], shape: &[usize], bits: u8, group_size: usize) -> Q
                 group_size,
             }
         }
-        _ => panic!("Unsupported quantization bits: {} (only 4 and 8 supported)", bits),
+        _ => panic!(
+            "Unsupported quantization bits: {} (only 4 and 8 supported)",
+            bits
+        ),
     }
 }
 
@@ -156,18 +159,12 @@ pub fn dequantize(qt: &QuantizedTensor) -> Vec<f32> {
 ///
 /// Reads a standard AndreAI checkpoint, quantizes every tensor to the
 /// specified bit width (4 or 8), and writes the result.
-pub fn quantize_checkpoint(
-    input_path: &str,
-    output_path: &str,
-    bits: u8,
-) -> std::io::Result<()> {
+pub fn quantize_checkpoint(input_path: &str, output_path: &str, bits: u8) -> std::io::Result<()> {
     assert!(bits == 4 || bits == 8, "bits must be 4 or 8");
 
     let ctx = MetalContext::new();
-    let (model, step) =
-        checkpoint::load_checkpoint(&ctx, input_path).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+    let (model, step) = checkpoint::load_checkpoint(&ctx, input_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
     let group_size: usize = if bits == 4 { 32 } else { 128 };
 
@@ -238,10 +235,7 @@ pub fn quantize_checkpoint(
 
 /// Load a quantized `.qbin` checkpoint, dequantize weights, and construct
 /// a `Transformer` ready for inference.
-pub fn load_quantized(
-    ctx: &Arc<MetalContext>,
-    path: &str,
-) -> std::io::Result<(Transformer, u32)> {
+pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(Transformer, u32)> {
     let mut file = std::fs::File::open(path)?;
     let mut buf4 = [0u8; 4];
 
@@ -430,10 +424,7 @@ fn read_config(file: &mut std::fs::File) -> std::io::Result<ModelConfig> {
     })
 }
 
-fn write_quantized_tensor(
-    file: &mut std::fs::File,
-    qt: &QuantizedTensor,
-) -> std::io::Result<()> {
+fn write_quantized_tensor(file: &mut std::fs::File, qt: &QuantizedTensor) -> std::io::Result<()> {
     // Shape
     let ndims = qt.shape.len() as u32;
     file.write_all(&ndims.to_le_bytes())?;
@@ -531,10 +522,10 @@ pub fn export_gguf(
     let config = &model.config;
 
     // GGUF magic + version
-    file.write_all(b"GGUF")?;                          // magic
-    file.write_all(&3u32.to_le_bytes())?;               // version 3
+    file.write_all(b"GGUF")?; // magic
+    file.write_all(&3u32.to_le_bytes())?; // version 3
     let n_tensors = model.parameters().len() as u64;
-    file.write_all(&n_tensors.to_le_bytes())?;           // tensor count
+    file.write_all(&n_tensors.to_le_bytes())?; // tensor count
 
     // Metadata KV pairs
     let metadata = vec![
@@ -556,29 +547,52 @@ pub fn export_gguf(
     write_gguf_u32(&mut file, "llama.embedding_length", config.d_model as u32)?;
     write_gguf_u32(&mut file, "llama.block_count", config.n_layers as u32)?;
     write_gguf_u32(&mut file, "llama.feed_forward_length", config.d_ff() as u32)?;
-    write_gguf_u32(&mut file, "llama.attention.head_count", config.n_heads as u32)?;
-    write_gguf_u32(&mut file, "llama.attention.head_count_kv", config.n_kv_heads as u32)?;
+    write_gguf_u32(
+        &mut file,
+        "llama.attention.head_count",
+        config.n_heads as u32,
+    )?;
+    write_gguf_u32(
+        &mut file,
+        "llama.attention.head_count_kv",
+        config.n_kv_heads as u32,
+    )?;
     write_gguf_u32(&mut file, "llama.vocab_size", config.vocab_size)?;
     write_gguf_f32(&mut file, "llama.rope.freq_base", config.rope_theta)?;
-    write_gguf_f32(&mut file, "llama.attention.layer_norm_rms_epsilon", config.norm_eps)?;
-    write_gguf_u32(&mut file, "general.file_type", if quantize_type == "q8_0" { 7 } else { 0 })?;
+    write_gguf_f32(
+        &mut file,
+        "llama.attention.layer_norm_rms_epsilon",
+        config.norm_eps,
+    )?;
+    write_gguf_u32(
+        &mut file,
+        "general.file_type",
+        if quantize_type == "q8_0" { 7 } else { 0 },
+    )?;
 
     // Tensor info headers (name, shape, type, offset)
     let params = model.parameters();
     let tensor_names = get_gguf_tensor_names(config);
-    assert_eq!(params.len(), tensor_names.len(),
+    assert_eq!(
+        params.len(),
+        tensor_names.len(),
         "Tensor count mismatch: model has {} but naming generates {}",
-        params.len(), tensor_names.len());
+        params.len(),
+        tensor_names.len()
+    );
 
     let mut data_offset: u64 = 0;
     let gguf_type = if quantize_type == "q8_0" { 8u32 } else { 0u32 }; // F32=0, Q8_0=8
 
     // Pre-quantize all tensors if Q8_0 so we know exact sizes for offset calculation
     let quantized_data: Vec<Option<QuantizedTensor>> = if quantize_type == "q8_0" {
-        params.iter().map(|p| {
-            let data = p.to_vec();
-            Some(quantize(&data, &p.shape, 8, 32))
-        }).collect()
+        params
+            .iter()
+            .map(|p| {
+                let data = p.to_vec();
+                Some(quantize(&data, &p.shape, 8, 32))
+            })
+            .collect()
     } else {
         params.iter().map(|_| None).collect()
     };
@@ -625,8 +639,10 @@ pub fn export_gguf(
     }
 
     let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
-    eprintln!("GGUF exported: {} ({:.1} MB, {} tensors, {})",
-        output_path, size_mb, n_tensors, quantize_type);
+    eprintln!(
+        "GGUF exported: {} ({:.1} MB, {} tensors, {})",
+        output_path, size_mb, n_tensors, quantize_type
+    );
     Ok(())
 }
 
@@ -662,7 +678,11 @@ fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
         names.push("token_embd_proj.weight".to_string());
     }
     // Per-layer tensors — when shared_layers, parameters() returns 1 unique layer
-    let n_unique_layers = if config.shared_layers { 1 } else { config.n_layers };
+    let n_unique_layers = if config.shared_layers {
+        1
+    } else {
+        config.n_layers
+    };
     for i in 0..n_unique_layers {
         if config.lowrank > 0 {
             // Low-rank: U and V for each projection
@@ -710,10 +730,7 @@ fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
 
 /// Export model to Safetensors format for HuggingFace ecosystem.
 /// Safetensors is a simple, safe format: JSON header + raw tensor data.
-pub fn export_safetensors(
-    model: &Transformer,
-    output_path: &str,
-) -> std::io::Result<()> {
+pub fn export_safetensors(model: &Transformer, output_path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let config = &model.config;
     let params = model.parameters();
@@ -724,12 +741,17 @@ pub fn export_safetensors(
     let mut header = String::from("{");
     let mut offset: usize = 0;
     for (i, (param, name)) in params.iter().zip(tensor_names.iter()).enumerate() {
-        if i > 0 { header.push(','); }
+        if i > 0 {
+            header.push(',');
+        }
         let nbytes = param.numel() * 4;
         let shape_str: Vec<String> = param.shape.iter().map(|d| d.to_string()).collect();
         header.push_str(&format!(
             "\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
-            name, shape_str.join(","), offset, offset + nbytes
+            name,
+            shape_str.join(","),
+            offset,
+            offset + nbytes
         ));
         offset += nbytes;
     }
@@ -753,7 +775,11 @@ pub fn export_safetensors(
     }
 
     let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
-    eprintln!("Safetensors exported: {} ({:.1} MB, {} tensors)",
-        output_path, size_mb, params.len());
+    eprintln!(
+        "Safetensors exported: {} ({:.1} MB, {} tensors)",
+        output_path,
+        size_mb,
+        params.len()
+    );
     Ok(())
 }

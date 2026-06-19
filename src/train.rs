@@ -1,9 +1,9 @@
 use crate::autograd;
 use crate::checkpoint;
 use crate::data::DataLoader;
-use crate::loss;
 use crate::gpu::compute;
 use crate::gpu::MetalContext;
+use crate::loss;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use std::io::Write as IoWrite;
@@ -213,8 +213,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         eprintln!("Matmul: hardware simdgroup MMA fast path enabled (default; --no-simdgroup-matmul to disable)");
     } else if config.bf16_matmul {
         compute::set_bf16_matmul(true);
-        eprintln!("Matmul: bf16 path enabled (fp32 range, ~7-bit mantissa — OVERFLOW-MITIGATION ONLY; \
-                   destabilizes training otherwise vs the more-precise fp16 default)");
+        eprintln!(
+            "Matmul: bf16 path enabled (fp32 range, ~7-bit mantissa — OVERFLOW-MITIGATION ONLY; \
+                   destabilizes training otherwise vs the more-precise fp16 default)"
+        );
     }
 
     // Create checkpoint directory
@@ -223,16 +225,25 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Training log file (CSV: step, loss, lr, tok/s, elapsed, tokens)
     let log_path = format!("{}/train.csv", config.checkpoint_dir);
     let log_exists = std::path::Path::new(&log_path).exists();
-    let mut log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     if !log_exists {
-        writeln!(log_file, "step,loss,lr,tok_per_sec,elapsed_sec,total_tokens")?;
+        writeln!(
+            log_file,
+            "step,loss,lr,tok_per_sec,elapsed_sec,total_tokens"
+        )?;
     }
 
     // Load teacher model for distillation (frozen, no grad)
     let teacher_model = match &config.teacher_checkpoint {
         Some(teacher_path) => {
             eprintln!("Distillation mode: loading teacher from {}", teacher_path);
-            eprintln!("  temperature={}, alpha={}", config.distill_temperature, config.distill_alpha);
+            eprintln!(
+                "  temperature={}, alpha={}",
+                config.distill_temperature, config.distill_alpha
+            );
             let (teacher, _step) = checkpoint::load_checkpoint(ctx, teacher_path)?;
             Some(teacher)
         }
@@ -242,8 +253,14 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Load reference model for speculative pretraining (frozen, scores batches)
     let ref_model = match &config.reference_model {
         Some(ref_path) => {
-            eprintln!("Speculative pretraining: loading reference from {}", ref_path);
-            eprintln!("  threshold={:.1} (skip batches where ref loss < threshold)", config.speculative_threshold);
+            eprintln!(
+                "Speculative pretraining: loading reference from {}",
+                ref_path
+            );
+            eprintln!(
+                "  threshold={:.1} (skip batches where ref loss < threshold)",
+                config.speculative_threshold
+            );
             let (ref_m, _) = checkpoint::load_checkpoint(ctx, ref_path)?;
             Some(ref_m)
         }
@@ -259,17 +276,27 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let empty_refs: Vec<&crate::tensor::Tensor> = Vec::new();
 
     // Initialize model + optimizer (fresh or from resume checkpoint)
-    let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) = config.resume_from {
+    let (model, mut optimizer, start_step, mut total_tokens) = if let Some(ref resume_path) =
+        config.resume_from
+    {
         eprintln!("=== RESUMING from {} ===", resume_path);
-        let (model, opt_states, step, opt_step, tokens) = checkpoint::load_training_state(ctx, resume_path)?;
+        let (model, opt_states, step, opt_step, tokens) =
+            checkpoint::load_training_state(ctx, resume_path)?;
         eprintln!(
             "Resumed model: {}M params, {} layers, d_model={}, {} heads",
             model.config.param_count() as f32 / 1e6,
-            model.config.n_layers, model.config.d_model, model.config.n_heads
+            model.config.n_layers,
+            model.config.d_model,
+            model.config.n_heads
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw {
+            &param_refs
+        } else {
+            &empty_refs
+        };
+        let optimizer =
+            AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         // Only restore AdamW state when the main AdamW is the live optimizer and the checkpoint
         // actually carries matching state (non-adamw checkpoints save none — see save_training_state).
         #[cfg(feature = "metal")]
@@ -292,7 +319,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
         // Resume from step+1 — the checkpoint was saved AFTER step completed
         let resume_step = step + 1;
-        eprintln!("Resuming at step {}/{}, {} tokens, optimizer step {}", resume_step, config.total_steps, tokens, opt_step);
+        eprintln!(
+            "Resuming at step {}/{}, {} tokens, optimizer step {}",
+            resume_step, config.total_steps, tokens, opt_step
+        );
         (model, optimizer, resume_step, tokens)
     } else if let Some(ref pretrained_path) = config.pretrained {
         // Load pretrained model weights (fresh optimizer, step 0).
@@ -302,17 +332,30 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         eprintln!(
             "Pretrained model: {}M params, {} layers, d_model={}, {} heads (trained to step {})",
             model.config.param_count() as f32 / 1e6,
-            model.config.n_layers, model.config.d_model, model.config.n_heads, step
+            model.config.n_layers,
+            model.config.d_model,
+            model.config.n_heads,
+            step
         );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw {
+            &param_refs
+        } else {
+            &empty_refs
+        };
+        let optimizer =
+            AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     } else {
         let model = Transformer::new(ctx, config.model_config.clone());
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw { &param_refs } else { &empty_refs };
-        let optimizer = AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
+        let opt_params: &[&crate::tensor::Tensor] = if uses_main_adamw {
+            &param_refs
+        } else {
+            &empty_refs
+        };
+        let optimizer =
+            AdamW::new_with_config(ctx, opt_params, config.weight_decay, config.adamw_hyper());
         (model, optimizer, 0, 0u64)
     };
 
@@ -320,17 +363,30 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut sophia_opt = if config.optimizer_type == "sophia" {
         eprintln!("Using Sophia optimizer (2x faster convergence)");
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        Some(crate::optim::Sophia::new(ctx, &param_refs, config.weight_decay))
+        Some(crate::optim::Sophia::new(
+            ctx,
+            &param_refs,
+            config.weight_decay,
+        ))
     } else {
         None
     };
 
     // Create Muon optimizer if selected (2.5x faster convergence than AdamW)
     let mut muon_opt = if config.optimizer_type == "muon" {
-        eprintln!("Using Muon optimizer (2.5x faster convergence — Newton-Schulz orthogonalization)");
+        eprintln!(
+            "Using Muon optimizer (2.5x faster convergence — Newton-Schulz orthogonalization)"
+        );
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let n_2d = param_refs.iter().filter(|p| p.shape.len() == 2 && p.shape[0] > 1 && p.shape[1] > 1).count();
-        eprintln!("  {}/{} params use Muon (2D), rest use AdamW fallback", n_2d, param_refs.len());
+        let n_2d = param_refs
+            .iter()
+            .filter(|p| p.shape.len() == 2 && p.shape[0] > 1 && p.shape[1] > 1)
+            .count();
+        eprintln!(
+            "  {}/{} params use Muon (2D), rest use AdamW fallback",
+            n_2d,
+            param_refs.len()
+        );
         let mut m = crate::optim::Muon::new(ctx, &param_refs, config.weight_decay);
         m.adamw_hyper = config.adamw_hyper();
         if config.normuon {
@@ -348,11 +404,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
     // Create Muon+AdamW hybrid if selected — Muon for hidden 2-D matrices, hardened AdamW for
     // embeddings/head/routers/norms (the canonical recipe; routes by role, not just by shape).
-    let mut hybrid_opt = if config.optimizer_type == "hybrid" || config.optimizer_type == "muon-adamw" {
+    let mut hybrid_opt = if config.optimizer_type == "hybrid"
+        || config.optimizer_type == "muon-adamw"
+    {
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
         let force_adamw = model.force_adamw_param_ids();
         let mut h = crate::optim::HybridOptimizer::new(
-            ctx, &param_refs, config.weight_decay, &force_adamw, config.adamw_hyper(),
+            ctx,
+            &param_refs,
+            config.weight_decay,
+            &force_adamw,
+            config.adamw_hyper(),
         );
         h.set_lr_scales(config.muon_lr_scale, config.adamw_lr_scale);
         if config.normuon {
@@ -374,10 +436,23 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Create 8-bit AdamW if selected — block-wise int8 moments, ~4× less optimizer memory.
     let mut adamw8_opt = if config.optimizer_type == "adamw-8bit" {
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
-        let o = crate::optim::AdamW8bit::new_with_config(ctx, &param_refs, config.weight_decay, config.adamw_hyper());
-        let full = model.parameters().iter().map(|p| p.numel() * 8).sum::<usize>(); // fp32 m+v
-        eprintln!("Using 8-bit AdamW: optimizer memory {:.1}MB (vs {:.1}MB fp32, {:.1}× smaller)",
-            o.memory_bytes() as f32 / 1e6, full as f32 / 1e6, full as f32 / o.memory_bytes().max(1) as f32);
+        let o = crate::optim::AdamW8bit::new_with_config(
+            ctx,
+            &param_refs,
+            config.weight_decay,
+            config.adamw_hyper(),
+        );
+        let full = model
+            .parameters()
+            .iter()
+            .map(|p| p.numel() * 8)
+            .sum::<usize>(); // fp32 m+v
+        eprintln!(
+            "Using 8-bit AdamW: optimizer memory {:.1}MB (vs {:.1}MB fp32, {:.1}× smaller)",
+            o.memory_bytes() as f32 / 1e6,
+            full as f32 / 1e6,
+            full as f32 / o.memory_bytes().max(1) as f32
+        );
         Some(o)
     } else {
         None
@@ -388,12 +463,22 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     if let Some(ref resume_path) = config.resume_from {
         match checkpoint::load_opt_sidecar(&format!("{resume_path}.opt"))? {
             Some((ty, ostep, blobs)) if ty == config.optimizer_type => {
-                if let Some(o) = muon_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
-                else if let Some(o) = hybrid_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
-                else if let Some(o) = adamw8_opt.as_mut() { o.load_state_blobs(ostep, &blobs); }
-                eprintln!("Restored '{}' optimizer state from sidecar (opt step {})", ty, ostep);
+                if let Some(o) = muon_opt.as_mut() {
+                    o.load_state_blobs(ostep, &blobs);
+                } else if let Some(o) = hybrid_opt.as_mut() {
+                    o.load_state_blobs(ostep, &blobs);
+                } else if let Some(o) = adamw8_opt.as_mut() {
+                    o.load_state_blobs(ostep, &blobs);
+                }
+                eprintln!(
+                    "Restored '{}' optimizer state from sidecar (opt step {})",
+                    ty, ostep
+                );
             }
-            Some((ty, _, _)) => eprintln!("[WARN] sidecar optimizer '{}' != configured '{}' — starting optimizer state fresh", ty, config.optimizer_type),
+            Some((ty, _, _)) => eprintln!(
+                "[WARN] sidecar optimizer '{}' != configured '{}' — starting optimizer state fresh",
+                ty, config.optimizer_type
+            ),
             None => {}
         }
     }
@@ -413,15 +498,20 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         config.max_lr, mup_scale, batch_scale, effective_lr, config.batch_size, config.lr_ref_batch
     );
     if mup_scale < 1.0 {
-        eprintln!("μP enabled: base_width={}, width-LR scale {:.4}",
-            config.model_config.mup_base_width, mup_scale);
+        eprintln!(
+            "μP enabled: base_width={}, width-LR scale {:.4}",
+            config.model_config.mup_base_width, mup_scale
+        );
     }
 
     // Learning rate scheduler — multiple options from research
     let get_lr: Box<dyn Fn(u32) -> f32> = if config.lr_schedule == "wsd" {
-        let wsd = crate::optim::WSDScheduler::new(effective_lr, config.warmup_steps, config.total_steps);
-        eprintln!("LR schedule: WSD (warmup={}, stable={}, decay={})",
-            wsd.warmup_steps, wsd.stable_steps, wsd.decay_steps);
+        let wsd =
+            crate::optim::WSDScheduler::new(effective_lr, config.warmup_steps, config.total_steps);
+        eprintln!(
+            "LR schedule: WSD (warmup={}, stable={}, decay={})",
+            wsd.warmup_steps, wsd.stable_steps, wsd.decay_steps
+        );
         Box::new(move |step| wsd.get_lr(step))
     } else if config.lr_schedule == "wso" {
         // Warmup-Stable-Only: no decay. Best before SFT. (arXiv 2602.06797)
@@ -429,8 +519,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let lr = effective_lr;
         eprintln!("LR schedule: WSO (warmup={}, then constant)", warmup);
         Box::new(move |step| {
-            if step < warmup { lr * (step as f32 / warmup.max(1) as f32) }
-            else { lr }
+            if step < warmup {
+                lr * (step as f32 / warmup.max(1) as f32)
+            } else {
+                lr
+            }
         })
     } else if config.lr_schedule == "invsqrt" {
         // Inverse sqrt: original Transformer schedule (Vaswani 2017)
@@ -445,11 +538,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         let after_warmup = total.saturating_sub(warmup);
         let stable = (after_warmup as f32 * 0.6) as u32;
         let lr = effective_lr;
-        eprintln!("LR schedule: trapezoid (warmup={}, stable={}, decay to 10%)", warmup, stable);
-        Box::new(move |step| crate::optim::trapezoidal_lr(lr, lr * 0.1, warmup, stable, total, step))
+        eprintln!(
+            "LR schedule: trapezoid (warmup={}, stable={}, decay to 10%)",
+            warmup, stable
+        );
+        Box::new(move |step| {
+            crate::optim::trapezoidal_lr(lr, lr * 0.1, warmup, stable, total, step)
+        })
     } else {
         let scheduler = if config.lr_restart_period > 0 {
-            CosineWarmupScheduler::with_restarts(effective_lr, config.warmup_steps, config.total_steps, config.lr_restart_period)
+            CosineWarmupScheduler::with_restarts(
+                effective_lr,
+                config.warmup_steps,
+                config.total_steps,
+                config.lr_restart_period,
+            )
         } else {
             CosineWarmupScheduler::new(effective_lr, config.warmup_steps, config.total_steps)
         };
@@ -461,7 +564,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // grad_logits buffer would be batch_seq × vocab × 4 bytes (268MB at batch=64).
     let batch_seq = config.batch_size * config.seq_len;
     let loss_ws = if !config.fused_ce || config.model_config.n_predict > 0 {
-        Some(loss::LossWorkspace::new(ctx, batch_seq, config.model_config.vocab_size as usize))
+        Some(loss::LossWorkspace::new(
+            ctx,
+            batch_seq,
+            config.model_config.vocab_size as usize,
+        ))
     } else {
         None
     };
@@ -471,11 +578,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Used as a teacher for KL-divergence self-distillation during training.
     let ema_buffers: Vec<crate::gpu::Buf> = if config.ema_decay > 0.0 {
         eprintln!("Self-distillation: EMA decay={}", config.ema_decay);
-        model.parameters().iter().map(|p| {
-            let buf = ctx.alloc_buffer(p.numel() * 4);
-            compute::gpu_copy(ctx, &p.buffer, &buf, p.numel() as u32);
-            buf
-        }).collect()
+        model
+            .parameters()
+            .iter()
+            .map(|p| {
+                let buf = ctx.alloc_buffer(p.numel() * 4);
+                compute::gpu_copy(ctx, &p.buffer, &buf, p.numel() as u32);
+                buf
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -483,8 +594,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // Data loader
     let mut data_loader = DataLoader::new(&config.dataset_path, config.batch_size, config.seq_len)?;
     let batches_per_epoch = data_loader.batches_per_epoch();
-    eprintln!("Dataset: {} tokens, ~{} batches/epoch", data_loader.total_tokens(), batches_per_epoch);
-
+    eprintln!(
+        "Dataset: {} tokens, ~{} batches/epoch",
+        data_loader.total_tokens(),
+        batches_per_epoch
+    );
 
     // total_tokens initialized from resume state or 0
     let start_time = Instant::now();
@@ -583,7 +697,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 // Run reference forward + loss entirely in no_grad to avoid tape pollution
                 let ref_loss_val = autograd::no_grad(|| {
                     ctx.begin_batch();
-                    let ref_logits = ref_m.forward(inputs, config.batch_size, effective_seq, None, false);
+                    let ref_logits =
+                        ref_m.forward(inputs, config.batch_size, effective_seq, None, false);
                     let (ref_loss, _) = loss::cross_entropy_loss(ctx, &ref_logits, targets);
                     ctx.flush_batch();
                     let val = ref_loss.to_vec()[0];
@@ -604,10 +719,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Two paths: standard (compute logits, then CE) or fused (LM head + CE in chunks)
             let n_predict = config.model_config.n_predict;
 
-            let (loss_tensor, grad_logits, grad_buffer_elems) = if config.fused_ce && n_predict == 0 && config.teacher_checkpoint.is_none() {
+            let (loss_tensor, grad_logits, grad_buffer_elems) = if config.fused_ce
+                && n_predict == 0
+                && config.teacher_checkpoint.is_none()
+            {
                 // FusedLinearCrossEntropy: compute logits+loss in chunks, never materialize full logit tensor.
                 // Saves ~2GB peak memory. Incompatible with MTP and distillation (they need full logits).
-                let hidden = model.forward_hidden(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                let hidden = model.forward_hidden(
+                    inputs,
+                    config.batch_size,
+                    effective_seq,
+                    config.gradient_checkpointing,
+                );
                 // For factored embedding, we need the un-factored embedding for the fused CE.
                 // Use the full vocab embedding (either direct or projected).
                 if model.embed_rank > 0 {
@@ -620,23 +743,53 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     } else {
                         loss::cross_entropy_loss(ctx, &logits, targets)
                     };
-                    (loss, grad, config.batch_size * effective_seq * config.model_config.vocab_size as usize)
+                    (
+                        loss,
+                        grad,
+                        config.batch_size * effective_seq * config.model_config.vocab_size as usize,
+                    )
                 } else {
-                    let (loss, grad) = loss::fused_linear_cross_entropy(ctx, &hidden, &model.embedding, targets, 1024);
-                    (loss, grad, config.batch_size * effective_seq * config.model_config.d_model)
+                    let (loss, grad) = loss::fused_linear_cross_entropy(
+                        ctx,
+                        &hidden,
+                        &model.embedding,
+                        targets,
+                        1024,
+                    );
+                    (
+                        loss,
+                        grad,
+                        config.batch_size * effective_seq * config.model_config.d_model,
+                    )
                 }
             } else {
                 // Standard path: compute hidden → LM head → CE
                 let (logits, extra_logits, hidden_for_distill) = if n_predict > 0 {
-                    let (l, e) = model.forward_mtp(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    let (l, e) = model.forward_mtp(
+                        inputs,
+                        config.batch_size,
+                        effective_seq,
+                        config.gradient_checkpointing,
+                    );
                     (l, e, None)
                 } else if config.ema_decay > 0.0 {
                     // When EMA active: use forward_hidden to get hidden states for self-distillation
-                    let hidden = model.forward_hidden(inputs, config.batch_size, effective_seq, config.gradient_checkpointing);
+                    let hidden = model.forward_hidden(
+                        inputs,
+                        config.batch_size,
+                        effective_seq,
+                        config.gradient_checkpointing,
+                    );
                     let logits = model.apply_lm_head(&hidden);
                     (logits, Vec::new(), Some(hidden))
                 } else {
-                    let l = model.forward(inputs, config.batch_size, effective_seq, None, config.gradient_checkpointing);
+                    let l = model.forward(
+                        inputs,
+                        config.batch_size,
+                        effective_seq,
+                        None,
+                        config.gradient_checkpointing,
+                    );
                     (l, Vec::new(), None)
                 };
 
@@ -645,8 +798,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                         teacher.forward(inputs, config.batch_size, effective_seq, None, false)
                     });
                     loss::distillation_loss(
-                        ctx, &logits, &teacher_logits,
-                        config.distill_temperature, config.distill_alpha, targets,
+                        ctx,
+                        &logits,
+                        &teacher_logits,
+                        config.distill_temperature,
+                        config.distill_alpha,
+                        targets,
                     )
                 } else if let Some(ref ws) = loss_ws {
                     loss::cross_entropy_loss_with_workspace(ctx, &logits, targets, ws)
@@ -656,7 +813,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
                 // Z-loss: penalize large logit magnitudes (MoE stability)
                 if config.z_loss_coefficient > 0.0 {
-                    loss::z_loss(ctx, &logits, &loss_tensor.buffer, &grad_logits, config.z_loss_coefficient);
+                    loss::z_loss(
+                        ctx,
+                        &logits,
+                        &loss_tensor.buffer,
+                        &grad_logits,
+                        config.z_loss_coefficient,
+                    );
                 }
 
                 // EMA self-distillation: teacher logits from hidden @ ema_embedding^T
@@ -678,29 +841,71 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                                 let d = config.model_config.d_model;
                                 let r = model.embed_rank;
                                 let h_proj_buf = ctx.alloc_buffer(n * r * 4);
-                                compute::gpu_matmul_trans_b(ctx, &h.buffer, ema_proj, &h_proj_buf,
-                                    n as u32, r as u32, d as u32);
+                                compute::gpu_matmul_trans_b(
+                                    ctx,
+                                    &h.buffer,
+                                    ema_proj,
+                                    &h_proj_buf,
+                                    n as u32,
+                                    r as u32,
+                                    d as u32,
+                                );
                                 let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
-                                compute::gpu_matmul_trans_b(ctx, &h_proj_buf, ema_embed, &teacher_buf,
-                                    n as u32, vocab as u32, r as u32);
-                                crate::tensor::Tensor::from_buffer(Arc::clone(&h.ctx), teacher_buf, vec![n, vocab])
+                                compute::gpu_matmul_trans_b(
+                                    ctx,
+                                    &h_proj_buf,
+                                    ema_embed,
+                                    &teacher_buf,
+                                    n as u32,
+                                    vocab as u32,
+                                    r as u32,
+                                );
+                                crate::tensor::Tensor::from_buffer(
+                                    Arc::clone(&h.ctx),
+                                    teacher_buf,
+                                    vec![n, vocab],
+                                )
                             } else {
                                 let d = config.model_config.d_model;
                                 let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
-                                compute::gpu_matmul_trans_b(ctx, &h.buffer, ema_embed, &teacher_buf,
-                                    n as u32, vocab as u32, d as u32);
-                                crate::tensor::Tensor::from_buffer(Arc::clone(&h.ctx), teacher_buf, vec![n, vocab])
+                                compute::gpu_matmul_trans_b(
+                                    ctx,
+                                    &h.buffer,
+                                    ema_embed,
+                                    &teacher_buf,
+                                    n as u32,
+                                    vocab as u32,
+                                    d as u32,
+                                );
+                                crate::tensor::Tensor::from_buffer(
+                                    Arc::clone(&h.ctx),
+                                    teacher_buf,
+                                    vec![n, vocab],
+                                )
                             }
                         });
                         // KL distillation: alpha=0.1, temperature=2.0
                         let (distill_loss, distill_grad) = loss::distillation_loss(
-                            ctx, &logits, &teacher_logits, 2.0, 0.1, targets,
+                            ctx,
+                            &logits,
+                            &teacher_logits,
+                            2.0,
+                            0.1,
+                            targets,
                         );
                         // Add distillation loss to main loss for display
                         compute::gpu_axpy(ctx, &loss_tensor.buffer, &distill_loss.buffer, 1, 0.1);
                         // Add distillation gradient to CE gradient
-                        compute::gpu_axpy(ctx, &grad_logits, &distill_grad,
-                            (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, 0.1);
+                        compute::gpu_axpy(
+                            ctx,
+                            &grad_logits,
+                            &distill_grad,
+                            (config.batch_size
+                                * effective_seq
+                                * config.model_config.vocab_size as usize)
+                                as u32,
+                            0.1,
+                        );
                     }
                 }
 
@@ -708,7 +913,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 if !extra_logits.is_empty() {
                     let mtp_weight = 1.0 / (n_predict + 1) as f32;
                     compute::gpu_scale(ctx, &loss_tensor.buffer, 1, mtp_weight);
-                    compute::gpu_scale(ctx, &grad_logits, (config.batch_size * effective_seq * config.model_config.vocab_size as usize) as u32, mtp_weight);
+                    compute::gpu_scale(
+                        ctx,
+                        &grad_logits,
+                        (config.batch_size
+                            * effective_seq
+                            * config.model_config.vocab_size as usize)
+                            as u32,
+                        mtp_weight,
+                    );
 
                     for (k, extra_log) in extra_logits.iter().enumerate() {
                         let shift = k + 1;
@@ -722,13 +935,18 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                                 }
                             }
                         }
-                        let (extra_loss, _extra_grad) = loss::cross_entropy_loss(ctx, extra_log, &shifted_targets);
+                        let (extra_loss, _extra_grad) =
+                            loss::cross_entropy_loss(ctx, extra_log, &shifted_targets);
                         compute::gpu_scale(ctx, &extra_loss.buffer, 1, mtp_weight);
                         compute::gpu_add_inplace(ctx, &loss_tensor.buffer, &extra_loss.buffer, 1);
                     }
                 }
 
-                (loss_tensor, grad_logits, config.batch_size * effective_seq * config.model_config.vocab_size as usize)
+                (
+                    loss_tensor,
+                    grad_logits,
+                    config.batch_size * effective_seq * config.model_config.vocab_size as usize,
+                )
             };
 
             // Online data pruning: skip backward if loss is below threshold.
@@ -782,9 +1000,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Frozen layers still run forward but don't get weight updates → saves optimizer compute.
         if config.freeze_fraction > 0.0 {
             let progress = step as f32 / config.total_steps as f32;
-            if progress > 0.25 { // start freezing after 25% of training
+            if progress > 0.25 {
+                // start freezing after 25% of training
                 let n_layers = model.blocks.len();
-                let n_freeze = ((n_layers as f32 * config.freeze_fraction * progress.min(1.0)) as usize).min(n_layers - 1);
+                let n_freeze = ((n_layers as f32 * config.freeze_fraction * progress.min(1.0))
+                    as usize)
+                    .min(n_layers - 1);
                 if n_freeze > 0 {
                     // Zero gradients for frozen layer parameters
                     for block in model.blocks.iter().take(n_freeze) {
@@ -838,7 +1059,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Alternating sign each step creates anticorrelated noise that navigates to flatter minima.
         // noise_t ≈ scale * ((-1)^step) * randn — simple sign-flip anticorrelation.
         if config.noise_scale > 0.0 && lr > 1e-10 {
-            let sign = if step % 2 == 0 { config.noise_scale } else { -config.noise_scale };
+            let sign = if step % 2 == 0 {
+                config.noise_scale
+            } else {
+                -config.noise_scale
+            };
             for param in &model.parameters() {
                 let noise = crate::tensor::Tensor::randn(ctx, param.shape.clone(), sign * lr);
                 compute::gpu_add_inplace(ctx, &param.buffer, &noise.buffer, param.numel() as u32);
@@ -848,7 +1073,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // EMA update: ema = decay * ema + (1-decay) * model_weights
         if config.ema_decay > 0.0 {
             for (ema_buf, param) in ema_buffers.iter().zip(model.parameters().iter()) {
-                compute::gpu_ema_update(ctx, ema_buf, &param.buffer, param.numel() as u32, config.ema_decay);
+                compute::gpu_ema_update(
+                    ctx,
+                    ema_buf,
+                    &param.buffer,
+                    param.numel() as u32,
+                    config.ema_decay,
+                );
             }
         }
         // Sync flush: wait for GPU to finish forward+backward+optimizer before reading any buffers.
@@ -859,7 +1090,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         autograd::zero_grads_recycle();
         crate::tensor::Tensor::clear_f16_cache_recycle();
 
-        let tokens_this_step = (config.batch_size * effective_seq * grad_accum_steps as usize) as u64;
+        let tokens_this_step =
+            (config.batch_size * effective_seq * grad_accum_steps as usize) as u64;
         total_tokens += tokens_this_step;
 
         // Logging + NaN detection (at log intervals and always on the final step).
@@ -874,23 +1106,36 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             } else {
                 0.0
             };
-            let loss_val = if grad_accum_steps > 1 { raw_loss / loss_scale } else { raw_loss };
+            let loss_val = if grad_accum_steps > 1 {
+                raw_loss / loss_scale
+            } else {
+                raw_loss
+            };
             if loss_val.is_nan() || loss_val.is_infinite() {
-                eprintln!("FATAL: loss is {} at step {}. Training diverged.", loss_val, step);
+                eprintln!(
+                    "FATAL: loss is {} at step {}. Training diverged.",
+                    loss_val, step
+                );
                 eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
                 break;
             }
             // Auto-detect loss spikes: if loss > 2× EMA, warn (may need lower LR)
             if ema_loss > 0.0 && loss_val > ema_loss * 2.0 && step > config.warmup_steps {
-                eprintln!("[WARN] Loss spike: {:.4} > 2× EMA {:.4} at step {}. Consider lowering --lr.",
-                    loss_val, ema_loss, step);
+                eprintln!(
+                    "[WARN] Loss spike: {:.4} > 2× EMA {:.4} at step {}. Consider lowering --lr.",
+                    loss_val, ema_loss, step
+                );
             }
             let step_time = step_start.elapsed().as_secs_f32();
             let tokens_per_sec = tokens_this_step as f32 / step_time;
             let elapsed = start_time.elapsed().as_secs();
             let (tape_ops, tape_bytes) = autograd::tape_stats();
             if step == 0 {
-                eprintln!("Tape: {} ops, {:.1} MB activation memory", tape_ops, tape_bytes as f64 / (1024.0 * 1024.0));
+                eprintln!(
+                    "Tape: {} ops, {:.1} MB activation memory",
+                    tape_ops,
+                    tape_bytes as f64 / (1024.0 * 1024.0)
+                );
             }
 
             let (pool_hits, pool_misses) = MetalContext::pool_stats();
@@ -899,7 +1144,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // gpu_l2_norm_check forces a batch flush + readback (8 bytes).
             let weight_norm = if step % 100 == 0 {
                 let param0 = &model.parameters()[0];
-                let (weight_norm_sq, has_nan) = compute::gpu_l2_norm_check(ctx, &param0.buffer, param0.numel() as u32);
+                let (weight_norm_sq, has_nan) =
+                    compute::gpu_l2_norm_check(ctx, &param0.buffer, param0.numel() as u32);
                 if has_nan {
                     eprintln!("[WARN] NaN detected in model weights at step {}", step);
                 }
@@ -909,12 +1155,17 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             };
 
             // Track EMA loss and peak throughput
-            if ema_loss == 0.0 { ema_loss = loss_val; }
-            else { ema_loss = 0.95 * ema_loss + 0.05 * loss_val; }
+            if ema_loss == 0.0 {
+                ema_loss = loss_val;
+            } else {
+                ema_loss = 0.95 * ema_loss + 0.05 * loss_val;
+            }
             if ema_loss < best_train_loss {
                 best_train_loss = ema_loss;
             }
-            if tokens_per_sec > peak_tok_s { peak_tok_s = tokens_per_sec; }
+            if tokens_per_sec > peak_tok_s {
+                peak_tok_s = tokens_per_sec;
+            }
 
             // ETA estimation
             let steps_done = (step - start_step + 1) as f32;
@@ -929,7 +1180,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 format!("{}s", eta_secs)
             };
 
-            let loss_delta = if prev_loss > 0.0 { loss_val - prev_loss } else { 0.0 };
+            let loss_delta = if prev_loss > 0.0 {
+                loss_val - prev_loss
+            } else {
+                0.0
+            };
             prev_loss = loss_val;
 
             eprintln!(
@@ -943,13 +1198,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             );
 
             // Write to CSV log file
-            let _ = writeln!(log_file, "{},{:.6},{:.6e},{:.1},{},{}", step, loss_val, lr, tokens_per_sec, elapsed, total_tokens);
+            let _ = writeln!(
+                log_file,
+                "{},{:.6},{:.6e},{:.1},{},{}",
+                step, loss_val, lr, tokens_per_sec, elapsed, total_tokens
+            );
         }
 
         // ReLoRA: periodically merge lowrank adapters into base weights, then reinitialize.
         // W_base += U @ V, reinit U/V. After K merges at rank r, effective rank ≈ K × r.
-        if config.relora_interval > 0 && config.model_config.lowrank > 0
-            && step > 0 && step % config.relora_interval == 0
+        if config.relora_interval > 0
+            && config.model_config.lowrank > 0
+            && step > 0
+            && step % config.relora_interval == 0
         {
             let reinit_scale = 0.01;
             let mut n_merged = 0;
@@ -964,8 +1225,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             // Stale momentum from pre-merge would push the fresh adapters in the wrong direction.
             optimizer.reset_states_for_params(ctx, &model.parameters());
 
-            eprintln!("[ReLoRA] Step {}: merged {} weight pairs across {} layers (reinit scale={})",
-                step, n_merged, model.blocks.len(), reinit_scale);
+            eprintln!(
+                "[ReLoRA] Step {}: merged {} weight pairs across {} layers (reinit scale={})",
+                step,
+                n_merged,
+                model.blocks.len(),
+                reinit_scale
+            );
         }
 
         // Checkpointing — save both model-only and full training state for resume
@@ -978,7 +1244,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             checkpoint::save_checkpoint(&path, &model, step)?;
             let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
-            save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
+            save_opt_sidecar_for(
+                &state_path,
+                &config.optimizer_type,
+                &muon_opt,
+                &hybrid_opt,
+                &adamw8_opt,
+            )?;
 
             // EMA export: the moving-average weights are usually a better model than the live snapshot
             // (self-distillation result). Save them alongside so they aren't discarded. Loads via the
@@ -1000,7 +1272,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // Validation loss + early stopping (if validation dataset provided)
         if let Some(ref val_path) = config.val_dataset {
             if step > 0 && step % config.checkpoint_interval == 0 {
-                let val_loss = compute_validation_loss(ctx, &model, val_path, config.batch_size, config.seq_len)?;
+                let val_loss = compute_validation_loss(
+                    ctx,
+                    &model,
+                    val_path,
+                    config.batch_size,
+                    config.seq_len,
+                )?;
                 let _ = writeln!(log_file, "# val_loss={:.6} at step {}", val_loss, step);
                 if val_loss < best_val_loss {
                     best_val_loss = val_loss;
@@ -1008,9 +1286,15 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     eprintln!("  val_loss: {:.4} (new best)", val_loss);
                 } else {
                     val_no_improve += 1;
-                    eprintln!("  val_loss: {:.4} (no improve {}/{})", val_loss, val_no_improve, early_stop_patience);
+                    eprintln!(
+                        "  val_loss: {:.4} (no improve {}/{})",
+                        val_loss, val_no_improve, early_stop_patience
+                    );
                     if early_stop_patience > 0 && val_no_improve >= early_stop_patience {
-                        eprintln!("Early stopping: val_loss didn't improve for {} checks", early_stop_patience);
+                        eprintln!(
+                            "Early stopping: val_loss didn't improve for {} checks",
+                            early_stop_patience
+                        );
                         break;
                     }
                 }
@@ -1023,8 +1307,20 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let path = format!("{}/final.bin", config.checkpoint_dir);
     checkpoint::save_checkpoint(&path, &model, config.total_steps)?;
     let state_path = format!("{}/state_final.bin", config.checkpoint_dir);
-    checkpoint::save_training_state(&state_path, &model, &optimizer, config.total_steps, total_tokens)?;
-    save_opt_sidecar_for(&state_path, &config.optimizer_type, &muon_opt, &hybrid_opt, &adamw8_opt)?;
+    checkpoint::save_training_state(
+        &state_path,
+        &model,
+        &optimizer,
+        config.total_steps,
+        total_tokens,
+    )?;
+    save_opt_sidecar_for(
+        &state_path,
+        &config.optimizer_type,
+        &muon_opt,
+        &hybrid_opt,
+        &adamw8_opt,
+    )?;
     if !ema_buffers.is_empty() {
         let ema_path = format!("{}/ema_final.bin", config.checkpoint_dir);
         checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, config.total_steps)?;
@@ -1034,20 +1330,44 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let total_time = elapsed_total.as_secs();
     let total_time_str = if total_time > 3600 {
         format!("{}h{}m", total_time / 3600, (total_time % 3600) / 60)
-    } else { format!("{}m{}s", total_time / 60, total_time % 60) };
+    } else {
+        format!("{}m{}s", total_time / 60, total_time % 60)
+    };
     let total_time_secs = elapsed_total.as_secs_f64();
-    let avg_tok_s = if total_time_secs > 0.0 { total_tokens as f64 / total_time_secs } else { 0.0 };
+    let avg_tok_s = if total_time_secs > 0.0 {
+        total_tokens as f64 / total_time_secs
+    } else {
+        0.0
+    };
     let tok_per_day = avg_tok_s * 86400.0;
     eprintln!("Training complete. Final checkpoint: {}", path);
     eprintln!("=== Training Summary ===");
     eprintln!("  Total time: {}", total_time_str);
-    eprintln!("  Total tokens: {}M ({:.1}B/day at avg throughput)", total_tokens / 1_000_000, tok_per_day / 1e9);
-    eprintln!("  Peak throughput: {:.0} tok/s | Avg: {:.0} tok/s", peak_tok_s, avg_tok_s);
-    eprintln!("  Final EMA loss: {:.4} | Best: {:.4}", ema_loss, best_train_loss);
-    eprintln!("  Epochs: {} | Steps: {}", data_loader.epoch(), config.total_steps);
-    eprintln!("  Model: {}M params, d={}, {}L, {} heads",
+    eprintln!(
+        "  Total tokens: {}M ({:.1}B/day at avg throughput)",
+        total_tokens / 1_000_000,
+        tok_per_day / 1e9
+    );
+    eprintln!(
+        "  Peak throughput: {:.0} tok/s | Avg: {:.0} tok/s",
+        peak_tok_s, avg_tok_s
+    );
+    eprintln!(
+        "  Final EMA loss: {:.4} | Best: {:.4}",
+        ema_loss, best_train_loss
+    );
+    eprintln!(
+        "  Epochs: {} | Steps: {}",
+        data_loader.epoch(),
+        config.total_steps
+    );
+    eprintln!(
+        "  Model: {}M params, d={}, {}L, {} heads",
         config.model_config.param_count() as f32 / 1e6,
-        config.model_config.d_model, config.model_config.n_layers, config.model_config.n_heads);
+        config.model_config.d_model,
+        config.model_config.n_layers,
+        config.model_config.n_heads
+    );
 
     Ok(())
 }
@@ -1081,7 +1401,11 @@ fn compute_validation_loss(
     });
     autograd::clear_tape();
 
-    Ok(if count > 0 { total_loss / count as f32 } else { f32::NAN })
+    Ok(if count > 0 {
+        total_loss / count as f32
+    } else {
+        f32::NAN
+    })
 }
 
 /// Clip gradients by global L2 norm. Also zeroes NaN/Inf gradients.
@@ -1124,7 +1448,11 @@ fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: 
             nan_indices.len(), &nan_indices[..nan_indices.len().min(10)]);
     }
     let needs_scale = total_norm > max_norm && total_norm.is_finite();
-    let scale = if needs_scale { max_norm / (total_norm + 1e-6) } else { 1.0 };
+    let scale = if needs_scale {
+        max_norm / (total_norm + 1e-6)
+    } else {
+        1.0
+    };
 
     if !nan_indices.is_empty() || needs_scale {
         ctx.begin_batch();
@@ -1280,7 +1608,11 @@ pub fn clip_gradients(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: f3
         );
     }
     let needs_scale = total_norm > max_norm && total_norm.is_finite();
-    let scale = if needs_scale { max_norm / (total_norm + 1e-6) } else { 1.0 };
+    let scale = if needs_scale {
+        max_norm / (total_norm + 1e-6)
+    } else {
+        1.0
+    };
 
     if !nan_indices.is_empty() || needs_scale {
         ctx.begin_batch();

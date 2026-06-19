@@ -1,7 +1,7 @@
 use crate::checkpoint;
 use crate::generate::{self, SamplingConfig};
-use crate::gpu::GpuContext as MetalContext;
 use crate::gpu::compute;
+use crate::gpu::GpuContext as MetalContext;
 use crate::model::Transformer;
 use crate::tokenizer::BpeTokenizer;
 use std::sync::Arc;
@@ -39,8 +39,12 @@ impl AndreAI {
             .map_err(|e| format!("Failed to load tokenizer '{}': {}", tokenizer_path, e))?;
 
         let (model, step) = if checkpoint_path.ends_with(".qbin") {
-            crate::quantize::load_quantized(&ctx, checkpoint_path)
-                .map_err(|e| format!("Failed to load quantized checkpoint '{}': {}", checkpoint_path, e))?
+            crate::quantize::load_quantized(&ctx, checkpoint_path).map_err(|e| {
+                format!(
+                    "Failed to load quantized checkpoint '{}': {}",
+                    checkpoint_path, e
+                )
+            })?
         } else {
             checkpoint::load_checkpoint(&ctx, checkpoint_path)
                 .map_err(|e| format!("Failed to load checkpoint '{}': {}", checkpoint_path, e))?
@@ -135,7 +139,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     compute::gpu_cast_f32_to_f16(ctx, &a, &f16, 4);
     compute::gpu_cast_f16_to_f32(ctx, &f16, &f32_back, 4);
     let vals = MetalContext::read_buffer(&f32_back, 4);
-    if (vals[0] - 1.0).abs() > 0.1 { passed = false; }
+    if (vals[0] - 1.0).abs() > 0.1 {
+        passed = false;
+    }
     tested += 2;
 
     // Batched FP16 matmul variants
@@ -146,9 +152,42 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let bb16 = ctx.alloc_buffer(8 * 2);
     compute::gpu_cast_f32_to_f16(ctx, &ba, &ba16, 8);
     compute::gpu_cast_f32_to_f16(ctx, &bb, &bb16, 8);
-    compute::gpu_batched_matmul_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
-    compute::gpu_batched_matmul_trans_b_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
-    compute::gpu_batched_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, compute::BatchedDims { batch: 2, m: 2, n: 2, k: 2 });
+    compute::gpu_batched_matmul_f16(
+        ctx,
+        &ba16,
+        &bb16,
+        &bc,
+        compute::BatchedDims {
+            batch: 2,
+            m: 2,
+            n: 2,
+            k: 2,
+        },
+    );
+    compute::gpu_batched_matmul_trans_b_f16(
+        ctx,
+        &ba16,
+        &bb16,
+        &bc,
+        compute::BatchedDims {
+            batch: 2,
+            m: 2,
+            n: 2,
+            k: 2,
+        },
+    );
+    compute::gpu_batched_matmul_trans_a_f16(
+        ctx,
+        &ba16,
+        &bb16,
+        &bc,
+        compute::BatchedDims {
+            batch: 2,
+            m: 2,
+            n: 2,
+            k: 2,
+        },
+    );
     // FP16 non-batched matmul backward variant (kept for large-matrix backward path)
     compute::gpu_matmul_trans_a_f16(ctx, &ba16, &bb16, &bc, 2, 2, 2);
     // Utility cast helper (used by FP16 backward when enabled)
@@ -157,7 +196,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let cast_back = ctx.alloc_buffer(4 * 4);
     compute::gpu_cast_f16_to_f32(ctx, &cast_test, &cast_back, 4);
     let cast_vals = MetalContext::read_buffer(&cast_back, 4);
-    if (cast_vals[0] - 1.0).abs() > 0.1 { passed = false; }
+    if (cast_vals[0] - 1.0).abs() > 0.1 {
+        passed = false;
+    }
     tested += 5;
 
     // MoE gather/scatter
@@ -175,13 +216,40 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let g = ctx.buffer_from_slice(&[0.1f32, -0.1]);
     let m = ctx.alloc_buffer(2 * 4);
     compute::gpu_fill(ctx, &m, 2, 0.0);
-    compute::gpu_lion_update(ctx, &p, &g, &m, 2, compute::LionParams { lr: 0.01, beta1: 0.9, beta2: 0.99, weight_decay: 0.0 });
+    compute::gpu_lion_update(
+        ctx,
+        &p,
+        &g,
+        &m,
+        2,
+        compute::LionParams {
+            lr: 0.01,
+            beta1: 0.9,
+            beta2: 0.99,
+            weight_decay: 0.0,
+        },
+    );
     tested += 1;
 
     // Sophia optimizer
     let h = ctx.alloc_buffer(2 * 4);
     compute::gpu_fill(ctx, &h, 2, 0.0);
-    compute::gpu_sophia_update(ctx, &p, &g, &m, &h, 2, compute::SophiaParams { lr: 0.01, beta1: 0.965, beta2: 0.99, eps: 1e-4, rho: 1.0, weight_decay: 0.0 });
+    compute::gpu_sophia_update(
+        ctx,
+        &p,
+        &g,
+        &m,
+        &h,
+        2,
+        compute::SophiaParams {
+            lr: 0.01,
+            beta1: 0.965,
+            beta2: 0.99,
+            eps: 1e-4,
+            rho: 1.0,
+            weight_decay: 0.0,
+        },
+    );
     tested += 1;
 
     // LogSumExp + Z-loss
@@ -189,8 +257,10 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let lse_out = ctx.alloc_buffer(2 * 4);
     compute::gpu_logsumexp(ctx, &lse_data, &lse_out, 2, 3);
     let lse_vals = MetalContext::read_buffer(&lse_out, 2);
-    if (lse_vals[0] - lse_vals[1]).abs() > 0.01 { passed = false; } // same rows → same lse
-    // Z-loss (disabled in training but function exists)
+    if (lse_vals[0] - lse_vals[1]).abs() > 0.01 {
+        passed = false;
+    } // same rows → same lse
+      // Z-loss (disabled in training but function exists)
     let z_logits = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
     let z_loss_buf = ctx.alloc_buffer(4);
     compute::gpu_fill(ctx, &z_loss_buf, 1, 0.0);
@@ -202,7 +272,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     if std::path::Path::new("data/train_v3.bin").exists() {
         let mixer = crate::data::DataMixer::new(
             &["data/train_v3.bin", "data/train_v3.bin"],
-            &[0.7, 0.3], 4, 16,
+            &[0.7, 0.3],
+            4,
+            16,
         );
         if let Ok(mut m) = mixer {
             let _ = m.total_tokens();
@@ -216,9 +288,8 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     let fce_hidden = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
     let fce_embed = crate::tensor::Tensor::randn(ctx, vec![16, 8], 0.1);
     let fce_targets = vec![0u32, 1, 2, 3];
-    let (_fce_loss, _fce_grad) = crate::loss::fused_linear_cross_entropy(
-        ctx, &fce_hidden, &fce_embed, &fce_targets, 2,
-    );
+    let (_fce_loss, _fce_grad) =
+        crate::loss::fused_linear_cross_entropy(ctx, &fce_hidden, &fce_embed, &fce_targets, 2);
     tested += 1;
 
     // WSD scheduler
@@ -234,7 +305,8 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     opt.step(0.0);
     opt.zero_grad();
     let _ = opt.adamw_step();
-    let mut soph_opt = crate::optim::Optimizer::Sophia(crate::optim::Sophia::new(ctx, &tiny_refs, 0.0));
+    let mut soph_opt =
+        crate::optim::Optimizer::Sophia(crate::optim::Sophia::new(ctx, &tiny_refs, 0.0));
     soph_opt.step(0.0);
     let mut muon_opt = crate::optim::Optimizer::Muon(crate::optim::Muon::new(ctx, &tiny_refs, 0.0));
     muon_opt.step(0.01);
@@ -242,9 +314,15 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
 
     // FlashAttention op variant
     let flash_op = crate::autograd::Op::FlashAttention {
-        batch_heads: 1, seq_q: 2, seq_k: 2, head_dim: 2, kv_offset: 0,
+        batch_heads: 1,
+        seq_q: 2,
+        seq_k: 2,
+        head_dim: 2,
+        kv_offset: 0,
     };
-    if !matches!(flash_op, crate::autograd::Op::FlashAttention { .. }) { passed = false; }
+    if !matches!(flash_op, crate::autograd::Op::FlashAttention { .. }) {
+        passed = false;
+    }
     tested += 1;
 
     // Verify grad recycling path exists (safe after sync flush)
@@ -270,38 +348,57 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     // L2 norm variants — verify sync and into-buffer paths agree
     let norm_data = ctx.buffer_from_slice(&[3.0f32, 4.0]); // norm = 5.0
     let norm_sync = compute::gpu_l2_norm(ctx, &norm_data, 2);
-    if (norm_sync - 5.0).abs() > 0.01 { passed = false; }
+    if (norm_sync - 5.0).abs() > 0.01 {
+        passed = false;
+    }
     let norm_out = ctx.alloc_buffer(4);
     compute::gpu_l2_norm_into(ctx, &norm_data, 2, &norm_out);
     let norm_async = MetalContext::read_buffer(&norm_out, 1)[0];
-    if (norm_async - 5.0).abs() > 0.01 { passed = false; }
+    if (norm_async - 5.0).abs() > 0.01 {
+        passed = false;
+    }
     tested += 2;
 
     // simdgroup_matrix (hardware MMA) fp32 matmul: must match the identity selection.
     let sg_c = ctx.alloc_buffer(4 * 4);
     compute::gpu_matmul_simdgroup(ctx, &a, &b, &sg_c, 2, 2, 2); // a @ I == a
     let sg_vals = MetalContext::read_buffer(&sg_c, 4);
-    if (sg_vals[0] - 1.0).abs() > 0.01 || (sg_vals[3] - 4.0).abs() > 0.01 { passed = false; }
+    if (sg_vals[0] - 1.0).abs() > 0.01 || (sg_vals[3] - 4.0).abs() > 0.01 {
+        passed = false;
+    }
     tested += 1;
 
     // Hybrid (Muon+AdamW) and 8-bit AdamW optimizer enum variants + MLA cache-footprint helper.
     let tiny2 = crate::tensor::Tensor::zeros(ctx, vec![2, 2]);
     let tiny2_refs: Vec<&crate::tensor::Tensor> = vec![&tiny2];
     let mut hybrid = crate::optim::Optimizer::Hybrid(crate::optim::HybridOptimizer::new(
-        ctx, &tiny2_refs, 0.0, &std::collections::HashSet::new(), crate::optim::AdamWHyper::default()));
+        ctx,
+        &tiny2_refs,
+        0.0,
+        &std::collections::HashSet::new(),
+        crate::optim::AdamWHyper::default(),
+    ));
     hybrid.step(0.0);
-    let mut q8 = crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(ctx, &tiny2_refs, 0.0));
+    let mut q8 =
+        crate::optim::Optimizer::AdamW8bit(crate::optim::AdamW8bit::new(ctx, &tiny2_refs, 0.0));
     q8.step(0.0);
     let (_std_kv, _mla_kv, shrink) = crate::mla::cache_footprint(1024, 64); // 2*1024/64 = 32×
-    if shrink < 8.0 { passed = false; }
+    if shrink < 8.0 {
+        passed = false;
+    }
     tested += 3;
 
     // MLA-enabled attention forward + per-tensor gradient clip (exercises the MLA path at runtime).
-    let mla_cfg = crate::model::ModelConfig { mla_latent_dim: 16, ..crate::model::ModelConfig::custom(32, 64, 4, 2, 2.67, 32) };
+    let mla_cfg = crate::model::ModelConfig {
+        mla_latent_dim: 16,
+        ..crate::model::ModelConfig::custom(32, 64, 4, 2, 2.67, 32)
+    };
     let mla_model = crate::model::Transformer::new(ctx, mla_cfg);
     let mla_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 0];
     let mla_logits = mla_model.forward(&mla_tokens, 1, 8, None, false);
-    if mla_logits.to_vec().iter().any(|x| !x.is_finite()) { passed = false; }
+    if mla_logits.to_vec().iter().any(|x| !x.is_finite()) {
+        passed = false;
+    }
     let (mla_loss, _) = crate::loss::cross_entropy_loss(ctx, &mla_logits, &[5u32; 8]);
     crate::autograd::backward(ctx, mla_loss.id);
     crate::autograd::clear_tape_keep_grads();
@@ -312,14 +409,24 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
 
     // Sequence packing: pack two short sequences into one row + block-diagonal causal mask.
     let packed = crate::datapipe::pack_sequences(&[vec![1, 2, 3], vec![4, 5]], 6, 0);
-    if packed.len() != 1 || packed[0].tokens.len() != 6 || packed[0].tokens[0] != 1 || packed[0].seg_ids[3] != 1 { passed = false; }
+    if packed.len() != 1
+        || packed[0].tokens.len() != 6
+        || packed[0].tokens[0] != 1
+        || packed[0].seg_ids[3] != 1
+    {
+        passed = false;
+    }
     let seg_buf = ctx.buffer_from_u32_slice(&packed[0].seg_ids);
     let scores = crate::tensor::Tensor::zeros(ctx, vec![1, 6, 6]);
     let masked = scores.causal_doc_mask(&seg_buf, 1).to_vec();
     // position 3 (segment 1) must NOT see position 0 (segment 0): cross-segment → -inf.
-    if masked[3 * 6].is_finite() { passed = false; }
+    if masked[3 * 6].is_finite() {
+        passed = false;
+    }
     // position 3 sees position 3 (same segment, causal) → unmasked (0.0).
-    if masked[3 * 6 + 3] != 0.0 { passed = false; }
+    if masked[3 * 6 + 3] != 0.0 {
+        passed = false;
+    }
     tested += 2;
 
     // RMSNorm-backward clamp toggle exists (investigation aid for the activation-collapse fix).
@@ -330,7 +437,9 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     // Subquadratic block-sparse gather attention (forward) — runs end to end on a tiny tensor.
     let bsq = crate::tensor::Tensor::zeros(ctx, vec![1, 8, 4]);
     let bsout = crate::attention::block_sparse_gather_attention(&bsq, &bsq, &bsq, 4, 1);
-    if bsout.shape != vec![1, 8, 4] || bsout.to_vec().iter().any(|x| !x.is_finite()) { passed = false; }
+    if bsout.shape != vec![1, 8, 4] || bsout.to_vec().iter().any(|x| !x.is_finite()) {
+        passed = false;
+    }
     tested += 1;
 
     (tested, passed)

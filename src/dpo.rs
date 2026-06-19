@@ -71,9 +71,16 @@ impl DpoDataset {
             pos += 4 + rejected_len * 4;
         }
 
-        eprintln!("DPO dataset loaded: {} preference pairs from {}", num_pairs, path);
+        eprintln!(
+            "DPO dataset loaded: {} preference pairs from {}",
+            num_pairs, path
+        );
 
-        Ok(Self { mmap, offsets, num_pairs })
+        Ok(Self {
+            mmap,
+            offsets,
+            num_pairs,
+        })
     }
 
     /// Get a preference pair by index.
@@ -81,35 +88,83 @@ impl DpoDataset {
     /// Validates all byte offsets against the mmap length before reading,
     /// preventing out-of-bounds access on truncated or malformed files.
     pub fn get_pair(&self, idx: usize) -> PreferencePair {
-        assert!(idx < self.num_pairs, "Pair index {} out of bounds ({})", idx, self.num_pairs);
+        assert!(
+            idx < self.num_pairs,
+            "Pair index {} out of bounds ({})",
+            idx,
+            self.num_pairs
+        );
         let mmap_len = self.mmap.len();
         let mut pos = self.offsets[idx];
 
         // --- prompt ---
-        assert!(pos + 4 <= mmap_len, "get_pair({}): prompt_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
+        assert!(
+            pos + 4 <= mmap_len,
+            "get_pair({}): prompt_len field at offset {} exceeds mmap ({})",
+            idx,
+            pos,
+            mmap_len
+        );
         let prompt_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
-        assert!(pos + prompt_len * 4 <= mmap_len, "get_pair({}): prompt tokens ({}) at offset {} exceed mmap ({})", idx, prompt_len, pos, mmap_len);
+        assert!(
+            pos + prompt_len * 4 <= mmap_len,
+            "get_pair({}): prompt tokens ({}) at offset {} exceed mmap ({})",
+            idx,
+            prompt_len,
+            pos,
+            mmap_len
+        );
         let prompt = read_u32_slice(&self.mmap, pos, prompt_len);
         pos += prompt_len * 4;
 
         // --- chosen ---
-        assert!(pos + 4 <= mmap_len, "get_pair({}): chosen_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
+        assert!(
+            pos + 4 <= mmap_len,
+            "get_pair({}): chosen_len field at offset {} exceeds mmap ({})",
+            idx,
+            pos,
+            mmap_len
+        );
         let chosen_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
-        assert!(pos + chosen_len * 4 <= mmap_len, "get_pair({}): chosen tokens ({}) at offset {} exceed mmap ({})", idx, chosen_len, pos, mmap_len);
+        assert!(
+            pos + chosen_len * 4 <= mmap_len,
+            "get_pair({}): chosen tokens ({}) at offset {} exceed mmap ({})",
+            idx,
+            chosen_len,
+            pos,
+            mmap_len
+        );
         let chosen = read_u32_slice(&self.mmap, pos, chosen_len);
         pos += chosen_len * 4;
 
         // --- rejected ---
-        assert!(pos + 4 <= mmap_len, "get_pair({}): rejected_len field at offset {} exceeds mmap ({})", idx, pos, mmap_len);
+        assert!(
+            pos + 4 <= mmap_len,
+            "get_pair({}): rejected_len field at offset {} exceeds mmap ({})",
+            idx,
+            pos,
+            mmap_len
+        );
         let rejected_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
-        assert!(pos + rejected_len * 4 <= mmap_len, "get_pair({}): rejected tokens ({}) at offset {} exceed mmap ({})", idx, rejected_len, pos, mmap_len);
+        assert!(
+            pos + rejected_len * 4 <= mmap_len,
+            "get_pair({}): rejected tokens ({}) at offset {} exceed mmap ({})",
+            idx,
+            rejected_len,
+            pos,
+            mmap_len
+        );
         let rejected = read_u32_slice(&self.mmap, pos, rejected_len);
         let _ = pos; // suppress unused after last read
 
-        PreferencePair { prompt, chosen, rejected }
+        PreferencePair {
+            prompt,
+            chosen,
+            rejected,
+        }
     }
 
     /// Number of preference pairs in the dataset.
@@ -234,7 +289,12 @@ impl DpoDataLoader {
 /// because logits[i-1] predicts the token at position i.
 ///
 /// Returns the sum of per-token log probabilities (a negative number).
-fn sequence_log_probs(logits_data: &[f32], vocab_size: usize, tokens: &[u32], prompt_len: usize) -> f32 {
+fn sequence_log_probs(
+    logits_data: &[f32],
+    vocab_size: usize,
+    tokens: &[u32],
+    prompt_len: usize,
+) -> f32 {
     let seq_len = tokens.len();
     assert_eq!(logits_data.len(), seq_len * vocab_size);
 
@@ -247,7 +307,11 @@ fn sequence_log_probs(logits_data: &[f32], vocab_size: usize, tokens: &[u32], pr
 
         // Numerically stable log-softmax: log_softmax(x)_j = x_j - log(sum(exp(x - max(x))))
         let max_logit = logit_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let log_sum_exp: f32 = logit_row.iter().map(|&x| (x - max_logit).exp()).sum::<f32>().ln();
+        let log_sum_exp: f32 = logit_row
+            .iter()
+            .map(|&x| (x - max_logit).exp())
+            .sum::<f32>()
+            .ln();
 
         let target_token = tok as usize;
         let log_prob = logit_row[target_token] - max_logit - log_sum_exp;
@@ -407,11 +471,15 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         let prompt_len = pair.prompt.len();
 
         // Build full sequences: prompt + response
-        let chosen_input: Vec<u32> = pair.prompt.iter()
+        let chosen_input: Vec<u32> = pair
+            .prompt
+            .iter()
             .chain(pair.chosen.iter())
             .copied()
             .collect();
-        let rejected_input: Vec<u32> = pair.prompt.iter()
+        let rejected_input: Vec<u32> = pair
+            .prompt
+            .iter()
             .chain(pair.rejected.iter())
             .copied()
             .collect();
@@ -426,26 +494,22 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
 
         // --- Forward pass: policy on chosen ---
         ctx.begin_batch();
-        let policy_chosen_logits = policy_model.forward(
-            &chosen_input, 1, chosen_seq_len, None, false,
-        );
+        let policy_chosen_logits =
+            policy_model.forward(&chosen_input, 1, chosen_seq_len, None, false);
         ctx.flush_batch();
         let policy_chosen_logits_data = policy_chosen_logits.to_vec();
 
         // --- Forward pass: policy on rejected ---
         ctx.begin_batch();
-        let policy_rejected_logits = policy_model.forward(
-            &rejected_input, 1, rejected_seq_len, None, false,
-        );
+        let policy_rejected_logits =
+            policy_model.forward(&rejected_input, 1, rejected_seq_len, None, false);
         ctx.flush_batch();
         let policy_rejected_logits_data = policy_rejected_logits.to_vec();
 
         // --- Forward pass: reference on chosen (no grad) ---
         let ref_chosen_logits_data = autograd::no_grad(|| {
             ctx.begin_batch();
-            let logits = ref_model.forward(
-                &chosen_input, 1, chosen_seq_len, None, false,
-            );
+            let logits = ref_model.forward(&chosen_input, 1, chosen_seq_len, None, false);
             ctx.flush_batch();
             logits.to_vec()
         });
@@ -453,25 +517,35 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         // --- Forward pass: reference on rejected (no grad) ---
         let ref_rejected_logits_data = autograd::no_grad(|| {
             ctx.begin_batch();
-            let logits = ref_model.forward(
-                &rejected_input, 1, rejected_seq_len, None, false,
-            );
+            let logits = ref_model.forward(&rejected_input, 1, rejected_seq_len, None, false);
             ctx.flush_batch();
             logits.to_vec()
         });
 
         // --- Compute sequence log-probabilities (response tokens only) ---
         let policy_chosen_logps = sequence_log_probs(
-            &policy_chosen_logits_data, vocab_size, &chosen_input, prompt_len,
+            &policy_chosen_logits_data,
+            vocab_size,
+            &chosen_input,
+            prompt_len,
         );
         let policy_rejected_logps = sequence_log_probs(
-            &policy_rejected_logits_data, vocab_size, &rejected_input, prompt_len,
+            &policy_rejected_logits_data,
+            vocab_size,
+            &rejected_input,
+            prompt_len,
         );
         let ref_chosen_logps = sequence_log_probs(
-            &ref_chosen_logits_data, vocab_size, &chosen_input, prompt_len,
+            &ref_chosen_logits_data,
+            vocab_size,
+            &chosen_input,
+            prompt_len,
         );
         let ref_rejected_logps = sequence_log_probs(
-            &ref_rejected_logits_data, vocab_size, &rejected_input, prompt_len,
+            &ref_rejected_logits_data,
+            vocab_size,
+            &rejected_input,
+            prompt_len,
         );
 
         // --- Compute DPO loss and gradients ---
@@ -519,9 +593,8 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         autograd::clear_tape();
 
         ctx.begin_batch();
-        let policy_chosen_logits_2 = policy_model.forward(
-            &chosen_input, 1, chosen_seq_len, None, false,
-        );
+        let policy_chosen_logits_2 =
+            policy_model.forward(&chosen_input, 1, chosen_seq_len, None, false);
         ctx.flush_batch();
 
         // Inject the DPO gradient as the loss gradient for backward
@@ -548,9 +621,8 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
         );
 
         ctx.begin_batch();
-        let policy_rejected_logits_2 = policy_model.forward(
-            &rejected_input, 1, rejected_seq_len, None, false,
-        );
+        let policy_rejected_logits_2 =
+            policy_model.forward(&rejected_input, 1, rejected_seq_len, None, false);
         ctx.flush_batch();
 
         let grad_buf_rej = ctx.buffer_from_slice(&rejected_grad_logits);
@@ -818,7 +890,9 @@ pub fn prepare_dpo_dataset(
 
     eprintln!(
         "DPO dataset prepared: {} preference pairs from {} → {}",
-        pairs.len(), input_path, output_path
+        pairs.len(),
+        input_path,
+        output_path
     );
 
     Ok(pairs.len())
@@ -1016,18 +1090,30 @@ mod tests {
 
         // Write JSONL
         let mut f = std::fs::File::create(&jsonl_path).unwrap();
-        writeln!(f, r#"{{"prompt": "What is 1+1?", "chosen": "2", "rejected": "3"}}"#).unwrap();
-        writeln!(f, r#"{{"prompt": "Hello", "chosen": "Hi there!", "rejected": "Go away"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"prompt": "What is 1+1?", "chosen": "2", "rejected": "3"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"prompt": "Hello", "chosen": "Hi there!", "rejected": "Go away"}}"#
+        )
+        .unwrap();
         drop(f);
 
         // We need a tokenizer — create a minimal one
         // Use byte-level encoding for simplicity in tests
-        let tok = BpeTokenizer::train(b"What is 1+1? 2 3 Hello Hi there! Go away User: Assistant:", 300);
+        let tok = BpeTokenizer::train(
+            b"What is 1+1? 2 3 Hello Hi there! Go away User: Assistant:",
+            300,
+        );
         let count = prepare_dpo_dataset(
             jsonl_path.to_str().unwrap(),
             bin_path.to_str().unwrap(),
             &tok,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(count, 2);
 
         // Verify the binary file is loadable
@@ -1046,10 +1132,20 @@ mod tests {
 
     #[test]
     fn test_extract_json_string_dpo() {
-        let json = r#"{"prompt": "test prompt", "chosen": "good answer", "rejected": "bad answer"}"#;
-        assert_eq!(extract_json_string(json, "prompt"), Some("test prompt".to_string()));
-        assert_eq!(extract_json_string(json, "chosen"), Some("good answer".to_string()));
-        assert_eq!(extract_json_string(json, "rejected"), Some("bad answer".to_string()));
+        let json =
+            r#"{"prompt": "test prompt", "chosen": "good answer", "rejected": "bad answer"}"#;
+        assert_eq!(
+            extract_json_string(json, "prompt"),
+            Some("test prompt".to_string())
+        );
+        assert_eq!(
+            extract_json_string(json, "chosen"),
+            Some("good answer".to_string())
+        );
+        assert_eq!(
+            extract_json_string(json, "rejected"),
+            Some("bad answer".to_string())
+        );
         assert_eq!(extract_json_string(json, "missing"), None);
     }
 
@@ -1065,7 +1161,8 @@ mod tests {
         let tokens = vec![0u32, 1, 2]; // prompt=[0], response=[1, 2]
 
         let grad_scale = -0.1; // negative = push probs up (chosen)
-        let grad = compute_dpo_logit_gradients(&logits, vocab_size, &tokens, prompt_len, grad_scale);
+        let grad =
+            compute_dpo_logit_gradients(&logits, vocab_size, &tokens, prompt_len, grad_scale);
 
         assert_eq!(grad.len(), seq_len * vocab_size);
 
@@ -1075,7 +1172,11 @@ mod tests {
         // grad[0][j!=1] = grad_scale * (0 - 0.25) = -0.1 * (-0.25) = 0.025
         let g00 = grad[0]; // row 0, j=0, not target
         let g01 = grad[1]; // row 0, j=1, IS target
-        assert!((g01 - (-0.075)).abs() < 1e-5, "Expected -0.075, got {}", g01);
+        assert!(
+            (g01 - (-0.075)).abs() < 1e-5,
+            "Expected -0.075, got {}",
+            g01
+        );
         assert!((g00 - 0.025).abs() < 1e-5, "Expected 0.025, got {}", g00);
 
         // Prompt position gradients should be zero
@@ -1119,7 +1220,8 @@ mod tests {
         let policy_chosen_data = policy_chosen_logits.to_vec();
 
         ctx.begin_batch();
-        let policy_rejected_logits = model.forward(&rejected_input, 1, rejected_input.len(), None, false);
+        let policy_rejected_logits =
+            model.forward(&rejected_input, 1, rejected_input.len(), None, false);
         ctx.flush_batch();
         let policy_rejected_data = policy_rejected_logits.to_vec();
 
@@ -1128,10 +1230,18 @@ mod tests {
         let ref_rejected_data = policy_rejected_data.clone();
 
         // Compute log-probs
-        let policy_chosen_logps = sequence_log_probs(&policy_chosen_data, vocab_size, &chosen_input, prompt_len);
-        let policy_rejected_logps = sequence_log_probs(&policy_rejected_data, vocab_size, &rejected_input, prompt_len);
-        let ref_chosen_logps = sequence_log_probs(&ref_chosen_data, vocab_size, &chosen_input, prompt_len);
-        let ref_rejected_logps = sequence_log_probs(&ref_rejected_data, vocab_size, &rejected_input, prompt_len);
+        let policy_chosen_logps =
+            sequence_log_probs(&policy_chosen_data, vocab_size, &chosen_input, prompt_len);
+        let policy_rejected_logps = sequence_log_probs(
+            &policy_rejected_data,
+            vocab_size,
+            &rejected_input,
+            prompt_len,
+        );
+        let ref_chosen_logps =
+            sequence_log_probs(&ref_chosen_data, vocab_size, &chosen_input, prompt_len);
+        let ref_rejected_logps =
+            sequence_log_probs(&ref_rejected_data, vocab_size, &rejected_input, prompt_len);
 
         // DPO loss
         let chosen_log_ratio = policy_chosen_logps - ref_chosen_logps;
@@ -1140,13 +1250,24 @@ mod tests {
         let loss_val = log1p_exp(-reward_diff);
 
         // Verify loss is finite and positive
-        assert!(loss_val.is_finite(), "DPO loss should be finite, got {}", loss_val);
-        assert!(loss_val > 0.0, "DPO loss should be positive, got {}", loss_val);
+        assert!(
+            loss_val.is_finite(),
+            "DPO loss should be finite, got {}",
+            loss_val
+        );
+        assert!(
+            loss_val > 0.0,
+            "DPO loss should be positive, got {}",
+            loss_val
+        );
 
         // When policy == ref, log ratios are 0, reward_diff = 0,
         // loss = log(1 + exp(0)) = log(2) ≈ 0.693
-        assert!((loss_val - 2.0f32.ln()).abs() < 1e-4,
-            "With identical policy/ref, DPO loss should be log(2) ≈ 0.693, got {}", loss_val);
+        assert!(
+            (loss_val - 2.0f32.ln()).abs() < 1e-4,
+            "With identical policy/ref, DPO loss should be log(2) ≈ 0.693, got {}",
+            loss_val
+        );
 
         // --- Backward and optimizer step ---
         let sigmoid_neg = sigmoid(-reward_diff);
@@ -1156,7 +1277,11 @@ mod tests {
         // Chosen backward
         autograd::clear_tape();
         let chosen_grad_logits = compute_dpo_logit_gradients(
-            &policy_chosen_data, vocab_size, &chosen_input, prompt_len, grad_chosen_scale,
+            &policy_chosen_data,
+            vocab_size,
+            &chosen_input,
+            prompt_len,
+            grad_chosen_scale,
         );
 
         ctx.begin_batch();
@@ -1174,7 +1299,11 @@ mod tests {
 
         // Rejected backward
         let rejected_grad_logits = compute_dpo_logit_gradients(
-            &policy_rejected_data, vocab_size, &rejected_input, prompt_len, grad_rejected_scale,
+            &policy_rejected_data,
+            vocab_size,
+            &rejected_input,
+            prompt_len,
+            grad_rejected_scale,
         );
 
         ctx.begin_batch();
@@ -1195,7 +1324,10 @@ mod tests {
                 vals.iter().any(|&v| v != 0.0)
             })
         });
-        assert!(has_nonzero_grad, "At least one parameter should have non-zero gradient");
+        assert!(
+            has_nonzero_grad,
+            "At least one parameter should have non-zero gradient"
+        );
 
         // Optimizer step
         let param_refs: Vec<&_> = model.parameters().into_iter().collect();
@@ -1210,8 +1342,13 @@ mod tests {
 
         // Verify weights changed
         let updated_weights: Vec<f32> = model.parameters()[0].to_vec();
-        let weights_changed = initial_weights.iter().zip(updated_weights.iter())
+        let weights_changed = initial_weights
+            .iter()
+            .zip(updated_weights.iter())
             .any(|(a, b)| (a - b).abs() > 1e-10);
-        assert!(weights_changed, "Policy model weights should have changed after DPO step");
+        assert!(
+            weights_changed,
+            "Policy model weights should have changed after DPO step"
+        );
     }
 }

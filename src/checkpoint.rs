@@ -45,12 +45,20 @@ pub fn save_checkpoint(path: &str, model: &Transformer, step: u32) -> std::io::R
         file.write_all(&byte_data)?;
 
         if i % 10 == 0 {
-            eprintln!("  saving tensor {}/{} ({} elements)", i + 1, n_tensors, data.len());
+            eprintln!(
+                "  saving tensor {}/{} ({} elements)",
+                i + 1,
+                n_tensors,
+                data.len()
+            );
         }
     }
 
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
-    eprintln!("Checkpoint saved: {} ({:.1} MB, step {})", path, size_mb, step);
+    eprintln!(
+        "Checkpoint saved: {} ({:.1} MB, step {})",
+        path, size_mb, step
+    );
     Ok(())
 }
 
@@ -79,8 +87,11 @@ pub fn save_checkpoint_ema(
     let params = model.parameters();
     let base_params = model.base_parameters();
     assert_eq!(
-        ema_buffers.len(), params.len(),
-        "save_checkpoint_ema: {} EMA buffers but {} trainable params", ema_buffers.len(), params.len()
+        ema_buffers.len(),
+        params.len(),
+        "save_checkpoint_ema: {} EMA buffers but {} trainable params",
+        ema_buffers.len(),
+        params.len()
     );
     let n_tensors = (params.len() + base_params.len()) as u32;
     file.write_all(&n_tensors.to_le_bytes())?;
@@ -109,13 +120,22 @@ pub fn save_checkpoint_ema(
     }
 
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
-    eprintln!("EMA checkpoint saved: {} ({:.1} MB, step {})", path, size_mb, step);
+    eprintln!(
+        "EMA checkpoint saved: {} ({:.1} MB, step {})",
+        path, size_mb, step
+    );
     Ok(())
 }
 
 /// Save full training state: model weights + optimizer state (m, v, step).
 /// This allows resuming training exactly where it left off.
-pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, step: u32, total_tokens: u64) -> std::io::Result<()> {
+pub fn save_training_state(
+    path: &str,
+    model: &Transformer,
+    optimizer: &AdamW,
+    step: u32,
+    total_tokens: u64,
+) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
 
     // Header: AMDT (AndreAI Model Training state)
@@ -160,16 +180,16 @@ pub fn save_training_state(path: &str, model: &Transformer, optimizer: &AdamW, s
     }
 
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
-    eprintln!("Training state saved: {} ({:.1} MB, step {}, {} tokens)", path, size_mb, step, total_tokens);
+    eprintln!(
+        "Training state saved: {} ({:.1} MB, step {}, {} tokens)",
+        path, size_mb, step, total_tokens
+    );
     Ok(())
 }
 
 /// Load full training state for resume. Returns (model, optimizer_data, step, total_tokens).
 /// The optimizer_data is (m_buffers, v_buffers, opt_step) — caller creates the AdamW and loads these.
-pub fn load_training_state(
-    ctx: &Arc<MetalContext>,
-    path: &str,
-) -> std::io::Result<TrainingState> {
+pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<TrainingState> {
     let mut file = std::fs::File::open(path)?;
     let mut buf4 = [0u8; 4];
     let mut buf8 = [0u8; 8];
@@ -181,7 +201,11 @@ pub fn load_training_state(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((2..=12).contains(&version), "Unsupported training state version: {}", version);
+    assert!(
+        (2..=12).contains(&version),
+        "Unsupported training state version: {}",
+        version
+    );
 
     // Step + total_tokens
     file.read_exact(&mut buf4)?;
@@ -191,8 +215,12 @@ pub fn load_training_state(
 
     // Config
     let config = read_config(&mut file, version)?;
-    eprintln!("Resuming: step {}, {}M params, {} tokens processed",
-        step, config.param_count() as f32 / 1e6, total_tokens);
+    eprintln!(
+        "Resuming: step {}, {}M params, {} tokens processed",
+        step,
+        config.param_count() as f32 / 1e6,
+        total_tokens
+    );
 
     // Model
     let model = Transformer::new(ctx, config);
@@ -203,10 +231,16 @@ pub fn load_training_state(
 
     // v4 training states include base params (ReLoRA frozen weights) after trainable params.
     // v2/v3 states only include trainable params.
-    let expected = if version >= 4 { params.len() + base_params.len() } else { params.len() };
-    assert_eq!(n_tensors, expected,
+    let expected = if version >= 4 {
+        params.len() + base_params.len()
+    } else {
+        params.len()
+    };
+    assert_eq!(
+        n_tensors, expected,
         "Training state has {} tensors, model expects {} (version {})",
-        n_tensors, expected, version);
+        n_tensors, expected, version
+    );
 
     let all_params: Vec<&_> = if version >= 4 {
         params.iter().chain(base_params.iter()).copied().collect()
@@ -250,12 +284,21 @@ pub fn load_training_state(
         let mut v_bytes = vec![0u8; size * 4];
         file.read_exact(&mut m_bytes)?;
         file.read_exact(&mut v_bytes)?;
-        let m: Vec<f32> = m_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let v: Vec<f32> = v_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let m: Vec<f32> = m_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let v: Vec<f32> = v_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         opt_states.push((m, v));
     }
 
-    eprintln!("Training state loaded: step {}, opt_step {}", step, opt_step);
+    eprintln!(
+        "Training state loaded: step {}, opt_step {}",
+        step, opt_step
+    );
     Ok((model, opt_states, step, opt_step, total_tokens))
 }
 
@@ -263,7 +306,12 @@ pub fn load_training_state(
 /// only carries AdamW m/v; muon/hybrid/8-bit state (momentum, int8 moments+scales) goes here so
 /// resume restores it instead of restarting the optimizer fresh. Format: "AOPT" magic, opt_type
 /// (len+utf8), step, n_blobs, then each blob (len + bytes).
-pub fn save_opt_sidecar(path: &str, opt_type: &str, step: u32, blobs: &[Vec<u8>]) -> std::io::Result<()> {
+pub fn save_opt_sidecar(
+    path: &str,
+    opt_type: &str,
+    step: u32,
+    blobs: &[Vec<u8>],
+) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(b"AOPT")?;
     let tb = opt_type.as_bytes();
@@ -313,10 +361,7 @@ pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<OptSidecar>> {
 }
 
 /// Load model from a checkpoint file.
-pub fn load_checkpoint(
-    ctx: &Arc<MetalContext>,
-    path: &str,
-) -> std::io::Result<(Transformer, u32)> {
+pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(Transformer, u32)> {
     let mut file = std::fs::File::open(path)?;
     let mut buf4 = [0u8; 4];
 
@@ -327,7 +372,11 @@ pub fn load_checkpoint(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!((1..=12).contains(&version), "Unsupported checkpoint version: {} (expected 1-12)", version);
+    assert!(
+        (1..=12).contains(&version),
+        "Unsupported checkpoint version: {} (expected 1-12)",
+        version
+    );
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -353,7 +402,11 @@ pub fn load_checkpoint(
     let all_params: Vec<&_> = params.iter().chain(base_params.iter()).copied().collect();
 
     // v3 checkpoints don't include base weights — allow loading with fewer tensors
-    let expected = if version <= 3 { params.len() } else { all_params.len() };
+    let expected = if version <= 3 {
+        params.len()
+    } else {
+        all_params.len()
+    };
     assert_eq!(
         n_tensors, expected,
         "Checkpoint has {} tensors, model expects {}",
@@ -361,7 +414,11 @@ pub fn load_checkpoint(
     );
 
     // Load each tensor (trainable params first, then base weights for v4+)
-    let load_params = if version <= 3 { &params[..] } else { &all_params[..] };
+    let load_params = if version <= 3 {
+        &params[..]
+    } else {
+        &all_params[..]
+    };
     for (i, param) in load_params.iter().enumerate() {
         // Shape
         file.read_exact(&mut buf4)?;
@@ -470,25 +527,26 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
     };
 
     // v3: lowrank, MoE, bitnet, shared_layers, mup
-    let (lowrank, n_experts, top_k_experts, bitnet, shared_layers, mup_base_width, n_predict) = if version >= 3 {
-        file.read_exact(&mut buf4)?;
-        let lr = u32::from_le_bytes(buf4) as usize;
-        file.read_exact(&mut buf4)?;
-        let ne = u32::from_le_bytes(buf4) as usize;
-        file.read_exact(&mut buf4)?;
-        let tk = u32::from_le_bytes(buf4) as usize;
-        file.read_exact(&mut buf4)?;
-        let bn = u32::from_le_bytes(buf4) != 0;
-        file.read_exact(&mut buf4)?;
-        let sl = u32::from_le_bytes(buf4) != 0;
-        file.read_exact(&mut buf4)?;
-        let mup = u32::from_le_bytes(buf4) as usize;
-        file.read_exact(&mut buf4)?;
-        let n_pred = u32::from_le_bytes(buf4) as usize;
-        (lr, ne, tk, bn, sl, mup, n_pred)
-    } else {
-        (0, 1, 1, false, false, 0, 0)  // defaults for v1/v2 checkpoints
-    };
+    let (lowrank, n_experts, top_k_experts, bitnet, shared_layers, mup_base_width, n_predict) =
+        if version >= 3 {
+            file.read_exact(&mut buf4)?;
+            let lr = u32::from_le_bytes(buf4) as usize;
+            file.read_exact(&mut buf4)?;
+            let ne = u32::from_le_bytes(buf4) as usize;
+            file.read_exact(&mut buf4)?;
+            let tk = u32::from_le_bytes(buf4) as usize;
+            file.read_exact(&mut buf4)?;
+            let bn = u32::from_le_bytes(buf4) != 0;
+            file.read_exact(&mut buf4)?;
+            let sl = u32::from_le_bytes(buf4) != 0;
+            file.read_exact(&mut buf4)?;
+            let mup = u32::from_le_bytes(buf4) as usize;
+            file.read_exact(&mut buf4)?;
+            let n_pred = u32::from_le_bytes(buf4) as usize;
+            (lr, ne, tk, bn, sl, mup, n_pred)
+        } else {
+            (0, 1, 1, false, false, 0, 0) // defaults for v1/v2 checkpoints
+        };
 
     // v5: linear (kernel) attention flag; older checkpoints default to softmax (false).
     let linear_attn = if version >= 5 {

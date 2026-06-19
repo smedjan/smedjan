@@ -25,7 +25,12 @@ use crate::tensor::Tensor;
 /// * `v` — `[n_tokens, kv_dim]` reconstructed values.
 ///
 /// Fully differentiable — gradients flow into `w_dkv`, `w_uk`, `w_uv`.
-pub fn mla_kv(x: &Tensor, w_dkv: &Tensor, w_uk: &Tensor, w_uv: &Tensor) -> (Tensor, Tensor, Tensor) {
+pub fn mla_kv(
+    x: &Tensor,
+    w_dkv: &Tensor,
+    w_uk: &Tensor,
+    w_uv: &Tensor,
+) -> (Tensor, Tensor, Tensor) {
     let c = x.matmul(w_dkv); // [n_tokens, d_c] — the compressed latent
     let k = c.matmul(w_uk); // [n_tokens, kv_dim]
     let v = c.matmul(w_uv); // [n_tokens, kv_dim]

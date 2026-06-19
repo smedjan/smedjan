@@ -48,16 +48,34 @@ impl Tensor {
     /// Create a tensor from raw float data.
     pub fn from_slice(ctx: &Arc<MetalContext>, data: &[f32], shape: Vec<usize>) -> Self {
         let expected: usize = shape.iter().product();
-        assert_eq!(data.len(), expected, "Data length {} != shape product {}", data.len(), expected);
+        assert_eq!(
+            data.len(),
+            expected,
+            "Data length {} != shape product {}",
+            data.len(),
+            expected
+        );
         let buffer = ctx.buffer_from_slice(data);
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: false, ctx: Arc::clone(ctx) }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: false,
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// Create a tensor from an existing GPU buffer (no copy).
     pub fn from_buffer(ctx: Arc<MetalContext>, buffer: crate::gpu::Buf, shape: Vec<usize>) -> Self {
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: false, ctx }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: false,
+            ctx,
+        }
     }
 
     /// Create a tensor of zeros.
@@ -66,7 +84,13 @@ impl Tensor {
         let buffer = ctx.alloc_buffer(size * 4);
         compute::gpu_fill(ctx, &buffer, size as u32, 0.0);
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: false, ctx: Arc::clone(ctx) }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: false,
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// Create a tensor filled with a value.
@@ -75,7 +99,13 @@ impl Tensor {
         let buffer = ctx.alloc_buffer(size * 4);
         compute::gpu_fill(ctx, &buffer, size as u32, value);
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: false, ctx: Arc::clone(ctx) }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: false,
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// Create a parameter tensor (requires_grad=true) with random normal initialization.
@@ -93,7 +123,13 @@ impl Tensor {
             .collect();
         let buffer = ctx.buffer_from_slice(&data);
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: true, ctx: Arc::clone(ctx) }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: true,
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// Create a parameter tensor initialized with ones (for norm weights).
@@ -102,7 +138,13 @@ impl Tensor {
         let buffer = ctx.alloc_buffer(size * 4);
         compute::gpu_fill(ctx, &buffer, size as u32, 1.0);
         let id = autograd::next_id();
-        Self { id, buffer, shape, requires_grad: true, ctx: Arc::clone(ctx) }
+        Self {
+            id,
+            buffer,
+            shape,
+            requires_grad: true,
+            ctx: Arc::clone(ctx),
+        }
     }
 
     /// Mark this tensor as a parameter (requires gradient).
@@ -173,14 +215,32 @@ impl Tensor {
             let absmean = self.ctx.alloc_buffer(n * 4);
             compute::gpu_ternary_absmean(&self.ctx, &weight.buffer, &absmean, k as u32, n as u32);
             let packed = self.ctx.alloc_buffer(packed_rows * n * 4);
-            compute::gpu_ternary_pack(&self.ctx, &weight.buffer, &absmean, &packed, k as u32, n as u32);
-            TERNARY_CACHE.with(|c| c.borrow_mut().insert(cache_key, (packed.clone(), absmean.clone())));
+            compute::gpu_ternary_pack(
+                &self.ctx,
+                &weight.buffer,
+                &absmean,
+                &packed,
+                k as u32,
+                n as u32,
+            );
+            TERNARY_CACHE.with(|c| {
+                c.borrow_mut()
+                    .insert(cache_key, (packed.clone(), absmean.clone()))
+            });
             (packed, absmean)
         };
 
         // Ternary matmul: add/subtract only, no float multiply
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        compute::gpu_ternary_matmul(&self.ctx, &self.buffer, &packed_buf, &out_buf, m as u32, n as u32, k as u32);
+        compute::gpu_ternary_matmul(
+            &self.ctx,
+            &self.buffer,
+            &packed_buf,
+            &out_buf,
+            m as u32,
+            n as u32,
+            k as u32,
+        );
 
         // Scale output by absmean PER COLUMN: out[i][j] *= absmean[j]. This restores the magnitude
         // lost by ternary quantization. Each output column j comes from weight column j, which has
@@ -192,7 +252,13 @@ impl Tensor {
         let scale_full = self.ctx.alloc_buffer(m * n * 4);
         compute::gpu_broadcast_rows(&self.ctx, &absmean_buf, &scale_full, m as u32, n as u32);
         let scaled_buf = self.ctx.alloc_buffer(m * n * 4);
-        compute::gpu_mul(&self.ctx, &out_buf, &scale_full, &scaled_buf, (m * n) as u32);
+        compute::gpu_mul(
+            &self.ctx,
+            &out_buf,
+            &scale_full,
+            &scaled_buf,
+            (m * n) as u32,
+        );
         let out_scaled = Tensor::from_buffer(Arc::clone(&self.ctx), scaled_buf, vec![m, n]);
 
         // STE: the per-column scaling above uses raw compute kernels (not recorded on the tape).
@@ -207,7 +273,11 @@ impl Tensor {
                 output: out_scaled.id,
                 input_buffers: vec![self.buffer.clone(), weight.buffer.clone()],
                 output_buffer: out_scaled.buffer.clone(),
-                shapes: vec![self.shape.clone(), weight.shape.clone(), out_scaled.shape.clone()],
+                shapes: vec![
+                    self.shape.clone(),
+                    weight.shape.clone(),
+                    out_scaled.shape.clone(),
+                ],
                 cached: None,
             });
         }
@@ -225,7 +295,14 @@ impl Tensor {
         assert_eq!(scales.shape, vec![rows], "scales must be [rows]");
 
         let out_buf = self.ctx.alloc_buffer(rows * cols * 4);
-        compute::gpu_scale_rows(&self.ctx, &self.buffer, &scales.buffer, &out_buf, rows as u32, cols as u32);
+        compute::gpu_scale_rows(
+            &self.ctx,
+            &self.buffer,
+            &scales.buffer,
+            &out_buf,
+            rows as u32,
+            cols as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -285,8 +362,11 @@ impl Tensor {
         // Record as identity on tape — gradient passes through unchanged
         let out_id = autograd::next_id();
         let out = Tensor {
-            id: out_id, buffer: f32_buf, shape: self.shape.clone(),
-            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+            id: out_id,
+            buffer: f32_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
         };
 
         if self.requires_grad || autograd::is_recording() {
@@ -348,7 +428,10 @@ impl Tensor {
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         let rank_a = self.shape.len();
         let rank_b = other.shape.len();
-        assert!(rank_a >= 2 && rank_b >= 2, "matmul requires at least 2D tensors");
+        assert!(
+            rank_a >= 2 && rank_b >= 2,
+            "matmul requires at least 2D tensors"
+        );
 
         let m = self.shape[rank_a - 2];
         let k = self.shape[rank_a - 1];
@@ -360,8 +443,10 @@ impl Tensor {
         let batch_a: usize = self.shape[..rank_a - 2].iter().product();
         let batch_b: usize = other.shape[..rank_b - 2].iter().product();
         let batch = batch_a.max(batch_b);
-        assert!(batch_a == 1 || batch_b == 1 || batch_a == batch_b,
-            "Incompatible batch dimensions");
+        assert!(
+            batch_a == 1 || batch_b == 1 || batch_a == batch_b,
+            "Incompatible batch dimensions"
+        );
 
         let total_m = batch * m;
         let out_size = total_m * n;
@@ -375,21 +460,43 @@ impl Tensor {
                 // Hardware MMA fast path — same fp16-input/fp32-output precision as gpu_matmul_f16.
                 let a_f16 = self.cast_to_f16();
                 let b_f16 = other.cast_to_f16();
-                compute::gpu_matmul_simdgroup_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+                compute::gpu_matmul_simdgroup_f16(
+                    &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+                );
             } else if compute::bf16_matmul_enabled() {
                 // bf16 path: fp32 operands, fp32 range (no ±65504 clamp), bf16 mantissa.
-                compute::gpu_matmul_bf16(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+                compute::gpu_matmul_bf16(
+                    &self.ctx,
+                    &self.buffer,
+                    &other.buffer,
+                    &out_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                );
             } else {
                 let a_f16 = self.cast_to_f16();
                 let b_f16 = other.cast_to_f16();
-                compute::gpu_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+                compute::gpu_matmul_f16(
+                    &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+                );
             }
         } else if batch_a == batch_b {
             // Equal batch dims: single-dispatch batched FP16 matmul (1 GPU dispatch for all batches)
             let a_f16 = self.cast_to_f16();
             let b_f16 = other.cast_to_f16();
-            compute::gpu_batched_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf,
-                compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 });
+            compute::gpu_batched_matmul_f16(
+                &self.ctx,
+                &a_f16,
+                &b_f16,
+                &out_buf,
+                compute::BatchedDims {
+                    batch: batch as u32,
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                },
+            );
         } else {
             // Broadcast: one operand has batch=1. Single-dispatch batched FP32 matmul
             // with the unbatched operand repeated via gpu_repeat_kv-style expansion.
@@ -398,20 +505,42 @@ impl Tensor {
             let (a_full, b_full) = if batch_a == 1 {
                 let expanded = self.ctx.alloc_buffer(batch * m * k * 4);
                 for i in 0..batch {
-                    compute::gpu_buffer_copy(&self.ctx, &self.buffer, &expanded,
-                        0, (i * m * k) as u32, (m * k) as u32);
+                    compute::gpu_buffer_copy(
+                        &self.ctx,
+                        &self.buffer,
+                        &expanded,
+                        0,
+                        (i * m * k) as u32,
+                        (m * k) as u32,
+                    );
                 }
                 (expanded, other.buffer.clone())
             } else {
                 let expanded = self.ctx.alloc_buffer(batch * k * n * 4);
                 for i in 0..batch {
-                    compute::gpu_buffer_copy(&self.ctx, &other.buffer, &expanded,
-                        0, (i * k * n) as u32, (k * n) as u32);
+                    compute::gpu_buffer_copy(
+                        &self.ctx,
+                        &other.buffer,
+                        &expanded,
+                        0,
+                        (i * k * n) as u32,
+                        (k * n) as u32,
+                    );
                 }
                 (self.buffer.clone(), expanded)
             };
-            compute::gpu_batched_matmul(&self.ctx, &a_full, &b_full, &out_buf,
-                compute::BatchedDims { batch: batch as u32, m: m as u32, n: n as u32, k: k as u32 });
+            compute::gpu_batched_matmul(
+                &self.ctx,
+                &a_full,
+                &b_full,
+                &out_buf,
+                compute::BatchedDims {
+                    batch: batch as u32,
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                },
+            );
         }
 
         let mut out_shape = self.shape[..rank_a - 2].to_vec();
@@ -454,11 +583,23 @@ impl Tensor {
         assert_eq!(other.shape.len(), 2, "matmul_precise expects 2D tensors");
         let m = self.shape[0];
         let k = self.shape[1];
-        assert_eq!(k, other.shape[0], "matmul_precise inner dims: {} vs {}", k, other.shape[0]);
+        assert_eq!(
+            k, other.shape[0],
+            "matmul_precise inner dims: {} vs {}",
+            k, other.shape[0]
+        );
         let n = other.shape[1];
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        compute::gpu_matmul_fp32(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+        compute::gpu_matmul_fp32(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            m as u32,
+            n as u32,
+            k as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -490,11 +631,23 @@ impl Tensor {
         assert_eq!(other.shape.len(), 2, "matmul_bf16 expects 2D tensors");
         let m = self.shape[0];
         let k = self.shape[1];
-        assert_eq!(k, other.shape[0], "matmul_bf16 inner dims: {} vs {}", k, other.shape[0]);
+        assert_eq!(
+            k, other.shape[0],
+            "matmul_bf16 inner dims: {} vs {}",
+            k, other.shape[0]
+        );
         let n = other.shape[1];
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        compute::gpu_matmul_bf16(&self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32);
+        compute::gpu_matmul_bf16(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            m as u32,
+            n as u32,
+            k as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -532,7 +685,9 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         let a_f16 = self.cast_to_f16();
         let b_f16 = other.cast_to_f16();
-        compute::gpu_matmul_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+        compute::gpu_matmul_f16(
+            &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -571,7 +726,9 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         let a_f16 = self.cast_to_f16();
         let b_f16 = other.cast_to_f16();
-        compute::gpu_matmul_trans_b_f16(&self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32);
+        compute::gpu_matmul_trans_b_f16(
+            &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -599,10 +756,20 @@ impl Tensor {
 
     /// Elementwise addition.
     pub fn add(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape, other.shape, "add shape mismatch: {:?} vs {:?}", self.shape, other.shape);
+        assert_eq!(
+            self.shape, other.shape,
+            "add shape mismatch: {:?} vs {:?}",
+            self.shape, other.shape
+        );
         let size = self.numel();
         let out_buf = self.ctx.alloc_buffer(size * 4);
-        compute::gpu_add(&self.ctx, &self.buffer, &other.buffer, &out_buf, size as u32);
+        compute::gpu_add(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            size as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -633,7 +800,13 @@ impl Tensor {
         assert_eq!(self.shape, other.shape, "mul shape mismatch");
         let size = self.numel();
         let out_buf = self.ctx.alloc_buffer(size * 4);
-        compute::gpu_mul(&self.ctx, &self.buffer, &other.buffer, &out_buf, size as u32);
+        compute::gpu_mul(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            size as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -698,7 +871,15 @@ impl Tensor {
         assert_eq!(weight.shape, vec![cols], "norm weight shape mismatch");
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
-        compute::gpu_rms_norm(&self.ctx, &self.buffer, &weight.buffer, &out_buf, rows as u32, cols as u32, eps);
+        compute::gpu_rms_norm(
+            &self.ctx,
+            &self.buffer,
+            &weight.buffer,
+            &out_buf,
+            rows as u32,
+            cols as u32,
+            eps,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -727,7 +908,10 @@ impl Tensor {
     /// Fused residual add + RMS norm: output = rms_norm(self + residual, weight, eps)
     /// Saves 1 kernel dispatch + 1 temp buffer vs separate add() + rms_norm().
     pub fn rms_norm_residual(&self, residual: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
-        assert_eq!(self.shape, residual.shape, "rms_norm_residual shape mismatch");
+        assert_eq!(
+            self.shape, residual.shape,
+            "rms_norm_residual shape mismatch"
+        );
         let cols = *self.shape.last().unwrap();
         let rows: usize = self.numel() / cols;
         assert_eq!(weight.shape, vec![cols], "norm weight shape mismatch");
@@ -735,8 +919,17 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         let sum_buf = self.ctx.alloc_buffer(self.numel() * 4); // stores (self + residual)
         compute::gpu_rms_norm_residual(
-            &self.ctx, &self.buffer, &residual.buffer, &weight.buffer,
-            &out_buf, &sum_buf, compute::RmsResDims { rows: rows as u32, cols: cols as u32, eps },
+            &self.ctx,
+            &self.buffer,
+            &residual.buffer,
+            &weight.buffer,
+            &out_buf,
+            &sum_buf,
+            compute::RmsResDims {
+                rows: rows as u32,
+                cols: cols as u32,
+                eps,
+            },
         );
 
         let out_id = autograd::next_id();
@@ -748,14 +941,27 @@ impl Tensor {
             ctx: Arc::clone(&self.ctx),
         };
 
-        if self.requires_grad || residual.requires_grad || weight.requires_grad || autograd::is_recording() {
+        if self.requires_grad
+            || residual.requires_grad
+            || weight.requires_grad
+            || autograd::is_recording()
+        {
             autograd::record(TapeEntry {
                 op: Op::RmsNormResidual { eps },
                 inputs: vec![self.id, residual.id, weight.id],
                 output: out_id,
-                input_buffers: vec![self.buffer.clone(), residual.buffer.clone(), weight.buffer.clone()],
+                input_buffers: vec![
+                    self.buffer.clone(),
+                    residual.buffer.clone(),
+                    weight.buffer.clone(),
+                ],
                 output_buffer: out.buffer.clone(),
-                shapes: vec![self.shape.clone(), residual.shape.clone(), weight.shape.clone(), out.shape.clone()],
+                shapes: vec![
+                    self.shape.clone(),
+                    residual.shape.clone(),
+                    weight.shape.clone(),
+                    out.shape.clone(),
+                ],
                 cached: Some(sum_buf),
             });
         }
@@ -766,8 +972,16 @@ impl Tensor {
     /// Fused add + RMS norm that also returns the sum tensor.
     /// Computes: sum = self + residual, out = rms_norm(sum, weight, eps)
     /// Returns (out, sum) — saves 1 kernel dispatch vs separate add + rms_norm.
-    pub fn rms_norm_residual_with_sum(&self, residual: &Tensor, weight: &Tensor, eps: f32) -> (Tensor, Tensor) {
-        assert_eq!(self.shape, residual.shape, "rms_norm_residual shape mismatch");
+    pub fn rms_norm_residual_with_sum(
+        &self,
+        residual: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> (Tensor, Tensor) {
+        assert_eq!(
+            self.shape, residual.shape,
+            "rms_norm_residual shape mismatch"
+        );
         let cols = *self.shape.last().unwrap();
         let rows: usize = self.numel() / cols;
         assert_eq!(weight.shape, vec![cols], "norm weight shape mismatch");
@@ -775,8 +989,17 @@ impl Tensor {
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         let sum_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_rms_norm_residual(
-            &self.ctx, &self.buffer, &residual.buffer, &weight.buffer,
-            &out_buf, &sum_buf, compute::RmsResDims { rows: rows as u32, cols: cols as u32, eps },
+            &self.ctx,
+            &self.buffer,
+            &residual.buffer,
+            &weight.buffer,
+            &out_buf,
+            &sum_buf,
+            compute::RmsResDims {
+                rows: rows as u32,
+                cols: cols as u32,
+                eps,
+            },
         );
 
         let out_id = autograd::next_id();
@@ -797,14 +1020,27 @@ impl Tensor {
             ctx: Arc::clone(&self.ctx),
         };
 
-        if self.requires_grad || residual.requires_grad || weight.requires_grad || autograd::is_recording() {
+        if self.requires_grad
+            || residual.requires_grad
+            || weight.requires_grad
+            || autograd::is_recording()
+        {
             autograd::record(TapeEntry {
                 op: Op::RmsNormResidual { eps },
                 inputs: vec![self.id, residual.id, weight.id],
                 output: out_id,
-                input_buffers: vec![self.buffer.clone(), residual.buffer.clone(), weight.buffer.clone()],
+                input_buffers: vec![
+                    self.buffer.clone(),
+                    residual.buffer.clone(),
+                    weight.buffer.clone(),
+                ],
                 output_buffer: out.buffer.clone(),
-                shapes: vec![self.shape.clone(), residual.shape.clone(), weight.shape.clone(), out.shape.clone()],
+                shapes: vec![
+                    self.shape.clone(),
+                    residual.shape.clone(),
+                    weight.shape.clone(),
+                    out.shape.clone(),
+                ],
                 cached: Some(sum_buf),
             });
         }
@@ -848,7 +1084,13 @@ impl Tensor {
         assert_eq!(self.shape, other.shape, "silu_gate shape mismatch");
         let size = self.numel();
         let out_buf = self.ctx.alloc_buffer(size * 4);
-        compute::gpu_silu_gate(&self.ctx, &self.buffer, &other.buffer, &out_buf, size as u32);
+        compute::gpu_silu_gate(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            size as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -877,7 +1119,13 @@ impl Tensor {
     /// Reshape tensor (view, no data copy if contiguous).
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let new_numel: usize = new_shape.iter().product();
-        assert_eq!(self.numel(), new_numel, "reshape: incompatible sizes {} vs {}", self.numel(), new_numel);
+        assert_eq!(
+            self.numel(),
+            new_numel,
+            "reshape: incompatible sizes {} vs {}",
+            self.numel(),
+            new_numel
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -906,15 +1154,29 @@ impl Tensor {
     /// Apply RoPE positional encoding in-place.
     /// self shape: [batch_heads, seq_len, head_dim]
     pub fn apply_rope(&self, offset: u32, theta: f32) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "rope expects 3D: [batch_heads, seq, head_dim]");
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "rope expects 3D: [batch_heads, seq, head_dim]"
+        );
         let total_rows = self.shape[0];
         let seq_len = self.shape[1];
         let head_dim = self.shape[2];
 
         // Out-of-place RoPE: dst = rotate(src, θ) in 1 dispatch (was copy + in-place = 2)
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
-        compute::gpu_rope_copy(&self.ctx, &self.buffer, &out_buf,
-            compute::RopeDims { total_rows: total_rows as u32, seq_len: seq_len as u32, head_dim: head_dim as u32, offset, theta });
+        compute::gpu_rope_copy(
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            compute::RopeDims {
+                total_rows: total_rows as u32,
+                seq_len: seq_len as u32,
+                head_dim: head_dim as u32,
+                offset,
+                theta,
+            },
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -927,7 +1189,12 @@ impl Tensor {
 
         if self.requires_grad || autograd::is_recording() {
             autograd::record(TapeEntry {
-                op: Op::RoPE { seq_len: seq_len as u32, head_dim: head_dim as u32, offset, theta },
+                op: Op::RoPE {
+                    seq_len: seq_len as u32,
+                    head_dim: head_dim as u32,
+                    offset,
+                    theta,
+                },
                 inputs: vec![self.id],
                 output: out_id,
                 input_buffers: vec![self.buffer.clone()],
@@ -951,7 +1218,14 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_causal_mask(&self.ctx, &out_buf, batch_heads as u32, seq_q as u32, seq_k as u32, offset);
+        compute::gpu_causal_mask(
+            &self.ctx,
+            &out_buf,
+            batch_heads as u32,
+            seq_q as u32,
+            seq_k as u32,
+            offset,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -985,14 +1259,28 @@ impl Tensor {
     /// don't attend across each other. Backward is passthrough (masked → 0 softmax weight → 0 grad),
     /// identical to `causal_mask`.
     pub fn causal_doc_mask(&self, seg_ids: &crate::gpu::Buf, n_heads: usize) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "causal_doc_mask expects [batch_heads, seq, seq] scores");
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "causal_doc_mask expects [batch_heads, seq, seq] scores"
+        );
         let batch_heads = self.shape[0];
         let seq = self.shape[1];
-        assert_eq!(self.shape[2], seq, "causal_doc_mask requires seq_q == seq_k (packed training path)");
+        assert_eq!(
+            self.shape[2], seq,
+            "causal_doc_mask requires seq_q == seq_k (packed training path)"
+        );
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_causal_doc_mask(&self.ctx, &out_buf, &crate::gpu::buf_as_u32(seg_ids), batch_heads as u32, seq as u32, n_heads as u32);
+        compute::gpu_causal_doc_mask(
+            &self.ctx,
+            &out_buf,
+            &crate::gpu::buf_as_u32(seg_ids),
+            batch_heads as u32,
+            seq as u32,
+            n_heads as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1025,9 +1313,18 @@ impl Tensor {
         let (bh, seq, hd) = (self.shape[0], self.shape[1], self.shape[2]);
         let nb = seq.div_ceil(block_size);
         let out_buf = self.ctx.alloc_buffer(bh * nb * hd * 4);
-        compute::gpu_block_mean_keys(&self.ctx, &self.buffer, &out_buf, compute::BlockMeanDims {
-            bh: bh as u32, seq: seq as u32, hd: hd as u32, nb: nb as u32, block_size: block_size as u32,
-        });
+        compute::gpu_block_mean_keys(
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            compute::BlockMeanDims {
+                bh: bh as u32,
+                seq: seq as u32,
+                hd: hd as u32,
+                nb: nb as u32,
+                block_size: block_size as u32,
+            },
+        );
         Tensor::from_buffer(Arc::clone(&self.ctx), out_buf, vec![bh, nb, hd])
     }
 
@@ -1036,16 +1333,37 @@ impl Tensor {
     /// query's own block + its top-k past blocks (and the causal future). Backward is passthrough
     /// (masked → 0 softmax weight → 0 grad), identical to `causal_mask`; the selection itself is not
     /// differentiated.
-    pub fn block_sparse_mask(&self, block_scores: &Tensor, block_size: usize, top_k: usize) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "block_sparse_mask expects [bh, seq, seq] scores");
+    pub fn block_sparse_mask(
+        &self,
+        block_scores: &Tensor,
+        block_size: usize,
+        top_k: usize,
+    ) -> Tensor {
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "block_sparse_mask expects [bh, seq, seq] scores"
+        );
         let (bh, seq) = (self.shape[0], self.shape[1]);
-        assert_eq!(self.shape[2], seq, "block_sparse_mask requires seq_q == seq_k");
+        assert_eq!(
+            self.shape[2], seq,
+            "block_sparse_mask requires seq_q == seq_k"
+        );
         let nb = block_scores.shape[2];
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_block_sparse_mask(&self.ctx, &out_buf, &block_scores.buffer, compute::BlockSparseDims {
-            bh: bh as u32, seq: seq as u32, nb: nb as u32, block_size: block_size as u32, top_k: top_k as u32,
-        });
+        compute::gpu_block_sparse_mask(
+            &self.ctx,
+            &out_buf,
+            &block_scores.buffer,
+            compute::BlockSparseDims {
+                bh: bh as u32,
+                seq: seq as u32,
+                nb: nb as u32,
+                block_size: block_size as u32,
+                top_k: top_k as u32,
+            },
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1082,13 +1400,24 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
         compute::gpu_fused_norm_matmul(
-            &self.ctx, &self.buffer, &weight.buffer, &b.buffer, &out_buf,
-            compute::NormMatmulDims { m: m as u32, n: n as u32, k: k as u32, eps },
+            &self.ctx,
+            &self.buffer,
+            &weight.buffer,
+            &b.buffer,
+            &out_buf,
+            compute::NormMatmulDims {
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                eps,
+            },
         );
 
         let out_id = autograd::next_id();
         let out = Tensor {
-            id: out_id, buffer: out_buf, shape: vec![m, n],
+            id: out_id,
+            buffer: out_buf,
+            shape: vec![m, n],
             requires_grad: self.requires_grad || b.requires_grad,
             ctx: Arc::clone(&self.ctx),
         };
@@ -1125,8 +1454,11 @@ impl Tensor {
 
         let out_id = autograd::next_id();
         let out = Tensor {
-            id: out_id, buffer: out_buf, shape: self.shape.clone(),
-            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
         };
 
         if self.requires_grad || autograd::is_recording() {
@@ -1152,8 +1484,11 @@ impl Tensor {
 
         let out_id = autograd::next_id();
         let out = Tensor {
-            id: out_id, buffer: out_buf, shape: self.shape.clone(),
-            requires_grad: self.requires_grad, ctx: Arc::clone(&self.ctx),
+            id: out_id,
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
         };
 
         if self.requires_grad || autograd::is_recording() {
@@ -1209,7 +1544,15 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32);
-        compute::gpu_causal_mask_window(&self.ctx, &out_buf, batch_heads as u32, seq_q as u32, seq_k as u32, offset, window);
+        compute::gpu_causal_mask_window(
+            &self.ctx,
+            &out_buf,
+            batch_heads as u32,
+            seq_q as u32,
+            seq_k as u32,
+            offset,
+            window,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1238,7 +1581,11 @@ impl Tensor {
     /// self shape: [batch_heads, seq_q, seq_k] (raw attention scores)
     /// Returns softmax(self * scale, causal_masked).
     pub fn scaled_causal_softmax(&self, scale: f32, kv_offset: u32) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "scaled_causal_softmax needs 3D [batch_heads, seq_q, seq_k]");
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "scaled_causal_softmax needs 3D [batch_heads, seq_q, seq_k]"
+        );
         let batch_heads = self.shape[0];
         let seq_q = self.shape[1];
         let seq_k = self.shape[2];
@@ -1246,8 +1593,16 @@ impl Tensor {
 
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
         compute::gpu_scaled_causal_softmax(
-            &self.ctx, &self.buffer, &out_buf,
-            compute::SoftmaxDims { total_rows: total_rows as u32, seq_q: seq_q as u32, seq_k: seq_k as u32, scale, kv_offset },
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            compute::SoftmaxDims {
+                total_rows: total_rows as u32,
+                seq_q: seq_q as u32,
+                seq_k: seq_k as u32,
+                scale,
+                kv_offset,
+            },
         );
 
         let out_id = autograd::next_id();
@@ -1277,14 +1632,26 @@ impl Tensor {
     /// Column-wise slice: extract columns [col_offset..col_offset+dst_cols) from [rows, src_cols].
     /// Returns [rows, dst_cols]. Tape-tracked for gradient flow.
     pub fn slice_cols(&self, col_offset: usize, dst_cols: usize) -> Tensor {
-        assert_eq!(self.shape.len(), 2, "slice_cols needs 2D, got {:?}", self.shape);
+        assert_eq!(
+            self.shape.len(),
+            2,
+            "slice_cols needs 2D, got {:?}",
+            self.shape
+        );
         let rows = self.shape[0];
         let src_cols = self.shape[1];
         assert!(col_offset + dst_cols <= src_cols);
 
         let out_buf = self.ctx.alloc_buffer(rows * dst_cols * 4);
-        compute::gpu_slice_cols(&self.ctx, &self.buffer, &out_buf,
-            rows as u32, src_cols as u32, dst_cols as u32, col_offset as u32);
+        compute::gpu_slice_cols(
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            rows as u32,
+            src_cols as u32,
+            dst_cols as u32,
+            col_offset as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1297,7 +1664,12 @@ impl Tensor {
 
         if self.requires_grad || autograd::is_recording() {
             autograd::record(TapeEntry {
-                op: Op::SliceCols { rows, src_cols, dst_cols, col_offset },
+                op: Op::SliceCols {
+                    rows,
+                    src_cols,
+                    dst_cols,
+                    col_offset,
+                },
                 inputs: vec![self.id],
                 output: out_id,
                 input_buffers: vec![self.buffer.clone()],
@@ -1315,11 +1687,22 @@ impl Tensor {
     pub fn slice_flat(&self, offset: usize, length: usize, new_shape: Vec<usize>) -> Tensor {
         let source_size = self.numel();
         assert!(offset + length <= source_size, "slice out of bounds");
-        assert_eq!(length, new_shape.iter().product::<usize>(), "shape doesn't match length");
+        assert_eq!(
+            length,
+            new_shape.iter().product::<usize>(),
+            "shape doesn't match length"
+        );
 
         // Copy the slice into a new buffer using GPU buffer copy — no CPU roundtrip
         let out_buf = self.ctx.alloc_buffer(length * 4);
-        compute::gpu_buffer_copy(&self.ctx, &self.buffer, &out_buf, offset as u32, 0, length as u32);
+        compute::gpu_buffer_copy(
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            offset as u32,
+            0,
+            length as u32,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1332,7 +1715,11 @@ impl Tensor {
 
         if self.requires_grad || autograd::is_recording() {
             autograd::record(TapeEntry {
-                op: Op::Slice { offset, length, source_size },
+                op: Op::Slice {
+                    offset,
+                    length,
+                    source_size,
+                },
                 inputs: vec![self.id],
                 output: out_id,
                 input_buffers: vec![self.buffer.clone()],
@@ -1349,7 +1736,11 @@ impl Tensor {
     pub fn concat_flat(tensors: &[&Tensor], new_shape: Vec<usize>) -> Tensor {
         let ctx = &tensors[0].ctx;
         let total: usize = tensors.iter().map(|t| t.numel()).sum();
-        assert_eq!(total, new_shape.iter().product::<usize>(), "shape doesn't match total");
+        assert_eq!(
+            total,
+            new_shape.iter().product::<usize>(),
+            "shape doesn't match total"
+        );
 
         let mut part_sizes = Vec::with_capacity(tensors.len());
         let mut input_ids = Vec::with_capacity(tensors.len());
@@ -1377,7 +1768,11 @@ impl Tensor {
         };
 
         if autograd::is_recording() {
-            let shapes: Vec<Vec<usize>> = tensors.iter().map(|t| t.shape.clone()).chain(std::iter::once(out.shape.clone())).collect();
+            let shapes: Vec<Vec<usize>> = tensors
+                .iter()
+                .map(|t| t.shape.clone())
+                .chain(std::iter::once(out.shape.clone()))
+                .collect();
             autograd::record(TapeEntry {
                 op: Op::ConcatParts { part_sizes },
                 inputs: input_ids,
@@ -1396,22 +1791,51 @@ impl Tensor {
     /// self: [B, M, K], other: [B, K, N] → result: [B, M, N]
     /// Records a single Op::BatchedMatmul tape entry.
     pub fn batched_matmul(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "batched_matmul expects 3D tensors, got {:?}", self.shape);
-        assert_eq!(other.shape.len(), 3, "batched_matmul expects 3D tensors, got {:?}", other.shape);
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "batched_matmul expects 3D tensors, got {:?}",
+            self.shape
+        );
+        assert_eq!(
+            other.shape.len(),
+            3,
+            "batched_matmul expects 3D tensors, got {:?}",
+            other.shape
+        );
         let batches = self.shape[0];
         let m = self.shape[1];
         let k = self.shape[2];
-        assert_eq!(other.shape[0], batches, "batch dim mismatch: {} vs {}", batches, other.shape[0]);
-        assert_eq!(other.shape[1], k, "inner dim mismatch: {} vs {}", k, other.shape[1]);
+        assert_eq!(
+            other.shape[0], batches,
+            "batch dim mismatch: {} vs {}",
+            batches, other.shape[0]
+        );
+        assert_eq!(
+            other.shape[1], k,
+            "inner dim mismatch: {} vs {}",
+            k, other.shape[1]
+        );
         let n = other.shape[2];
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
         // Batched matmul. NB: despite "FP32 inputs", the batched_matmul_tiled kernel casts both
         // operands to half in shared memory (like the dense matmul) — results are fp16-precision.
-        let bd = compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 };
+        let bd = compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
         if compute::simdgroup_matmul_enabled() {
-            compute::gpu_batched_matmul_simdgroup(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+            compute::gpu_batched_matmul_simdgroup(
+                &self.ctx,
+                &self.buffer,
+                &other.buffer,
+                &out_buf,
+                bd,
+            );
         } else {
             compute::gpu_batched_matmul(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
         }
@@ -1444,24 +1868,59 @@ impl Tensor {
     /// self: [B, M, K], other: [B, N, K] → result: [B, M, N]
     /// Records a single Op::BatchedMatmulTransB tape entry.
     pub fn batched_matmul_trans_b(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "batched_matmul_trans_b expects 3D tensors, got {:?}", self.shape);
-        assert_eq!(other.shape.len(), 3, "batched_matmul_trans_b expects 3D tensors, got {:?}", other.shape);
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "batched_matmul_trans_b expects 3D tensors, got {:?}",
+            self.shape
+        );
+        assert_eq!(
+            other.shape.len(),
+            3,
+            "batched_matmul_trans_b expects 3D tensors, got {:?}",
+            other.shape
+        );
         let batches = self.shape[0];
         let m = self.shape[1];
         let k = self.shape[2];
-        assert_eq!(other.shape[0], batches, "batch dim mismatch: {} vs {}", batches, other.shape[0]);
-        assert_eq!(other.shape[2], k, "inner dim mismatch: {} vs {}", k, other.shape[2]);
+        assert_eq!(
+            other.shape[0], batches,
+            "batch dim mismatch: {} vs {}",
+            batches, other.shape[0]
+        );
+        assert_eq!(
+            other.shape[2], k,
+            "inner dim mismatch: {} vs {}",
+            k, other.shape[2]
+        );
         let n = other.shape[1];
 
         let out_buf = self.ctx.alloc_buffer(batches * m * n * 4);
 
         // Batched matmul trans_b. NB: the kernel casts both operands to half in shared memory —
         // results are fp16-precision, not fp32 (the "FP32 inputs" wording is misleading).
-        let bd = compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 };
+        let bd = compute::BatchedDims {
+            batch: batches as u32,
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
         if compute::simdgroup_matmul_enabled() {
-            compute::gpu_batched_matmul_trans_b_simdgroup(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+            compute::gpu_batched_matmul_trans_b_simdgroup(
+                &self.ctx,
+                &self.buffer,
+                &other.buffer,
+                &out_buf,
+                bd,
+            );
         } else {
-            compute::gpu_batched_matmul_trans_b(&self.ctx, &self.buffer, &other.buffer, &out_buf, bd);
+            compute::gpu_batched_matmul_trans_b(
+                &self.ctx,
+                &self.buffer,
+                &other.buffer,
+                &out_buf,
+                bd,
+            );
         }
 
         let out_id = autograd::next_id();
@@ -1494,18 +1953,47 @@ impl Tensor {
     /// running-state update `Kᵀ V` used by linear-attention / SSM recurrences.
     /// Records a single Op::BatchedMatmulTransA tape entry.
     pub fn batched_matmul_trans_a(&self, other: &Tensor) -> Tensor {
-        assert_eq!(self.shape.len(), 3, "batched_matmul_trans_a expects 3D tensors, got {:?}", self.shape);
-        assert_eq!(other.shape.len(), 3, "batched_matmul_trans_a expects 3D tensors, got {:?}", other.shape);
+        assert_eq!(
+            self.shape.len(),
+            3,
+            "batched_matmul_trans_a expects 3D tensors, got {:?}",
+            self.shape
+        );
+        assert_eq!(
+            other.shape.len(),
+            3,
+            "batched_matmul_trans_a expects 3D tensors, got {:?}",
+            other.shape
+        );
         let batches = self.shape[0];
         let m = self.shape[1];
         let k = self.shape[2];
-        assert_eq!(other.shape[0], batches, "batch dim mismatch: {} vs {}", batches, other.shape[0]);
-        assert_eq!(other.shape[1], m, "contract dim mismatch: {} vs {}", m, other.shape[1]);
+        assert_eq!(
+            other.shape[0], batches,
+            "batch dim mismatch: {} vs {}",
+            batches, other.shape[0]
+        );
+        assert_eq!(
+            other.shape[1], m,
+            "contract dim mismatch: {} vs {}",
+            m, other.shape[1]
+        );
         let n = other.shape[2];
 
         let out_buf = self.ctx.alloc_buffer(batches * k * n * 4);
 
-        compute::gpu_batched_matmul_trans_a(&self.ctx, &self.buffer, &other.buffer, &out_buf, compute::BatchedDims { batch: batches as u32, m: m as u32, n: n as u32, k: k as u32 });
+        compute::gpu_batched_matmul_trans_a(
+            &self.ctx,
+            &self.buffer,
+            &other.buffer,
+            &out_buf,
+            compute::BatchedDims {
+                batch: batches as u32,
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+            },
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {
@@ -1535,7 +2023,13 @@ impl Tensor {
     pub fn scale(&self, factor: f32) -> Tensor {
         // Fused out-of-place: dst = src * factor in 1 dispatch (was copy + scale = 2)
         let out_buf = self.ctx.alloc_buffer(self.numel() * 4);
-        compute::gpu_scale_copy(&self.ctx, &self.buffer, &out_buf, self.numel() as u32, factor);
+        compute::gpu_scale_copy(
+            &self.ctx,
+            &self.buffer,
+            &out_buf,
+            self.numel() as u32,
+            factor,
+        );
 
         let out_id = autograd::next_id();
         let out = Tensor {

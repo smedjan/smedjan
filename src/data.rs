@@ -141,7 +141,11 @@ impl DataLoader {
 
         for b in 0..self.batch_size {
             // Random position for each sequence in the batch
-            let start = if max_start > 0 { rng.gen_range(0..max_start) } else { 0 };
+            let start = if max_start > 0 {
+                rng.gen_range(0..max_start)
+            } else {
+                0
+            };
             let tokens = self.dataset.get_tokens_slice(start, seq_tokens);
 
             let dst_offset = b * self.seq_len;
@@ -193,7 +197,11 @@ pub fn pad_sequences(sequences: &[Vec<u32>], max_len: usize) -> Vec<u32> {
 /// Verify a dataset shard by round-tripping a sample through a GPU u32 buffer.
 /// Also verifies the GPU transpose kernel by transposing a small matrix and checking the result.
 /// Returns the number of verified tokens. Panics on mismatch.
-pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_size: usize) -> usize {
+pub fn verify_dataset_gpu(
+    ctx: &Arc<MetalContext>,
+    dataset_path: &str,
+    sample_size: usize,
+) -> usize {
     use crate::gpu::compute;
 
     let dataset = Dataset::load(dataset_path).expect("Failed to load dataset for verification");
@@ -204,7 +212,10 @@ pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_si
     let gpu_buf = ctx.buffer_from_u32_slice(&tokens);
     let readback = MetalContext::read_buffer_u32(&gpu_buf, count);
 
-    assert_eq!(tokens, readback, "GPU round-trip verification failed for dataset");
+    assert_eq!(
+        tokens, readback,
+        "GPU round-trip verification failed for dataset"
+    );
 
     // Verify GPU transpose kernel (sanity check that compute shaders are working correctly).
     // Transpose a 2x(count/2) float matrix and verify the result, ensuring the shader
@@ -227,13 +238,19 @@ pub fn verify_dataset_gpu(ctx: &Arc<MetalContext>, dataset_path: &str, sample_si
                 assert!(
                     (actual - expected).abs() < 1e-6,
                     "GPU transpose verification failed at ({}, {}): expected {}, got {}",
-                    i, j, expected, actual
+                    i,
+                    j,
+                    expected,
+                    actual
                 );
             }
         }
     }
 
-    eprintln!("Dataset verification passed: {} tokens round-tripped through GPU (transpose OK)", count);
+    eprintln!(
+        "Dataset verification passed: {} tokens round-tripped through GPU (transpose OK)",
+        count
+    );
     count
 }
 
@@ -267,20 +284,35 @@ impl DataMixer {
             cumulative.push(cum);
         }
 
-        let loaders = paths.iter()
+        let loaders = paths
+            .iter()
             .map(|p| DataLoader::new(p, batch_size, seq_len))
             .collect::<std::io::Result<Vec<_>>>()?;
 
-        eprintln!("DataMixer: {} sources, weights={:?}", paths.len(),
-            norm_weights.iter().map(|w| format!("{:.1}%", w * 100.0)).collect::<Vec<_>>());
+        eprintln!(
+            "DataMixer: {} sources, weights={:?}",
+            paths.len(),
+            norm_weights
+                .iter()
+                .map(|w| format!("{:.1}%", w * 100.0))
+                .collect::<Vec<_>>()
+        );
 
-        Ok(Self { loaders, weights: norm_weights, cumulative })
+        Ok(Self {
+            loaders,
+            weights: norm_weights,
+            cumulative,
+        })
     }
 
     /// Get next batch from a randomly selected source (weighted).
     pub fn next_batch(&mut self) -> (&[u32], &[u32]) {
         let r: f32 = rand::random();
-        let idx = self.cumulative.iter().position(|&c| r < c).unwrap_or(self.loaders.len() - 1);
+        let idx = self
+            .cumulative
+            .iter()
+            .position(|&c| r < c)
+            .unwrap_or(self.loaders.len() - 1);
         self.loaders[idx].next_batch()
     }
 

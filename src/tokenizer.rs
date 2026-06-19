@@ -24,7 +24,11 @@ pub struct BpeTokenizer {
 /// (which live in this char space) back to their raw bytes.
 fn gpt2_byte_to_unicode() -> Vec<(u8, char)> {
     let mut bs: Vec<u32> = Vec::new();
-    for (lo, hi) in [(b'!' as u32, b'~' as u32), (0xA1u32, 0xACu32), (0xAEu32, 0xFFu32)] {
+    for (lo, hi) in [
+        (b'!' as u32, b'~' as u32),
+        (0xA1u32, 0xACu32),
+        (0xAEu32, 0xFFu32),
+    ] {
         bs.extend(lo..=hi);
     }
     let mut cs: Vec<u32> = bs.clone();
@@ -45,7 +49,10 @@ fn gpt2_byte_to_unicode() -> Vec<(u8, char)> {
 impl BpeTokenizer {
     /// Train a BPE tokenizer from a corpus.
     pub fn train(corpus: &[u8], vocab_size: u32) -> Self {
-        assert!(vocab_size > 256 + SPECIAL_TOKENS, "vocab_size must be > 259");
+        assert!(
+            vocab_size > 256 + SPECIAL_TOKENS,
+            "vocab_size must be > 259"
+        );
 
         // Initialize vocab: special tokens + 256 byte-level tokens
         let mut inverse_vocab: Vec<Vec<u8>> = Vec::new();
@@ -76,7 +83,12 @@ impl BpeTokenizer {
 
         for merge_idx in 0..target_merges {
             if merge_idx % 100 == 0 {
-                eprintln!("BPE merge {}/{} (vocab size: {})", merge_idx, target_merges, inverse_vocab.len());
+                eprintln!(
+                    "BPE merge {}/{} (vocab size: {})",
+                    merge_idx,
+                    target_merges,
+                    inverse_vocab.len()
+                );
             }
 
             // Count all adjacent pairs
@@ -110,7 +122,8 @@ impl BpeTokenizer {
             let mut new_tokens = Vec::with_capacity(tokens.len());
             let mut i = 0;
             while i < tokens.len() {
-                if i + 1 < tokens.len() && tokens[i] == best_pair.0 && tokens[i + 1] == best_pair.1 {
+                if i + 1 < tokens.len() && tokens[i] == best_pair.0 && tokens[i + 1] == best_pair.1
+                {
                     new_tokens.push(new_id);
                     i += 2;
                 } else {
@@ -126,7 +139,11 @@ impl BpeTokenizer {
             merge_priority.insert((a, b), priority);
         }
 
-        eprintln!("BPE training complete: {} tokens, {} merges", inverse_vocab.len(), merges.len());
+        eprintln!(
+            "BPE training complete: {} tokens, {} merges",
+            inverse_vocab.len(),
+            merges.len()
+        );
 
         Self {
             vocab,
@@ -142,10 +159,14 @@ impl BpeTokenizer {
     /// merges) rather than the source's, which is what a freshly-trained model needs. No vocab.json
     /// required — the vocab is rebuilt from the byte base by applying the merges in order.
     pub fn import_gpt2_merges(merges_text: &str) -> Self {
-        let char2byte: HashMap<char, u8> =
-            gpt2_byte_to_unicode().into_iter().map(|(b, c)| (c, b)).collect();
+        let char2byte: HashMap<char, u8> = gpt2_byte_to_unicode()
+            .into_iter()
+            .map(|(b, c)| (c, b))
+            .collect();
         // Decode a GPT-2 char-space token to its raw bytes (None if it contains an unmapped char).
-        let decode = |s: &str| -> Option<Vec<u8>> { s.chars().map(|c| char2byte.get(&c).copied()).collect() };
+        let decode = |s: &str| -> Option<Vec<u8>> {
+            s.chars().map(|c| char2byte.get(&c).copied()).collect()
+        };
 
         let mut inverse_vocab: Vec<Vec<u8>> = Vec::new();
         let mut vocab: HashMap<Vec<u8>, u32> = HashMap::new();
@@ -193,7 +214,12 @@ impl BpeTokenizer {
             vocab.insert(merged.clone(), merged_id);
             inverse_vocab.push(merged);
         }
-        BpeTokenizer { vocab, inverse_vocab, merges, merge_priority }
+        BpeTokenizer {
+            vocab,
+            inverse_vocab,
+            merges,
+            merge_priority,
+        }
     }
 
     /// Encode text to token IDs.
@@ -414,7 +440,11 @@ impl BpeTokenizer {
         // Version
         file.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        assert!((1..=2).contains(&version), "Unsupported tokenizer version: {}", version);
+        assert!(
+            (1..=2).contains(&version),
+            "Unsupported tokenizer version: {}",
+            version
+        );
 
         // Vocab size
         file.read_exact(&mut buf4)?;

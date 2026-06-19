@@ -31,10 +31,9 @@
 //! Note: this materialised form is `O(bh·hd·seq²)` memory (`≈ batch·dim·seq²`); for long sequences the
 //! chunked/running-state scan is the production follow-up. Correctness and trainability are proven here.
 
-
-use crate::tensor::Tensor;
 #[cfg(test)]
 use crate::gpu::MetalContext;
+use crate::tensor::Tensor;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -110,8 +109,9 @@ pub fn wkv(k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
     // P with channel folded into batch: P2[(b,d),i,0] = P[b,i,d]; out2[(b,d),t,0] = Σ_{i<t} D·P2.
     let p2 = crate::attention::transpose_bsh_to_bhs(&p, bh, seq, hd, 1).reshape(vec![bhd, seq, 1]);
     let out2 = d2.batched_matmul(&p2); // [bhd, seq, 1]
-    // transpose_bhs_to_bsh returns the flattened [bh·seq, hd]; reshape back to [bh, seq, hd].
-    let past = crate::attention::transpose_bhs_to_bsh(&out2, bh, seq, hd, 1).reshape(vec![bh, seq, hd]);
+                                       // transpose_bhs_to_bsh returns the flattened [bh·seq, hd]; reshape back to [bh, seq, hd].
+    let past =
+        crate::attention::transpose_bhs_to_bsh(&out2, bh, seq, hd, 1).reshape(vec![bh, seq, hd]);
 
     // Current-token bonus: exp(u[d])·P_t[d].
     let expu = broadcast_hd(&u.exp(), bh, seq);
@@ -147,12 +147,18 @@ mod tests {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 4usize, 3usize);
         let x: Vec<f32> = (0..bh * seq * hd).map(|i| i as f32 * 0.1).collect();
-        let got = autograd::no_grad(|| token_shift(&Tensor::from_slice(&ctx, &x, vec![bh, seq, hd])).to_vec());
+        let got = autograd::no_grad(|| {
+            token_shift(&Tensor::from_slice(&ctx, &x, vec![bh, seq, hd])).to_vec()
+        });
         // out[b,t] = x[b,t-1], out[b,0] = 0
         for b in 0..bh {
             for t in 0..seq {
                 for d in 0..hd {
-                    let want = if t == 0 { 0.0 } else { x[(b * seq + (t - 1)) * hd + d] };
+                    let want = if t == 0 {
+                        0.0
+                    } else {
+                        x[(b * seq + (t - 1)) * hd + d]
+                    };
                     assert!((got[(b * seq + t) * hd + d] - want).abs() < 5e-3);
                 }
             }
@@ -160,7 +166,15 @@ mod tests {
     }
 
     /// CPU ground truth for the WKV numerator (RWKV-6 form).
-    fn cpu_wkv(k: &[f32], v: &[f32], w: &[f32], u: &[f32], bh: usize, seq: usize, hd: usize) -> Vec<f32> {
+    fn cpu_wkv(
+        k: &[f32],
+        v: &[f32],
+        w: &[f32],
+        u: &[f32],
+        bh: usize,
+        seq: usize,
+        hd: usize,
+    ) -> Vec<f32> {
         let mut out = vec![0.0f32; bh * seq * hd];
         for b in 0..bh {
             for t in 0..seq {
@@ -182,8 +196,12 @@ mod tests {
     fn wkv_matches_cpu() {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 5usize, 3usize);
-        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.15).collect();
-        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.4).collect();
+        let k: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.15)
+            .collect();
+        let v: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.4)
+            .collect();
         let w: Vec<f32> = (0..hd).map(|d| 0.3 + d as f32 * 0.2).collect(); // decay rate > 0
         let u: Vec<f32> = (0..hd).map(|d| 0.1 - d as f32 * 0.05).collect();
 
@@ -196,7 +214,10 @@ mod tests {
         });
         let want = cpu_wkv(&k, &v, &w, &u, bh, seq, hd);
         for (idx, (g, ww)) in got.iter().zip(want.iter()).enumerate() {
-            assert!((g - ww).abs() <= 0.02 * (1.0 + ww.abs()), "wkv mismatch at {idx}: gpu={g} cpu={ww}");
+            assert!(
+                (g - ww).abs() <= 0.02 * (1.0 + ww.abs()),
+                "wkv mismatch at {idx}: gpu={g} cpu={ww}"
+            );
         }
     }
 
@@ -207,8 +228,12 @@ mod tests {
     fn wkv_stable_at_long_seq() {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 40usize, 4usize);
-        let k: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
-        let v: Vec<f32> = (0..bh * seq * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.3).collect();
+        let k: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let v: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.3)
+            .collect();
         let w: Vec<f32> = (0..hd).map(|d| 0.9 + d as f32 * 0.05).collect(); // ≈ exp(rwkv_w) ≈ 1
         let u: Vec<f32> = (0..hd).map(|d| 0.1 - d as f32 * 0.03).collect();
 
@@ -220,7 +245,10 @@ mod tests {
             wkv(&kt, &vt, &wt, &ut).to_vec()
         });
         let want = cpu_wkv(&k, &v, &w, &u, bh, seq, hd);
-        assert!(got.iter().all(|x| x.is_finite()), "non-finite wkv output at seq {seq}");
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "non-finite wkv output at seq {seq}"
+        );
         for (idx, (g, ww)) in got.iter().zip(want.iter()).enumerate() {
             assert!(
                 (g - ww).abs() <= 0.02 * (1.0 + ww.abs()),
@@ -236,12 +264,37 @@ mod tests {
         let (bh, seq, hd) = (1usize, 4usize, 3usize);
         let n = bh * seq * hd;
         let mk = |f: fn(usize) -> f32| (0..n).map(f).collect::<Vec<_>>();
-        let x = Tensor::from_slice(&ctx, &mk(|i| ((i * 9 % 17) as f32 - 8.0) * 0.1), vec![bh, seq, hd]).with_grad();
+        let x = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 9 % 17) as f32 - 8.0) * 0.1),
+            vec![bh, seq, hd],
+        )
+        .with_grad();
         let r = token_shift(&x).add(&x); // exercise token-shift in the graph
-        let k = Tensor::from_slice(&ctx, &mk(|i| ((i * 5 % 13) as f32 - 6.0) * 0.1), vec![bh, seq, hd]).with_grad();
-        let v = Tensor::from_slice(&ctx, &mk(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2), vec![bh, seq, hd]).with_grad();
-        let w = Tensor::from_slice(&ctx, &(0..hd).map(|d| 0.3 + d as f32 * 0.1).collect::<Vec<_>>(), vec![hd]).with_grad();
-        let u = Tensor::from_slice(&ctx, &(0..hd).map(|d| 0.1 * d as f32).collect::<Vec<_>>(), vec![hd]).with_grad();
+        let k = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 5 % 13) as f32 - 6.0) * 0.1),
+            vec![bh, seq, hd],
+        )
+        .with_grad();
+        let v = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2),
+            vec![bh, seq, hd],
+        )
+        .with_grad();
+        let w = Tensor::from_slice(
+            &ctx,
+            &(0..hd).map(|d| 0.3 + d as f32 * 0.1).collect::<Vec<_>>(),
+            vec![hd],
+        )
+        .with_grad();
+        let u = Tensor::from_slice(
+            &ctx,
+            &(0..hd).map(|d| 0.1 * d as f32).collect::<Vec<_>>(),
+            vec![hd],
+        )
+        .with_grad();
 
         let out = time_mix(&r, &k, &v, &w, &u);
         let ones = Tensor::ones(&ctx, vec![n, 1]);
@@ -257,8 +310,14 @@ mod tests {
         ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, shape).to_vec();
-            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad for {name}");
-            assert!(gv.iter().any(|x| x.abs() > 1e-6), "all-zero grad for {name}");
+            assert!(
+                gv.iter().all(|x| x.is_finite()),
+                "non-finite grad for {name}"
+            );
+            assert!(
+                gv.iter().any(|x| x.abs() > 1e-6),
+                "all-zero grad for {name}"
+            );
         }
         autograd::zero_grads();
     }

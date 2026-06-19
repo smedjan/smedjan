@@ -11,7 +11,7 @@ All claims below were grounded against the tree, not assumed.
 - **Gradient checkpointing**: re-enabled; root cause was buffer-pool corruption in `clear_tape` /
   `clear_tape_keep_grads` (recycling buffers still referenced as inputs) + checkpoint cleanup +
   recompute pool aliasing. Fixed; exact grad equivalence test (`gradient_checkpointing_matches_standard`,
-  `#[ignore]` — needs `--test-threads=1`, the GPU layer is single-threaded).
+  run serially with `--test-threads=1`; the GPU layer is single-threaded).
 - **clippy.toml deleted**: all 31 `too_many_arguments` + the `large_enum_variant` fixed by real
   refactors (dim/param structs, `Box<TrainArgs>`, deleted dead fused/persistent paths). **0 `#[allow]`
   in `src/`.**
@@ -28,8 +28,9 @@ All claims below were grounded against the tree, not assumed.
      below uniform**. Guard: `adamw_training_stays_bounded_no_grad_explosion`.
 - **Verified on BOTH M3 (dev) and M1 (mini)**: full suite 130/130 on each; bf16 (`bfloat`) compiles and
   matches on M1. Cross-Apple-Silicon portable.
-- **Still blocked**: CUDA backend (22/89 stub, no NVIDIA hardware — the mini is Apple Silicon, not a
-  CUDA box); distributed/multi-GPU (needs the network plumbing — the mini is the second device for it).
+- **Still hardware-gated**: CUDA compile parity now passes on the Mac toolchain, but CUDA runtime
+  training still needs an NVIDIA box for real execution/sanitizer proof. Distributed/multi-GPU still
+  needs the network plumbing — the mini is the second device for it.
 
 Build/test: `cargo test --no-default-features --features metal`. Serial GPU tests:
 `-- --include-ignored --test-threads=1`. Mini: `ssh mini`, repo at `~/projects/andreai` (has local WIP
@@ -150,9 +151,10 @@ Suggested order to maximize ROI: **(1) simdgroup_matrix** → **(2) 8-bit optimi
 
 ## 4. DELIVERED (session after the handoff — all tested, clippy-clean, on `origin/main`)
 
-The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full suite **145 passed /
-0 failed / 4 ignored** (the 4 ignored = long multi-step GPU trajectories that need
-`--test-threads=1`; the GPU layer is single-threaded by design). Build is warning-free with **0
+The entire suggested ROI sequence above, plus the bulk of the AdamW thread. At this historical
+handoff point the full suite was **145 passed / 0 failed / 4 ignored**. Current CI runs GPU tests
+serially, and the exact gradient-checkpointing + matmul-backward correctness checks are active
+serial tests rather than ignored tests. Build is warning-free with **0
 `#[allow]`** kept — test-only surfaces are exercised by `api::gpu_diagnostic` at runtime.
 
 **AdamW thread**
@@ -209,10 +211,10 @@ The entire suggested ROI sequence above, plus the bulk of the AdamW thread. Full
 - **Flaky `hybrid_optimizer_converges_overfitting` [FIXED].** It was `#[ignore]`d as "serial-only" but
   was actually flaky EVEN serially — the head-dominated 32-vocab micro-overfit spikes on some random
   inits at the lr needed to memorize it. Replaced with `hybrid_optimizer_trains_stably` (gentle lr,
-  bounded-stability assertion, mirrors the AdamW guard) → parallel-safe, deterministic, **de-ignored**
-  (4 ignored → 3). Convergence is proven by the deterministic routing test + the real-data smoke
-  (1.56). The remaining 3 ignored are legit: exact-comparison gradient-checkpointing, the manual
-  simdgroup benchmark, and a pre-existing fp16-nondeterminism matmul check.
+  bounded-stability assertion, mirrors the AdamW guard) → parallel-safe, deterministic, **de-ignored**.
+  Convergence is proven by the deterministic routing test + the real-data smoke (1.56). Current
+  ignored tests are benchmarks only; the exact gradient-checkpointing and matmul-backward checks run
+  in the serial GPU gate.
 **Follow-ups DRAINED (review round 2):**
 - **Optimizer-state persistence across resume [DONE].** Muon/hybrid/8-bit now serialize their own
   state (momentum, int8 moments + scales) to a `<state>.opt` sidecar and restore it; resume continues

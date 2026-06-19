@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 /// Pre-allocated buffers for loss computation — avoids 33MB+ allocation every step.
 pub struct LossWorkspace {
-    pub targets_buf: crate::gpu::BufU32,   // [batch * seq_len] u32
-    pub losses_buf: crate::gpu::Buf,    // [batch * seq_len] f32
+    pub targets_buf: crate::gpu::BufU32,  // [batch * seq_len] u32
+    pub losses_buf: crate::gpu::Buf,      // [batch * seq_len] f32
     pub grad_logits_buf: crate::gpu::Buf, // [batch * seq_len, vocab] f32
-    pub scalar_buf: crate::gpu::Buf,    // [1] f32
+    pub scalar_buf: crate::gpu::Buf,      // [1] f32
 }
 
 impl LossWorkspace {
@@ -60,12 +60,19 @@ fn cross_entropy_loss_impl(
         Some(ws) => {
             // Write targets into pre-allocated buffer
             MetalContext::write_u32_to_buffer(&ws.targets_buf, targets);
-            (ws.targets_buf.clone(), ws.losses_buf.clone(), ws.grad_logits_buf.clone(), ws.scalar_buf.clone())
+            (
+                ws.targets_buf.clone(),
+                ws.losses_buf.clone(),
+                ws.grad_logits_buf.clone(),
+                ws.scalar_buf.clone(),
+            )
         }
-        None => {
-            (ctx.buffer_from_u32_slice(targets), ctx.alloc_buffer(batch * 4),
-             ctx.alloc_buffer(batch * vocab * 4), ctx.alloc_buffer(4))
-        }
+        None => (
+            ctx.buffer_from_u32_slice(targets),
+            ctx.alloc_buffer(batch * 4),
+            ctx.alloc_buffer(batch * vocab * 4),
+            ctx.alloc_buffer(4),
+        ),
     };
 
     compute::gpu_cross_entropy(
@@ -117,7 +124,9 @@ pub fn z_loss(
     _grad_buf: &crate::gpu::Buf, // z-loss gradients flow through tape, not fused into CE grad
     coefficient: f32,
 ) {
-    if coefficient <= 0.0 { return; }
+    if coefficient <= 0.0 {
+        return;
+    }
     let shape = &logits.shape;
     let batch = shape[0];
     let vocab = shape[1];
@@ -176,10 +185,10 @@ pub fn z_loss(
 /// hidden @ embedding^T loss semantics.
 pub fn fused_linear_cross_entropy(
     ctx: &Arc<MetalContext>,
-    hidden: &Tensor,         // [n_tokens, d_model]
-    embedding: &Tensor,      // [vocab, d_model] (weight-tied LM head)
-    targets: &[u32],         // [n_tokens]
-    chunk_size: usize,       // tokens per chunk (1024 recommended)
+    hidden: &Tensor,    // [n_tokens, d_model]
+    embedding: &Tensor, // [vocab, d_model] (weight-tied LM head)
+    targets: &[u32],    // [n_tokens]
+    chunk_size: usize,  // tokens per chunk (1024 recommended)
 ) -> (Tensor, crate::gpu::Buf) {
     let n_tokens = hidden.shape[0];
     let d_model = hidden.shape[1];
@@ -212,14 +221,25 @@ pub fn fused_linear_cross_entropy(
         // Copy chunk of hidden states to temp buffer (matmul reads from offset 0).
         // This costs one extra copy per chunk but ensures correct offset.
         let h_chunk_buf = ctx.alloc_buffer(h_chunk_size * 4);
-        compute::gpu_buffer_copy(ctx, &hidden.buffer, &h_chunk_buf,
-            h_offset as u32, 0, h_chunk_size as u32);
+        compute::gpu_buffer_copy(
+            ctx,
+            &hidden.buffer,
+            &h_chunk_buf,
+            h_offset as u32,
+            0,
+            h_chunk_size as u32,
+        );
 
         // Compute chunk logits: h_chunk @ embedding^T → [c, vocab]
         let chunk_logits_buf = ctx.alloc_buffer(c * vocab * 4);
         compute::gpu_matmul_trans_b(
-            ctx, &h_chunk_buf, &embedding.buffer, &chunk_logits_buf,
-            c as u32, vocab as u32, d_model as u32,
+            ctx,
+            &h_chunk_buf,
+            &embedding.buffer,
+            &chunk_logits_buf,
+            c as u32,
+            vocab as u32,
+            d_model as u32,
         );
 
         // Compute cross-entropy loss + gradient for this chunk
@@ -229,12 +249,21 @@ pub fn fused_linear_cross_entropy(
         let chunk_grad_logits = ctx.alloc_buffer(c * vocab * 4);
 
         compute::gpu_cross_entropy(
-            ctx, &chunk_logits_buf, &chunk_targets_buf,
-            &chunk_losses_buf, &chunk_grad_logits,
-            c as u32, vocab as u32,
+            ctx,
+            &chunk_logits_buf,
+            &chunk_targets_buf,
+            &chunk_losses_buf,
+            &chunk_grad_logits,
+            c as u32,
+            vocab as u32,
         );
         if c != n_tokens {
-            compute::gpu_scale(ctx, &chunk_grad_logits, (c * vocab) as u32, c as f32 / n_tokens as f32);
+            compute::gpu_scale(
+                ctx,
+                &chunk_grad_logits,
+                (c * vocab) as u32,
+                c as f32 / n_tokens as f32,
+            );
         }
 
         // Accumulate chunk loss into total
@@ -246,24 +275,43 @@ pub fn fused_linear_cross_entropy(
         // This gives the gradient w.r.t. the hidden states for this chunk
         let grad_h_chunk = ctx.alloc_buffer(c * d_model * 4);
         compute::gpu_matmul(
-            ctx, &chunk_grad_logits, &embedding.buffer, &grad_h_chunk,
-            c as u32, d_model as u32, vocab as u32,
+            ctx,
+            &chunk_grad_logits,
+            &embedding.buffer,
+            &grad_h_chunk,
+            c as u32,
+            d_model as u32,
+            vocab as u32,
         );
 
         // Tied LM-head gradient: d_embedding += d_logits^T @ hidden_chunk.
         let grad_embedding_chunk = ctx.alloc_buffer(vocab * d_model * 4);
         compute::gpu_matmul_trans_a(
-            ctx, &chunk_grad_logits, &h_chunk_buf, &grad_embedding_chunk,
-            c as u32, vocab as u32, d_model as u32,
+            ctx,
+            &chunk_grad_logits,
+            &h_chunk_buf,
+            &grad_embedding_chunk,
+            c as u32,
+            vocab as u32,
+            d_model as u32,
         );
-        compute::gpu_add_inplace(ctx, &grad_embedding, &grad_embedding_chunk, (vocab * d_model) as u32);
+        compute::gpu_add_inplace(
+            ctx,
+            &grad_embedding,
+            &grad_embedding_chunk,
+            (vocab * d_model) as u32,
+        );
 
         // Copy chunk gradient into the full gradient buffer at the right offset.
         // Chunks are non-overlapping (each covers [start..end) of hidden states),
         // so copy is correct — each position is written by exactly one chunk.
         compute::gpu_buffer_copy(
-            ctx, &grad_h_chunk, &grad_hidden,
-            0, h_offset as u32, h_chunk_size as u32,
+            ctx,
+            &grad_h_chunk,
+            &grad_hidden,
+            0,
+            h_offset as u32,
+            h_chunk_size as u32,
         );
 
         // chunk_logits_buf is automatically dropped here — memory freed for next chunk
@@ -287,7 +335,11 @@ pub fn fused_linear_cross_entropy(
             op: Op::CrossEntropy,
             inputs: vec![hidden.id, embedding.id],
             output: loss_id,
-            input_buffers: vec![hidden.buffer.clone(), embedding.buffer.clone(), grad_embedding.clone()],
+            input_buffers: vec![
+                hidden.buffer.clone(),
+                embedding.buffer.clone(),
+                grad_embedding.clone(),
+            ],
             output_buffer: loss.buffer.clone(),
             shapes: vec![hidden.shape.clone(), embedding.shape.clone(), vec![1]],
             cached: Some(grad_hidden.clone()),
@@ -316,7 +368,10 @@ pub fn distillation_loss(
     assert_eq!(shape.len(), 2, "student_logits must be [batch, vocab]");
     let batch = shape[0];
     let vocab = shape[1];
-    assert_eq!(teacher_logits.shape, *shape, "teacher and student logit shapes must match");
+    assert_eq!(
+        teacher_logits.shape, *shape,
+        "teacher and student logit shapes must match"
+    );
     assert_eq!(targets.len(), batch, "targets length must match batch size");
     assert!(temperature > 0.0, "temperature must be positive");
     assert!((0.0..=1.0).contains(&alpha), "alpha must be in [0, 1]");
@@ -331,7 +386,11 @@ pub fn distillation_loss(
         &student_logits.buffer,
         &kl_losses_buf,
         &kl_grad_buf,
-        compute::KlDims { batch_size: batch as u32, vocab_size: vocab as u32, temperature },
+        compute::KlDims {
+            batch_size: batch as u32,
+            vocab_size: vocab as u32,
+            temperature,
+        },
     );
 
     // KL scalar mean
