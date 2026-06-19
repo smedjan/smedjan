@@ -210,11 +210,15 @@ Build + unit suite (both machines, per the existing handoff convention):
 ```
 cargo fmt --check
 git diff --check
-cargo test --no-default-features --features metal
-cargo test --no-default-features --features metal -- --include-ignored --test-threads=1   # serial GPU tests
+cargo test --no-default-features --features metal -- --test-threads=1
 cargo clippy --no-default-features --features metal,bufsan --all-targets -- -D warnings
 cargo check --no-default-features --features cuda
+./scripts/train-smoke.sh
 ```
+
+The remaining `#[ignore]` tests are performance benchmarks only. Run them manually on a quiet machine
+with `cargo test --release --no-default-features --features metal bench_ -- --ignored --nocapture`;
+they are not a correctness CI gate.
 
 (A) **Loss readout** — the real regression test, since unit tests don't catch it:
 ```

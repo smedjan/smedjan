@@ -39,10 +39,10 @@ Canonical protocol (from `HANDOFF_buffer_hazard_and_followups.md` §5):
 ```bash
 cargo fmt --check
 git diff --check
-cargo test --no-default-features --features metal
-cargo test --no-default-features --features metal -- --include-ignored --test-threads=1  # serial GPU tests
+cargo test --no-default-features --features metal -- --test-threads=1
 cargo clippy --no-default-features --features metal,bufsan --all-targets -- -D warnings
 cargo check --no-default-features --features cuda
+./scripts/train-smoke.sh
 ```
 
 Then the run-level gates that the unit suite can't cover:
@@ -53,6 +53,9 @@ Then the run-level gates that the unit suite can't cover:
   divergence at batch 32 (the Frobenius fix). **Re-check `--muon-lr-scale`** (and with
   `--normuon`, per-neuron magnitude changed).
 - **`--bitnet` smoke**: one short run; confirms the per-column ternary scale.
+- **Benchmarks**: the remaining `#[ignore]` tests are performance benchmarks only; run manually on a
+  quiet machine with `cargo test --release --no-default-features --features metal bench_ -- --ignored
+  --nocapture`, not in the correctness CI gate.
 
 Per the closure table (§8 of the buffer-hazard handoff), once these pass the **bug backlog
 is empty** and everything after is feature work. If any fails, that's the first bleeding

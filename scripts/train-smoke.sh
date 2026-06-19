@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# End-to-end training smoke for CI. Builds its own tiny tokenizer/dataset under target/
+# so a fresh clone can exercise the real CLI/train loop without external data.
+set -euo pipefail
+export CARGO_INCREMENTAL=0
+
+REPO="${ANDREAI_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OUT="${ANDREAI_TRAIN_SMOKE_DIR:-$REPO/target/ci-train-smoke}"
+BIN="$REPO/target/release/andreai"
+LOG_DIR="$OUT/logs"
+CORPUS="$OUT/corpus.txt"
+TOKENIZER="$OUT/tokenizer.bin"
+DATASET="$OUT/dataset.bin"
+
+rm -rf "$OUT"
+mkdir -p "$LOG_DIR"
+
+cat > "$CORPUS" <<'CORPUS'
+AndreAI trains compact language models on local Metal GPUs.
+The runtime must keep losses finite, write checkpoints, and exercise optimizer state.
+Short smoke runs cover dense attention, fused CE, gradient checkpointing, BitNet, SSM, block sparse routing, and hybrid Muon.
+The corpus repeats enough structure for the tiny tokenizer and dataset pipeline.
+AndreAI trains compact language models on local Metal GPUs.
+The runtime must keep losses finite, write checkpoints, and exercise optimizer state.
+Short smoke runs cover dense attention, fused CE, gradient checkpointing, BitNet, SSM, block sparse routing, and hybrid Muon.
+The corpus repeats enough structure for the tiny tokenizer and dataset pipeline.
+CORPUS
+
+run_logged() {
+  local name=$1; shift
+  local log="$LOG_DIR/$name.log"
+  echo "---- $name ----"
+  if "$@" > "$log" 2>&1; then
+    echo "PASS: $name"
+  else
+    echo "FAIL: $name (see $log)"
+    tail -40 "$log"
+    exit 1
+  fi
+}
+
+run_train() {
+  local name=$1; shift
+  local ckpt="$OUT/$name"
+  local log="$LOG_DIR/$name.log"
+  echo "---- train:$name ----"
+  if "$BIN" train \
+    --dataset "$DATASET" \
+    --tokenizer "$TOKENIZER" \
+    --size tiny \
+    --batch-size 2 \
+    --seq-len 16 \
+    --steps 5 \
+    --warmup 1 \
+    --lr 0.001 \
+    --checkpoint-dir "$ckpt" \
+    "$@" > "$log" 2>&1; then
+    :
+  else
+    echo "FAIL: train:$name (see $log)"
+    tail -60 "$log"
+    exit 1
+  fi
+  if grep -E 'FATAL|NaN detected|loss is (NaN|inf|-inf)' "$log" >/dev/null; then
+    echo "FAIL: train:$name emitted a fatal/non-finite loss signal"
+    tail -60 "$log"
+    exit 1
+  fi
+  if ! grep -q "Training complete" "$log"; then
+    echo "FAIL: train:$name did not complete"
+    tail -60 "$log"
+    exit 1
+  fi
+  if [[ ! -s "$ckpt/final.bin" || ! -s "$ckpt/state_final.bin" ]]; then
+    echo "FAIL: train:$name did not write final checkpoints"
+    tail -60 "$log"
+    exit 1
+  fi
+  echo "PASS: train:$name"
+}
+
+cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
+
+run_logged build cargo build --release --no-default-features --features metal
+run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
+run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
+
+run_train adamw
+run_train checkpoint_fused --gradient-checkpointing --fused-ce
+run_train hybrid_normuon --optimizer hybrid --normuon
+run_train bitnet_accum --grad-accum 2 --bitnet
+run_train ssm --ssm
+run_train block_sparse --block-sparse-top-k 1 --block-size 4
+run_train linear_period --linear-attn-period 2
+
+echo "ALL TRAIN SMOKES PASS"

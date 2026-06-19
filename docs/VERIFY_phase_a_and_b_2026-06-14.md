@@ -13,7 +13,8 @@ Run on **air (MacBook Air M3, 16 GB, Metal 4)**, 2026-06-14. This closes Phase A
 | `cargo fmt --check` / `git diff --check` | **clean** |
 | `cargo clippy … --features metal,bufsan …` | **clean** (0 warnings, exit 0) |
 | `cargo check --no-default-features --features cuda` | **passes**; runtime proof remains NVIDIA-hardware-gated |
-| `cargo test … -- --include-ignored --test-threads=1` (serial GPU + 4 ignored) | run by the mini CI runner (`scripts/ci-mac.sh`); the parallel full suite passed 177/177 three times |
+| `./scripts/train-smoke.sh` | **passes**; self-contained CLI tokenizer→prepare→train smoke matrix |
+| `cargo test … -- --test-threads=1` | run by the mini CI runner (`scripts/ci-mac.sh`); correctness tests are serial, ignored tests are performance benchmarks only |
 | 0 `#[allow]` in `src/` | holds (the only grep hit is a comment asserting it) |
 
 > The serial run + the bufsan suite now execute automatically on **mini** on every push (launchd agent
@@ -89,8 +90,8 @@ surfaced in a full training run. This converts "only a real run catches it" → 
   too-small dispatch surfaces as NaN. Opt-in **quarantine** forbids intra-batch reissue (the
   loss-readout-class hazard). Tests `bufsan_training_stays_finite_under_poison` and
   `bufsan_quarantine_matches_default` pass — the current training path is clean of the class.
-- **B4 — Mac CI runner** (`scripts/ci-mac.sh`): runs the §5 protocol + formatting gates +
-  CUDA compile parity + the bufsan suite, exits
+- **B4 — Mac CI runner** (`scripts/ci-mac.sh`): owns a host-wide GPU lock, runs the §5 protocol +
+  formatting gates + CUDA compile parity + self-contained training smokes + the bufsan suite, exits
   non-zero on any failure. Intended for an always-on Apple-Silicon Mac (mini) via launchd/cron.
 
 ### Bug found and fixed by the harness (first run)

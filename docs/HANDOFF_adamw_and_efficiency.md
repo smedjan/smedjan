@@ -32,9 +32,10 @@ All claims below were grounded against the tree, not assumed.
   training still needs an NVIDIA box for real execution/sanitizer proof. Distributed/multi-GPU still
   needs the network plumbing — the mini is the second device for it.
 
-Build/test: `cargo test --no-default-features --features metal`. Serial GPU tests:
-`-- --include-ignored --test-threads=1`. Mini: `ssh mini`, repo at `~/projects/andreai` (has local WIP
-on `main` — DON'T touch it; verify in a throwaway worktree: `git worktree add /tmp/x origin/main`).
+Build/test: `cargo test --no-default-features --features metal -- --test-threads=1`. Ignored tests are
+benchmarks only; run them manually on a quiet machine. Mini: `ssh mini`, repo at `~/projects/andreai`
+(has local WIP on `main` — DON'T touch it; verify in a throwaway worktree:
+`git worktree add /tmp/x origin/main`).
 
 ---
 

@@ -8,6 +8,7 @@
 #   ANDREAI_REPO      repo path        (default: $HOME/projects/andreai)
 #   ANDREAI_CI_PULL   1 = fetch+reset to origin/main before testing (default: 0 = test tree)
 #   ANDREAI_CI_LOG    per-gate log dir (default: /tmp/andreai-ci)
+#   ANDREAI_CI_LOCK   host-wide GPU lock dir (default: /tmp/andreai-mac-gpu-ci.lock)
 set -uo pipefail
 export CARGO_INCREMENTAL=0
 
@@ -15,9 +16,33 @@ REPO="${ANDREAI_REPO:-$HOME/projects/andreai}"
 PULL="${ANDREAI_CI_PULL:-0}"
 FEAT=(--no-default-features --features metal)
 LOG_DIR="${ANDREAI_CI_LOG:-/tmp/andreai-ci}"
+LOCK_DIR="${ANDREAI_CI_LOCK:-/tmp/andreai-mac-gpu-ci.lock}"
+LOCK_WAIT_SECS="${ANDREAI_CI_LOCK_WAIT_SECS:-14400}"
 mkdir -p "$LOG_DIR"
 ts() { date +%Y-%m-%dT%H:%M:%S; }
 cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
+
+acquire_lock() {
+  local start now elapsed owner
+  start=$(date +%s)
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    now=$(date +%s)
+    elapsed=$((now - start))
+    if (( elapsed >= LOCK_WAIT_SECS )); then
+      echo "FAIL: timed out waiting for Mac GPU CI lock $LOCK_DIR"
+      exit 2
+    fi
+    echo "WAIT: another Mac GPU CI run owns $LOCK_DIR; retrying in 10s"
+    sleep 10
+  done
+  echo "$$" > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+}
 
 if [[ "$PULL" == "1" ]]; then
   git fetch --quiet origin && git reset --hard --quiet origin/main \
@@ -25,6 +50,7 @@ if [[ "$PULL" == "1" ]]; then
 fi
 HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
 echo "== andreai Mac CI @ $(ts) — $HEAD =="
+acquire_lock
 
 NAMES=(); RESULTS=()
 gate() { # name  command...
@@ -44,9 +70,9 @@ gate() { # name  command...
 gate fmt        cargo fmt --check
 gate diffcheck  git diff --check
 gate unit       cargo test   "${FEAT[@]}" -- --test-threads=1
-gate serial_gpu cargo test   "${FEAT[@]}" -- --include-ignored --test-threads=1
 gate clippy     cargo clippy --no-default-features --features metal,bufsan --all-targets -- -D warnings
 gate cuda_check cargo check  --no-default-features --features cuda
+gate train_smoke ./scripts/train-smoke.sh
 # Phase B sanitizer: whole suite under NaN-poison + a quarantine differential
 gate bufsan     cargo test   --no-default-features --features metal,bufsan -- --test-threads=1
 
