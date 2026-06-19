@@ -5,7 +5,7 @@
        2. Substitute the home path:    sed "s#__HOME__#$HOME#g" ~/ci/andreai/scripts/ci-mac.plist \
                                          > ~/Library/LaunchAgents/nu.andreai.ci.plist
        3. Load it:                     launchctl load ~/Library/LaunchAgents/nu.andreai.ci.plist
-     It polls origin/main every 30 min and runs the §5 + bufsan gate only when it advances.
+     It polls origin/main every 30 min and runs the full Mac CI gate only when it advances.
      Verdict + log: ~/.andreai-ci-report.txt ; last-tested commit: ~/.andreai-ci-last . -->
 <plist version="1.0">
 <dict>

@@ -37,9 +37,12 @@ work is **correctness infrastructure** + the **bounded** items below.
 Canonical protocol (from `HANDOFF_buffer_hazard_and_followups.md` §5):
 
 ```bash
+cargo fmt --check
+git diff --check
 cargo test --no-default-features --features metal
 cargo test --no-default-features --features metal -- --include-ignored --test-threads=1  # serial GPU tests
-cargo clippy --no-default-features --features metal --all-targets   # expect 0 warnings, 0 #[allow]
+cargo clippy --no-default-features --features metal,bufsan --all-targets -- -D warnings
+cargo check --no-default-features --features cuda
 ```
 
 Then the run-level gates that the unit suite can't cover:

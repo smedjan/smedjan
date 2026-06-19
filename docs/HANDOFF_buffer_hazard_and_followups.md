@@ -208,9 +208,12 @@ claims. They're specced to the exact call sites/kernels so they land fast on the
 
 Build + unit suite (both machines, per the existing handoff convention):
 ```
+cargo fmt --check
+git diff --check
 cargo test --no-default-features --features metal
 cargo test --no-default-features --features metal -- --include-ignored --test-threads=1   # serial GPU tests
-cargo clippy --no-default-features --features metal --all-targets    # expect 0 warnings, 0 #[allow]
+cargo clippy --no-default-features --features metal,bufsan --all-targets -- -D warnings
+cargo check --no-default-features --features cuda
 ```
 
 (A) **Loss readout** — the real regression test, since unit tests don't catch it:
