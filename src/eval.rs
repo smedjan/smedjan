@@ -407,3 +407,152 @@ pub fn build_padded_batch(
 
     result
 }
+
+
+// ============================================================================
+// Long-context retrieval / reasoning suite (NIAH + RULER-style probes)
+// ============================================================================
+
+/// Deterministic 7-digit "needle" value from an index, so eval sweeps reproduce run to run.
+/// Plain digit runs tokenize cleanly and even a weak model can copy them verbatim; the filler
+/// contains no digits, so a needle value never collides with filler text.
+fn needle_value(idx: usize) -> String {
+    let v = 1_000_000u64 + (idx as u64).wrapping_mul(2_654_435_761) % 9_000_000;
+    v.to_string()
+}
+
+/// Symmetric depth offsets (+/-0.2 around a center) so K needles in one example do not stack.
+fn depths_spread(k: usize) -> Vec<f32> {
+    if k <= 1 {
+        return vec![0.0];
+    }
+    let step = 0.4 / (k as f32 - 1.0);
+    (0..k).map(|i| -0.2 + step * i as f32).collect()
+}
+
+/// Assemble ~`target_tokens` of neutral filler (cycling `filler`, token counts precomputed in
+/// `filler_tokens`) and splice each `(depth, text)` needle in at its fractional block position.
+/// Later positions are inserted first so earlier inserts do not shift their indices.
+fn build_context(
+    filler: &[&str],
+    filler_tokens: &[usize],
+    target_tokens: usize,
+    needles: &[(f32, String)],
+) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut tok_count = 0usize;
+    let mut i = 0usize;
+    while tok_count < target_tokens {
+        blocks.push(format!("{} ", filler[i % filler.len()]));
+        tok_count += filler_tokens[i % filler.len()];
+        i += 1;
+    }
+    let n_blocks = blocks.len().max(1);
+    let mut placed: Vec<(usize, String)> = needles
+        .iter()
+        .map(|(d, text)| {
+            let pos = ((d.clamp(0.0, 1.0) * n_blocks as f32) as usize).min(n_blocks);
+            (pos, text.clone())
+        })
+        .collect();
+    placed.sort_by(|a, b| b.0.cmp(&a.0));
+    for (pos, text) in placed {
+        blocks.insert(pos, text);
+    }
+    blocks.concat()
+}
+
+/// Synthetic long-context retrieval/reasoning suite (NIAH + RULER-style), token-length calibrated.
+/// Each example's `category` is `<probe>_L<tokens>`, so `EvalResults::print_report`'s per-category
+/// breakdown doubles as a length-vs-score curve. Three probe families separate *retrieval* from
+/// *reasoning at length*:
+///   - `niah`     : one needle in filler at varied depth -- pure retrieval.
+///   - `multikey` : K keyed needles, retrieve one specific key -- retrieval under distractors.
+///   - `vartrace` : X1=v; X2=X1; X3=X2 chain, ask X3 -- multi-hop reasoning a pure retriever fails.
+/// `lengths` are target token counts; `depths` are fractional insertion points in [0,1].
+pub fn longctx_eval_set(
+    tokenizer: &BpeTokenizer,
+    lengths: &[usize],
+    depths: &[f32],
+) -> Vec<EvalExample> {
+    const FILLER: &[&str] = &[
+        "The harbor town woke slowly under a pale and even sky.",
+        "Merchants unpacked their crates while gulls wheeled overhead.",
+        "A narrow road wound past the orchard toward the older quarter.",
+        "Rain had washed the cobblestones clean during the long night.",
+        "Children carried baskets of bread between the quiet houses.",
+        "The river moved without hurry beneath the wooden bridge.",
+    ];
+    let filler_tokens: Vec<usize> = FILLER
+        .iter()
+        .map(|s| tokenizer.encode(&format!("{s} ")).len().max(1))
+        .collect();
+
+    let mut examples = Vec::new();
+    let mut idx = 0usize;
+
+    for &len in lengths {
+        for &depth in depths {
+            // NIAH single needle -- pure retrieval.
+            {
+                let code = needle_value(idx);
+                idx += 1;
+                let needle = format!("Note: the secret access code is {code}. ");
+                let context = build_context(FILLER, &filler_tokens, len, &[(depth, needle)]);
+                examples.push(EvalExample {
+                    prompt: format!(
+                        "{context}\n\nQuestion: what is the secret access code?\nAnswer: the secret access code is"
+                    ),
+                    expected: code,
+                    category: format!("niah_L{len}"),
+                });
+            }
+
+            // Multi-key -- retrieve one specific key among distractors.
+            {
+                let keys = ["alpha", "bravo", "charlie", "delta"];
+                let target = 1usize;
+                let span = depths_spread(keys.len());
+                let mut needles = Vec::new();
+                let mut target_value = String::new();
+                for (k, key) in keys.iter().enumerate() {
+                    let value = needle_value(idx);
+                    idx += 1;
+                    if k == target {
+                        target_value = value.clone();
+                    }
+                    let d = (depth + span[k]).clamp(0.0, 1.0);
+                    needles.push((d, format!("Record: key {key} maps to value {value}. ")));
+                }
+                let context = build_context(FILLER, &filler_tokens, len, &needles);
+                examples.push(EvalExample {
+                    prompt: format!(
+                        "{context}\n\nQuestion: what value does key {} map to?\nAnswer: key {} maps to value",
+                        keys[target], keys[target]
+                    ),
+                    expected: target_value,
+                    category: format!("multikey_L{len}"),
+                });
+            }
+
+            // Variable tracing -- multi-hop reasoning, not retrieval.
+            {
+                let value = needle_value(idx);
+                idx += 1;
+                let span = depths_spread(3);
+                let needles = vec![
+                    ((depth + span[0]).clamp(0.0, 1.0), format!("Let X1 = {value}. ")),
+                    ((depth + span[1]).clamp(0.0, 1.0), "Let X2 = X1. ".to_string()),
+                    ((depth + span[2]).clamp(0.0, 1.0), "Let X3 = X2. ".to_string()),
+                ];
+                let context = build_context(FILLER, &filler_tokens, len, &needles);
+                examples.push(EvalExample {
+                    prompt: format!("{context}\n\nQuestion: what is the value of X3?\nAnswer: X3 ="),
+                    expected: value,
+                    category: format!("vartrace_L{len}"),
+                });
+            }
+        }
+    }
+    examples
+}

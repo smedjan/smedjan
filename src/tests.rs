@@ -948,6 +948,37 @@ mod suite {
     }
 
     #[test]
+    fn longctx_eval_set_builds_calibrated_probes() {
+        let corpus = b"the quick brown fox jumps over the lazy dog 0123456789 harbor town river bridge orchard";
+        let tok = BpeTokenizer::train(corpus, 300);
+        let lengths = [128usize, 256];
+        let depths = [0.0f32, 0.5, 1.0];
+        let set = crate::eval::longctx_eval_set(&tok, &lengths, &depths);
+        assert_eq!(set.len(), 3 * lengths.len() * depths.len());
+        for ex in &set {
+            let (probe, lpart) = ex
+                .category
+                .split_once("_L")
+                .expect("category form <probe>_L<len>");
+            assert!(
+                ["niah", "multikey", "vartrace"].contains(&probe),
+                "unexpected probe {probe}"
+            );
+            let len: usize = lpart.parse().expect("numeric length suffix");
+            assert!(lengths.contains(&len), "length {len} not requested");
+            assert!(!ex.expected.is_empty(), "empty expected answer");
+            assert!(
+                ex.prompt.contains(&ex.expected),
+                "needle {} must be embedded in its {} prompt",
+                ex.expected,
+                ex.category
+            );
+            let n_tok = tok.encode(&ex.prompt).len();
+            assert!(n_tok >= len / 2, "{} prompt {n_tok} tok, expected ~{len}", ex.category);
+        }
+    }
+
+    #[test]
     fn tokenizer_long_text_chunked_encoding() {
         let corpus = b"abcdefghijklmnopqrstuvwxyz 0123456789 the quick brown fox jumps";
         let tok = BpeTokenizer::train(corpus, 280);

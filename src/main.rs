@@ -427,6 +427,16 @@ enum Commands {
         checkpoint: String,
         #[arg(long)]
         tokenizer: String,
+        /// Run the synthetic long-context suite (NIAH + RULER-style retrieval/reasoning) instead
+        /// of the builtin shell-command set.
+        #[arg(long, default_value = "false")]
+        longctx: bool,
+        /// Long-context suite: comma-separated target context lengths in tokens.
+        #[arg(long, default_value = "256,512,1024")]
+        longctx_lengths: String,
+        /// Long-context suite: comma-separated needle depths in [0,1].
+        #[arg(long, default_value = "0.0,0.5,1.0")]
+        longctx_depths: String,
     },
 
     /// Supervised fine-tuning on instruction-response pairs
@@ -1239,6 +1249,9 @@ fn main() {
         Commands::Eval {
             checkpoint: ckpt_path,
             tokenizer: tok_path,
+            longctx,
+            longctx_lengths,
+            longctx_depths,
         } => {
             let tok = result_or_exit(
                 tokenizer::BpeTokenizer::load(&tok_path),
@@ -1254,21 +1267,36 @@ fn main() {
                 model.config.param_count() as f64 / 1e6
             );
 
-            let examples = eval::builtin_eval_set();
+            let examples = if longctx {
+                let lengths: Vec<usize> = longctx_lengths
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let depths: Vec<f32> = longctx_depths
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                eprintln!("Long-context suite: lengths={:?} tokens, depths={:?}", lengths, depths);
+                eval::longctx_eval_set(&tok, &lengths, &depths)
+            } else {
+                eval::builtin_eval_set()
+            };
             eprintln!("Running {} evaluation examples...", examples.len());
 
-            // Verify tensor batch utilities (zeros, full, with_grad, slice_flat, concat_flat)
-            let sample_seqs: Vec<Vec<f32>> = examples
-                .iter()
-                .take(4)
-                .map(|e| e.prompt.bytes().map(|b| b as f32).collect())
-                .collect();
-            let batch_tensor = eval::build_padded_batch(&ctx, &sample_seqs, 32);
-            eprintln!(
-                "Batch tensor check: {:?} ({} elements)",
-                batch_tensor.shape,
-                batch_tensor.numel()
-            );
+            if !longctx {
+                // Verify tensor batch utilities (zeros, full, with_grad, slice_flat, concat_flat)
+                let sample_seqs: Vec<Vec<f32>> = examples
+                    .iter()
+                    .take(4)
+                    .map(|e| e.prompt.bytes().map(|b| b as f32).collect())
+                    .collect();
+                let batch_tensor = eval::build_padded_batch(&ctx, &sample_seqs, 32);
+                eprintln!(
+                    "Batch tensor check: {:?} ({} elements)",
+                    batch_tensor.shape,
+                    batch_tensor.numel()
+                );
+            }
 
             let results = eval::evaluate(&ctx, &model, &tok, &examples);
             results.print_report();
