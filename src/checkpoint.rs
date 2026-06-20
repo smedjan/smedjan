@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 13; // v13: AMDT step is next training step to run. v12: sliding_window. v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const VERSION: u32 = 14; // v14: YaRN RoPE config. v13: AMDT step is next training step to run. v12: sliding_window. v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 const MAX_TENSOR_DIMS: usize = 8;
 
 fn invalid_checkpoint_data(message: impl Into<String>) -> Error {
@@ -252,9 +252,9 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if !(2..=13).contains(&version) {
+    if !(2..=14).contains(&version) {
         return Err(invalid_checkpoint_data(format!(
-            "unsupported training state version: {version} (expected 2-13)"
+            "unsupported training state version: {version} (expected 2-14)"
         )));
     }
 
@@ -491,9 +491,9 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if !(1..=13).contains(&version) {
+    if !(1..=14).contains(&version) {
         return Err(invalid_checkpoint_data(format!(
-            "unsupported checkpoint version: {version} (expected 1-13)"
+            "unsupported checkpoint version: {version} (expected 1-14)"
         )));
     }
 
@@ -613,6 +613,10 @@ fn write_config(file: &mut std::fs::File, config: &ModelConfig) -> std::io::Resu
     // not silently load as full-causal. (stochastic_depth/fp16_activations are intentionally NOT
     // persisted: they're train-time-only knobs that should default off at inference/resume.)
     file.write_all(&(config.sliding_window as u32).to_le_bytes())?;
+    // v14: YaRN RoPE scaling. Forward-affecting — an extended-context model must not silently
+    // reload as plain RoPE.
+    file.write_all(&config.yarn_scale.to_le_bytes())?;
+    file.write_all(&(config.yarn_orig_max_seq as u32).to_le_bytes())?;
     Ok(())
 }
 
@@ -732,6 +736,17 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         0
     };
 
+    // v14: YaRN RoPE scaling; older checkpoints default to off/plain RoPE.
+    let (yarn_scale, yarn_orig_max_seq) = if version >= 14 {
+        file.read_exact(&mut buf4)?;
+        let scale = f32::from_le_bytes(buf4);
+        file.read_exact(&mut buf4)?;
+        let orig = u32::from_le_bytes(buf4) as usize;
+        (scale, orig)
+    } else {
+        (1.0, 0)
+    };
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
@@ -759,7 +774,7 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         mla_latent_dim,
         block_sparse_top_k,
         block_size,
-        yarn_scale: 1.0,
-        yarn_orig_max_seq: 0,
+        yarn_scale,
+        yarn_orig_max_seq,
     })
 }

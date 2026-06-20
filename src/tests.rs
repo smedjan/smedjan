@@ -2940,14 +2940,21 @@ mod suite {
         let targets: Vec<u32> = vec![5u32; 8];
         let logits = model.forward(&tokens, batch, seq_len, None, false);
         assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
-        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "yarn-on forward produced non-finite logits");
+        assert!(
+            logits.to_vec().iter().all(|x| x.is_finite()),
+            "yarn-on forward produced non-finite logits"
+        );
         let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
         assert!(loss.to_vec()[0].is_finite(), "yarn-on loss non-finite");
         let wq_id = model.blocks[0].attn.w_q.id;
         autograd::backward(&ctx, loss.id);
         let g = autograd::get_grad(wq_id).expect("no gradient reached w_q under yarn-on");
-        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone()).to_vec();
-        assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on w_q under yarn-on (backward must carry the forward yarn)");
+        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone())
+            .to_vec();
+        assert!(
+            gv.iter().all(|x| x.is_finite()),
+            "non-finite grad on w_q under yarn-on (backward must carry the forward yarn)"
+        );
     }
 
     #[test]
@@ -5315,7 +5322,7 @@ mod suite {
                     2,
                     4,
                     0,
-                    crate::attention::RopeParams::plain(10000.0),
+                    crate::attention::RopeParams::yarn(10000.0, 1.0, 0.0),
                 )
             },
             GC_EPS,
@@ -6144,6 +6151,27 @@ mod suite {
             loaded.blocks[0].attn.attn_kind,
             crate::attention::AttnKind::Linear
         );
+        std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn yarn_checkpoint_roundtrip_preserves_rope_scaling() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 64).with_yarn(2.0);
+        let model = Transformer::new(&ctx, cfg);
+        assert_eq!(model.config.yarn_scale, 2.0);
+        assert_eq!(model.config.yarn_orig_max_seq, 64);
+        assert_eq!(model.blocks[0].attn.yarn_scale, 2.0);
+        assert_eq!(model.blocks[0].attn.yarn_orig_max, 64.0);
+
+        let tmp = "/tmp/andreai_yarn_ckpt.bin";
+        crate::checkpoint::save_checkpoint(tmp, &model, 14).expect("save failed");
+        let (loaded, step) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
+        assert_eq!(step, 14);
+        assert_eq!(loaded.config.yarn_scale, 2.0);
+        assert_eq!(loaded.config.yarn_orig_max_seq, 64);
+        assert_eq!(loaded.blocks[0].attn.yarn_scale, 2.0);
+        assert_eq!(loaded.blocks[0].attn.yarn_orig_max, 64.0);
         std::fs::remove_file(tmp).ok();
     }
 

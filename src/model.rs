@@ -301,14 +301,23 @@ impl ModelConfig {
                 self.n_heads / self.n_kv_heads
             )
         };
+        let yarn_info = if (self.yarn_scale - 1.0).abs() <= f32::EPSILON {
+            String::new()
+        } else {
+            format!(
+                ", yarn_scale={}, yarn_orig_max_seq={}",
+                self.yarn_scale, self.yarn_orig_max_seq
+            )
+        };
         format!(
-            "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
+            "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}{}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
             self.d_model,
             self.n_heads,
             gqa_info,
             self.n_layers,
             self.d_ff(),
             self.max_seq_len,
+            yarn_info,
             self.param_count() as f64 / 1e6,
             self.training_memory_bytes() as f64 / (1024.0 * 1024.0),
             self.inference_memory_bytes() as f64 / (1024.0 * 1024.0),

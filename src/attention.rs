@@ -1058,17 +1058,13 @@ pub(crate) struct RopeParams {
 }
 
 impl RopeParams {
-    pub(crate) fn plain(theta: f32) -> Self {
-        Self {
-            theta,
-            yarn_scale: 1.0,
-            yarn_orig_max: 0.0,
-        }
-    }
-
     /// YaRN-scaled rope. `yarn_scale == 1.0` is identical to `plain` (the kernel early-outs).
     pub(crate) fn yarn(theta: f32, yarn_scale: f32, yarn_orig_max: f32) -> Self {
-        Self { theta, yarn_scale, yarn_orig_max }
+        Self {
+            theta,
+            yarn_scale,
+            yarn_orig_max,
+        }
     }
 }
 

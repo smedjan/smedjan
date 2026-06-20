@@ -1037,6 +1037,10 @@ fn main() {
             println!("  ffn_multiplier: {}", c.ffn_multiplier);
             println!("  max_seq_len: {}", c.max_seq_len);
             println!("  RoPE theta: {}", c.rope_theta);
+            if (c.yarn_scale - 1.0).abs() > f32::EPSILON {
+                println!("  YaRN scale: {}", c.yarn_scale);
+                println!("  YaRN original max seq: {}", c.yarn_orig_max_seq);
+            }
             println!(
                 "  Training RAM: {:.0} MB",
                 c.training_memory_bytes() as f64 / (1024.0 * 1024.0)
