@@ -280,7 +280,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         config.resume_from
     {
         eprintln!("=== RESUMING from {} ===", resume_path);
-        let (model, opt_states, step, opt_step, tokens) =
+        let (model, opt_states, next_step, opt_step, tokens) =
             checkpoint::load_training_state(ctx, resume_path)?;
         eprintln!(
             "Resumed model: {}M params, {} layers, d_model={}, {} heads",
@@ -304,13 +304,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
                 opt_states.len(), config.optimizer_type);
         }
-        // Resume from step+1 — the checkpoint was saved AFTER step completed
-        let resume_step = step + 1;
-        eprintln!(
-            "Resuming at step {}/{}, {} tokens, optimizer step {}",
-            resume_step, config.total_steps, tokens, opt_step
-        );
-        (model, optimizer, resume_step, tokens)
+        (model, optimizer, next_step, tokens)
     } else if let Some(ref pretrained_path) = config.pretrained {
         // Load pretrained model weights (fresh optimizer, step 0).
         // Used for progressive training: grow small → large, then continue.
@@ -468,6 +462,21 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             ),
             None => {}
         }
+        let active_opt_step = if let Some(o) = hybrid_opt.as_ref() {
+            o.adamw.step
+        } else if let Some(o) = adamw8_opt.as_ref() {
+            o.step
+        } else if let Some(o) = muon_opt.as_ref() {
+            o.step
+        } else if let Some(o) = sophia_opt.as_ref() {
+            o.step
+        } else {
+            optimizer.step
+        };
+        eprintln!(
+            "Resuming at step {}/{}, {} tokens, optimizer step {}",
+            start_step, config.total_steps, total_tokens, active_opt_step
+        );
     }
 
     // μP: scale learning rate by base_width / d_model (WIDTH transfer).
@@ -1230,7 +1239,13 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             let path = format!("{}/step_{}.bin", config.checkpoint_dir, step);
             checkpoint::save_checkpoint(&path, &model, step)?;
             let state_path = format!("{}/state_{}.bin", config.checkpoint_dir, step);
-            checkpoint::save_training_state(&state_path, &model, &optimizer, step, total_tokens)?;
+            checkpoint::save_training_state(
+                &state_path,
+                &model,
+                &optimizer,
+                step + 1,
+                total_tokens,
+            )?;
             save_opt_sidecar_for(
                 &state_path,
                 &config.optimizer_type,

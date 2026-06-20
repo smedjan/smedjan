@@ -79,6 +79,78 @@ run_train() {
   echo "PASS: train:$name"
 }
 
+run_resume_train() {
+  local name=$1; shift
+  local base="$OUT/${name}_base"
+  local resumed="$OUT/${name}_resume"
+  local base_log="$LOG_DIR/${name}_base.log"
+  local resume_log="$LOG_DIR/${name}_resume.log"
+  echo "---- resume:$name ----"
+  if "$BIN" train \
+    --dataset "$DATASET" \
+    --tokenizer "$TOKENIZER" \
+    --size tiny \
+    --batch-size 2 \
+    --seq-len 16 \
+    --steps 2 \
+    --warmup 1 \
+    --lr 0.001 \
+    --checkpoint-dir "$base" \
+    "$@" > "$base_log" 2>&1; then
+    :
+  else
+    echo "FAIL: resume:$name base run (see $base_log)"
+    tail -60 "$base_log"
+    exit 1
+  fi
+  if [[ ! -s "$base/state_final.bin" ]]; then
+    echo "FAIL: resume:$name base run did not write state_final.bin"
+    tail -60 "$base_log"
+    exit 1
+  fi
+  if "$BIN" train \
+    --dataset "$DATASET" \
+    --tokenizer "$TOKENIZER" \
+    --size tiny \
+    --batch-size 2 \
+    --seq-len 16 \
+    --steps 4 \
+    --warmup 1 \
+    --lr 0.001 \
+    --checkpoint-dir "$resumed" \
+    --resume "$base/state_final.bin" \
+    "$@" > "$resume_log" 2>&1; then
+    :
+  else
+    echo "FAIL: resume:$name resume run (see $resume_log)"
+    tail -80 "$resume_log"
+    exit 1
+  fi
+  if grep -E 'FATAL|NaN detected|loss is (NaN|inf|-inf)' "$base_log" "$resume_log" >/dev/null; then
+    echo "FAIL: resume:$name emitted a fatal/non-finite loss signal"
+    tail -80 "$resume_log"
+    exit 1
+  fi
+  if ! grep -q "Resuming at step 2/4" "$resume_log"; then
+    echo "FAIL: resume:$name did not continue at the next saved step"
+    tail -80 "$resume_log"
+    exit 1
+  fi
+  if [[ -s "$base/state_final.bin.opt" ]] && ! grep -q "Restored '" "$resume_log"; then
+    echo "FAIL: resume:$name did not restore optimizer sidecar state"
+    tail -80 "$resume_log"
+    exit 1
+  fi
+  local last_step last_tokens
+  read -r last_step last_tokens < <(awk -F, 'NR > 1 { step=$1; tokens=$6 } END { print step, tokens }' "$resumed/train.csv")
+  if [[ "$last_step" != "3" || "$last_tokens" != "128" ]]; then
+    echo "FAIL: resume:$name ended at step=$last_step tokens=$last_tokens, expected step=3 tokens=128"
+    cat "$resumed/train.csv"
+    exit 1
+  fi
+  echo "PASS: resume:$name"
+}
+
 cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
 
 run_logged build cargo build --release --no-default-features --features metal
@@ -86,8 +158,10 @@ run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --outpu
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
 
 run_train adamw
+run_resume_train adamw_resume
 run_train checkpoint_fused --gradient-checkpointing --fused-ce
 run_train hybrid_normuon --optimizer hybrid --normuon
+run_resume_train hybrid_resume --optimizer hybrid --normuon
 run_train bitnet_accum --grad-accum 2 --bitnet
 run_train ssm --ssm
 run_train block_sparse --block-sparse-top-k 1 --block-size 4

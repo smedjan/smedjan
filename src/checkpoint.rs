@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
-const VERSION: u32 = 12; // v12: sliding_window (windowed attention is forward-affecting — was silently lost on load). v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const VERSION: u32 = 13; // v13: AMDT step is next training step to run. v12: sliding_window. v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 
-/// Return type for load_training_state: (model, optimizer_states, step, opt_step, total_tokens)
+/// Return type for load_training_state: (model, optimizer_states, next_step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
 
 /// Save model weights and config to a binary checkpoint file.
@@ -127,13 +127,13 @@ pub fn save_checkpoint_ema(
     Ok(())
 }
 
-/// Save full training state: model weights + optimizer state (m, v, step).
+/// Save full training state: model weights + optimizer state (m, v, next_step).
 /// This allows resuming training exactly where it left off.
 pub fn save_training_state(
     path: &str,
     model: &Transformer,
     optimizer: &AdamW,
-    step: u32,
+    next_step: u32,
     total_tokens: u64,
 ) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
@@ -141,7 +141,7 @@ pub fn save_training_state(
     // Header: AMDT (AndreAI Model Training state)
     file.write_all(b"AMDT")?;
     file.write_all(&VERSION.to_le_bytes())?;
-    file.write_all(&step.to_le_bytes())?;
+    file.write_all(&next_step.to_le_bytes())?;
     file.write_all(&total_tokens.to_le_bytes())?;
 
     // Model config
@@ -181,13 +181,13 @@ pub fn save_training_state(
 
     let size_mb = std::fs::metadata(path)?.len() as f32 / (1024.0 * 1024.0);
     eprintln!(
-        "Training state saved: {} ({:.1} MB, step {}, {} tokens)",
-        path, size_mb, step, total_tokens
+        "Training state saved: {} ({:.1} MB, next_step {}, {} tokens)",
+        path, size_mb, next_step, total_tokens
     );
     Ok(())
 }
 
-/// Load full training state for resume. Returns (model, optimizer_data, step, total_tokens).
+/// Load full training state for resume.
 /// The optimizer_data is (m_buffers, v_buffers, opt_step) — caller creates the AdamW and loads these.
 pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<TrainingState> {
     let mut file = std::fs::File::open(path)?;
@@ -202,22 +202,24 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
     assert!(
-        (2..=12).contains(&version),
+        (2..=13).contains(&version),
         "Unsupported training state version: {}",
         version
     );
 
-    // Step + total_tokens
+    // v13+: next training step to run. v12 and older stored the last completed loop step for
+    // periodic states, while state_final.bin stored total_steps; normalize both to next_step.
     file.read_exact(&mut buf4)?;
-    let step = u32::from_le_bytes(buf4);
+    let raw_step = u32::from_le_bytes(buf4);
+    let next_step = normalize_training_state_next_step(version, raw_step, path);
     file.read_exact(&mut buf8)?;
     let total_tokens = u64::from_le_bytes(buf8);
 
     // Config
     let config = read_config(&mut file, version)?;
     eprintln!(
-        "Resuming: step {}, {}M params, {} tokens processed",
-        step,
+        "Resuming: next_step {}, {}M params, {} tokens processed",
+        next_step,
         config.param_count() as f32 / 1e6,
         total_tokens
     );
@@ -296,10 +298,25 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     }
 
     eprintln!(
-        "Training state loaded: step {}, opt_step {}",
-        step, opt_step
+        "Training state loaded: next_step {}, opt_step {}",
+        next_step, opt_step
     );
-    Ok((model, opt_states, step, opt_step, total_tokens))
+    Ok((model, opt_states, next_step, opt_step, total_tokens))
+}
+
+pub(crate) fn normalize_training_state_next_step(version: u32, raw_step: u32, path: &str) -> u32 {
+    if version >= 13 {
+        return raw_step;
+    }
+    let is_legacy_final = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("state_final.bin");
+    if is_legacy_final {
+        raw_step
+    } else {
+        raw_step.saturating_add(1)
+    }
 }
 
 /// Save a non-AdamW optimizer's state to a resume sidecar (`<state>.opt`). The main AMDT format
@@ -373,8 +390,8 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
     assert!(
-        (1..=12).contains(&version),
-        "Unsupported checkpoint version: {} (expected 1-12)",
+        (1..=13).contains(&version),
+        "Unsupported checkpoint version: {} (expected 1-13)",
         version
     );
 

@@ -5693,6 +5693,25 @@ mod suite {
         autograd::zero_grads_recycle();
     }
 
+    #[test]
+    fn training_state_next_step_normalizes_legacy_files() {
+        assert_eq!(
+            crate::checkpoint::normalize_training_state_next_step(13, 2, "/tmp/state_final.bin"),
+            2,
+            "v13 stores the next step directly"
+        );
+        assert_eq!(
+            crate::checkpoint::normalize_training_state_next_step(12, 2, "/tmp/state_2.bin"),
+            3,
+            "legacy periodic states stored the last completed loop step"
+        );
+        assert_eq!(
+            crate::checkpoint::normalize_training_state_next_step(12, 2, "/tmp/state_final.bin"),
+            2,
+            "legacy final states stored total_steps, already the next step"
+        );
+    }
+
     /// Cross-entropy loss: verify gradient matches finite differences.
     #[test]
     fn cross_entropy_gradient_check() {
