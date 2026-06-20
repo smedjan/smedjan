@@ -3080,7 +3080,7 @@ pub const TRANSPOSE_ROPE: &str = r#"
 using namespace metal;
 
 struct TransposeRopeParams {
-    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta;
+    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta; float yarn_scale; float yarn_orig_max;
 };
 
 kernel void transpose_rope(
@@ -3111,7 +3111,23 @@ kernel void transpose_rope(
 
     // Apply RoPE: rotate pairs (d, d+1) by angle based on position
     uint pair = d / 2;
-    float freq = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float inv_extrap = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float freq;
+    if (params.yarn_scale == 1.0f) {
+        freq = inv_extrap;
+    } else {
+        // YaRN NTK-by-parts: extrapolate high-frequency dims, interpolate low-frequency dims.
+        float inv_interp = inv_extrap / params.yarn_scale;
+        float two_pi = 6.28318530718f;
+        float log_base = log(params.theta);
+        float low = floor(float(head_dim) * log(params.yarn_orig_max / (32.0f * two_pi)) / (2.0f * log_base));
+        float high = ceil(float(head_dim) * log(params.yarn_orig_max / two_pi) / (2.0f * log_base));
+        low = max(low, 0.0f);
+        high = min(high, float(head_dim / 2 - 1));
+        float ramp = clamp((float(pair) - low) / max(high - low, 1e-3f), 0.0f, 1.0f);
+        float extrap_mask = 1.0f - ramp;
+        freq = inv_interp * (1.0f - extrap_mask) + inv_extrap * extrap_mask;
+    }
     float angle = float(s + params.offset) * freq;
     float cos_val;
     float sin_val = sincos(angle, cos_val);
@@ -3136,7 +3152,7 @@ pub const TRANSPOSE_ROPE_BACKWARD: &str = r#"
 using namespace metal;
 
 struct TransposeRopeParams {
-    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta;
+    uint batch; uint seq; uint n_heads; uint head_dim; uint offset; float theta; float yarn_scale; float yarn_orig_max;
 };
 
 kernel void transpose_rope_backward(
@@ -3167,7 +3183,23 @@ kernel void transpose_rope_backward(
 
     // Inverse RoPE: rotate by -angle
     uint pair = d / 2;
-    float freq = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float inv_extrap = 1.0f / pow(params.theta, float(2 * pair) / float(head_dim));
+    float freq;
+    if (params.yarn_scale == 1.0f) {
+        freq = inv_extrap;
+    } else {
+        // YaRN NTK-by-parts: extrapolate high-frequency dims, interpolate low-frequency dims.
+        float inv_interp = inv_extrap / params.yarn_scale;
+        float two_pi = 6.28318530718f;
+        float log_base = log(params.theta);
+        float low = floor(float(head_dim) * log(params.yarn_orig_max / (32.0f * two_pi)) / (2.0f * log_base));
+        float high = ceil(float(head_dim) * log(params.yarn_orig_max / two_pi) / (2.0f * log_base));
+        low = max(low, 0.0f);
+        high = min(high, float(head_dim / 2 - 1));
+        float ramp = clamp((float(pair) - low) / max(high - low, 1e-3f), 0.0f, 1.0f);
+        float extrap_mask = 1.0f - ramp;
+        freq = inv_interp * (1.0f - extrap_mask) + inv_extrap * extrap_mask;
+    }
     float angle = float(s + params.offset) * freq;
     float cos_val;
     float sin_val = sincos(angle, cos_val);

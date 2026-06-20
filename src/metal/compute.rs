@@ -483,6 +483,8 @@ pub struct TrRopeDims {
     pub head_dim: u32,
     pub offset: u32,
     pub theta: f32,
+    pub yarn_scale: f32,
+    pub yarn_orig_max: f32,
 }
 /// Flash-attention dims.
 #[derive(Clone, Copy)]
@@ -2955,6 +2957,8 @@ pub fn gpu_transpose_rope(
         head_dim,
         offset,
         theta,
+        yarn_scale,
+        yarn_orig_max,
     } = d;
     #[repr(C)]
     struct Params {
@@ -2964,6 +2968,8 @@ pub fn gpu_transpose_rope(
         head_dim: u32,
         offset: u32,
         theta: f32,
+        yarn_scale: f32,
+        yarn_orig_max: f32,
     }
     let params = Params {
         batch,
@@ -2972,6 +2978,8 @@ pub fn gpu_transpose_rope(
         head_dim,
         offset,
         theta,
+        yarn_scale,
+        yarn_orig_max,
     };
     let params_buf = params_buffer(ctx, &params);
 
@@ -3004,6 +3012,8 @@ pub fn gpu_transpose_rope_backward(
         head_dim,
         offset,
         theta,
+        yarn_scale,
+        yarn_orig_max,
     } = d;
     #[repr(C)]
     struct Params {
@@ -3013,6 +3023,8 @@ pub fn gpu_transpose_rope_backward(
         head_dim: u32,
         offset: u32,
         theta: f32,
+        yarn_scale: f32,
+        yarn_orig_max: f32,
     }
     let params = Params {
         batch,
@@ -3021,6 +3033,8 @@ pub fn gpu_transpose_rope_backward(
         head_dim,
         offset,
         theta,
+        yarn_scale,
+        yarn_orig_max,
     };
     let params_buf = params_buffer(ctx, &params);
 

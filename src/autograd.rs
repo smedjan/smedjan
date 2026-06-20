@@ -724,6 +724,8 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
                     head_dim: *head_dim as u32,
                     offset: *offset,
                     theta: *theta,
+                    yarn_scale: 1.0,
+                    yarn_orig_max: 0.0,
                 },
             );
         }

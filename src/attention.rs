@@ -596,6 +596,8 @@ impl MultiHeadAttention {
             hd,
             old_len as u32,
             self.rope_theta,
+            1.0,
+            0.0,
         );
         let k = fused_transpose_rope(
             &k_all,
@@ -605,6 +607,8 @@ impl MultiHeadAttention {
             hd,
             0,
             self.rope_theta,
+            1.0,
+            0.0,
         );
         let v = transpose_bsh_to_bhs(&v_all, batch, total, self.n_kv_heads, hd);
         let q = if self.d_model >= 512 {
@@ -735,6 +739,8 @@ impl MultiHeadAttention {
             self.head_dim,
             offset,
             self.rope_theta,
+            1.0,
+            0.0,
         );
         let k = fused_transpose_rope(
             &k,
@@ -744,6 +750,8 @@ impl MultiHeadAttention {
             self.head_dim,
             offset,
             self.rope_theta,
+            1.0,
+            0.0,
         );
         // V only needs transpose (no RoPE)
         let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
@@ -1056,6 +1064,8 @@ pub(crate) fn fused_transpose_rope(
     head_dim: usize,
     offset: u32,
     theta: f32,
+    yarn_scale: f32,
+    yarn_orig_max: f32,
 ) -> Tensor {
     let bh = batch * n_heads;
     let size = bh * seq_len * head_dim;
@@ -1072,6 +1082,8 @@ pub(crate) fn fused_transpose_rope(
             head_dim: head_dim as u32,
             offset,
             theta,
+            yarn_scale,
+            yarn_orig_max,
         },
     );
 
