@@ -856,6 +856,92 @@ mod suite {
         }
     }
 
+    #[test]
+    fn quantize_checkpoint_rejects_invalid_bits_before_io() {
+        let err = crate::quantize::quantize_checkpoint(
+            "/tmp/andreai_missing_checkpoint_for_bad_bits.bin",
+            "/tmp/andreai_bad_bits.qbin",
+            3,
+        )
+        .expect_err("unsupported quantization bits should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("bits must be 4 or 8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn export_gguf_rejects_invalid_quantization_without_output() {
+        let ctx = test_ctx();
+        let model = Transformer::new(&ctx, ModelConfig::custom(32, 32, 4, 1, 2.0, 16));
+        let path = std::env::temp_dir().join("andreai_invalid_quant.gguf");
+        std::fs::remove_file(&path).ok();
+
+        let err = crate::quantize::export_gguf(&model, path.to_str().unwrap(), "q5")
+            .expect_err("unsupported GGUF quantization should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported GGUF quantization"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "invalid GGUF export should fail before creating output"
+        );
+    }
+
+    #[test]
+    fn quantized_loader_rejects_malformed_tensor_metadata() {
+        use std::io::Write;
+
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(32, 32, 4, 1, 2.0, 16);
+        let model = Transformer::new(&ctx, cfg.clone());
+        let path = std::env::temp_dir().join("andreai_malformed_quantized.qbin");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        file.write_all(b"AMQZ").unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&cfg.vocab_size.to_le_bytes()).unwrap();
+        file.write_all(&(cfg.d_model as u32).to_le_bytes()).unwrap();
+        file.write_all(&(cfg.n_heads as u32).to_le_bytes()).unwrap();
+        file.write_all(&(cfg.n_layers as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&cfg.ffn_multiplier.to_le_bytes()).unwrap();
+        file.write_all(&(cfg.max_seq_len as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&cfg.rope_theta.to_le_bytes()).unwrap();
+        file.write_all(&cfg.norm_eps.to_le_bytes()).unwrap();
+        file.write_all(&(cfg.n_kv_heads as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&[4u8]).unwrap();
+        file.write_all(&32u32.to_le_bytes()).unwrap();
+        file.write_all(&(model.parameters().len() as u32).to_le_bytes())
+            .unwrap();
+
+        // First tensor declares one element but zero quantization groups. The loader must
+        // reject the metadata before dequantization instead of inferring a bogus layout.
+        file.write_all(&1u32.to_le_bytes()).unwrap(); // rank
+        file.write_all(&1u32.to_le_bytes()).unwrap(); // shape[0]
+        file.write_all(&0u32.to_le_bytes()).unwrap(); // n_groups, expected 1
+        file.write_all(&0u32.to_le_bytes()).unwrap(); // data_len
+        drop(file);
+
+        let err = match crate::quantize::load_quantized(&ctx, path.to_str().unwrap()) {
+            Ok(_) => panic!("malformed quantized tensor should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("group count mismatch"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
     // =========================================================================
     // 9. Tokenizer edge cases
     // =========================================================================

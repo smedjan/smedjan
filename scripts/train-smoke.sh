@@ -17,6 +17,7 @@ BAD_SHARD="$OUT/bad-shard.bin"
 SFT_JSONL="$OUT/sft.jsonl"
 DPO_JSONL="$OUT/dpo.jsonl"
 DPO_BIN="$OUT/dpo.bin"
+QBIN="$OUT/adamw.qbin"
 
 rm -rf "$OUT"
 mkdir -p "$LOG_DIR"
@@ -215,6 +216,33 @@ run_dpo() {
   echo "PASS: dpo:$name"
 }
 
+run_conversion_smokes() {
+  local ckpt=$1
+  echo "---- convert:quantize_q8 ----"
+  run_logged quantize_q8 "$BIN" quantize --checkpoint "$ckpt" --output "$QBIN" --bits 8
+  if [[ ! -s "$QBIN" ]]; then
+    echo "FAIL: convert:quantize_q8 did not write $QBIN"
+    exit 1
+  fi
+
+  echo "---- convert:generate_qbin ----"
+  run_logged generate_qbin "$BIN" generate --checkpoint "$QBIN" --tokenizer "$TOKENIZER" --prompt "AndreAI" --max-tokens 1 --temperature 0
+
+  echo "---- convert:export_gguf ----"
+  run_logged export_gguf "$BIN" export-gguf --checkpoint "$ckpt" --output "$OUT/model.gguf" --quant f32
+  if [[ ! -s "$OUT/model.gguf" ]]; then
+    echo "FAIL: convert:export_gguf did not write output"
+    exit 1
+  fi
+
+  echo "---- convert:export_safetensors ----"
+  run_logged export_safetensors "$BIN" export-safetensors --checkpoint "$ckpt" --output "$OUT/model.safetensors"
+  if [[ ! -s "$OUT/model.safetensors" ]]; then
+    echo "FAIL: convert:export_safetensors did not write output"
+    exit 1
+  fi
+}
+
 run_resume_train() {
   local name=$1; shift
   local base="$OUT/${name}_base"
@@ -319,6 +347,7 @@ run_reject_logged sft_invalid_seq_len "seq_len must be greater than 0" "$BIN" sf
 run_reject_logged dpo_invalid_beta "beta must be finite and > 0" "$BIN" dpo --checkpoint "$BAD_CHECKPOINT" --ref-checkpoint "$BAD_CHECKPOINT" --tokenizer "$TOKENIZER" --dataset "$OUT/missing-dpo.bin" --beta 0
 run_reject_logged distill_zero_samples "n_samples must be greater than 0" "$BIN" distill --output "$OUT/distill-zero.jsonl" --n-samples 0
 run_reject_logged distill_missing_api_key "api_key must not be empty" "$BIN" distill --api-url https://api.openai.com/v1/chat/completions --model gpt-4o --output "$OUT/distill-openai.jsonl" --n-samples 1
+run_reject_logged quantize_bad_bits "bits must be 4 or 8" "$BIN" quantize --checkpoint "$BAD_CHECKPOINT" --output "$OUT/bad-bits.qbin" --bits 3
 run_reject_logged train_missing_dataset "Failed to verify dataset" "$BIN" train --dataset "$OUT/missing-dataset.bin" --tokenizer "$TOKENIZER" --size tiny --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_missing_dataset"
 run_reject_logged train_unknown_size "Unknown model size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size definitely-not-real --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_unknown_size"
 run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size custom --layers 1 --heads 1 --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_custom_missing_dim"
@@ -329,6 +358,8 @@ run_reject_train invalid_grad_accum "grad_accum_steps must be greater than 0" --
 run_reject_train invalid_dropout "dropout must be finite and in [0, 1)" --dropout 1
 run_reject_train invalid_moe_top_k "--top-k-experts must be in 1..=--n-experts" --n-experts 2 --top-k-experts 0
 run_train adamw
+run_reject_logged export_gguf_invalid_quant "unsupported GGUF quantization" "$BIN" export-gguf --checkpoint "$OUT/adamw/final.bin" --output "$OUT/invalid.gguf" --quant q5
+run_conversion_smokes "$OUT/adamw/final.bin"
 run_sft sft_tiny "$OUT/adamw/final.bin"
 run_logged dpo_prepare "$BIN" dpo-prepare --input "$DPO_JSONL" --output "$DPO_BIN" --tokenizer "$TOKENIZER"
 run_dpo dpo_tiny "$OUT/adamw/final.bin"

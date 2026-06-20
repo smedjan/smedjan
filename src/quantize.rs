@@ -1,7 +1,7 @@
 use crate::checkpoint;
 use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::sync::Arc;
 
 /// Magic bytes for quantized AndreAI checkpoint files.
@@ -160,7 +160,7 @@ pub fn dequantize(qt: &QuantizedTensor) -> Vec<f32> {
 /// Reads a standard AndreAI checkpoint, quantizes every tensor to the
 /// specified bit width (4 or 8), and writes the result.
 pub fn quantize_checkpoint(input_path: &str, output_path: &str, bits: u8) -> std::io::Result<()> {
-    assert!(bits == 4 || bits == 8, "bits must be 4 or 8");
+    validate_quant_bits(bits)?;
 
     let ctx = MetalContext::new();
     let (model, step) = checkpoint::load_checkpoint(&ctx, input_path)
@@ -269,9 +269,17 @@ pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(T
     let mut buf1 = [0u8; 1];
     file.read_exact(&mut buf1)?;
     let bits = buf1[0];
+    if bits != 4 && bits != 8 {
+        return Err(invalid_data(format!(
+            "quantized checkpoint bits must be 4 or 8, got {bits}"
+        )));
+    }
 
     file.read_exact(&mut buf4)?;
     let group_size = u32::from_le_bytes(buf4) as usize;
+    if group_size == 0 {
+        return Err(invalid_data("quantized checkpoint group_size must be > 0"));
+    }
 
     eprintln!(
         "Loading Q{} checkpoint: step {}, {:.1}M params, group_size={}",
@@ -301,7 +309,7 @@ pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(T
     }
 
     for (i, param) in params.iter().enumerate() {
-        let qt = read_quantized_tensor(&mut file)?;
+        let qt = read_quantized_tensor(&mut file, bits, group_size)?;
 
         if qt.shape != param.shape {
             return Err(std::io::Error::new(
@@ -314,6 +322,13 @@ pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(T
         }
 
         let dequantized = dequantize(&qt);
+        if dequantized.len() != param.numel() {
+            return Err(invalid_data(format!(
+                "Tensor {i} dequantized to {} values, expected {}",
+                dequantized.len(),
+                param.numel()
+            )));
+        }
         let byte_data: Vec<u8> = dequantized.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         crate::gpu::buf_write_bytes(&param.buffer, &byte_data);
@@ -323,11 +338,59 @@ pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(T
         }
     }
 
+    let pos = file.stream_position()?;
+    let len = file.metadata()?.len();
+    if pos != len {
+        return Err(invalid_data(format!(
+            "Quantized checkpoint has {} trailing bytes",
+            len.saturating_sub(pos)
+        )));
+    }
+
     eprintln!("Quantized checkpoint loaded: {} (step {})", path, step);
     Ok((model, step))
 }
 
 // --- Internal helpers ---
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn validate_quant_bits(bits: u8) -> std::io::Result<()> {
+    if bits == 4 || bits == 8 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("bits must be 4 or 8, got {bits}")))
+    }
+}
+
+fn validate_gguf_quantize_type(quantize_type: &str) -> std::io::Result<()> {
+    match quantize_type {
+        "f32" | "q8_0" => Ok(()),
+        other => Err(invalid_input(format!(
+            "unsupported GGUF quantization '{other}'; supported values: f32, q8_0"
+        ))),
+    }
+}
+
+fn ensure_tensor_names_match(
+    context: &str,
+    n_params: usize,
+    n_names: usize,
+) -> std::io::Result<()> {
+    if n_params == n_names {
+        Ok(())
+    } else {
+        Err(invalid_data(format!(
+            "{context} tensor count mismatch: model has {n_params} tensors but naming generates {n_names}"
+        )))
+    }
+}
 
 /// Compute per-group scale and zero point for Q8 (affine mapping to 0..255).
 fn compute_scale_zero_q8(group: &[f32]) -> (f32, f32) {
@@ -456,50 +519,82 @@ fn write_quantized_tensor(file: &mut std::fs::File, qt: &QuantizedTensor) -> std
     Ok(())
 }
 
-fn read_quantized_tensor(file: &mut std::fs::File) -> std::io::Result<QuantizedTensor> {
+fn read_quantized_tensor(
+    file: &mut std::fs::File,
+    bits: u8,
+    group_size: usize,
+) -> std::io::Result<QuantizedTensor> {
     let mut buf4 = [0u8; 4];
 
     // Shape
     file.read_exact(&mut buf4)?;
     let ndims = u32::from_le_bytes(buf4) as usize;
+    if ndims == 0 || ndims > 8 {
+        return Err(invalid_data(format!(
+            "quantized tensor has invalid rank {ndims}"
+        )));
+    }
     let mut shape = Vec::with_capacity(ndims);
     for _ in 0..ndims {
         file.read_exact(&mut buf4)?;
-        shape.push(u32::from_le_bytes(buf4) as usize);
+        let dim = u32::from_le_bytes(buf4) as usize;
+        if dim == 0 {
+            return Err(invalid_data("quantized tensor has a zero-sized dimension"));
+        }
+        shape.push(dim);
     }
 
     // Number of groups
     file.read_exact(&mut buf4)?;
     let n_groups = u32::from_le_bytes(buf4) as usize;
+    let n_elements = shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| invalid_data("quantized tensor element count overflows usize"))
+    })?;
+    let expected_groups = n_elements.div_ceil(group_size);
+    if n_groups != expected_groups {
+        return Err(invalid_data(format!(
+            "quantized tensor group count mismatch: file has {n_groups}, expected {expected_groups} for {n_elements} elements with group_size {group_size}"
+        )));
+    }
 
     // Scales
     let mut scales = Vec::with_capacity(n_groups);
     for _ in 0..n_groups {
         file.read_exact(&mut buf4)?;
-        scales.push(f32::from_le_bytes(buf4));
+        let value = f32::from_le_bytes(buf4);
+        if !value.is_finite() {
+            return Err(invalid_data("quantized tensor scale is not finite"));
+        }
+        scales.push(value);
     }
 
     // Zeros
     let mut zeros = Vec::with_capacity(n_groups);
     for _ in 0..n_groups {
         file.read_exact(&mut buf4)?;
-        zeros.push(f32::from_le_bytes(buf4));
+        let value = f32::from_le_bytes(buf4);
+        if !value.is_finite() {
+            return Err(invalid_data("quantized tensor zero point is not finite"));
+        }
+        zeros.push(value);
     }
 
     // Quantized data
     file.read_exact(&mut buf4)?;
     let data_len = u32::from_le_bytes(buf4) as usize;
+    let expected_data_len = match bits {
+        8 => n_elements,
+        4 => n_elements.div_ceil(2),
+        _ => return Err(invalid_input(format!("bits must be 4 or 8, got {bits}"))),
+    };
+    if data_len != expected_data_len {
+        return Err(invalid_data(format!(
+            "quantized tensor data length mismatch: file has {data_len} bytes, expected {expected_data_len} for Q{bits} and {n_elements} elements"
+        )));
+    }
     let mut data = vec![0u8; data_len];
     file.read_exact(&mut data)?;
-
-    // Infer bits and group_size from data length and element count
-    let n_elements: usize = shape.iter().product();
-    let bits = if data_len == n_elements { 8 } else { 4 };
-    let group_size = if n_groups > 0 {
-        n_elements.div_ceil(n_groups)
-    } else {
-        n_elements
-    };
 
     Ok(QuantizedTensor {
         data,
@@ -520,13 +615,18 @@ pub fn export_gguf(
     quantize_type: &str, // "f32" or "q8_0"
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = std::fs::File::create(output_path)?;
+    validate_gguf_quantize_type(quantize_type)?;
     let config = &model.config;
+    let params = model.parameters();
+    let tensor_names = get_gguf_tensor_names(config);
+    ensure_tensor_names_match("GGUF export", params.len(), tensor_names.len())?;
+
+    let mut file = std::fs::File::create(output_path)?;
 
     // GGUF magic + version
     file.write_all(b"GGUF")?; // magic
     file.write_all(&3u32.to_le_bytes())?; // version 3
-    let n_tensors = model.parameters().len() as u64;
+    let n_tensors = params.len() as u64;
     file.write_all(&n_tensors.to_le_bytes())?; // tensor count
 
     // Metadata KV pairs
@@ -573,16 +673,6 @@ pub fn export_gguf(
     )?;
 
     // Tensor info headers (name, shape, type, offset)
-    let params = model.parameters();
-    let tensor_names = get_gguf_tensor_names(config);
-    assert_eq!(
-        params.len(),
-        tensor_names.len(),
-        "Tensor count mismatch: model has {} but naming generates {}",
-        params.len(),
-        tensor_names.len()
-    );
-
     let mut data_offset: u64 = 0;
     let gguf_type = if quantize_type == "q8_0" { 8u32 } else { 0u32 }; // F32=0, Q8_0=8
 
@@ -737,7 +827,7 @@ pub fn export_safetensors(model: &Transformer, output_path: &str) -> std::io::Re
     let config = &model.config;
     let params = model.parameters();
     let tensor_names = get_gguf_tensor_names(config); // reuse naming
-    assert_eq!(params.len(), tensor_names.len());
+    ensure_tensor_names_match("Safetensors export", params.len(), tensor_names.len())?;
 
     // Build JSON header: { "tensor_name": { "dtype": "F32", "shape": [...], "data_offsets": [start, end] } }
     let mut header = String::from("{");

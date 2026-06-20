@@ -1549,6 +1549,22 @@ fn main() {
                 if base_params.len() != other_params.len() {
                     exit_with_message("Checkpoint param count mismatch");
                 }
+                for (idx, (bp, op)) in base_params.iter().zip(other_params.iter()).enumerate() {
+                    if bp.shape != op.shape {
+                        exit_with_message(format!(
+                            "Checkpoint tensor {idx} shape mismatch: base {:?} vs {} {:?}",
+                            bp.shape, ckpt_path, op.shape
+                        ));
+                    }
+                    if bp.numel() != op.numel() {
+                        exit_with_message(format!(
+                            "Checkpoint tensor {idx} element count mismatch: base {} vs {} {}",
+                            bp.numel(),
+                            ckpt_path,
+                            op.numel()
+                        ));
+                    }
+                }
 
                 // Accumulate: base += other
                 for (bp, op) in base_params.iter().zip(other_params.iter()) {
