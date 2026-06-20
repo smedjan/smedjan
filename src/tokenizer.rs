@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 
 /// Special token IDs.
 pub const PAD_TOKEN: u32 = 0;
@@ -17,6 +17,44 @@ pub struct BpeTokenizer {
     pub merges: Vec<(u32, u32, u32)>,
     /// Fast lookup: (a, b) → priority (lower = higher priority)
     pub merge_priority: HashMap<(u32, u32), usize>,
+}
+
+fn invalid_tokenizer_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn read_tokenizer_exact(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    consumed: &mut u64,
+) -> std::io::Result<()> {
+    file.read_exact(buf)?;
+    *consumed += buf.len() as u64;
+    Ok(())
+}
+
+fn read_tokenizer_u32(file: &mut std::fs::File, consumed: &mut u64) -> std::io::Result<u32> {
+    let mut buf4 = [0u8; 4];
+    read_tokenizer_exact(file, &mut buf4, consumed)?;
+    Ok(u32::from_le_bytes(buf4))
+}
+
+fn ensure_tokenizer_remaining(
+    file_len: u64,
+    consumed: u64,
+    needed: u64,
+    context: impl Into<String>,
+) -> std::io::Result<()> {
+    let remaining = file_len.saturating_sub(consumed);
+    if needed > remaining {
+        return Err(invalid_tokenizer_data(format!(
+            "{} exceeds remaining tokenizer file bytes: need {}, remaining {}",
+            context.into(),
+            needed,
+            remaining
+        )));
+    }
+    Ok(())
 }
 
 /// GPT-2's reversible byte→unicode map: bytes in the printable ranges map to themselves, the rest
@@ -431,50 +469,133 @@ impl BpeTokenizer {
     /// Load tokenizer from a binary file.
     pub fn load(path: &str) -> std::io::Result<Self> {
         let mut file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut consumed = 0u64;
         let mut buf4 = [0u8; 4];
 
         // Magic
-        file.read_exact(&mut buf4)?;
-        assert_eq!(&buf4, b"ABPE", "Not a valid tokenizer file");
+        read_tokenizer_exact(&mut file, &mut buf4, &mut consumed)?;
+        if &buf4 != b"ABPE" {
+            return Err(invalid_tokenizer_data(format!(
+                "not a valid tokenizer file: expected ABPE magic, got {:02x?}",
+                buf4
+            )));
+        }
 
         // Version
-        file.read_exact(&mut buf4)?;
-        let version = u32::from_le_bytes(buf4);
-        assert!(
-            (1..=2).contains(&version),
-            "Unsupported tokenizer version: {}",
-            version
-        );
+        let version = read_tokenizer_u32(&mut file, &mut consumed)?;
+        if !(1..=2).contains(&version) {
+            return Err(invalid_tokenizer_data(format!(
+                "unsupported tokenizer version: {version}"
+            )));
+        }
 
         // Vocab size
-        file.read_exact(&mut buf4)?;
-        let vocab_len = u32::from_le_bytes(buf4) as usize;
+        let vocab_len = read_tokenizer_u32(&mut file, &mut consumed)? as usize;
+        let min_vocab_len = (SPECIAL_TOKENS + 256) as usize;
+        if vocab_len < min_vocab_len {
+            return Err(invalid_tokenizer_data(format!(
+                "tokenizer vocab must include {SPECIAL_TOKENS} special tokens and 256 byte tokens, got {vocab_len}"
+            )));
+        }
+        let min_vocab_bytes = (vocab_len as u64)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| invalid_tokenizer_data("tokenizer vocab section is too large"))?;
+        ensure_tokenizer_remaining(
+            file_len,
+            consumed,
+            min_vocab_bytes,
+            format!("tokenizer vocab table for {vocab_len} entries"),
+        )?;
 
         let mut inverse_vocab = Vec::with_capacity(vocab_len);
         let mut vocab = HashMap::new();
         for id in 0..vocab_len {
-            file.read_exact(&mut buf4)?;
-            let len = u32::from_le_bytes(buf4) as usize;
+            let len = read_tokenizer_u32(&mut file, &mut consumed)? as usize;
+            if len == 0 {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer token {id} has zero length"
+                )));
+            }
+            ensure_tokenizer_remaining(
+                file_len,
+                consumed,
+                len as u64,
+                format!("tokenizer token {id} length {len}"),
+            )?;
             let mut token_bytes = vec![0u8; len];
-            file.read_exact(&mut token_bytes)?;
-            vocab.insert(token_bytes.clone(), id as u32);
+            read_tokenizer_exact(&mut file, &mut token_bytes, &mut consumed)?;
+            if vocab.insert(token_bytes.clone(), id as u32).is_some() {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer contains duplicate token bytes at id {id}"
+                )));
+            }
             inverse_vocab.push(token_bytes);
+        }
+        for (id, expected) in [
+            b"<|pad|>".as_slice(),
+            b"<|bos|>".as_slice(),
+            b"<|eos|>".as_slice(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if inverse_vocab[id] != *expected {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer special token id {id} is invalid"
+                )));
+            }
+        }
+        for byte in 0u8..=255 {
+            let id = byte as usize + SPECIAL_TOKENS as usize;
+            if inverse_vocab[id] != [byte] {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer byte token id {id} is invalid"
+                )));
+            }
         }
 
         // Merges
-        file.read_exact(&mut buf4)?;
-        let merge_count = u32::from_le_bytes(buf4) as usize;
+        let merge_count = read_tokenizer_u32(&mut file, &mut consumed)? as usize;
+        let merge_bytes = (merge_count as u64)
+            .checked_mul(12)
+            .ok_or_else(|| invalid_tokenizer_data("tokenizer merge section is too large"))?;
+        ensure_tokenizer_remaining(
+            file_len,
+            consumed,
+            merge_bytes,
+            format!("tokenizer merge table for {merge_count} entries"),
+        )?;
         let mut merges = Vec::with_capacity(merge_count);
         let mut merge_priority = HashMap::new();
         for priority in 0..merge_count {
-            file.read_exact(&mut buf4)?;
-            let a = u32::from_le_bytes(buf4);
-            file.read_exact(&mut buf4)?;
-            let b = u32::from_le_bytes(buf4);
-            file.read_exact(&mut buf4)?;
-            let c = u32::from_le_bytes(buf4);
+            let a = read_tokenizer_u32(&mut file, &mut consumed)?;
+            let b = read_tokenizer_u32(&mut file, &mut consumed)?;
+            let c = read_tokenizer_u32(&mut file, &mut consumed)?;
+            if a as usize >= vocab_len || b as usize >= vocab_len || c as usize >= vocab_len {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer merge {priority} references token ids ({a}, {b}, {c}) outside vocab size {vocab_len}"
+                )));
+            }
+            if (c as usize) < min_vocab_len {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer merge {priority} output id {c} overlaps the base byte vocabulary"
+                )));
+            }
+            if merge_priority.contains_key(&(a, b)) {
+                return Err(invalid_tokenizer_data(format!(
+                    "tokenizer merge {priority} duplicates pair ({a}, {b})"
+                )));
+            }
             merges.push((a, b, c));
             merge_priority.insert((a, b), priority);
+        }
+        if consumed != file_len {
+            return Err(invalid_tokenizer_data(format!(
+                "tokenizer file has {} trailing bytes",
+                file_len - consumed
+            )));
         }
 
         Ok(Self {

@@ -898,6 +898,56 @@ mod suite {
     }
 
     #[test]
+    fn tokenizer_load_rejects_malformed_files() {
+        let bad_magic_path = "/tmp/andreai_test_bad_tokenizer_magic.bin";
+        std::fs::write(bad_magic_path, b"NOPE").expect("write bad tokenizer magic");
+        let err = match BpeTokenizer::load(bad_magic_path) {
+            Ok(_) => panic!("bad tokenizer magic should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("not a valid tokenizer file"),
+            "unexpected error: {err}"
+        );
+
+        let bad_version_path = "/tmp/andreai_test_bad_tokenizer_version.bin";
+        let mut bad_version = Vec::new();
+        bad_version.extend_from_slice(b"ABPE");
+        bad_version.extend_from_slice(&99u32.to_le_bytes());
+        std::fs::write(bad_version_path, bad_version).expect("write bad tokenizer version");
+        let err = match BpeTokenizer::load(bad_version_path) {
+            Ok(_) => panic!("bad tokenizer version should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("unsupported tokenizer version"),
+            "unexpected error: {err}"
+        );
+
+        let truncated_path = "/tmp/andreai_test_truncated_tokenizer.bin";
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(b"ABPE");
+        truncated.extend_from_slice(&1u32.to_le_bytes());
+        truncated.extend_from_slice(&(SPECIAL_TOKENS + 256).to_le_bytes());
+        std::fs::write(truncated_path, truncated).expect("write truncated tokenizer");
+        let err = match BpeTokenizer::load(truncated_path) {
+            Ok(_) => panic!("truncated tokenizer should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("vocab table"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(bad_magic_path).ok();
+        std::fs::remove_file(bad_version_path).ok();
+        std::fs::remove_file(truncated_path).ok();
+    }
+
+    #[test]
     fn tokenizer_long_text_chunked_encoding() {
         let corpus = b"abcdefghijklmnopqrstuvwxyz 0123456789 the quick brown fox jumps";
         let tok = BpeTokenizer::train(corpus, 280);

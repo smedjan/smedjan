@@ -11,6 +11,7 @@ LOG_DIR="$OUT/logs"
 CORPUS="$OUT/corpus.txt"
 TOKENIZER="$OUT/tokenizer.bin"
 DATASET="$OUT/dataset.bin"
+BAD_TOKENIZER="$OUT/bad-tokenizer.bin"
 BAD_SHARD="$OUT/bad-shard.bin"
 
 rm -rf "$OUT"
@@ -216,6 +217,8 @@ cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
 run_logged build cargo build --release --no-default-features --features metal
 run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tokenizer --input "$OUT/missing-corpus.txt" --vocab-size 260 --output "$OUT/missing-tokenizer.bin"
 run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
+printf 'not-a-tokenizer' > "$BAD_TOKENIZER"
+run_reject_logged prepare_bad_tokenizer "not a valid tokenizer file" "$BIN" prepare --input "$CORPUS" --tokenizer "$BAD_TOKENIZER" --output "$OUT/bad-tokenizer-dataset.bin"
 run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
 printf '\001\002\003' > "$BAD_SHARD"
