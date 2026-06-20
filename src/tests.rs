@@ -3,7 +3,7 @@ mod suite {
     use crate::autograd;
     use crate::datapipe;
     use crate::gpu::{compute, MetalContext};
-    use crate::model::{ModelConfig, Transformer};
+    use crate::model::{ModelConfig, MoeSpec, Transformer, TransformerBlock};
     use crate::tensor::Tensor;
     use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, SPECIAL_TOKENS};
     use std::sync::Arc;
@@ -2366,6 +2366,139 @@ mod suite {
             err.to_string().contains("unsupported lr_schedule"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn train_config_rejects_invalid_numeric_ranges() {
+        fn expect_invalid<F>(needle: &str, mutate: F)
+        where
+            F: FnOnce(&mut crate::train::TrainConfig),
+        {
+            let mut cfg = crate::train::TrainConfig::default_small("dataset.bin", "tokenizer.bin");
+            mutate(&mut cfg);
+            let err = cfg.validate().expect_err("invalid config should fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(needle),
+                "expected error containing '{needle}', got '{err}'"
+            );
+        }
+
+        expect_invalid("batch_size", |c| c.batch_size = 0);
+        expect_invalid("seq_len", |c| c.seq_len = 0);
+        expect_invalid("total_steps", |c| c.total_steps = 0);
+        expect_invalid("grad_accum_steps", |c| c.grad_accum_steps = 0);
+        expect_invalid("checkpoint_interval", |c| c.checkpoint_interval = 0);
+        expect_invalid("max_lr", |c| c.max_lr = f32::NAN);
+        expect_invalid("max_grad_norm", |c| c.max_grad_norm = 0.0);
+        expect_invalid("distill_temperature", |c| c.distill_temperature = 0.0);
+        expect_invalid("distill_alpha", |c| c.distill_alpha = 1.1);
+        expect_invalid("dropout", |c| c.dropout = 1.0);
+        expect_invalid("ema_decay", |c| c.ema_decay = 1.0);
+        expect_invalid("adamw_beta1", |c| c.adamw_beta1 = -0.1);
+        expect_invalid("adamw_beta2", |c| c.adamw_beta2 = 1.0);
+        expect_invalid("adamw_eps", |c| c.adamw_eps = 0.0);
+        expect_invalid("model_config.n_heads", |c| c.model_config.n_heads = 0);
+        expect_invalid("divisible by n_kv_heads", |c| {
+            c.model_config.n_kv_heads = 3;
+        });
+        expect_invalid("top_k_experts", |c| c.model_config.top_k_experts = 0);
+        expect_invalid("block_size", |c| {
+            c.model_config.block_sparse_top_k = 1;
+            c.model_config.block_size = 0;
+        });
+        expect_invalid("yarn_scale", |c| c.model_config.yarn_scale = 0.5);
+        expect_invalid("batch_size * grad_accum_steps", |c| {
+            c.batch_size = usize::MAX;
+            c.grad_accum_steps = 2;
+        });
+        expect_invalid("batch_size * seq_len", |c| {
+            c.batch_size = usize::MAX;
+            c.seq_len = 2;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "top_k_experts must be > 0")]
+    fn model_config_rejects_zero_top_k_moe() {
+        let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 64);
+        let _ = ModelConfig::custom_moe(
+            cfg,
+            MoeSpec {
+                n_experts: 2,
+                top_k_experts: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn moe_ffn_honors_top_k_experts() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let config = ModelConfig::custom_moe(
+                ModelConfig::custom(16, 2, 1, 1, 1.0, 4),
+                MoeSpec {
+                    n_experts: 2,
+                    top_k_experts: 1,
+                },
+            );
+            let mut block = TransformerBlock::new(&ctx, &config, 0);
+            let ff = config.d_ff();
+
+            block.ffn_w2 = Tensor::zeros(&ctx, vec![ff, 2]);
+            block.router_weight = Tensor::from_slice(&ctx, &[2.0, 1.0, 0.0, 0.0], vec![2, 2]);
+            for expert in &mut block.experts {
+                expert.w1 = Tensor::zeros(&ctx, vec![2, ff]);
+                expert.w2 = Tensor::zeros(&ctx, vec![ff, 2]);
+                expert.w3 = Tensor::zeros(&ctx, vec![2, ff]);
+            }
+
+            let mut w1 = vec![0.0f32; 2 * ff];
+            let mut w2 = vec![0.0f32; ff * 2];
+            let mut w3 = vec![0.0f32; 2 * ff];
+            w1[0] = 1.0;
+            w2[0] = 1000.0;
+            w3[0] = 1.0;
+            block.experts[1].w1 = Tensor::from_slice(&ctx, &w1, vec![2, ff]);
+            block.experts[1].w2 = Tensor::from_slice(&ctx, &w2, vec![ff, 2]);
+            block.experts[1].w3 = Tensor::from_slice(&ctx, &w3, vec![2, ff]);
+
+            let x = Tensor::from_slice(&ctx, &[1.0, 0.0], vec![1, 1, 2]);
+            let masked = block.moe_ffn(&x, 1, 1, 2).to_vec();
+            assert!(
+                masked[0].abs() < 1e-5 && masked[1].abs() < 1e-5,
+                "top_k=1 must mask the lower-scored expert: {masked:?}"
+            );
+
+            block.top_k = 2;
+            let unmasked = block.moe_ffn(&x, 1, 1, 2).to_vec();
+            assert!(
+                unmasked[0] > 700.0 && unmasked[1].abs() < 1e-5,
+                "top_k=2 should include the lower-scored expert contribution: {unmasked:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn scaled_moe_model_initializes_experts() {
+        let ctx = test_ctx();
+        autograd::no_grad(|| {
+            let config = ModelConfig::custom_moe(
+                ModelConfig::custom(16, 2, 1, 1, 1.0, 4),
+                MoeSpec {
+                    n_experts: 2,
+                    top_k_experts: 1,
+                },
+            );
+            let model = Transformer::new_scaled(&ctx, config, 0.01);
+            assert_eq!(model.blocks[0].experts.len(), 2);
+            let logits = model.forward(&[1, 2], 1, 2, None, false);
+            assert_eq!(logits.shape, vec![2, 16]);
+            assert!(
+                logits.to_vec().iter().all(|v| v.is_finite()),
+                "scaled MoE forward produced non-finite logits"
+            );
+        });
     }
 
     #[test]

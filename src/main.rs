@@ -779,6 +779,12 @@ fn main() {
                 normuon,
                 cautious,
             } = *args;
+            if n_experts == 0 {
+                exit_with_message("--n-experts must be greater than 0");
+            }
+            if top_k_experts == 0 || top_k_experts > n_experts {
+                exit_with_message("--top-k-experts must be in 1..=--n-experts");
+            }
             let tok = result_or_exit(
                 tokenizer::BpeTokenizer::load(&tok_path),
                 "Failed to load tokenizer",
@@ -802,19 +808,50 @@ fn main() {
                     let fm = ffn_mult.unwrap_or(2.67);
                     let kvh = kv_heads.unwrap_or(h);
                     let ms = max_seq.unwrap_or(512);
-                    if n_experts > 1 {
-                        model::ModelConfig::custom_moe(
-                            model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms),
-                            model::MoeSpec { n_experts, top_k_experts },
-                        )
-                    } else {
-                        model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
+                    if d == 0 {
+                        exit_with_message("--dim must be greater than 0");
                     }
+                    if l == 0 {
+                        exit_with_message("--layers must be greater than 0");
+                    }
+                    if h == 0 {
+                        exit_with_message("--heads must be greater than 0");
+                    }
+                    if kvh == 0 {
+                        exit_with_message("--kv-heads must be greater than 0");
+                    }
+                    if ms == 0 {
+                        exit_with_message("--max-seq must be greater than 0");
+                    }
+                    if !fm.is_finite() || fm <= 0.0 {
+                        exit_with_message("--ffn-mult must be finite and > 0");
+                    }
+                    if d % h != 0 {
+                        exit_with_message("--dim must be divisible by --heads");
+                    }
+                    if kvh > h {
+                        exit_with_message("--kv-heads must be <= --heads");
+                    }
+                    if h % kvh != 0 {
+                        exit_with_message("--heads must be divisible by --kv-heads");
+                    }
+                    model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
                 }
                 _ => exit_with_message(format!(
                     "Unknown model size: '{}'. Use: tiny, small, medium, large, xl, max, huge, 8b, custom",
                     size
                 )),
+            };
+            let model_config = if n_experts > 1 {
+                model::ModelConfig::custom_moe(
+                    model_config,
+                    model::MoeSpec {
+                        n_experts,
+                        top_k_experts,
+                    },
+                )
+            } else {
+                model_config
             };
 
             if !yarn_scale.is_finite() || yarn_scale < 1.0 {
@@ -1058,6 +1095,10 @@ fn main() {
             if (c.yarn_scale - 1.0).abs() > f32::EPSILON {
                 println!("  YaRN scale: {}", c.yarn_scale);
                 println!("  YaRN original max seq: {}", c.yarn_orig_max_seq);
+            }
+            if c.n_experts > 1 {
+                println!("  n_experts: {}", c.n_experts);
+                println!("  top_k_experts: {}", c.top_k_experts);
             }
             println!(
                 "  Training RAM: {:.0} MB",

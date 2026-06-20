@@ -234,6 +234,9 @@ run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BI
 run_reject_train invalid_optimizer "unsupported optimizer" --optimizer definitely-not-real
 run_reject_train invalid_lr_schedule "unsupported lr_schedule" --lr-schedule lunar
 run_reject_train invalid_yarn_scale "--yarn-scale must be finite and >= 1.0" --yarn-scale 0
+run_reject_train invalid_grad_accum "grad_accum_steps must be greater than 0" --grad-accum 0
+run_reject_train invalid_dropout "dropout must be finite and in [0, 1)" --dropout 1
+run_reject_train invalid_moe_top_k "--top-k-experts must be in 1..=--n-experts" --n-experts 2 --top-k-experts 0
 run_train adamw
 run_resume_train adamw_resume
 run_train checkpoint_fused --gradient-checkpointing --fused-ce
@@ -244,5 +247,11 @@ run_train ssm --ssm
 run_train block_sparse --block-sparse-top-k 1 --block-size 4
 run_train linear_period --linear-attn-period 2
 run_train yarn --yarn-scale 2.0
+run_train moe_preset --n-experts 2 --top-k-experts 1
+if ! grep -Fq "n_experts=2, top_k_experts=1" "$LOG_DIR/moe_preset.log"; then
+  echo "FAIL: train:moe_preset did not build the requested MoE preset"
+  tail -60 "$LOG_DIR/moe_preset.log"
+  exit 1
+fi
 
 echo "ALL TRAIN SMOKES PASS"

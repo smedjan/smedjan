@@ -172,6 +172,7 @@ impl ModelConfig {
     /// Add a mixture-of-experts spec to a base config (e.g. one from [`Self::custom_gqa`]).
     pub fn custom_moe(mut config: ModelConfig, moe: MoeSpec) -> Self {
         assert!(moe.n_experts > 0, "n_experts must be > 0");
+        assert!(moe.top_k_experts > 0, "top_k_experts must be > 0");
         assert!(
             moe.top_k_experts <= moe.n_experts,
             "top_k ({}) must be <= n_experts ({})",
@@ -309,8 +310,16 @@ impl ModelConfig {
                 self.yarn_scale, self.yarn_orig_max_seq
             )
         };
+        let moe_info = if self.n_experts > 1 {
+            format!(
+                ", n_experts={}, top_k_experts={}",
+                self.n_experts, self.top_k_experts
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}{}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
+            "d_model={}, n_heads={}{}, n_layers={}, d_ff={}, seq={}{}{}, params={}M, train_ram={:.0}MB, infer_ram={:.0}MB",
             self.d_model,
             self.n_heads,
             gqa_info,
@@ -318,6 +327,7 @@ impl ModelConfig {
             self.d_ff(),
             self.max_seq_len,
             yarn_info,
+            moe_info,
             self.param_count() as f64 / 1e6,
             self.training_memory_bytes() as f64 / (1024.0 * 1024.0),
             self.inference_memory_bytes() as f64 / (1024.0 * 1024.0),
@@ -393,6 +403,23 @@ pub struct TransformerBlock {
     pub norm_eps: f32,
     pub mod_router: Tensor, // [d_model, 1] — Mixture of Depths router (scores tokens for skip)
     pub mod_capacity: f32,  // 0.0=disabled, 0.5=process top 50% tokens per layer
+}
+
+fn top_k_expert_masks(scores: &[f32], n_tokens: usize, n_experts: usize, top_k: usize) -> Vec<f32> {
+    assert_eq!(scores.len(), n_tokens * n_experts);
+    assert!(top_k > 0 && top_k <= n_experts);
+
+    let mut masks = vec![0.0f32; n_tokens * n_experts];
+    let mut order: Vec<usize> = (0..n_experts).collect();
+    for token_idx in 0..n_tokens {
+        let row_start = token_idx * n_experts;
+        let row = &scores[row_start..row_start + n_experts];
+        order.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then_with(|| a.cmp(&b)));
+        for &expert_idx in order.iter().take(top_k) {
+            masks[expert_idx * n_tokens + token_idx] = 1.0;
+        }
+    }
+    masks
 }
 
 impl TransformerBlock {
@@ -595,6 +622,27 @@ impl TransformerBlock {
             config.max_seq_len as f32
         };
 
+        let experts = if config.n_experts > 1 {
+            (0..config.n_experts)
+                .map(|_| ExpertFFN {
+                    w1: Tensor::randn(ctx, vec![d, ff], ff_std),
+                    w2: Tensor::randn(ctx, vec![ff, d], down_std),
+                    w3: Tensor::randn(ctx, vec![d, ff], ff_std),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let router_weight = if config.n_experts > 1 {
+            Tensor::randn(
+                ctx,
+                vec![d, config.n_experts],
+                (2.0 / d as f32).sqrt() * scale,
+            )
+        } else {
+            z()
+        };
+
         Self {
             attn,
             ffn_w1: Tensor::randn(ctx, vec![d, ff], ff_std),
@@ -610,8 +658,8 @@ impl TransformerBlock {
             ffn_w3_u: w3u,
             ffn_w3_v: w3v,
             lowrank: r,
-            experts: Vec::new(),
-            router_weight: z(),
+            experts,
+            router_weight,
             router_bias: vec![0.0f32; config.n_experts.max(1)],
             n_experts: config.n_experts,
             top_k: config.top_k_experts,
@@ -736,10 +784,21 @@ impl TransformerBlock {
 
     /// Shared-Expert Mixture of Experts with ReLU routing (DeepSeek-V3 + ReMoE).
     /// 1 shared expert (block's FFN weights) always active for ALL tokens.
-    /// N routed experts use ReLU gating instead of softmax+topk (ICLR 2025, ReMoE):
-    ///   gate_i = ReLU(x @ W_router_i) — positive → active, zero → inactive
-    /// ReLU is fully differentiable, naturally sparse, no load balancing loss needed.
-    fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
+    /// N routed experts use ReLU gating plus a per-token top-K mask:
+    ///   gate_i = ReLU(x @ W_router_i), masked to the K highest scores.
+    /// Scores remain differentiable for selected experts; the top-K decision is discrete.
+    pub(crate) fn moe_ffn(&self, x: &Tensor, batch: usize, seq_len: usize, d: usize) -> Tensor {
+        assert!(
+            self.top_k > 0 && self.top_k <= self.n_experts,
+            "MoE top_k must be in 1..=n_experts"
+        );
+        assert_eq!(
+            self.experts.len(),
+            self.n_experts,
+            "MoE block has {} expert tensors but n_experts={}",
+            self.experts.len(),
+            self.n_experts
+        );
         let n_tokens = batch * seq_len;
         let x_flat = x.reshape(vec![n_tokens, d]);
 
@@ -748,11 +807,12 @@ impl TransformerBlock {
             .swiglu_ffn(x, batch, seq_len, d)
             .reshape(vec![n_tokens, d]);
 
-        // ReMoE routing (ICLR 2025): ReLU gate instead of softmax+topk.
-        // gate_i = ReLU(x @ W_router_i) — positive activates, zero deactivates.
-        // Fully differentiable, naturally sparse, no auxiliary balance loss needed.
+        // ReMoE-style routing: ReLU scores are naturally sparse, then top-K caps active experts.
         let router_logits = x_flat.matmul(&self.router_weight); // [n_tokens, n_experts]
         let router_probs = router_logits.relu(); // ReLU: natural sparsity
+        let top_k_masks = (self.top_k < self.n_experts).then(|| {
+            top_k_expert_masks(&router_probs.to_vec(), n_tokens, self.n_experts, self.top_k)
+        });
 
         // Soft MoE: each routed expert adds a weighted delta on top of the shared output.
         let mut combined = shared_out;
@@ -774,7 +834,16 @@ impl TransformerBlock {
                 vec![self.n_experts, 1],
             );
             let weight_col = router_probs.matmul(&selector); // [n_tokens, 1]
-            let weights = weight_col.reshape(vec![n_tokens]); // [n_tokens]
+            let mut weights = weight_col.reshape(vec![n_tokens]); // [n_tokens]
+            if let Some(masks) = &top_k_masks {
+                let start = expert_idx * n_tokens;
+                let mask = Tensor::from_slice(
+                    &x_flat.ctx,
+                    &masks[start..start + n_tokens],
+                    vec![n_tokens],
+                );
+                weights = weights.mul(&mask);
+            }
 
             // Add weighted expert delta to combined output
             let scaled = expert_out.scale_rows(&weights);

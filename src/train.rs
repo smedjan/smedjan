@@ -146,6 +146,41 @@ impl TrainConfig {
             &self.lr_schedule,
             Self::SUPPORTED_LR_SCHEDULES,
         )?;
+        validate_positive_usize("batch_size", self.batch_size)?;
+        validate_positive_usize("seq_len", self.seq_len)?;
+        validate_positive_u32("total_steps", self.total_steps)?;
+        validate_positive_u32("grad_accum_steps", self.grad_accum_steps)?;
+        validate_positive_u32("log_interval", self.log_interval)?;
+        validate_positive_u32("checkpoint_interval", self.checkpoint_interval)?;
+        validate_finite_non_negative("max_lr", self.max_lr)?;
+        validate_finite_non_negative("weight_decay", self.weight_decay)?;
+        validate_finite_positive("max_grad_norm", self.max_grad_norm)?;
+        validate_finite_positive("distill_temperature", self.distill_temperature)?;
+        validate_finite_fraction_inclusive("distill_alpha", self.distill_alpha)?;
+        validate_finite_fraction_exclusive("dropout", self.dropout)?;
+        validate_finite_non_negative("prune_threshold", self.prune_threshold)?;
+        validate_finite_non_negative("speculative_threshold", self.speculative_threshold)?;
+        validate_finite_non_negative("z_loss_coefficient", self.z_loss_coefficient)?;
+        validate_finite_fraction_exclusive("ema_decay", self.ema_decay)?;
+        validate_finite_non_negative("noise_scale", self.noise_scale)?;
+        validate_finite_fraction_inclusive("freeze_fraction", self.freeze_fraction)?;
+        validate_finite_fraction_exclusive("adamw_beta1", self.adamw_beta1)?;
+        validate_finite_fraction_exclusive("adamw_beta2", self.adamw_beta2)?;
+        validate_finite_positive("adamw_eps", self.adamw_eps)?;
+        validate_finite_non_negative("update_clip", self.update_clip)?;
+        validate_finite_non_negative("muon_lr_scale", self.muon_lr_scale)?;
+        validate_finite_non_negative("adamw_lr_scale", self.adamw_lr_scale)?;
+        validate_model_config(&self.model_config)?;
+        self.batch_size
+            .checked_mul(self.grad_accum_steps as usize)
+            .ok_or_else(|| invalid_input("batch_size * grad_accum_steps overflows usize"))?;
+        let batch_seq = self
+            .batch_size
+            .checked_mul(self.seq_len)
+            .ok_or_else(|| invalid_input("batch_size * seq_len overflows usize"))?;
+        batch_seq
+            .checked_mul(self.model_config.vocab_size as usize)
+            .ok_or_else(|| invalid_input("batch_size * seq_len * vocab_size overflows usize"))?;
         Ok(())
     }
 
@@ -164,13 +199,117 @@ fn validate_choice(field: &str, value: &str, supported: &[&str]) -> std::io::Res
     if supported.contains(&value) {
         return Ok(());
     }
-    Err(Error::new(
-        ErrorKind::InvalidInput,
-        format!(
-            "unsupported {field} '{value}'; supported values: {}",
-            supported.join(", ")
-        ),
-    ))
+    Err(invalid_input(format!(
+        "unsupported {field} '{value}'; supported values: {}",
+        supported.join(", ")
+    )))
+}
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_positive_usize(field: &str, value: usize) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_positive_u32(field: &str, value: u32) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_finite_positive(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and > 0")))
+    }
+}
+
+fn validate_finite_non_negative(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and >= 0")))
+    }
+}
+
+fn validate_finite_fraction_inclusive(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "{field} must be finite and in [0, 1]"
+        )))
+    }
+}
+
+fn validate_finite_fraction_exclusive(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "{field} must be finite and in [0, 1)"
+        )))
+    }
+}
+
+fn validate_model_config(config: &ModelConfig) -> std::io::Result<()> {
+    validate_positive_u32("model_config.vocab_size", config.vocab_size)?;
+    validate_positive_usize("model_config.d_model", config.d_model)?;
+    validate_positive_usize("model_config.n_heads", config.n_heads)?;
+    validate_positive_usize("model_config.n_kv_heads", config.n_kv_heads)?;
+    validate_positive_usize("model_config.n_layers", config.n_layers)?;
+    validate_positive_usize("model_config.max_seq_len", config.max_seq_len)?;
+    validate_finite_positive("model_config.ffn_multiplier", config.ffn_multiplier)?;
+    validate_finite_positive("model_config.rope_theta", config.rope_theta)?;
+    validate_finite_positive("model_config.norm_eps", config.norm_eps)?;
+    validate_positive_usize("model_config.n_experts", config.n_experts)?;
+    validate_positive_usize("model_config.top_k_experts", config.top_k_experts)?;
+    validate_finite_fraction_exclusive("model_config.stochastic_depth", config.stochastic_depth)?;
+    validate_finite_positive("model_config.yarn_scale", config.yarn_scale)?;
+    if !config.d_model.is_multiple_of(config.n_heads) {
+        return Err(invalid_input(
+            "model_config.d_model must be divisible by n_heads",
+        ));
+    }
+    if config.n_kv_heads > config.n_heads {
+        return Err(invalid_input(
+            "model_config.n_kv_heads must be <= model_config.n_heads",
+        ));
+    }
+    if !config.n_heads.is_multiple_of(config.n_kv_heads) {
+        return Err(invalid_input(
+            "model_config.n_heads must be divisible by n_kv_heads",
+        ));
+    }
+    if config.top_k_experts > config.n_experts {
+        return Err(invalid_input(
+            "model_config.top_k_experts must be <= model_config.n_experts",
+        ));
+    }
+    if config.block_sparse_top_k > 0 && config.block_size == 0 {
+        return Err(invalid_input(
+            "model_config.block_size must be greater than 0 when block sparse attention is enabled",
+        ));
+    }
+    if config.yarn_scale < 1.0 {
+        return Err(invalid_input("model_config.yarn_scale must be >= 1.0"));
+    }
+    let rope_head_dim = config.d_model / config.n_heads;
+    if config.yarn_scale > 1.0 && !rope_head_dim.is_multiple_of(2) {
+        return Err(invalid_input(
+            "model_config head_dim must be even when YaRN is enabled",
+        ));
+    }
+    Ok(())
 }
 
 impl TrainConfig {
