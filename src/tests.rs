@@ -3928,6 +3928,28 @@ mod suite {
     /// logits, backprop a finite gradient into the latent down-projection W_dkv, and train stably
     /// (clipped, warmed-up Muon steps never go non-finite). Mirrors linear_attn_model_trains_stably.
     #[test]
+    fn safetensors_roundtrips_an_andreai_model() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
+        let model = Transformer::new(&ctx, cfg.clone());
+        let path = "/tmp/andreai_safetensors_roundtrip.safetensors";
+        crate::safetensors::export_safetensors(path, &model).expect("export");
+        let loaded = crate::safetensors::import_safetensors(&ctx, path, cfg).expect("import");
+        let a = model.parameters();
+        let b = loaded.parameters();
+        assert_eq!(a.len(), b.len(), "param count");
+        for (i, (pa, pb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(pa.shape, pb.shape, "tensor {i} shape");
+            let (va, vb) = (pa.to_vec(), pb.to_vec());
+            assert_eq!(va.len(), vb.len(), "tensor {i} len");
+            for (j, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "tensor {i} elem {j} mismatch");
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn mla_model_trains_stably() {
         let ctx = test_ctx();
         let vocab = 48u32;

@@ -10,6 +10,7 @@ mod datapipe;
 mod distill;
 mod dpo;
 mod eval;
+mod safetensors;
 mod generate;
 mod gpu;
 mod linear_attention;
