@@ -36,6 +36,30 @@ impl Default for SamplingConfig {
     }
 }
 
+impl SamplingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 {
+            return Err("--max-tokens must be greater than 0".to_string());
+        }
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err("--temperature must be finite and >= 0".to_string());
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err("--top-p must be finite and in (0, 1]".to_string());
+        }
+        if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
+            return Err("--repetition-penalty must be finite and > 0".to_string());
+        }
+        if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
+            return Err("--min-p must be finite and in [0, 1]".to_string());
+        }
+        if !self.typical_p.is_finite() || self.typical_p <= 0.0 || self.typical_p > 1.0 {
+            return Err("--typical-p must be finite and in (0, 1]".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn logits_host(tensor: &Tensor) -> Cow<'_, [f32]> {
     #[cfg(feature = "metal")]
     {
@@ -44,6 +68,14 @@ fn logits_host(tensor: &Tensor) -> Cow<'_, [f32]> {
     #[cfg(not(feature = "metal"))]
     {
         Cow::Owned(tensor.to_vec())
+    }
+}
+
+fn select_token(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u32 {
+    if config.temperature < 0.01 {
+        argmax(logits)
+    } else {
+        sample_token(logits, config, generated)
     }
 }
 
@@ -155,7 +187,7 @@ pub fn generate(
         // Zero-copy: as_slice() returns a reference to shared GPU/CPU memory.
         let all_logits = logits_host(&logits);
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
-        let mut next_token = sample_token(last_logits, config, &[]);
+        let mut next_token = select_token(last_logits, config, &[]);
 
         let mut generated = Vec::new();
         generated.push(next_token);
@@ -518,7 +550,7 @@ pub fn generate_streaming<F>(
         let all_logits = logits_host(&logits);
         let last_logits = &all_logits[(seq_len - 1) * vocab_size..seq_len * vocab_size];
 
-        let mut next_token = sample_token(last_logits, config, &[]);
+        let mut next_token = select_token(last_logits, config, &[]);
         let mut generated: Vec<u32> = Vec::new();
 
         for _ in 0..config.max_tokens {
@@ -737,7 +769,7 @@ fn generate_speculative_inner<F>(
         // Get last token prediction from main model after prefill (this is the first generated token)
         let main_all = main_logits.to_vec();
         let main_last = &main_all[(prompt_len - 1) * main_vocab..prompt_len * main_vocab];
-        let mut last_main_token = sample_token(main_last, config, &[]);
+        let mut last_main_token = select_token(main_last, config, &[]);
 
         // Also get the draft model's prediction for the same position
         let draft_all = draft_logits.to_vec();
@@ -826,7 +858,7 @@ fn generate_speculative_inner<F>(
                     }
                 } else {
                     // Rejection: use main model's sampled token instead
-                    let sampled = sample_token(position_logits, config, &[]);
+                    let sampled = select_token(position_logits, config, generated);
                     generated.push(sampled);
                     emit_token(tokenizer, sampled, &mut on_token);
 
@@ -847,7 +879,7 @@ fn generate_speculative_inner<F>(
                 // main model's prediction at position n_drafted (the last logit row)
                 let bonus_offset = n_drafted * main_vocab;
                 let bonus_logits = &all_logits[bonus_offset..bonus_offset + main_vocab];
-                let bonus_token = sample_token(bonus_logits, config, &[]);
+                let bonus_token = select_token(bonus_logits, config, generated);
                 generated.push(bonus_token);
                 emit_token(tokenizer, bonus_token, &mut on_token);
 
@@ -931,7 +963,58 @@ fn argmax(logits: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod ngram_tests {
-    use super::no_repeat_ngram_banned;
+    use super::{no_repeat_ngram_banned, select_token, SamplingConfig};
+
+    #[test]
+    fn sampling_config_rejects_invalid_ranges() {
+        let valid = SamplingConfig::default();
+        assert!(valid.validate().is_ok());
+
+        let mut cfg = SamplingConfig {
+            max_tokens: 0,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--max-tokens"));
+
+        cfg = SamplingConfig {
+            temperature: -0.1,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--temperature"));
+
+        cfg = SamplingConfig {
+            top_p: 0.0,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--top-p"));
+
+        cfg = SamplingConfig {
+            repetition_penalty: 0.0,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--repetition-penalty"));
+
+        cfg = SamplingConfig {
+            min_p: f32::NAN,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--min-p"));
+
+        cfg = SamplingConfig {
+            typical_p: 1.01,
+            ..SamplingConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("--typical-p"));
+    }
+
+    #[test]
+    fn zero_temperature_selects_argmax_for_prefill_token() {
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            ..SamplingConfig::default()
+        };
+        assert_eq!(select_token(&[0.1, 2.0, 1.0], &cfg, &[]), 1);
+    }
 
     #[test]
     fn disabled_and_short_history_ban_nothing() {

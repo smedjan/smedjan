@@ -220,6 +220,10 @@ printf 'not-a-checkpoint' > "$BAD_CHECKPOINT"
 run_reject_logged info_bad_checkpoint "not a valid AndreAI checkpoint" "$BIN" info --checkpoint "$BAD_CHECKPOINT"
 run_reject_logged eval_bad_longctx_length "invalid --longctx-lengths entry 'abc'" "$BIN" eval --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --longctx --longctx-lengths abc --longctx-depths 0.5
 run_reject_logged eval_bad_longctx_depth "--longctx-depths entries must be finite and in [0, 1]" "$BIN" eval --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --longctx --longctx-lengths 64 --longctx-depths 1.5
+run_reject_logged generate_bad_temperature "--temperature must be finite and >= 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --temperature=-1
+run_reject_logged generate_bad_top_p "--top-p must be finite and in (0, 1]" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --top-p 0
+run_reject_logged generate_bad_max_tokens "--max-tokens must be greater than 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --max-tokens 0
+run_reject_logged generate_bad_draft_tokens "--draft-tokens must be greater than 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --speculative --draft-tokens 0
 run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tokenizer --input "$OUT/missing-corpus.txt" --vocab-size 260 --output "$OUT/missing-tokenizer.bin"
 run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
 printf 'not-a-tokenizer' > "$BAD_TOKENIZER"

@@ -1008,6 +1008,22 @@ fn main() {
             draft_tokens,
             batch_file,
         } => {
+            let config = generate::SamplingConfig {
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repetition_penalty,
+                min_p,
+                typical_p,
+                no_repeat_ngram_size,
+            };
+            result_or_exit(config.validate(), "Invalid sampling config");
+            if speculative && draft_tokens == 0 {
+                exit_with_message(
+                    "--draft-tokens must be greater than 0 when --speculative is set",
+                );
+            }
             let tok = result_or_exit(
                 tokenizer::BpeTokenizer::load(&tok_path),
                 "Failed to load tokenizer",
@@ -1025,21 +1041,22 @@ fn main() {
             };
             eprintln!("Loaded main model at step {}", step);
 
-            let config = generate::SamplingConfig {
-                temperature,
-                top_p,
-                top_k,
-                max_tokens,
-                repetition_penalty,
-                min_p,
-                typical_p,
-                no_repeat_ngram_size,
-            };
-
             if let Some(bf) = batch_file {
                 let text =
                     result_or_exit(std::fs::read_to_string(&bf), "Failed to read --batch-file");
                 let prompts: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                if prompts.is_empty() {
+                    exit_with_message("--batch-file must contain at least one non-empty prompt");
+                }
+                let token_lens: Vec<usize> =
+                    prompts.iter().map(|p| 1 + tok.encode(p).len()).collect();
+                let first_len = token_lens[0];
+                if token_lens.iter().any(|&len| len != first_len) {
+                    exit_with_message(format!(
+                        "--batch-file prompts must encode to equal token lengths (got {:?})",
+                        token_lens
+                    ));
+                }
                 let outs = generate::generate_batch(&ctx, &model, &tok, &prompts, &config);
                 for (p, o) in prompts.iter().zip(&outs) {
                     println!("[{}] => {}", p, o);
