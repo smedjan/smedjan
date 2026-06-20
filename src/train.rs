@@ -6,7 +6,7 @@ use crate::gpu::MetalContext;
 use crate::loss;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::{AdamW, CosineWarmupScheduler};
-use std::io::Write as IoWrite;
+use std::io::{Error, ErrorKind, Write as IoWrite};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ pub struct TrainConfig {
     pub lr_restart_period: u32,
     /// Data pruning: skip batches where loss < threshold. 0.0 = disabled.
     pub prune_threshold: f32,
-    /// Optimizer: "adamw" or "sophia". Default: adamw.
+    /// Optimizer: adamw, adamw-cpu, sophia, muon, hybrid/muon-adamw, or adamw-8bit.
     pub optimizer_type: String,
     /// Speculative pretraining: path to a tiny reference model.
     /// Skip batches where reference model already has low loss (easy data).
@@ -58,7 +58,7 @@ pub struct TrainConfig {
     /// Z-loss coefficient: penalize large logit magnitudes. 0.0=disabled, 1e-4=recommended for MoE.
     /// Prevents router/logit explosion that causes expert collapse (PaLM, ST-MoE).
     pub z_loss_coefficient: f32,
-    /// LR schedule: "cosine" (default) or "wsd" (warmup-stable-decay, 5-10% better)
+    /// LR schedule: cosine, wsd, wso, invsqrt, or trapezoid.
     pub lr_schedule: String,
     /// Self-distillation via EMA: decay rate for exponential moving average teacher.
     /// 0.0=disabled, 0.999=recommended. EMA model teaches the student with KL divergence.
@@ -123,6 +123,32 @@ pub struct TrainConfig {
 }
 
 impl TrainConfig {
+    pub const SUPPORTED_OPTIMIZERS: &'static [&'static str] = &[
+        "adamw",
+        "adamw-cpu",
+        "sophia",
+        "muon",
+        "hybrid",
+        "muon-adamw",
+        "adamw-8bit",
+    ];
+    pub const SUPPORTED_LR_SCHEDULES: &'static [&'static str] =
+        &["cosine", "wsd", "wso", "invsqrt", "trapezoid"];
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        validate_choice(
+            "optimizer",
+            &self.optimizer_type,
+            Self::SUPPORTED_OPTIMIZERS,
+        )?;
+        validate_choice(
+            "lr_schedule",
+            &self.lr_schedule,
+            Self::SUPPORTED_LR_SCHEDULES,
+        )?;
+        Ok(())
+    }
+
     /// Bundle the AdamW hyperparameters for optimizer construction.
     pub fn adamw_hyper(&self) -> crate::optim::AdamWHyper {
         crate::optim::AdamWHyper {
@@ -132,6 +158,19 @@ impl TrainConfig {
             update_clip: self.update_clip,
         }
     }
+}
+
+fn validate_choice(field: &str, value: &str, supported: &[&str]) -> std::io::Result<()> {
+    if supported.contains(&value) {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "unsupported {field} '{value}'; supported values: {}",
+            supported.join(", ")
+        ),
+    ))
 }
 
 impl TrainConfig {
@@ -190,6 +229,8 @@ impl TrainConfig {
 
 /// Run the training loop.
 pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<()> {
+    config.validate()?;
+
     eprintln!("=== AndreAI Training ===");
     eprintln!(
         "Model: {}M params, {} layers, d_model={}, {} heads",

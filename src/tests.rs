@@ -2196,6 +2196,41 @@ mod suite {
     }
 
     #[test]
+    fn train_config_rejects_unknown_optimizer_and_schedule() {
+        let mut cfg = crate::train::TrainConfig::default_small("dataset.bin", "tokenizer.bin");
+        for opt in crate::train::TrainConfig::SUPPORTED_OPTIMIZERS {
+            cfg.optimizer_type = (*opt).to_string();
+            cfg.lr_schedule = "cosine".to_string();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("optimizer {opt} should validate: {e}"));
+        }
+        for sched in crate::train::TrainConfig::SUPPORTED_LR_SCHEDULES {
+            cfg.optimizer_type = "adamw".to_string();
+            cfg.lr_schedule = (*sched).to_string();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("schedule {sched} should validate: {e}"));
+        }
+
+        cfg.optimizer_type = "definitely-not-real".to_string();
+        cfg.lr_schedule = "cosine".to_string();
+        let err = cfg.validate().expect_err("unknown optimizer should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported optimizer"),
+            "unexpected error: {err}"
+        );
+
+        cfg.optimizer_type = "adamw".to_string();
+        cfg.lr_schedule = "lunar".to_string();
+        let err = cfg.validate().expect_err("unknown LR schedule should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported lr_schedule"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn inverse_sqrt_schedule() {
         let lr = crate::optim::inverse_sqrt_lr(1.0, 100, 0);
         assert!(lr < 0.02); // step 0 during warmup

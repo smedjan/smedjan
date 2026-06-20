@@ -39,6 +39,41 @@ run_logged() {
   fi
 }
 
+run_reject_train() {
+  local name=$1
+  local pattern=$2
+  shift 2
+  local ckpt="$OUT/$name"
+  local log="$LOG_DIR/$name.log"
+  echo "---- reject:$name ----"
+  if "$BIN" train \
+    --dataset "$DATASET" \
+    --tokenizer "$TOKENIZER" \
+    --size tiny \
+    --batch-size 2 \
+    --seq-len 16 \
+    --steps 1 \
+    --warmup 1 \
+    --lr 0.001 \
+    --checkpoint-dir "$ckpt" \
+    "$@" > "$log" 2>&1; then
+    echo "FAIL: reject:$name unexpectedly succeeded"
+    tail -60 "$log"
+    exit 1
+  fi
+  if ! grep -q "$pattern" "$log"; then
+    echo "FAIL: reject:$name did not report '$pattern'"
+    tail -60 "$log"
+    exit 1
+  fi
+  if grep -q "panicked at" "$log"; then
+    echo "FAIL: reject:$name reported via panic"
+    tail -60 "$log"
+    exit 1
+  fi
+  echo "PASS: reject:$name"
+}
+
 run_train() {
   local name=$1; shift
   local ckpt="$OUT/$name"
@@ -157,6 +192,8 @@ run_logged build cargo build --release --no-default-features --features metal
 run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
 
+run_reject_train invalid_optimizer "unsupported optimizer" --optimizer definitely-not-real
+run_reject_train invalid_lr_schedule "unsupported lr_schedule" --lr-schedule lunar
 run_train adamw
 run_resume_train adamw_resume
 run_train checkpoint_fused --gradient-checkpointing --fused-ce

@@ -158,9 +158,8 @@ struct TrainArgs {
     /// Speculative threshold: skip if reference loss < this value. Default: 7.0
     #[arg(long, default_value = "7.0")]
     speculative_threshold: f32,
-    /// Optimizer: "adamw", "sophia", "muon", "hybrid" (Muon for 2-D matrices + AdamW for
-    /// embeddings/head/routers/norms — the canonical Muon recipe), or "adamw-8bit" (block-wise
-    /// int8 moments, ~4× less optimizer memory). Default: adamw
+    /// Optimizer: adamw, adamw-cpu, sophia, muon, hybrid/muon-adamw (Muon for 2-D matrices + AdamW
+    /// for embeddings/head/routers/norms), or adamw-8bit (block-wise int8 moments). Default: adamw
     #[arg(long, default_value = "adamw")]
     optimizer: String,
     /// AdamW first-moment decay (beta1). Default: 0.9
@@ -226,7 +225,7 @@ struct TrainArgs {
     /// FP16 activation compression between layers. Halves inter-layer memory.
     #[arg(long)]
     fp16_activations: bool,
-    /// LR schedule: "cosine" (default) or "wsd" (warmup-stable-decay, 5-10% better)
+    /// LR schedule: cosine, wsd, wso, invsqrt, or trapezoid. Default: cosine
     #[arg(long, default_value = "cosine")]
     lr_schedule: String,
     /// Self-distillation EMA decay. 0=off, 0.999=recommended. EMA teacher improves sample efficiency.
@@ -837,7 +836,10 @@ fn main() {
             config.normuon = normuon;
             config.cautious = cautious;
 
-            train::train(&ctx, &config).expect("Training failed");
+            if let Err(e) = train::train(&ctx, &config) {
+                eprintln!("Training failed: {e}");
+                std::process::exit(1);
+            }
         }
 
         Commands::Generate {
