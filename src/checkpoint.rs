@@ -759,5 +759,7 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         mla_latent_dim,
         block_sparse_top_k,
         block_size,
+        yarn_scale: 1.0,
+        yarn_orig_max_seq: 0,
     })
 }

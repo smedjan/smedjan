@@ -36,6 +36,8 @@ pub struct ModelConfig {
     pub mla_latent_dim: usize, // Multi-head Latent Attention: KV latent dim d_c (0=off). 10-50× KV-cache shrink.
     pub block_sparse_top_k: usize, // Block-sparse attention: # past blocks attended per query (0=off).
     pub block_size: usize,         // Block-sparse attention block length (default 64).
+    pub yarn_scale: f32,           // YaRN RoPE scaling (1.0 = off / plain RoPE).
+    pub yarn_orig_max_seq: usize,  // YaRN: pre-extension context length (0 = use max_seq_len).
 }
 
 /// Mixture-of-experts spec for [`ModelConfig::custom_moe`].
@@ -134,6 +136,8 @@ impl ModelConfig {
             mla_latent_dim: 0,
             block_sparse_top_k: 0,
             block_size: 64,
+            yarn_scale: 1.0,
+            yarn_orig_max_seq: 0,
         }
     }
 
@@ -319,6 +323,16 @@ impl ModelConfig {
         config.max_seq_len = (config.max_seq_len as f32 * factor) as usize;
         config
     }
+
+    /// Apply YaRN RoPE scaling to extend context length (per-frequency NTK-by-parts, more faithful
+    /// than `with_rope_scaling`). `factor = desired_context / max_seq_len`.
+    pub fn with_yarn(&self, factor: f32) -> Self {
+        let mut config = self.clone();
+        config.yarn_scale = factor;
+        config.yarn_orig_max_seq = config.max_seq_len;
+        config.max_seq_len = (config.max_seq_len as f32 * factor) as usize;
+        config
+    }
 }
 
 /// Expert FFN weights for Mixture of Experts.
@@ -455,6 +469,12 @@ impl TransformerBlock {
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
+        attn.yarn_scale = config.yarn_scale;
+        attn.yarn_orig_max = if config.yarn_orig_max_seq > 0 {
+            config.yarn_orig_max_seq as f32
+        } else {
+            config.max_seq_len as f32
+        };
 
         Self {
             attn,
@@ -550,6 +570,12 @@ impl TransformerBlock {
         } else if layer_is_linear {
             attn.attn_kind = crate::attention::AttnKind::Linear;
         }
+        attn.yarn_scale = config.yarn_scale;
+        attn.yarn_orig_max = if config.yarn_orig_max_seq > 0 {
+            config.yarn_orig_max_seq as f32
+        } else {
+            config.max_seq_len as f32
+        };
 
         Self {
             attn,

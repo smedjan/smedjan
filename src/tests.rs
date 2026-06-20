@@ -2926,6 +2926,31 @@ mod suite {
     /// convergence *quality* of this micro weight-tied model under aggressive top_k=1 sparsity is a
     /// training-recipe matter, not asserted here (real-data descent is shown by the training smoke).
     #[test]
+    fn yarn_model_forward_backward_is_finite() {
+        let ctx = test_ctx();
+        let vocab = 48u32;
+        let cfg = ModelConfig {
+            yarn_scale: 2.0,
+            yarn_orig_max_seq: 32,
+            ..ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64)
+        };
+        let model = Transformer::new(&ctx, cfg);
+        let (batch, seq_len) = (1usize, 8usize);
+        let tokens: Vec<u32> = vec![3, 7, 1, 5, 2, 6, 4, 0];
+        let targets: Vec<u32> = vec![5u32; 8];
+        let logits = model.forward(&tokens, batch, seq_len, None, false);
+        assert_eq!(logits.shape, vec![batch * seq_len, vocab as usize]);
+        assert!(logits.to_vec().iter().all(|x| x.is_finite()), "yarn-on forward produced non-finite logits");
+        let (loss, _) = crate::loss::cross_entropy_loss(&ctx, &logits, &targets);
+        assert!(loss.to_vec()[0].is_finite(), "yarn-on loss non-finite");
+        let wq_id = model.blocks[0].attn.w_q.id;
+        autograd::backward(&ctx, loss.id);
+        let g = autograd::get_grad(wq_id).expect("no gradient reached w_q under yarn-on");
+        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, model.blocks[0].attn.w_q.shape.clone()).to_vec();
+        assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad on w_q under yarn-on (backward must carry the forward yarn)");
+    }
+
+    #[test]
     fn block_sparse_model_trains_stably() {
         let ctx = test_ctx();
         let vocab = 48u32;

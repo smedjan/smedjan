@@ -196,6 +196,8 @@ pub struct MultiHeadAttention {
     pub head_dim: usize,
     pub d_model: usize,
     pub rope_theta: f32,
+    pub yarn_scale: f32,
+    pub yarn_orig_max: f32,
     pub qk_norm_weight: Tensor, // [head_dim] — QK-norm weight (ones for fixed normalization)
     pub sliding_window: usize,  // 0=full causal, >0=attend only last W positions
     pub attn_kind: AttnKind,    // Softmax (default), Linear, Ssm, or Rwkv
@@ -429,6 +431,8 @@ impl MultiHeadAttention {
             d_model,
             rope_theta,
             qk_norm_weight: Tensor::ones(ctx, vec![head_dim]),
+            yarn_scale: 1.0,
+            yarn_orig_max: 0.0,
             sliding_window: 0,
             attn_kind: AttnKind::Softmax,
             ssm_loga: Tensor::randn(
@@ -510,6 +514,8 @@ impl MultiHeadAttention {
             d_model,
             rope_theta,
             qk_norm_weight,
+            yarn_scale: 1.0,
+            yarn_orig_max: 0.0,
             sliding_window: 0,
             attn_kind: AttnKind::Softmax,
             ssm_loga: Tensor::randn(ctx, vec![d_model, n_heads], (1.0 / d_model as f32).sqrt()),
@@ -595,7 +601,7 @@ impl MultiHeadAttention {
             self.n_heads,
             hd,
             old_len as u32,
-            RopeParams::plain(self.rope_theta),
+            RopeParams::yarn(self.rope_theta, self.yarn_scale, self.yarn_orig_max),
         );
         let k = fused_transpose_rope(
             &k_all,
@@ -604,7 +610,7 @@ impl MultiHeadAttention {
             self.n_kv_heads,
             hd,
             0,
-            RopeParams::plain(self.rope_theta),
+            RopeParams::yarn(self.rope_theta, self.yarn_scale, self.yarn_orig_max),
         );
         let v = transpose_bsh_to_bhs(&v_all, batch, total, self.n_kv_heads, hd);
         let q = if self.d_model >= 512 {
@@ -734,7 +740,7 @@ impl MultiHeadAttention {
             self.n_heads,
             self.head_dim,
             offset,
-            RopeParams::plain(self.rope_theta),
+            RopeParams::yarn(self.rope_theta, self.yarn_scale, self.yarn_orig_max),
         );
         let k = fused_transpose_rope(
             &k,
@@ -743,7 +749,7 @@ impl MultiHeadAttention {
             self.n_kv_heads,
             self.head_dim,
             offset,
-            RopeParams::plain(self.rope_theta),
+            RopeParams::yarn(self.rope_theta, self.yarn_scale, self.yarn_orig_max),
         );
         // V only needs transpose (no RoPE)
         let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
@@ -1058,6 +1064,11 @@ impl RopeParams {
             yarn_scale: 1.0,
             yarn_orig_max: 0.0,
         }
+    }
+
+    /// YaRN-scaled rope. `yarn_scale == 1.0` is identical to `plain` (the kernel early-outs).
+    pub(crate) fn yarn(theta: f32, yarn_scale: f32, yarn_orig_max: f32) -> Self {
+        Self { theta, yarn_scale, yarn_orig_max }
     }
 }
 
