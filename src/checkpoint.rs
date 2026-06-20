@@ -1,12 +1,58 @@
 use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::AdamW;
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::sync::Arc;
 
 /// Magic bytes for AndreAI checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
 const VERSION: u32 = 13; // v13: AMDT step is next training step to run. v12: sliding_window. v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
+const MAX_TENSOR_DIMS: usize = 8;
+
+fn invalid_checkpoint_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn checked_tensor_byte_len(shape: &[usize], context: impl Into<String>) -> std::io::Result<usize> {
+    let context = context.into();
+    let n_elements = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| {
+            invalid_checkpoint_data(format!("{context} element count overflows usize"))
+        })?;
+    n_elements
+        .checked_mul(4)
+        .ok_or_else(|| invalid_checkpoint_data(format!("{context} byte length overflows usize")))
+}
+
+fn read_exact_count(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    consumed: &mut u64,
+) -> std::io::Result<()> {
+    file.read_exact(buf)?;
+    *consumed += buf.len() as u64;
+    Ok(())
+}
+
+fn ensure_remaining_bytes(
+    file_len: u64,
+    consumed: u64,
+    needed: u64,
+    context: impl Into<String>,
+) -> std::io::Result<()> {
+    let remaining = file_len.saturating_sub(consumed);
+    if needed > remaining {
+        return Err(invalid_checkpoint_data(format!(
+            "{} exceeds remaining artifact bytes: need {}, remaining {}",
+            context.into(),
+            needed,
+            remaining
+        )));
+    }
+    Ok(())
+}
 
 /// Return type for load_training_state: (model, optimizer_states, next_step, opt_step, total_tokens)
 pub type TrainingState = (Transformer, Vec<(Vec<f32>, Vec<f32>)>, u32, u32, u64);
@@ -196,16 +242,21 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
 
     // Magic
     file.read_exact(&mut buf4)?;
-    assert_eq!(&buf4, b"AMDT", "Not a valid AndreAI training state file");
+    if &buf4 != b"AMDT" {
+        return Err(invalid_checkpoint_data(format!(
+            "not a valid AndreAI training state file: expected AMDT magic, got {:02x?}",
+            buf4
+        )));
+    }
 
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(
-        (2..=13).contains(&version),
-        "Unsupported training state version: {}",
-        version
-    );
+    if !(2..=13).contains(&version) {
+        return Err(invalid_checkpoint_data(format!(
+            "unsupported training state version: {version} (expected 2-13)"
+        )));
+    }
 
     // v13+: next training step to run. v12 and older stored the last completed loop step for
     // periodic states, while state_final.bin stored total_steps; normalize both to next_step.
@@ -238,11 +289,11 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     } else {
         params.len()
     };
-    assert_eq!(
-        n_tensors, expected,
-        "Training state has {} tensors, model expects {} (version {})",
-        n_tensors, expected, version
-    );
+    if n_tensors != expected {
+        return Err(invalid_checkpoint_data(format!(
+            "training state has {n_tensors} tensors, model expects {expected} (version {version})"
+        )));
+    }
 
     let all_params: Vec<&_> = if version >= 4 {
         params.iter().chain(base_params.iter()).copied().collect()
@@ -253,15 +304,25 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     for (i, param) in all_params.iter().enumerate() {
         file.read_exact(&mut buf4)?;
         let ndims = u32::from_le_bytes(buf4) as usize;
+        if ndims == 0 || ndims > MAX_TENSOR_DIMS {
+            return Err(invalid_checkpoint_data(format!(
+                "training state tensor {i} has invalid dimension count {ndims}"
+            )));
+        }
         let mut shape = Vec::with_capacity(ndims);
         for _ in 0..ndims {
             file.read_exact(&mut buf4)?;
             shape.push(u32::from_le_bytes(buf4) as usize);
         }
-        assert_eq!(shape, param.shape, "Shape mismatch tensor {}", i);
+        if shape != param.shape {
+            return Err(invalid_checkpoint_data(format!(
+                "shape mismatch for training state tensor {i}: state {:?} vs model {:?}",
+                shape, param.shape
+            )));
+        }
 
-        let n_elements: usize = shape.iter().product();
-        let mut byte_data = vec![0u8; n_elements * 4];
+        let byte_len = checked_tensor_byte_len(&shape, format!("training state tensor {i}"))?;
+        let mut byte_data = vec![0u8; byte_len];
         file.read_exact(&mut byte_data)?;
         crate::gpu::buf_write_bytes(&param.buffer, &byte_data);
     }
@@ -278,6 +339,12 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     } else {
         params.len()
     };
+    if opt_count > params.len() {
+        return Err(invalid_checkpoint_data(format!(
+            "training state has optimizer state for {opt_count} params, model expects at most {}",
+            params.len()
+        )));
+    }
 
     let mut opt_states = Vec::with_capacity(opt_count);
     for param in params.iter().take(opt_count) {
@@ -354,25 +421,55 @@ pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<OptSidecar>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    let file_len = file.metadata()?.len();
+    let mut consumed = 0u64;
     let mut buf4 = [0u8; 4];
-    file.read_exact(&mut buf4)?;
-    assert_eq!(&buf4, b"AOPT", "Not a valid AndreAI optimizer sidecar");
-    file.read_exact(&mut buf4)?;
+    read_exact_count(&mut file, &mut buf4, &mut consumed)?;
+    if &buf4 != b"AOPT" {
+        return Err(invalid_checkpoint_data(format!(
+            "not a valid AndreAI optimizer sidecar: expected AOPT magic, got {:02x?}",
+            buf4
+        )));
+    }
+    read_exact_count(&mut file, &mut buf4, &mut consumed)?;
     let type_len = u32::from_le_bytes(buf4) as usize;
+    ensure_remaining_bytes(file_len, consumed, type_len as u64, "optimizer type")?;
     let mut tb = vec![0u8; type_len];
-    file.read_exact(&mut tb)?;
-    let opt_type = String::from_utf8_lossy(&tb).into_owned();
-    file.read_exact(&mut buf4)?;
+    read_exact_count(&mut file, &mut tb, &mut consumed)?;
+    let opt_type = String::from_utf8(tb).map_err(|e| {
+        invalid_checkpoint_data(format!("optimizer sidecar type is not valid UTF-8: {e}"))
+    })?;
+    read_exact_count(&mut file, &mut buf4, &mut consumed)?;
     let step = u32::from_le_bytes(buf4);
-    file.read_exact(&mut buf4)?;
+    read_exact_count(&mut file, &mut buf4, &mut consumed)?;
     let n_blobs = u32::from_le_bytes(buf4) as usize;
+    ensure_remaining_bytes(
+        file_len,
+        consumed,
+        (n_blobs as u64)
+            .checked_mul(4)
+            .ok_or_else(|| invalid_checkpoint_data("optimizer sidecar blob table is too large"))?,
+        format!("optimizer sidecar table for {n_blobs} blobs"),
+    )?;
     let mut blobs = Vec::with_capacity(n_blobs);
-    for _ in 0..n_blobs {
-        file.read_exact(&mut buf4)?;
+    for i in 0..n_blobs {
+        read_exact_count(&mut file, &mut buf4, &mut consumed)?;
         let len = u32::from_le_bytes(buf4) as usize;
+        ensure_remaining_bytes(
+            file_len,
+            consumed,
+            len as u64,
+            format!("optimizer sidecar blob {i} length {len}"),
+        )?;
         let mut b = vec![0u8; len];
-        file.read_exact(&mut b)?;
+        read_exact_count(&mut file, &mut b, &mut consumed)?;
         blobs.push(b);
+    }
+    if consumed != file_len {
+        return Err(invalid_checkpoint_data(format!(
+            "optimizer sidecar has {} trailing bytes",
+            file_len - consumed
+        )));
     }
     Ok(Some((opt_type, step, blobs)))
 }
@@ -384,16 +481,21 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
 
     // Magic
     file.read_exact(&mut buf4)?;
-    assert_eq!(&buf4, MAGIC, "Not a valid AndreAI checkpoint");
+    if &buf4 != MAGIC {
+        return Err(invalid_checkpoint_data(format!(
+            "not a valid AndreAI checkpoint: expected AMDL magic, got {:02x?}",
+            buf4
+        )));
+    }
 
     // Version
     file.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    assert!(
-        (1..=13).contains(&version),
-        "Unsupported checkpoint version: {} (expected 1-13)",
-        version
-    );
+    if !(1..=13).contains(&version) {
+        return Err(invalid_checkpoint_data(format!(
+            "unsupported checkpoint version: {version} (expected 1-13)"
+        )));
+    }
 
     // Step
     file.read_exact(&mut buf4)?;
@@ -424,11 +526,11 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
     } else {
         all_params.len()
     };
-    assert_eq!(
-        n_tensors, expected,
-        "Checkpoint has {} tensors, model expects {}",
-        n_tensors, expected
-    );
+    if n_tensors != expected {
+        return Err(invalid_checkpoint_data(format!(
+            "checkpoint has {n_tensors} tensors, model expects {expected}"
+        )));
+    }
 
     // Load each tensor (trainable params first, then base weights for v4+)
     let load_params = if version <= 3 {
@@ -440,21 +542,27 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
         // Shape
         file.read_exact(&mut buf4)?;
         let ndims = u32::from_le_bytes(buf4) as usize;
+        if ndims == 0 || ndims > MAX_TENSOR_DIMS {
+            return Err(invalid_checkpoint_data(format!(
+                "checkpoint tensor {i} has invalid dimension count {ndims}"
+            )));
+        }
         let mut shape = Vec::with_capacity(ndims);
         for _ in 0..ndims {
             file.read_exact(&mut buf4)?;
             shape.push(u32::from_le_bytes(buf4) as usize);
         }
 
-        assert_eq!(
-            shape, param.shape,
-            "Shape mismatch for tensor {}: checkpoint {:?} vs model {:?}",
-            i, shape, param.shape
-        );
+        if shape != param.shape {
+            return Err(invalid_checkpoint_data(format!(
+                "shape mismatch for checkpoint tensor {i}: checkpoint {:?} vs model {:?}",
+                shape, param.shape
+            )));
+        }
 
         // Data
-        let n_elements: usize = shape.iter().product();
-        let mut byte_data = vec![0u8; n_elements * 4];
+        let byte_len = checked_tensor_byte_len(&shape, format!("checkpoint tensor {i}"))?;
+        let mut byte_data = vec![0u8; byte_len];
         file.read_exact(&mut byte_data)?;
 
         // Write directly to the Metal buffer (unified memory, zero-copy)

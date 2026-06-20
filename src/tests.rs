@@ -4837,6 +4837,40 @@ mod suite {
         }
     }
 
+    #[test]
+    fn checkpoint_load_rejects_malformed_headers() {
+        let ctx = test_ctx();
+        let bad_magic_path = "/tmp/andreai_test_bad_checkpoint_magic.bin";
+        std::fs::write(bad_magic_path, b"NOPE").expect("write bad checkpoint magic");
+        let err = match crate::checkpoint::load_checkpoint(&ctx, bad_magic_path) {
+            Ok(_) => panic!("bad checkpoint magic should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("not a valid AndreAI checkpoint"),
+            "unexpected error: {err}"
+        );
+
+        let bad_version_path = "/tmp/andreai_test_bad_checkpoint_version.bin";
+        let mut bad_version = Vec::new();
+        bad_version.extend_from_slice(b"AMDL");
+        bad_version.extend_from_slice(&99u32.to_le_bytes());
+        std::fs::write(bad_version_path, bad_version).expect("write bad checkpoint version");
+        let err = match crate::checkpoint::load_checkpoint(&ctx, bad_version_path) {
+            Ok(_) => panic!("bad checkpoint version should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("unsupported checkpoint version"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(bad_magic_path).ok();
+        std::fs::remove_file(bad_version_path).ok();
+    }
+
     // 2e-2 abs / 5e-2 rel: comfortably passes the fp16-accumulate matmul paths while still
     // failing a structurally-wrong backward (those miss by >50%, not a few percent).
     const GC_EPS: f32 = 1e-2;
@@ -5829,6 +5863,72 @@ mod suite {
         std::fs::remove_file(tmp_path).ok();
         autograd::clear_tape();
         autograd::zero_grads_recycle();
+    }
+
+    #[test]
+    fn training_state_load_rejects_malformed_headers_and_sidecars() {
+        let ctx = test_ctx();
+        let bad_magic_path = "/tmp/andreai_test_bad_state_magic.bin";
+        std::fs::write(bad_magic_path, b"NOPE").expect("write bad state magic");
+        let err = match crate::checkpoint::load_training_state(&ctx, bad_magic_path) {
+            Ok(_) => panic!("bad training state magic should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("not a valid AndreAI training state file"),
+            "unexpected error: {err}"
+        );
+
+        let bad_version_path = "/tmp/andreai_test_bad_state_version.bin";
+        let mut bad_version = Vec::new();
+        bad_version.extend_from_slice(b"AMDT");
+        bad_version.extend_from_slice(&99u32.to_le_bytes());
+        std::fs::write(bad_version_path, bad_version).expect("write bad state version");
+        let err = match crate::checkpoint::load_training_state(&ctx, bad_version_path) {
+            Ok(_) => panic!("bad training state version should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("unsupported training state version"),
+            "unexpected error: {err}"
+        );
+
+        let bad_sidecar_magic_path = "/tmp/andreai_test_bad_sidecar_magic.opt";
+        std::fs::write(bad_sidecar_magic_path, b"NOPE").expect("write bad sidecar magic");
+        let err = match crate::checkpoint::load_opt_sidecar(bad_sidecar_magic_path) {
+            Ok(_) => panic!("bad optimizer sidecar magic should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("not a valid AndreAI optimizer sidecar"),
+            "unexpected error: {err}"
+        );
+
+        let truncated_sidecar_path = "/tmp/andreai_test_truncated_sidecar.opt";
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(b"AOPT");
+        truncated.extend_from_slice(&128u32.to_le_bytes());
+        std::fs::write(truncated_sidecar_path, truncated).expect("write truncated sidecar");
+        let err = match crate::checkpoint::load_opt_sidecar(truncated_sidecar_path) {
+            Ok(_) => panic!("truncated optimizer sidecar should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("optimizer type"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(bad_magic_path).ok();
+        std::fs::remove_file(bad_version_path).ok();
+        std::fs::remove_file(bad_sidecar_magic_path).ok();
+        std::fs::remove_file(truncated_sidecar_path).ok();
     }
 
     #[test]

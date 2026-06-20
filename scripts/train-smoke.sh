@@ -12,6 +12,7 @@ CORPUS="$OUT/corpus.txt"
 TOKENIZER="$OUT/tokenizer.bin"
 DATASET="$OUT/dataset.bin"
 BAD_TOKENIZER="$OUT/bad-tokenizer.bin"
+BAD_CHECKPOINT="$OUT/bad-checkpoint.bin"
 BAD_SHARD="$OUT/bad-shard.bin"
 
 rm -rf "$OUT"
@@ -215,6 +216,8 @@ run_resume_train() {
 cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
 
 run_logged build cargo build --release --no-default-features --features metal
+printf 'not-a-checkpoint' > "$BAD_CHECKPOINT"
+run_reject_logged info_bad_checkpoint "not a valid AndreAI checkpoint" "$BIN" info --checkpoint "$BAD_CHECKPOINT"
 run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tokenizer --input "$OUT/missing-corpus.txt" --vocab-size 260 --output "$OUT/missing-tokenizer.bin"
 run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
 printf 'not-a-tokenizer' > "$BAD_TOKENIZER"
