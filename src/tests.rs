@@ -705,6 +705,59 @@ mod suite {
     }
 
     #[test]
+    fn datapipe_mix_rejects_invalid_weights_and_malformed_shards() {
+        let valid_path = std::path::PathBuf::from("/tmp/andreai_mix_valid.bin");
+        let bad_path = std::path::PathBuf::from("/tmp/andreai_mix_bad.bin");
+        let output_path = std::path::PathBuf::from("/tmp/andreai_mix_out.bin");
+        let tokens: Vec<u32> = (0..32).collect();
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        std::fs::write(&valid_path, bytes).expect("write valid shard");
+        std::fs::write(&bad_path, [1u8, 2, 3]).expect("write malformed shard");
+
+        let err = match datapipe::mix_shards(&[], &output_path) {
+            Ok(_) => panic!("empty shard list should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match datapipe::mix_shards(&[(valid_path.clone(), 0.0)], &output_path) {
+            Ok(_) => panic!("zero total weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("sum to > 0"),
+            "unexpected error: {err}"
+        );
+
+        let err = match datapipe::mix_shards(&[(valid_path.clone(), -1.0)], &output_path) {
+            Ok(_) => panic!("negative weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match datapipe::mix_shards(&[(valid_path.clone(), f32::NAN)], &output_path) {
+            Ok(_) => panic!("NaN weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match datapipe::mix_shards(&[(bad_path.clone(), 1.0)], &output_path) {
+            Ok(_) => panic!("malformed shard should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("multiple of 4"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(valid_path).ok();
+        std::fs::remove_file(bad_path).ok();
+        std::fs::remove_file(output_path).ok();
+    }
+
+    #[test]
     fn datapipe_exact_dedup() {
         let docs = vec![
             "doc one".to_string(),
@@ -6166,6 +6219,50 @@ mod suite {
             err.to_string().contains("dataset too small"),
             "unexpected error: {err}"
         );
+
+        std::fs::remove_file(tmp_path).ok();
+    }
+
+    #[test]
+    fn data_mixer_rejects_invalid_source_weights() {
+        let tmp_path = "/tmp/andreai_test_mixer_data.bin";
+        let tokens: Vec<u32> = (0..64).collect();
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        std::fs::write(tmp_path, bytes).expect("write mixer dataset");
+
+        let err = match crate::data::DataMixer::new(&[tmp_path], &[], 1, 8) {
+            Ok(_) => panic!("mismatched paths and weights should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataMixer::new(&[], &[], 1, 8) {
+            Ok(_) => panic!("empty data mixer should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataMixer::new(&[tmp_path], &[0.0], 1, 8) {
+            Ok(_) => panic!("zero total mixer weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("sum to > 0"),
+            "unexpected error: {err}"
+        );
+
+        let err = match crate::data::DataMixer::new(&[tmp_path], &[-0.1], 1, 8) {
+            Ok(_) => panic!("negative mixer weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataMixer::new(&[tmp_path], &[f32::INFINITY], 1, 8) {
+            Ok(_) => panic!("infinite mixer weight should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
         std::fs::remove_file(tmp_path).ok();
     }

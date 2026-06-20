@@ -11,6 +11,7 @@ LOG_DIR="$OUT/logs"
 CORPUS="$OUT/corpus.txt"
 TOKENIZER="$OUT/tokenizer.bin"
 DATASET="$OUT/dataset.bin"
+BAD_SHARD="$OUT/bad-shard.bin"
 
 rm -rf "$OUT"
 mkdir -p "$LOG_DIR"
@@ -217,7 +218,10 @@ run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tok
 run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
 run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
+printf '\001\002\003' > "$BAD_SHARD"
 
+run_reject_logged mix_zero_weight "data mixing weights must sum to > 0" "$BIN" mix --shards "$DATASET:0" --output "$OUT/mix-zero.bin"
+run_reject_logged mix_malformed_shard "byte length must be a multiple of 4" "$BIN" mix --shards "$BAD_SHARD:1" --output "$OUT/mix-bad.bin"
 run_reject_logged train_missing_dataset "Failed to verify dataset" "$BIN" train --dataset "$OUT/missing-dataset.bin" --tokenizer "$TOKENIZER" --size tiny --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_missing_dataset"
 run_reject_logged train_unknown_size "Unknown model size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size definitely-not-real --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_unknown_size"
 run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size custom --layers 1 --heads 1 --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_custom_missing_dim"

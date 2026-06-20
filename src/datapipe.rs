@@ -3,7 +3,7 @@
 
 use crate::tokenizer::BpeTokenizer;
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// SHA-256 hash of a byte slice.
@@ -477,11 +477,37 @@ pub fn mix_shards(
     output_path: &Path,
 ) -> std::io::Result<usize> {
     eprintln!("Mixing {} shards...", shard_paths.len());
+    if shard_paths.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "need at least one shard to mix",
+        ));
+    }
 
     // Load all shards
     let mut shards: Vec<(Vec<u32>, f32)> = Vec::new();
     for (path, weight) in shard_paths {
+        if !weight.is_finite() || *weight < 0.0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "shard weight for {} must be finite and non-negative, got {}",
+                    path.display(),
+                    weight
+                ),
+            ));
+        }
         let data = std::fs::read(path)?;
+        if data.len() % 4 != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "shard {} byte length must be a multiple of 4 bytes, got {} bytes",
+                    path.display(),
+                    data.len()
+                ),
+            ));
+        }
         let tokens: Vec<u32> = data
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -497,11 +523,12 @@ pub fn mix_shards(
 
     // Normalize weights
     let total_weight: f32 = shards.iter().map(|(_, w)| w).sum();
-    assert!(
-        total_weight > 0.0,
-        "Data mixing weights must sum to > 0 (got {})",
-        total_weight
-    );
+    if total_weight <= 0.0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("data mixing weights must sum to > 0, got {total_weight}"),
+        ));
+    }
 
     // Compute how many tokens to take from each shard
     let total_tokens: usize = shards.iter().map(|(t, _)| t.len()).sum();

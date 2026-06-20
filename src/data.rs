@@ -314,10 +314,38 @@ impl DataMixer {
         batch_size: usize,
         seq_len: usize,
     ) -> std::io::Result<Self> {
-        assert_eq!(paths.len(), weights.len(), "paths and weights must match");
-        assert!(!paths.is_empty(), "need at least one data source");
+        if paths.len() != weights.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "paths and weights must match: {} paths, {} weights",
+                    paths.len(),
+                    weights.len()
+                ),
+            ));
+        }
+        if paths.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "need at least one data source",
+            ));
+        }
+        for (i, weight) in weights.iter().enumerate() {
+            if !weight.is_finite() || *weight < 0.0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("weight {i} must be finite and non-negative, got {weight}"),
+                ));
+            }
+        }
 
         let total: f32 = weights.iter().sum();
+        if total <= 0.0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("data source weights must sum to > 0, got {total}"),
+            ));
+        }
         let norm_weights: Vec<f32> = weights.iter().map(|w| w / total).collect();
         let mut cumulative = Vec::with_capacity(norm_weights.len());
         let mut cum = 0.0f32;
