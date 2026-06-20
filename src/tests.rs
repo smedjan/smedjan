@@ -5592,7 +5592,11 @@ mod suite {
             assert_eq!(pa.shape, pb.shape, "tensor {i} shape");
             let (va, vb) = (pa.to_vec(), pb.to_vec());
             for (x, y) in va.iter().zip(vb.iter()) {
-                assert_eq!(x.to_bits(), y.to_bits(), "tensor {i} (HF transpose+permute not an exact inverse)");
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "tensor {i} (HF transpose+permute not an exact inverse)"
+                );
             }
         }
         std::fs::remove_file(path).ok();

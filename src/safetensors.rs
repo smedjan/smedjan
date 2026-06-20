@@ -30,19 +30,35 @@ enum Json {
 
 impl Json {
     fn as_obj(&self) -> Option<&[(String, Json)]> {
-        if let Json::Obj(e) = self { Some(e) } else { None }
+        if let Json::Obj(e) = self {
+            Some(e)
+        } else {
+            None
+        }
     }
     fn get(&self, k: &str) -> Option<&Json> {
         self.as_obj()?.iter().find(|(n, _)| n == k).map(|(_, v)| v)
     }
     fn as_str(&self) -> Option<&str> {
-        if let Json::Str(s) = self { Some(s) } else { None }
+        if let Json::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
     fn as_u64(&self) -> Option<u64> {
-        if let Json::Num(n) = self { Some(*n as u64) } else { None }
+        if let Json::Num(n) = self {
+            Some(*n as u64)
+        } else {
+            None
+        }
     }
     fn as_arr(&self) -> Option<&[Json]> {
-        if let Json::Arr(a) = self { Some(a) } else { None }
+        if let Json::Arr(a) = self {
+            Some(a)
+        } else {
+            None
+        }
     }
 }
 
@@ -66,9 +82,18 @@ impl<'a> JsonParser<'a> {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
             Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b't') => { self.lit("true")?; Ok(Json::Bool(true)) }
-            Some(b'f') => { self.lit("false")?; Ok(Json::Bool(false)) }
-            Some(b'n') => { self.lit("null")?; Ok(Json::Null) }
+            Some(b't') => {
+                self.lit("true")?;
+                Ok(Json::Bool(true))
+            }
+            Some(b'f') => {
+                self.lit("false")?;
+                Ok(Json::Bool(false))
+            }
+            Some(b'n') => {
+                self.lit("null")?;
+                Ok(Json::Null)
+            }
             Some(_) => self.number(),
             None => Err(invalid("safetensors header: unexpected end of JSON")),
         }
@@ -102,7 +127,10 @@ impl<'a> JsonParser<'a> {
             self.ws();
             match self.b.get(self.i) {
                 Some(b',') => self.i += 1,
-                Some(b'}') => { self.i += 1; break; }
+                Some(b'}') => {
+                    self.i += 1;
+                    break;
+                }
                 _ => return Err(invalid("safetensors header: expected ',' or '}'")),
             }
         }
@@ -122,7 +150,10 @@ impl<'a> JsonParser<'a> {
             self.ws();
             match self.b.get(self.i) {
                 Some(b',') => self.i += 1,
-                Some(b']') => { self.i += 1; break; }
+                Some(b']') => {
+                    self.i += 1;
+                    break;
+                }
                 _ => return Err(invalid("safetensors header: expected ',' or ']'")),
             }
         }
@@ -139,7 +170,10 @@ impl<'a> JsonParser<'a> {
             match c {
                 b'"' => return Ok(s),
                 b'\\' => {
-                    let e = *self.b.get(self.i).ok_or_else(|| invalid("safetensors header: bad escape"))?;
+                    let e = *self
+                        .b
+                        .get(self.i)
+                        .ok_or_else(|| invalid("safetensors header: bad escape"))?;
                     self.i += 1;
                     match e {
                         b'"' => s.push('"'),
@@ -174,7 +208,10 @@ impl<'a> JsonParser<'a> {
     fn number(&mut self) -> std::io::Result<Json> {
         let start = self.i;
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            && matches!(
+                self.b[self.i],
+                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'
+            )
         {
             self.i += 1;
         }
@@ -306,14 +343,14 @@ pub fn import_safetensors(
             .get("data_offsets")
             .and_then(|o| o.as_arr())
             .ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
-        let start = offs
-            .first()
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
-        let end = offs
-            .get(1)
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
+        let start =
+            offs.first()
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
+        let end =
+            offs.get(1)
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
         let expect = p.numel() * 4;
         if start > end || end > blob.len() || end - start != expect {
             return Err(invalid(format!(
@@ -323,7 +360,11 @@ pub fn import_safetensors(
         }
         crate::gpu::buf_write_bytes(&p.buffer, &blob[start..end]);
     }
-    eprintln!("safetensors imported: {} tensors from {}", targets.len(), path);
+    eprintln!(
+        "safetensors imported: {} tensors from {}",
+        targets.len(),
+        path
+    );
     Ok(model)
 }
 
@@ -339,7 +380,7 @@ pub fn import_safetensors(
 // ============================================================================
 
 const HF_BLOCK_PARAMS: usize = 10; // params per standard block in parameters() order:
-// [w_q, w_k, w_v, w_o, qk_norm, ffn_w1(gate), ffn_w2(down), ffn_w3(up), ln1, ln2]
+                                   // [w_q, w_k, w_v, w_o, qk_norm, ffn_w1(gate), ffn_w2(down), ffn_w3(up), ln1, ln2]
 
 /// Transpose a row-major [rows, cols] f32 matrix to [cols, rows].
 fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -390,7 +431,11 @@ fn write_named(path: &str, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> std::i
         let start = blob.len();
         blob.extend(data.iter().flat_map(|f| f.to_le_bytes()));
         let end = blob.len();
-        let sh = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+        let sh = shape
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         entries.push(format!(
             "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{sh}],\"data_offsets\":[{start},{end}]}}"
         ));
@@ -439,19 +484,38 @@ pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result
     let hd = d / nh;
 
     let mut named: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
-    named.push(("model.embed_tokens.weight".into(), p[0].shape.clone(), p[0].to_vec()));
-    named.push(("model.norm.weight".into(), p[1].shape.clone(), p[1].to_vec()));
+    named.push((
+        "model.embed_tokens.weight".into(),
+        p[0].shape.clone(),
+        p[0].to_vec(),
+    ));
+    named.push((
+        "model.norm.weight".into(),
+        p[1].shape.clone(),
+        p[1].to_vec(),
+    ));
     for b in 0..c.n_layers {
         let base = 2 + b * HF_BLOCK_PARAMS;
         let pfx = format!("model.layers.{b}");
         let lin = |t: &crate::tensor::Tensor| -> (Vec<usize>, Vec<f32>) {
-            (vec![t.shape[1], t.shape[0]], transpose_2d(&t.to_vec(), t.shape[0], t.shape[1]))
+            (
+                vec![t.shape[1], t.shape[0]],
+                transpose_2d(&t.to_vec(), t.shape[0], t.shape[1]),
+            )
         };
         // q_proj/k_proj: transpose then un-permute (interleaved -> half-split)
         let (qs, qt) = lin(p[base]);
-        named.push((format!("{pfx}.self_attn.q_proj.weight"), qs, rope_permute_rows(&qt, nh, hd, d, false)));
+        named.push((
+            format!("{pfx}.self_attn.q_proj.weight"),
+            qs,
+            rope_permute_rows(&qt, nh, hd, d, false),
+        ));
         let (ks, kt) = lin(p[base + 1]);
-        named.push((format!("{pfx}.self_attn.k_proj.weight"), ks, rope_permute_rows(&kt, kvh, hd, d, false)));
+        named.push((
+            format!("{pfx}.self_attn.k_proj.weight"),
+            ks,
+            rope_permute_rows(&kt, kvh, hd, d, false),
+        ));
         let (vs, vt) = lin(p[base + 2]);
         named.push((format!("{pfx}.self_attn.v_proj.weight"), vs, vt));
         let (os, ot) = lin(p[base + 3]);
@@ -463,11 +527,22 @@ pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result
         named.push((format!("{pfx}.mlp.down_proj.weight"), ds, dt));
         let (us, ut) = lin(p[base + 7]);
         named.push((format!("{pfx}.mlp.up_proj.weight"), us, ut));
-        named.push((format!("{pfx}.input_layernorm.weight"), p[base + 8].shape.clone(), p[base + 8].to_vec()));
-        named.push((format!("{pfx}.post_attention_layernorm.weight"), p[base + 9].shape.clone(), p[base + 9].to_vec()));
+        named.push((
+            format!("{pfx}.input_layernorm.weight"),
+            p[base + 8].shape.clone(),
+            p[base + 8].to_vec(),
+        ));
+        named.push((
+            format!("{pfx}.post_attention_layernorm.weight"),
+            p[base + 9].shape.clone(),
+            p[base + 9].to_vec(),
+        ));
     }
     write_named(path, &named)?;
-    eprintln!("HF-layout safetensors exported: {} ({} layers)", path, c.n_layers);
+    eprintln!(
+        "HF-layout safetensors exported: {} ({} layers)",
+        path, c.n_layers
+    );
     Ok(())
 }
 
@@ -495,22 +570,45 @@ pub fn import_hf_safetensors(
     ensure_standard(&c, p.len())?;
 
     let fetch = |name: &str| -> std::io::Result<Vec<f32>> {
-        let e = json.get(name).ok_or_else(|| invalid(format!("HF safetensors: missing {name}")))?;
-        let dtype = e.get("dtype").and_then(|x| x.as_str()).ok_or_else(|| invalid(format!("{name}: no dtype")))?;
+        let e = json
+            .get(name)
+            .ok_or_else(|| invalid(format!("HF safetensors: missing {name}")))?;
+        let dtype = e
+            .get("dtype")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
         if dtype != "F32" {
-            return Err(invalid(format!("{name}: dtype {dtype} unsupported (convert to F32; bf16/f16 is a follow-up)")));
+            return Err(invalid(format!(
+                "{name}: dtype {dtype} unsupported (convert to F32; bf16/f16 is a follow-up)"
+            )));
         }
-        let offs = e.get("data_offsets").and_then(|o| o.as_arr()).ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
-        let s = offs.first().and_then(|x| x.as_u64()).ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
-        let en = offs.get(1).and_then(|x| x.as_u64()).ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
+        let offs = e
+            .get("data_offsets")
+            .and_then(|o| o.as_arr())
+            .ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
+        let s = offs
+            .first()
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
+        let en = offs
+            .get(1)
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
         if s > en || en > blob.len() {
             return Err(invalid(format!("{name}: offsets out of range")));
         }
-        Ok(blob[s..en].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+        Ok(blob[s..en]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
     };
     let put = |t: &crate::tensor::Tensor, data: &[f32]| -> std::io::Result<()> {
         if data.len() != t.numel() {
-            return Err(invalid(format!("tensor size mismatch: got {} f32, model wants {}", data.len(), t.numel())));
+            return Err(invalid(format!(
+                "tensor size mismatch: got {} f32, model wants {}",
+                data.len(),
+                t.numel()
+            )));
         }
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
         crate::gpu::buf_write_bytes(&t.buffer, &bytes);
@@ -522,20 +620,64 @@ pub fn import_hf_safetensors(
     for b in 0..c.n_layers {
         let base = 2 + b * HF_BLOCK_PARAMS;
         let pfx = format!("model.layers.{b}");
-        let q = rope_permute_rows(&fetch(&format!("{pfx}.self_attn.q_proj.weight"))?, nh, hd, d, true);
+        let q = rope_permute_rows(
+            &fetch(&format!("{pfx}.self_attn.q_proj.weight"))?,
+            nh,
+            hd,
+            d,
+            true,
+        );
         put(p[base], &transpose_2d(&q, nh * hd, d))?;
-        let k = rope_permute_rows(&fetch(&format!("{pfx}.self_attn.k_proj.weight"))?, kvh, hd, d, true);
+        let k = rope_permute_rows(
+            &fetch(&format!("{pfx}.self_attn.k_proj.weight"))?,
+            kvh,
+            hd,
+            d,
+            true,
+        );
         put(p[base + 1], &transpose_2d(&k, kvh * hd, d))?;
-        put(p[base + 2], &transpose_2d(&fetch(&format!("{pfx}.self_attn.v_proj.weight"))?, kvh * hd, d))?;
-        put(p[base + 3], &transpose_2d(&fetch(&format!("{pfx}.self_attn.o_proj.weight"))?, d, nh * hd))?;
+        put(
+            p[base + 2],
+            &transpose_2d(
+                &fetch(&format!("{pfx}.self_attn.v_proj.weight"))?,
+                kvh * hd,
+                d,
+            ),
+        )?;
+        put(
+            p[base + 3],
+            &transpose_2d(
+                &fetch(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                d,
+                nh * hd,
+            ),
+        )?;
         // p[base + 4] = qk_norm: left at the AndreAI default (HF has none)
         let dff = p[base + 5].shape[1];
-        put(p[base + 5], &transpose_2d(&fetch(&format!("{pfx}.mlp.gate_proj.weight"))?, dff, d))?;
-        put(p[base + 6], &transpose_2d(&fetch(&format!("{pfx}.mlp.down_proj.weight"))?, d, dff))?;
-        put(p[base + 7], &transpose_2d(&fetch(&format!("{pfx}.mlp.up_proj.weight"))?, dff, d))?;
-        put(p[base + 8], &fetch(&format!("{pfx}.input_layernorm.weight"))?)?;
-        put(p[base + 9], &fetch(&format!("{pfx}.post_attention_layernorm.weight"))?)?;
+        put(
+            p[base + 5],
+            &transpose_2d(&fetch(&format!("{pfx}.mlp.gate_proj.weight"))?, dff, d),
+        )?;
+        put(
+            p[base + 6],
+            &transpose_2d(&fetch(&format!("{pfx}.mlp.down_proj.weight"))?, d, dff),
+        )?;
+        put(
+            p[base + 7],
+            &transpose_2d(&fetch(&format!("{pfx}.mlp.up_proj.weight"))?, dff, d),
+        )?;
+        put(
+            p[base + 8],
+            &fetch(&format!("{pfx}.input_layernorm.weight"))?,
+        )?;
+        put(
+            p[base + 9],
+            &fetch(&format!("{pfx}.post_attention_layernorm.weight"))?,
+        )?;
     }
-    eprintln!("HF safetensors imported as AndreAI init: {} layers from {}", c.n_layers, path);
+    eprintln!(
+        "HF safetensors imported as AndreAI init: {} layers from {}",
+        c.n_layers, path
+    );
     Ok(model)
 }
