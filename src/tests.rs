@@ -974,7 +974,11 @@ mod suite {
                 ex.category
             );
             let n_tok = tok.encode(&ex.prompt).len();
-            assert!(n_tok >= len / 2, "{} prompt {n_tok} tok, expected ~{len}", ex.category);
+            assert!(
+                n_tok >= len / 2,
+                "{} prompt {n_tok} tok, expected ~{len}",
+                ex.category
+            );
         }
     }
 

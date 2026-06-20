@@ -1276,7 +1276,10 @@ fn main() {
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
-                eprintln!("Long-context suite: lengths={:?} tokens, depths={:?}", lengths, depths);
+                eprintln!(
+                    "Long-context suite: lengths={:?} tokens, depths={:?}",
+                    lengths, depths
+                );
                 eval::longctx_eval_set(&tok, &lengths, &depths)
             } else {
                 eval::builtin_eval_set()

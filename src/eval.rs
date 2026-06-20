@@ -408,7 +408,6 @@ pub fn build_padded_batch(
     result
 }
 
-
 // ============================================================================
 // Long-context retrieval / reasoning suite (NIAH + RULER-style probes)
 // ============================================================================
@@ -455,7 +454,7 @@ fn build_context(
             (pos, text.clone())
         })
         .collect();
-    placed.sort_by(|a, b| b.0.cmp(&a.0));
+    placed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (pos, text) in placed {
         blocks.insert(pos, text);
     }
@@ -466,9 +465,10 @@ fn build_context(
 /// Each example's `category` is `<probe>_L<tokens>`, so `EvalResults::print_report`'s per-category
 /// breakdown doubles as a length-vs-score curve. Three probe families separate *retrieval* from
 /// *reasoning at length*:
-///   - `niah`     : one needle in filler at varied depth -- pure retrieval.
-///   - `multikey` : K keyed needles, retrieve one specific key -- retrieval under distractors.
-///   - `vartrace` : X1=v; X2=X1; X3=X2 chain, ask X3 -- multi-hop reasoning a pure retriever fails.
+/// - `niah`     : one needle in filler at varied depth -- pure retrieval.
+/// - `multikey` : K keyed needles, retrieve one specific key -- retrieval under distractors.
+/// - `vartrace` : X1=v; X2=X1; X3=X2 chain, ask X3 -- multi-hop reasoning a pure retriever fails.
+///
 /// `lengths` are target token counts; `depths` are fractional insertion points in [0,1].
 pub fn longctx_eval_set(
     tokenizer: &BpeTokenizer,
@@ -541,13 +541,24 @@ pub fn longctx_eval_set(
                 idx += 1;
                 let span = depths_spread(3);
                 let needles = vec![
-                    ((depth + span[0]).clamp(0.0, 1.0), format!("Let X1 = {value}. ")),
-                    ((depth + span[1]).clamp(0.0, 1.0), "Let X2 = X1. ".to_string()),
-                    ((depth + span[2]).clamp(0.0, 1.0), "Let X3 = X2. ".to_string()),
+                    (
+                        (depth + span[0]).clamp(0.0, 1.0),
+                        format!("Let X1 = {value}. "),
+                    ),
+                    (
+                        (depth + span[1]).clamp(0.0, 1.0),
+                        "Let X2 = X1. ".to_string(),
+                    ),
+                    (
+                        (depth + span[2]).clamp(0.0, 1.0),
+                        "Let X3 = X2. ".to_string(),
+                    ),
                 ];
                 let context = build_context(FILLER, &filler_tokens, len, &needles);
                 examples.push(EvalExample {
-                    prompt: format!("{context}\n\nQuestion: what is the value of X3?\nAnswer: X3 ="),
+                    prompt: format!(
+                        "{context}\n\nQuestion: what is the value of X3?\nAnswer: X3 ="
+                    ),
                     expected: value,
                     category: format!("vartrace_L{len}"),
                 });
