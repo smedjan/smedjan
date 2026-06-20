@@ -31,12 +31,37 @@ mod train;
 mod tests;
 
 use clap::{Parser, Subcommand};
+use std::fmt::Display;
 
 #[derive(Parser)]
 #[command(name = "andreai", about = "AndreAI — Pure Rust AI Engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+fn exit_with_message(message: impl Display) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
+}
+
+fn exit_with_error(context: impl Display, err: impl Display) -> ! {
+    eprintln!("{context}: {err}");
+    std::process::exit(1);
+}
+
+fn result_or_exit<T, E: Display>(result: Result<T, E>, context: impl Display) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => exit_with_error(context, err),
+    }
+}
+
+fn option_or_exit<T>(option: Option<T>, message: impl Display) -> T {
+    match option {
+        Some(value) => value,
+        None => exit_with_message(message),
+    }
 }
 
 /// Arguments for the `train` subcommand (boxed in `Commands::Train` to keep the enum small).
@@ -618,9 +643,9 @@ fn main() {
             output,
         } => {
             eprintln!("Training BPE tokenizer: vocab_size={}", vocab_size);
-            let corpus = std::fs::read(&input).expect("Failed to read input file");
+            let corpus = result_or_exit(std::fs::read(&input), "Failed to read input file");
             let tok = tokenizer::BpeTokenizer::train(&corpus, vocab_size);
-            tok.save(&output).expect("Failed to save tokenizer");
+            result_or_exit(tok.save(&output), "Failed to save tokenizer");
             eprintln!("Tokenizer saved to {}", output);
 
             tok.print_stats();
@@ -644,9 +669,14 @@ fn main() {
             tokenizer: tok_path,
             output,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let n =
-                data::prepare_dataset(&input, &tok, &output).expect("Failed to prepare dataset");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
+            let n = result_or_exit(
+                data::prepare_dataset(&input, &tok, &output),
+                "Failed to prepare dataset",
+            );
 
             // Demonstrate batch padding utility: encode a sample and pad to fixed length
             let sample_text = std::fs::read_to_string(&input)
@@ -734,7 +764,10 @@ fn main() {
                 normuon,
                 cautious,
             } = *args;
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
             tok.print_stats();
             let vocab_size = tok.vocab_size();
 
@@ -748,9 +781,9 @@ fn main() {
                 "huge" => model::ModelConfig::huge(vocab_size),
                 "8b" => model::ModelConfig::eight_b(vocab_size),
                 "custom" => {
-                    let d = dim.expect("--dim required for custom size");
-                    let l = layers.expect("--layers required for custom size");
-                    let h = heads.expect("--heads required for custom size");
+                    let d = option_or_exit(dim, "--dim required for custom size");
+                    let l = option_or_exit(layers, "--layers required for custom size");
+                    let h = option_or_exit(heads, "--heads required for custom size");
                     let fm = ffn_mult.unwrap_or(2.67);
                     let kvh = kv_heads.unwrap_or(h);
                     let ms = max_seq.unwrap_or(512);
@@ -763,16 +796,19 @@ fn main() {
                         model::ModelConfig::custom_gqa(vocab_size, d, h, kvh, l, fm, ms)
                     }
                 }
-                _ => panic!(
+                _ => exit_with_message(format!(
                     "Unknown model size: '{}'. Use: tiny, small, medium, large, xl, max, huge, 8b, custom",
                     size
-                ),
+                )),
             };
 
             eprintln!("Config: {}", model_config.summary());
 
             // Verify dataset integrity via GPU round-trip before training
-            data::verify_dataset_gpu(&ctx, &dataset, 1024);
+            result_or_exit(
+                data::verify_dataset_gpu(&ctx, &dataset, 1024),
+                "Failed to verify dataset",
+            );
 
             // Use default_small as the base config, then override with CLI args.
             // This ensures all defaults are centralized in TrainConfig::default_small.
@@ -860,12 +896,20 @@ fn main() {
             draft_tokens,
             batch_file,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
             let (model, step) = if ckpt_path.ends_with(".qbin") {
-                quantize::load_quantized(&ctx, &ckpt_path)
-                    .expect("Failed to load quantized checkpoint")
+                result_or_exit(
+                    quantize::load_quantized(&ctx, &ckpt_path),
+                    "Failed to load quantized checkpoint",
+                )
             } else {
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint")
+                result_or_exit(
+                    checkpoint::load_checkpoint(&ctx, &ckpt_path),
+                    "Failed to load checkpoint",
+                )
             };
             eprintln!("Loaded main model at step {}", step);
 
@@ -881,29 +925,37 @@ fn main() {
             };
 
             if let Some(bf) = batch_file {
-                let text = std::fs::read_to_string(&bf).expect("Failed to read --batch-file");
+                let text =
+                    result_or_exit(std::fs::read_to_string(&bf), "Failed to read --batch-file");
                 let prompts: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                 let outs = generate::generate_batch(&ctx, &model, &tok, &prompts, &config);
                 for (p, o) in prompts.iter().zip(&outs) {
                     println!("[{}] => {}", p, o);
                 }
             } else if speculative {
-                let draft_ckpt = draft_checkpoint
-                    .expect("--draft-checkpoint is required when --speculative is set");
+                let draft_ckpt = option_or_exit(
+                    draft_checkpoint,
+                    "--draft-checkpoint is required when --speculative is set",
+                );
                 let (draft_model, draft_step) = if draft_ckpt.ends_with(".qbin") {
-                    quantize::load_quantized(&ctx, &draft_ckpt)
-                        .expect("Failed to load quantized draft checkpoint")
+                    result_or_exit(
+                        quantize::load_quantized(&ctx, &draft_ckpt),
+                        "Failed to load quantized draft checkpoint",
+                    )
                 } else {
-                    checkpoint::load_checkpoint(&ctx, &draft_ckpt)
-                        .expect("Failed to load draft checkpoint")
+                    result_or_exit(
+                        checkpoint::load_checkpoint(&ctx, &draft_ckpt),
+                        "Failed to load draft checkpoint",
+                    )
                 };
                 eprintln!("Loaded draft model at step {}", draft_step);
 
-                assert_eq!(
-                    model.config.vocab_size, draft_model.config.vocab_size,
-                    "Main and draft models must have the same vocab_size (main={}, draft={})",
-                    model.config.vocab_size, draft_model.config.vocab_size
-                );
+                if model.config.vocab_size != draft_model.config.vocab_size {
+                    exit_with_message(format!(
+                        "Main and draft models must have the same vocab_size (main={}, draft={})",
+                        model.config.vocab_size, draft_model.config.vocab_size
+                    ));
+                }
 
                 if stream {
                     print!("{}", prompt);
@@ -953,8 +1005,10 @@ fn main() {
         Commands::Info {
             checkpoint: ckpt_path,
         } => {
-            let (model, step) =
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            let (model, step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &ckpt_path),
+                "Failed to load checkpoint",
+            );
             let c = &model.config;
             println!("AndreAI Model Checkpoint");
             println!("  Step: {}", step);
@@ -1030,26 +1084,36 @@ fn main() {
             text,
             file,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tokenizer).expect("Failed to load tokenizer");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tokenizer),
+                "Failed to load tokenizer",
+            );
             let (model, step) = if checkpoint.ends_with(".qbin") {
-                quantize::load_quantized(&ctx, &checkpoint)
-                    .expect("Failed to load quantized checkpoint")
+                result_or_exit(
+                    quantize::load_quantized(&ctx, &checkpoint),
+                    "Failed to load quantized checkpoint",
+                )
             } else {
-                checkpoint::load_checkpoint(&ctx, &checkpoint).expect("Failed to load checkpoint")
+                result_or_exit(
+                    checkpoint::load_checkpoint(&ctx, &checkpoint),
+                    "Failed to load checkpoint",
+                )
             };
             let corpus = match file {
-                Some(f) => {
-                    String::from_utf8_lossy(&std::fs::read(&f).expect("Failed to read --file"))
-                        .into_owned()
-                }
+                Some(f) => String::from_utf8_lossy(&result_or_exit(
+                    std::fs::read(&f),
+                    "Failed to read --file",
+                ))
+                .into_owned(),
                 None => text,
             };
             let tokens = tok.encode(&corpus);
-            assert!(
-                tokens.len() >= 2,
-                "need >= 2 tokens to score perplexity (got {})",
-                tokens.len()
-            );
+            if tokens.len() < 2 {
+                exit_with_message(format!(
+                    "need >= 2 tokens to score perplexity (got {})",
+                    tokens.len()
+                ));
+            }
             let ppl = eval::perplexity(&ctx, &model, &tokens);
             println!(
                 "Perplexity: {:.3} over {} tokens (model step {})",
@@ -1060,9 +1124,12 @@ fn main() {
         }
 
         Commands::ImportBpe { merges, output } => {
-            let text = std::fs::read_to_string(&merges).expect("Failed to read merges file");
+            let text = result_or_exit(
+                std::fs::read_to_string(&merges),
+                "Failed to read merges file",
+            );
             let tok = tokenizer::BpeTokenizer::import_gpt2_merges(&text);
-            tok.save(&output).expect("Failed to save tokenizer");
+            result_or_exit(tok.save(&output), "Failed to save tokenizer");
             println!(
                 "Imported {} merges → {} tokens, saved to {}",
                 tok.merges.len(),
@@ -1081,24 +1148,31 @@ fn main() {
             source_url,
             license,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let stats = datapipe::process_source(
-                std::path::Path::new(&input),
-                std::path::Path::new(&output),
-                &tok,
-                &separator,
-            )
-            .expect("Processing failed");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
+            let stats = result_or_exit(
+                datapipe::process_source(
+                    std::path::Path::new(&input),
+                    std::path::Path::new(&output),
+                    &tok,
+                    &separator,
+                ),
+                "Processing failed",
+            );
 
             if let Some(log_path) = provenance_log {
-                datapipe::record_provenance(
-                    std::path::Path::new(&log_path),
-                    &source_name,
-                    &source_url,
-                    &license,
-                    &stats,
-                )
-                .expect("Failed to write provenance log");
+                result_or_exit(
+                    datapipe::record_provenance(
+                        std::path::Path::new(&log_path),
+                        &source_name,
+                        &source_url,
+                        &license,
+                        &stats,
+                    ),
+                    "Failed to write provenance log",
+                );
             }
 
             println!(
@@ -1116,7 +1190,7 @@ fn main() {
                     let parts: Vec<&str> = entry.splitn(2, ':').collect();
                     let path = std::path::PathBuf::from(parts[0]);
                     let weight = if parts.len() > 1 {
-                        parts[1].parse::<f32>().expect("Invalid weight")
+                        result_or_exit(parts[1].parse::<f32>(), "Invalid weight")
                     } else {
                         1.0
                     };
@@ -1147,14 +1221,18 @@ fn main() {
                 .map(|s| (s.path.clone(), s.weight * s.upsample as f32))
                 .collect();
 
-            let total = datapipe::mix_shards(&shard_pairs, std::path::Path::new(&output))
-                .expect("Mixing failed");
+            let total = result_or_exit(
+                datapipe::mix_shards(&shard_pairs, std::path::Path::new(&output)),
+                "Mixing failed",
+            );
             println!("Mixed dataset: {} tokens", total);
         }
 
         Commands::Hash { file } => {
-            let hash =
-                datapipe::sha256_file(std::path::Path::new(&file)).expect("Failed to hash file");
+            let hash = result_or_exit(
+                datapipe::sha256_file(std::path::Path::new(&file)),
+                "Failed to hash file",
+            );
             println!("{}", hash);
         }
 
@@ -1162,9 +1240,14 @@ fn main() {
             checkpoint: ckpt_path,
             tokenizer: tok_path,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let (model, step) =
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
+            let (model, step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &ckpt_path),
+                "Failed to load checkpoint",
+            );
             eprintln!(
                 "Evaluating model at step {} ({:.1}M params)",
                 step,
@@ -1210,12 +1293,14 @@ fn main() {
             config.warmup_steps = warmup;
             config.output_dir = output_dir;
 
-            sft::sft_train(&ctx, &config).expect("SFT training failed");
+            result_or_exit(sft::sft_train(&ctx, &config), "SFT training failed");
         }
 
         Commands::SftPrepare { input, output } => {
-            let count =
-                sft::generate_sft_dataset(&input, &output).expect("SFT data preparation failed");
+            let count = result_or_exit(
+                sft::generate_sft_dataset(&input, &output),
+                "SFT data preparation failed",
+            );
             println!("Generated {} instruction-response pairs", count);
         }
 
@@ -1224,7 +1309,10 @@ fn main() {
             output,
             bits,
         } => {
-            quantize::quantize_checkpoint(&ckpt_path, &output, bits).expect("Quantization failed");
+            result_or_exit(
+                quantize::quantize_checkpoint(&ckpt_path, &output, bits),
+                "Quantization failed",
+            );
         }
 
         Commands::ExportGguf {
@@ -1232,58 +1320,69 @@ fn main() {
             output,
             quant,
         } => {
-            let (model, step) =
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            let (model, step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &ckpt_path),
+                "Failed to load checkpoint",
+            );
             eprintln!(
                 "Loaded checkpoint: step {}, {}M params",
                 step,
                 model.config.param_count() as f32 / 1e6
             );
-            quantize::export_gguf(&model, &output, &quant).expect("GGUF export failed");
+            result_or_exit(
+                quantize::export_gguf(&model, &output, &quant),
+                "GGUF export failed",
+            );
         }
 
         Commands::ExportSafetensors {
             checkpoint: ckpt_path,
             output,
         } => {
-            let (model, step) =
-                checkpoint::load_checkpoint(&ctx, &ckpt_path).expect("Failed to load checkpoint");
+            let (model, step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &ckpt_path),
+                "Failed to load checkpoint",
+            );
             eprintln!(
                 "Loaded: step {}, {}M params",
                 step,
                 model.config.param_count() as f32 / 1e6
             );
-            quantize::export_safetensors(&model, &output).expect("Safetensors export failed");
+            result_or_exit(
+                quantize::export_safetensors(&model, &output),
+                "Safetensors export failed",
+            );
         }
 
         Commands::Merge {
             checkpoints,
             output,
         } => {
-            assert!(
-                checkpoints.len() >= 2,
-                "Need at least 2 checkpoints to merge"
-            );
+            if checkpoints.len() < 2 {
+                exit_with_message("Need at least 2 checkpoints to merge");
+            }
             eprintln!("Merging {} checkpoints...", checkpoints.len());
 
             // Load first checkpoint as base
-            let (base_model, base_step) = checkpoint::load_checkpoint(&ctx, &checkpoints[0])
-                .expect("Failed to load first checkpoint");
+            let (base_model, base_step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &checkpoints[0]),
+                "Failed to load first checkpoint",
+            );
             let n = checkpoints.len() as f32;
             eprintln!("  Base: {} (step {})", checkpoints[0], base_step);
 
             // Average weights: for each param, compute mean across all checkpoints
             let base_params = base_model.parameters();
             for ckpt_path in &checkpoints[1..] {
-                let (other_model, other_step) = checkpoint::load_checkpoint(&ctx, ckpt_path)
-                    .unwrap_or_else(|_| panic!("Failed to load checkpoint: {}", ckpt_path));
+                let (other_model, other_step) = result_or_exit(
+                    checkpoint::load_checkpoint(&ctx, ckpt_path),
+                    format!("Failed to load checkpoint: {}", ckpt_path),
+                );
                 eprintln!("  + {} (step {})", ckpt_path, other_step);
                 let other_params = other_model.parameters();
-                assert_eq!(
-                    base_params.len(),
-                    other_params.len(),
-                    "Checkpoint param count mismatch"
-                );
+                if base_params.len() != other_params.len() {
+                    exit_with_message("Checkpoint param count mismatch");
+                }
 
                 // Accumulate: base += other
                 for (bp, op) in base_params.iter().zip(other_params.iter()) {
@@ -1302,8 +1401,10 @@ fn main() {
             }
 
             // Save merged checkpoint
-            checkpoint::save_checkpoint(&output, &base_model, base_step)
-                .expect("Failed to save merged checkpoint");
+            result_or_exit(
+                checkpoint::save_checkpoint(&output, &base_model, base_step),
+                "Failed to save merged checkpoint",
+            );
             eprintln!(
                 "Merged {} checkpoints → {} ({:.1} MB)",
                 checkpoints.len(),
@@ -1335,7 +1436,7 @@ fn main() {
             config.warmup_steps = warmup;
             config.output_dir = output_dir;
 
-            dpo::dpo_train(&ctx, &config).expect("DPO training failed");
+            result_or_exit(dpo::dpo_train(&ctx, &config), "DPO training failed");
         }
 
         Commands::DpoPrepare {
@@ -1343,9 +1444,14 @@ fn main() {
             output,
             tokenizer: tok_path,
         } => {
-            let tok = tokenizer::BpeTokenizer::load(&tok_path).expect("Failed to load tokenizer");
-            let count = dpo::prepare_dpo_dataset(&input, &output, &tok)
-                .expect("DPO data preparation failed");
+            let tok = result_or_exit(
+                tokenizer::BpeTokenizer::load(&tok_path),
+                "Failed to load tokenizer",
+            );
+            let count = result_or_exit(
+                dpo::prepare_dpo_dataset(&input, &output, &tok),
+                "DPO data preparation failed",
+            );
             println!("Generated {} preference pairs", count);
         }
 
@@ -1366,7 +1472,10 @@ fn main() {
                 max_tokens,
                 temperature: 0.7,
             };
-            let count = distill::generate_training_data(&config).expect("Data generation failed");
+            let count = result_or_exit(
+                distill::generate_training_data(&config),
+                "Data generation failed",
+            );
             println!("Generated {} training pairs", count);
         }
 
@@ -1376,11 +1485,11 @@ fn main() {
             threshold,
             min_quality,
         } => {
-            let docs: Vec<String> = std::fs::read_to_string(&input)
-                .expect("Failed to read input")
-                .lines()
-                .map(|l| l.to_string())
-                .collect();
+            let docs: Vec<String> =
+                result_or_exit(std::fs::read_to_string(&input), "Failed to read input")
+                    .lines()
+                    .map(|l| l.to_string())
+                    .collect();
 
             eprintln!("Input: {} documents", docs.len());
 
@@ -1402,10 +1511,10 @@ fn main() {
                 dedup_keep.len()
             );
 
-            let mut out = std::fs::File::create(&output).expect("Failed to create output");
+            let mut out = result_or_exit(std::fs::File::create(&output), "Failed to create output");
             for &i in &dedup_keep {
                 use std::io::Write;
-                writeln!(out, "{}", quality_docs[i]).expect("Write failed");
+                result_or_exit(writeln!(out, "{}", quality_docs[i]), "Write failed");
             }
             eprintln!("Output: {} → {} documents", docs.len(), dedup_keep.len());
         }
@@ -1762,8 +1871,10 @@ fn main() {
             layers,
             heads,
         } => {
-            let (small_model, step) = checkpoint::load_checkpoint(&ctx, &checkpoint)
-                .expect("Failed to load small checkpoint");
+            let (small_model, step) = result_or_exit(
+                checkpoint::load_checkpoint(&ctx, &checkpoint),
+                "Failed to load small checkpoint",
+            );
             let large_config = model::ModelConfig::custom(
                 small_model.config.vocab_size,
                 dim,
@@ -1773,8 +1884,10 @@ fn main() {
                 small_model.config.max_seq_len,
             );
             let grown = model::grow_model(&ctx, &small_model, large_config);
-            checkpoint::save_checkpoint(&output, &grown, step)
-                .expect("Failed to save grown checkpoint");
+            result_or_exit(
+                checkpoint::save_checkpoint(&output, &grown, step),
+                "Failed to save grown checkpoint",
+            );
         }
     }
 }

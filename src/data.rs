@@ -238,15 +238,15 @@ pub fn pad_sequences(sequences: &[Vec<u32>], max_len: usize) -> Vec<u32> {
 
 /// Verify a dataset shard by round-tripping a sample through a GPU u32 buffer.
 /// Also verifies the GPU transpose kernel by transposing a small matrix and checking the result.
-/// Returns the number of verified tokens. Panics on mismatch.
+/// Returns the number of verified tokens. Panics on GPU mismatch.
 pub fn verify_dataset_gpu(
     ctx: &Arc<MetalContext>,
     dataset_path: &str,
     sample_size: usize,
-) -> usize {
+) -> std::io::Result<usize> {
     use crate::gpu::compute;
 
-    let dataset = Dataset::load(dataset_path).expect("Failed to load dataset for verification");
+    let dataset = Dataset::load(dataset_path)?;
     let count = sample_size.min(dataset.len());
     let tokens = dataset.get_tokens(0, count);
 
@@ -293,7 +293,7 @@ pub fn verify_dataset_gpu(
         "Dataset verification passed: {} tokens round-tripped through GPU (transpose OK)",
         count
     );
-    count
+    Ok(count)
 }
 
 /// Multi-source data mixer: samples from multiple datasets with configurable weights.

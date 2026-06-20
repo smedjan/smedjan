@@ -39,6 +39,30 @@ run_logged() {
   fi
 }
 
+run_reject_logged() {
+  local name=$1
+  local pattern=$2
+  shift 2
+  local log="$LOG_DIR/$name.log"
+  echo "---- reject:$name ----"
+  if "$@" > "$log" 2>&1; then
+    echo "FAIL: reject:$name unexpectedly succeeded"
+    tail -60 "$log"
+    exit 1
+  fi
+  if ! grep -Fq -- "$pattern" "$log"; then
+    echo "FAIL: reject:$name did not report '$pattern'"
+    tail -60 "$log"
+    exit 1
+  fi
+  if grep -Fq "panicked at" "$log"; then
+    echo "FAIL: reject:$name reported via panic"
+    tail -60 "$log"
+    exit 1
+  fi
+  echo "PASS: reject:$name"
+}
+
 run_reject_train() {
   local name=$1
   local pattern=$2
@@ -189,9 +213,14 @@ run_resume_train() {
 cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
 
 run_logged build cargo build --release --no-default-features --features metal
+run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tokenizer --input "$OUT/missing-corpus.txt" --vocab-size 260 --output "$OUT/missing-tokenizer.bin"
+run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
 run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
 
+run_reject_logged train_missing_dataset "Failed to verify dataset" "$BIN" train --dataset "$OUT/missing-dataset.bin" --tokenizer "$TOKENIZER" --size tiny --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_missing_dataset"
+run_reject_logged train_unknown_size "Unknown model size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size definitely-not-real --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_unknown_size"
+run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size custom --layers 1 --heads 1 --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_custom_missing_dim"
 run_reject_train invalid_optimizer "unsupported optimizer" --optimizer definitely-not-real
 run_reject_train invalid_lr_schedule "unsupported lr_schedule" --lr-schedule lunar
 run_train adamw
