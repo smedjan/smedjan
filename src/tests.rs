@@ -990,6 +990,24 @@ mod suite {
     }
 
     #[test]
+    fn longctx_cli_parsers_reject_invalid_entries() {
+        assert_eq!(
+            crate::parse_longctx_lengths("128, 256").unwrap(),
+            vec![128, 256]
+        );
+        assert_eq!(
+            crate::parse_longctx_depths("0, 0.5, 1").unwrap(),
+            vec![0.0, 0.5, 1.0]
+        );
+        assert!(crate::parse_longctx_lengths("128,,256").is_err());
+        assert!(crate::parse_longctx_lengths("0").is_err());
+        assert!(crate::parse_longctx_lengths("abc").is_err());
+        assert!(crate::parse_longctx_depths("").is_err());
+        assert!(crate::parse_longctx_depths("NaN").is_err());
+        assert!(crate::parse_longctx_depths("1.01").is_err());
+    }
+
+    #[test]
     fn tokenizer_long_text_chunked_encoding() {
         let corpus = b"abcdefghijklmnopqrstuvwxyz 0123456789 the quick brown fox jumps";
         let tok = BpeTokenizer::train(corpus, 280);

@@ -104,7 +104,19 @@ pub fn cross_entropy_loss_per_sample(
         vocab as u32,
     );
 
-    // Reweight gradient rows in place: (softmax-onehot)/n_tokens -> (softmax-onehot)*w_loss.
+    // Read the per-row CE to the host and form the weighted scalar there. Interleaving more same-size
+    // (n_tokens*4-byte) pooled scratch buffers between the kernel and a GPU reduce lets the buffer
+    // pool alias and silently clobber `losses_buf`; the CPU reduce sidesteps that entirely.
+    ctx.wait_gpu();
+    let losses_host = MetalContext::read_buffer(&losses_buf, n_tokens);
+    let mut loss_val = 0f32;
+    for i in 0..n_tokens {
+        loss_val += losses_host[i] * w_loss[i];
+    }
+
+    // Reweight gradient rows in place: (softmax-onehot)/n_tokens -> (softmax-onehot)*w_loss, i.e.
+    // scale row i by r_grad[i] = n_tokens * w_loss[i]. grad_logits is vocab-wide so it can't alias
+    // the small r_grad vector, and r_grad is consumed immediately.
     let r_grad_buf = Tensor::from_slice(ctx, &r_grad, vec![n_tokens]).buffer;
     compute::gpu_scale_rows(
         ctx,
@@ -115,13 +127,7 @@ pub fn cross_entropy_loss_per_sample(
         vocab as u32,
     );
 
-    // Loss scalar = sum_row losses[row] * w_loss[row].
-    let w_loss_buf = Tensor::from_slice(ctx, &w_loss, vec![n_tokens]).buffer;
-    let weighted = ctx.alloc_buffer(n_tokens * 4);
-    compute::gpu_mul(ctx, &losses_buf, &w_loss_buf, &weighted, n_tokens as u32);
-    let scalar_buf = ctx.alloc_buffer(4);
-    compute::gpu_reduce_sum(ctx, &weighted, &scalar_buf, n_tokens as u32);
-
+    let scalar_buf = Tensor::from_slice(ctx, &[loss_val], vec![1]).buffer;
     let loss_id = autograd::next_id();
     let loss = Tensor {
         id: loss_id,

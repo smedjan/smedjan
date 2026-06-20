@@ -1,3 +1,5 @@
+#![cfg_attr(all(feature = "cuda", not(feature = "metal")), allow(dead_code))]
+
 #[cfg(feature = "metal")]
 pub mod api;
 mod attention;
@@ -62,6 +64,50 @@ fn option_or_exit<T>(option: Option<T>, message: impl Display) -> T {
     match option {
         Some(value) => value,
         None => exit_with_message(message),
+    }
+}
+
+fn parse_longctx_lengths(value: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for raw in value.split(',') {
+        let part = raw.trim();
+        if part.is_empty() {
+            return Err("--longctx-lengths entries must not be empty".to_string());
+        }
+        let len = part
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --longctx-lengths entry '{part}'"))?;
+        if len == 0 {
+            return Err("--longctx-lengths entries must be greater than 0".to_string());
+        }
+        out.push(len);
+    }
+    if out.is_empty() {
+        Err("--longctx-lengths must include at least one length".to_string())
+    } else {
+        Ok(out)
+    }
+}
+
+fn parse_longctx_depths(value: &str) -> Result<Vec<f32>, String> {
+    let mut out = Vec::new();
+    for raw in value.split(',') {
+        let part = raw.trim();
+        if part.is_empty() {
+            return Err("--longctx-depths entries must not be empty".to_string());
+        }
+        let depth = part
+            .parse::<f32>()
+            .map_err(|_| format!("invalid --longctx-depths entry '{part}'"))?;
+        if !depth.is_finite() || !(0.0..=1.0).contains(&depth) {
+            return Err("--longctx-depths entries must be finite and in [0, 1]".to_string());
+        }
+        out.push(depth);
+    }
+    if out.is_empty() {
+        Err("--longctx-depths must include at least one depth".to_string())
+    } else {
+        Ok(out)
     }
 }
 
@@ -1317,6 +1363,20 @@ fn main() {
             longctx_lengths,
             longctx_depths,
         } => {
+            let longctx_config = if longctx {
+                Some((
+                    result_or_exit(
+                        parse_longctx_lengths(&longctx_lengths),
+                        "Invalid long-context lengths",
+                    ),
+                    result_or_exit(
+                        parse_longctx_depths(&longctx_depths),
+                        "Invalid long-context depths",
+                    ),
+                ))
+            } else {
+                None
+            };
             let tok = result_or_exit(
                 tokenizer::BpeTokenizer::load(&tok_path),
                 "Failed to load tokenizer",
@@ -1332,14 +1392,8 @@ fn main() {
             );
 
             let examples = if longctx {
-                let lengths: Vec<usize> = longctx_lengths
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-                let depths: Vec<f32> = longctx_depths
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
+                let (lengths, depths) =
+                    longctx_config.expect("longctx config should be parsed when --longctx is set");
                 eprintln!(
                     "Long-context suite: lengths={:?} tokens, depths={:?}",
                     lengths, depths
