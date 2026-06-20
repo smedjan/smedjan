@@ -3,6 +3,7 @@ use crate::tokenizer::{BpeTokenizer, PAD_TOKEN};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 /// Pre-tokenized dataset stored as flat u32 array on disk.
@@ -16,6 +17,15 @@ impl Dataset {
     pub fn load(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() % 4 != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "dataset byte length must be a multiple of 4 bytes, got {} bytes",
+                    mmap.len()
+                ),
+            ));
+        }
         let len = mmap.len() / 4; // u32 = 4 bytes
         Ok(Self { mmap, len })
     }
@@ -100,19 +110,51 @@ pub struct DataLoader {
 
 impl DataLoader {
     pub fn new(dataset_path: &str, batch_size: usize, seq_len: usize) -> std::io::Result<Self> {
+        if batch_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "batch_size must be greater than 0",
+            ));
+        }
+        if seq_len == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "seq_len must be greater than 0",
+            ));
+        }
+        let seq_tokens = seq_len.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "seq_len is too large to include next-token target",
+            )
+        })?;
+        let needed = batch_size.checked_mul(seq_tokens).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "batch_size * (seq_len + 1) overflows usize",
+            )
+        })?;
+        let cap = batch_size.checked_mul(seq_len).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "batch_size * seq_len overflows usize",
+            )
+        })?;
         let dataset = Dataset::load(dataset_path)?;
-        let needed = batch_size * (seq_len + 1);
-        assert!(
-            dataset.len() >= needed,
-            "Dataset too small: {} tokens, need at least {} (batch_size={} * (seq_len+1={}))",
-            dataset.len(),
-            needed,
-            batch_size,
-            seq_len + 1,
-        );
+        if dataset.len() < needed {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "dataset too small: {} tokens, need at least {} (batch_size={} * (seq_len+1={}))",
+                    dataset.len(),
+                    needed,
+                    batch_size,
+                    seq_tokens,
+                ),
+            ));
+        }
 
         // Pre-allocate reusable buffers (avoid allocation every step)
-        let cap = batch_size * seq_len;
         let inputs_buf = vec![0u32; cap];
         let targets_buf = vec![0u32; cap];
 

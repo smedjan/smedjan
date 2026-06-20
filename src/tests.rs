@@ -6067,4 +6067,71 @@ mod suite {
 
         std::fs::remove_file(tmp_path).ok();
     }
+
+    #[test]
+    fn dataset_rejects_partial_u32_file() {
+        let tmp_path = "/tmp/andreai_test_bad_data.bin";
+        std::fs::write(tmp_path, [1u8, 2, 3]).expect("write malformed dataset");
+
+        let err = match crate::data::Dataset::load(tmp_path) {
+            Ok(_) => panic!("malformed dataset should fail to load"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("multiple of 4"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(tmp_path).ok();
+    }
+
+    #[test]
+    fn data_loader_rejects_invalid_batch_geometry() {
+        let missing_path = "/tmp/andreai_missing_data_loader.bin";
+
+        let err = match crate::data::DataLoader::new(missing_path, 0, 8) {
+            Ok(_) => panic!("zero batch_size should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataLoader::new(missing_path, 1, 0) {
+            Ok(_) => panic!("zero seq_len should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataLoader::new(missing_path, 1, usize::MAX) {
+            Ok(_) => panic!("overflowing seq_len should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = match crate::data::DataLoader::new(missing_path, usize::MAX, 2) {
+            Ok(_) => panic!("overflowing batch geometry should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn data_loader_rejects_too_small_dataset() {
+        let tmp_path = "/tmp/andreai_test_tiny_data.bin";
+        let tokens: Vec<u32> = (0..8).collect();
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        std::fs::write(tmp_path, &bytes).expect("write tiny dataset");
+
+        let err = match crate::data::DataLoader::new(tmp_path, 2, 8) {
+            Ok(_) => panic!("too-small dataset should fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("dataset too small"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(tmp_path).ok();
+    }
 }
