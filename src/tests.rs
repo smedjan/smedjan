@@ -3949,6 +3949,117 @@ mod suite {
         std::fs::remove_file(path).ok();
     }
 
+    fn write_test_safetensors(path: &str, header: &str, blob: &[u8]) {
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(path).expect("create safetensors test file");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("write header len");
+        file.write_all(header.as_bytes()).expect("write header");
+        file.write_all(blob).expect("write blob");
+    }
+
+    fn read_test_safetensors(path: &str) -> (String, Vec<u8>) {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).expect("open safetensors test file");
+        let mut lenb = [0u8; 8];
+        file.read_exact(&mut lenb).expect("read header len");
+        let header_len = u64::from_le_bytes(lenb) as usize;
+        let mut header = vec![0u8; header_len];
+        file.read_exact(&mut header).expect("read header");
+        let mut blob = Vec::new();
+        file.read_to_end(&mut blob).expect("read blob");
+        (String::from_utf8(header).expect("utf8 header"), blob)
+    }
+
+    fn replace_after(mut text: String, key: &str, from: &str, to: &str) -> String {
+        let key_pos = text.find(key).expect("key in header");
+        let rel = text[key_pos..].find(from).expect("pattern after key");
+        let start = key_pos + rel;
+        text.replace_range(start..start + from.len(), to);
+        text
+    }
+
+    fn bump_offset_end_after(mut text: String, key: &str) -> String {
+        let key_pos = text.find(key).expect("key in header");
+        let off_key = "\"data_offsets\":[";
+        let start =
+            key_pos + text[key_pos..].find(off_key).expect("offsets after key") + off_key.len();
+        let end = start + text[start..].find(']').expect("offset end");
+        let (a, b) = text[start..end].split_once(',').expect("two offsets");
+        let bumped = b.parse::<usize>().expect("integer end") + 1;
+        text.replace_range(start..end, &format!("{a},{bumped}"));
+        text
+    }
+
+    fn expect_import_err(result: std::io::Result<Transformer>, context: &str) -> std::io::Error {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn safetensors_import_rejects_malformed_headers_and_numeric_fields() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
+
+        let trailing_path = "/tmp/andreai_safetensors_trailing_header.safetensors";
+        write_test_safetensors(trailing_path, "{} junk", &[]);
+        let err = expect_import_err(
+            crate::safetensors::import_safetensors(&ctx, trailing_path, cfg.clone()),
+            "trailing non-whitespace after JSON must be rejected",
+        );
+        assert!(
+            err.to_string().contains("trailing data"),
+            "unexpected error: {err}"
+        );
+
+        let huge_header_path = "/tmp/andreai_safetensors_huge_header.safetensors";
+        {
+            use std::io::Write;
+            let mut file =
+                std::fs::File::create(huge_header_path).expect("create huge header file");
+            file.write_all(&u64::MAX.to_le_bytes())
+                .expect("write huge header len");
+        }
+        let err = expect_import_err(
+            crate::safetensors::import_safetensors(&ctx, huge_header_path, cfg.clone()),
+            "huge declared header must be rejected before allocation",
+        );
+        assert!(
+            err.to_string().contains("header too large"),
+            "unexpected error: {err}"
+        );
+
+        let good_path = "/tmp/andreai_safetensors_numeric_good.safetensors";
+        let bad_path = "/tmp/andreai_safetensors_numeric_bad.safetensors";
+        let model = Transformer::new(&ctx, cfg.clone());
+        crate::safetensors::export_safetensors(good_path, &model).expect("export good");
+        let (header, blob) = read_test_safetensors(good_path);
+        let header = replace_after(
+            header,
+            "\"p0\":",
+            "\"data_offsets\":[0,",
+            "\"data_offsets\":[-1,",
+        );
+        write_test_safetensors(bad_path, &header, &blob);
+        let err = expect_import_err(
+            crate::safetensors::import_safetensors(&ctx, bad_path, cfg),
+            "negative offsets must be rejected",
+        );
+        assert!(
+            err.to_string().contains("data_offsets[0]"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(trailing_path).ok();
+        std::fs::remove_file(huge_header_path).ok();
+        std::fs::remove_file(good_path).ok();
+        std::fs::remove_file(bad_path).ok();
+    }
+
     #[test]
     fn mla_model_trains_stably() {
         let ctx = test_ctx();
@@ -5640,6 +5751,51 @@ mod suite {
             }
         }
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn hf_safetensors_import_rejects_wrong_shapes_and_ragged_bytes() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 32);
+        let model = Transformer::new(&ctx, cfg.clone());
+        let good_path = "/tmp/andreai_hf_malformed_good.safetensors";
+        let bad_shape_path = "/tmp/andreai_hf_bad_shape.safetensors";
+        let ragged_path = "/tmp/andreai_hf_ragged_bytes.safetensors";
+        let q_key = "\"model.layers.0.self_attn.q_proj.weight\":";
+
+        crate::safetensors::export_hf_safetensors(good_path, &model).expect("export_hf");
+        let (header, blob) = read_test_safetensors(good_path);
+
+        let bad_shape = replace_after(
+            header.clone(),
+            q_key,
+            "\"shape\":[64,64]",
+            "\"shape\":[32,128]",
+        );
+        write_test_safetensors(bad_shape_path, &bad_shape, &blob);
+        let err = expect_import_err(
+            crate::safetensors::import_hf_safetensors(&ctx, bad_shape_path, cfg.clone()),
+            "HF importer must reject mismatched declared shapes",
+        );
+        assert!(
+            err.to_string().contains("HF shape"),
+            "unexpected error: {err}"
+        );
+
+        let ragged = bump_offset_end_after(header, q_key);
+        write_test_safetensors(ragged_path, &ragged, &blob);
+        let err = expect_import_err(
+            crate::safetensors::import_hf_safetensors(&ctx, ragged_path, cfg),
+            "HF importer must reject byte ranges that are not exact f32 tensors",
+        );
+        assert!(
+            err.to_string().contains("byte range"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(good_path).ok();
+        std::fs::remove_file(bad_shape_path).ok();
+        std::fs::remove_file(ragged_path).ok();
     }
 
     #[test]

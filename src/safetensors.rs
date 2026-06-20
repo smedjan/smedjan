@@ -23,7 +23,7 @@ enum Json {
     Obj(Vec<(String, Json)>),
     Arr(Vec<Json>),
     Str(String),
-    Num(f64),
+    Num(String),
     Bool(bool),
     Null,
 }
@@ -48,7 +48,7 @@ impl Json {
     }
     fn as_u64(&self) -> Option<u64> {
         if let Json::Num(n) = self {
-            Some(*n as u64)
+            n.parse::<u64>().ok()
         } else {
             None
         }
@@ -217,13 +217,93 @@ impl<'a> JsonParser<'a> {
         }
         std::str::from_utf8(&self.b[start..self.i])
             .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(Json::Num)
+            .and_then(|s| s.parse::<f64>().ok().map(|_| Json::Num(s.to_string())))
             .ok_or_else(|| invalid("safetensors header: bad number"))
     }
 }
 
 const ST_DTYPE: &str = "F32";
+const MAX_HEADER_LEN: u64 = 100_000_000;
+
+fn parse_header(header: &[u8]) -> std::io::Result<Json> {
+    let mut parser = JsonParser::new(header);
+    let json = parser.value()?;
+    parser.ws();
+    if parser.i != parser.b.len() {
+        return Err(invalid("safetensors header: trailing data after JSON"));
+    }
+    Ok(json)
+}
+
+fn read_parts(path: &str) -> std::io::Result<(Json, Vec<u8>)> {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut lenb = [0u8; 8];
+    file.read_exact(&mut lenb)?;
+    let header_len = u64::from_le_bytes(lenb);
+    if header_len > MAX_HEADER_LEN {
+        return Err(invalid(format!(
+            "safetensors header too large: {header_len} bytes"
+        )));
+    }
+    if header_len > file_len.saturating_sub(8) {
+        return Err(invalid(format!(
+            "safetensors header length {header_len} exceeds file payload"
+        )));
+    }
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| invalid("safetensors header length does not fit usize"))?;
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header)?;
+    let mut blob = Vec::new();
+    file.read_to_end(&mut blob)?;
+    Ok((parse_header(&header)?, blob))
+}
+
+fn json_usize(value: &Json, field: impl Into<String>) -> std::io::Result<usize> {
+    let field = field.into();
+    let n = value
+        .as_u64()
+        .ok_or_else(|| invalid(format!("{field}: expected non-negative integer")))?;
+    usize::try_from(n).map_err(|_| invalid(format!("{field}: integer does not fit usize")))
+}
+
+fn tensor_byte_len(numel: usize, name: &str) -> std::io::Result<usize> {
+    numel
+        .checked_mul(4)
+        .ok_or_else(|| invalid(format!("{name}: tensor byte length overflows usize")))
+}
+
+fn shape_numel(shape: &[usize], name: &str) -> std::io::Result<usize> {
+    shape.iter().try_fold(1usize, |acc, &d| {
+        acc.checked_mul(d)
+            .ok_or_else(|| invalid(format!("{name}: shape product overflows usize")))
+    })
+}
+
+fn shape_field(entry: &Json, name: &str) -> std::io::Result<Vec<usize>> {
+    entry
+        .get("shape")
+        .and_then(|s| s.as_arr())
+        .ok_or_else(|| invalid(format!("{name}: no shape")))?
+        .iter()
+        .enumerate()
+        .map(|(i, d)| json_usize(d, format!("{name}: shape[{i}]")))
+        .collect()
+}
+
+fn offsets_field(entry: &Json, name: &str) -> std::io::Result<(usize, usize)> {
+    let offs = entry
+        .get("data_offsets")
+        .and_then(|o| o.as_arr())
+        .ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
+    if offs.len() != 2 {
+        return Err(invalid(format!("{name}: data_offsets must have 2 entries")));
+    }
+    let start = json_usize(&offs[0], format!("{name}: data_offsets[0]"))?;
+    let end = json_usize(&offs[1], format!("{name}: data_offsets[1]"))?;
+    Ok((start, end))
+}
 
 /// Export an AndreAI model to a `.safetensors` file (F32). Tensors are named `p{i}` in
 /// `parameters()`-then-`base_parameters()` order, the same order `import_safetensors` walks.
@@ -285,16 +365,7 @@ pub fn import_safetensors(
     path: &str,
     config: ModelConfig,
 ) -> std::io::Result<Transformer> {
-    let mut file = std::fs::File::open(path)?;
-    let mut lenb = [0u8; 8];
-    file.read_exact(&mut lenb)?;
-    let header_len = u64::from_le_bytes(lenb) as usize;
-    let mut header = vec![0u8; header_len];
-    file.read_exact(&mut header)?;
-    let mut blob = Vec::new();
-    file.read_to_end(&mut blob)?;
-
-    let json = JsonParser::new(&header).value()?;
+    let (json, blob) = read_parts(path)?;
     let obj = json
         .as_obj()
         .ok_or_else(|| invalid("safetensors header is not a JSON object"))?;
@@ -325,33 +396,15 @@ pub fn import_safetensors(
                 "{name}: dtype {dtype} unsupported (only F32; bf16/f16 import is a follow-up)"
             )));
         }
-        let shape: Vec<usize> = entry
-            .get("shape")
-            .and_then(|s| s.as_arr())
-            .ok_or_else(|| invalid(format!("{name}: no shape")))?
-            .iter()
-            .map(|d| d.as_u64().map(|n| n as usize))
-            .collect::<Option<_>>()
-            .ok_or_else(|| invalid(format!("{name}: bad shape")))?;
+        let shape = shape_field(entry, &name)?;
         if shape != p.shape {
             return Err(invalid(format!(
                 "{name}: safetensors shape {:?} != model shape {:?}",
                 shape, p.shape
             )));
         }
-        let offs = entry
-            .get("data_offsets")
-            .and_then(|o| o.as_arr())
-            .ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
-        let start =
-            offs.first()
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
-        let end =
-            offs.get(1)
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| invalid(format!("{name}: bad data_offsets")))? as usize;
-        let expect = p.numel() * 4;
+        let (start, end) = offsets_field(entry, &name)?;
+        let expect = tensor_byte_len(p.numel(), &name)?;
         if start > end || end > blob.len() || end - start != expect {
             return Err(invalid(format!(
                 "{name}: byte range [{start},{end}) invalid (expected {expect} bytes, blob {})",
@@ -428,6 +481,14 @@ fn write_named(path: &str, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> std::i
     let mut blob: Vec<u8> = Vec::new();
     let mut entries: Vec<String> = Vec::with_capacity(tensors.len());
     for (name, shape, data) in tensors {
+        let expect = shape_numel(shape, name)?;
+        if expect != data.len() {
+            return Err(invalid(format!(
+                "{name}: shape {:?} has {expect} elements but data has {}",
+                shape,
+                data.len()
+            )));
+        }
         let start = blob.len();
         blob.extend(data.iter().flat_map(|f| f.to_le_bytes()));
         let end = blob.len();
@@ -467,9 +528,19 @@ fn ensure_standard(config: &ModelConfig, n_params: usize) -> std::io::Result<()>
         && config.lowrank == 0
         && !config.shared_layers
         && config.n_predict == 0;
+    let heads_ok = config.n_heads > 0
+        && config.n_kv_heads > 0
+        && config.d_model.is_multiple_of(config.n_heads)
+        && (config.d_model / config.n_heads).is_multiple_of(2);
     if !standard || n_params != expected {
         return Err(invalid(format!(
             "HF interop supports only the standard Llama-arch shape (Softmax attn, dense FFN, full-rank, full embedding, tied head): expected {expected} params, got {n_params}. MoE/MLA/RWKV/SSM/low-rank are not HF-mappable."
+        )));
+    }
+    if !heads_ok {
+        return Err(invalid(format!(
+            "HF interop requires non-zero heads and an even RoPE head_dim; got d_model={}, n_heads={}, n_kv_heads={}",
+            config.d_model, config.n_heads, config.n_kv_heads
         )));
     }
     Ok(())
@@ -552,15 +623,7 @@ pub fn import_hf_safetensors(
     path: &str,
     config: ModelConfig,
 ) -> std::io::Result<Transformer> {
-    let mut file = std::fs::File::open(path)?;
-    let mut lenb = [0u8; 8];
-    file.read_exact(&mut lenb)?;
-    let hlen = u64::from_le_bytes(lenb) as usize;
-    let mut header = vec![0u8; hlen];
-    file.read_exact(&mut header)?;
-    let mut blob = Vec::new();
-    file.read_to_end(&mut blob)?;
-    let json = JsonParser::new(&header).value()?;
+    let (json, blob) = read_parts(path)?;
 
     let c = config.clone();
     let (d, nh, kvh) = (c.d_model, c.n_heads, c.n_kv_heads);
@@ -569,7 +632,7 @@ pub fn import_hf_safetensors(
     let p = model.parameters();
     ensure_standard(&c, p.len())?;
 
-    let fetch = |name: &str| -> std::io::Result<Vec<f32>> {
+    let fetch = |name: &str, expect_shape: &[usize]| -> std::io::Result<Vec<f32>> {
         let e = json
             .get(name)
             .ok_or_else(|| invalid(format!("HF safetensors: missing {name}")))?;
@@ -582,20 +645,20 @@ pub fn import_hf_safetensors(
                 "{name}: dtype {dtype} unsupported (convert to F32; bf16/f16 is a follow-up)"
             )));
         }
-        let offs = e
-            .get("data_offsets")
-            .and_then(|o| o.as_arr())
-            .ok_or_else(|| invalid(format!("{name}: no data_offsets")))?;
-        let s = offs
-            .first()
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
-        let en = offs
-            .get(1)
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| invalid(format!("{name}: bad offsets")))? as usize;
-        if s > en || en > blob.len() {
-            return Err(invalid(format!("{name}: offsets out of range")));
+        let shape = shape_field(e, name)?;
+        if shape != expect_shape {
+            return Err(invalid(format!(
+                "{name}: HF shape {:?} != expected {:?}",
+                shape, expect_shape
+            )));
+        }
+        let (s, en) = offsets_field(e, name)?;
+        let expect_bytes = tensor_byte_len(shape_numel(expect_shape, name)?, name)?;
+        if s > en || en > blob.len() || en - s != expect_bytes {
+            return Err(invalid(format!(
+                "{name}: byte range [{s},{en}) invalid (expected {expect_bytes} bytes, blob {})",
+                blob.len()
+            )));
         }
         Ok(blob[s..en]
             .chunks_exact(4)
@@ -615,13 +678,20 @@ pub fn import_hf_safetensors(
         Ok(())
     };
 
-    put(p[0], &fetch("model.embed_tokens.weight")?)?;
-    put(p[1], &fetch("model.norm.weight")?)?;
+    put(p[0], &fetch("model.embed_tokens.weight", &p[0].shape)?)?;
+    put(p[1], &fetch("model.norm.weight", &p[1].shape)?)?;
     for b in 0..c.n_layers {
         let base = 2 + b * HF_BLOCK_PARAMS;
         let pfx = format!("model.layers.{b}");
+        let q_shape = vec![nh * hd, d];
+        let k_shape = vec![kvh * hd, d];
+        let v_shape = vec![kvh * hd, d];
+        let o_shape = vec![d, nh * hd];
+        let dff = p[base + 5].shape[1];
+        let up_shape = vec![dff, d];
+        let down_shape = vec![d, dff];
         let q = rope_permute_rows(
-            &fetch(&format!("{pfx}.self_attn.q_proj.weight"))?,
+            &fetch(&format!("{pfx}.self_attn.q_proj.weight"), &q_shape)?,
             nh,
             hd,
             d,
@@ -629,7 +699,7 @@ pub fn import_hf_safetensors(
         );
         put(p[base], &transpose_2d(&q, nh * hd, d))?;
         let k = rope_permute_rows(
-            &fetch(&format!("{pfx}.self_attn.k_proj.weight"))?,
+            &fetch(&format!("{pfx}.self_attn.k_proj.weight"), &k_shape)?,
             kvh,
             hd,
             d,
@@ -639,7 +709,7 @@ pub fn import_hf_safetensors(
         put(
             p[base + 2],
             &transpose_2d(
-                &fetch(&format!("{pfx}.self_attn.v_proj.weight"))?,
+                &fetch(&format!("{pfx}.self_attn.v_proj.weight"), &v_shape)?,
                 kvh * hd,
                 d,
             ),
@@ -647,32 +717,46 @@ pub fn import_hf_safetensors(
         put(
             p[base + 3],
             &transpose_2d(
-                &fetch(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                &fetch(&format!("{pfx}.self_attn.o_proj.weight"), &o_shape)?,
                 d,
                 nh * hd,
             ),
         )?;
         // p[base + 4] = qk_norm: left at the AndreAI default (HF has none)
-        let dff = p[base + 5].shape[1];
         put(
             p[base + 5],
-            &transpose_2d(&fetch(&format!("{pfx}.mlp.gate_proj.weight"))?, dff, d),
+            &transpose_2d(
+                &fetch(&format!("{pfx}.mlp.gate_proj.weight"), &up_shape)?,
+                dff,
+                d,
+            ),
         )?;
         put(
             p[base + 6],
-            &transpose_2d(&fetch(&format!("{pfx}.mlp.down_proj.weight"))?, d, dff),
+            &transpose_2d(
+                &fetch(&format!("{pfx}.mlp.down_proj.weight"), &down_shape)?,
+                d,
+                dff,
+            ),
         )?;
         put(
             p[base + 7],
-            &transpose_2d(&fetch(&format!("{pfx}.mlp.up_proj.weight"))?, dff, d),
+            &transpose_2d(
+                &fetch(&format!("{pfx}.mlp.up_proj.weight"), &up_shape)?,
+                dff,
+                d,
+            ),
         )?;
         put(
             p[base + 8],
-            &fetch(&format!("{pfx}.input_layernorm.weight"))?,
+            &fetch(&format!("{pfx}.input_layernorm.weight"), &p[base + 8].shape)?,
         )?;
         put(
             p[base + 9],
-            &fetch(&format!("{pfx}.post_attention_layernorm.weight"))?,
+            &fetch(
+                &format!("{pfx}.post_attention_layernorm.weight"),
+                &p[base + 9].shape,
+            )?,
         )?;
     }
     eprintln!(
