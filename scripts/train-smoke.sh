@@ -242,5 +242,6 @@ run_train bitnet_accum --grad-accum 2 --bitnet
 run_train ssm --ssm
 run_train block_sparse --block-sparse-top-k 1 --block-size 4
 run_train linear_period --linear-attn-period 2
+run_train yarn --yarn-scale 2.0
 
 echo "ALL TRAIN SMOKES PASS"

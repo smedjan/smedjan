@@ -1738,6 +1738,7 @@ pub fn gpu_transpose_rope(
     output: &GpuBuffer,
     d: TrRopeDims,
 ) {
+    assert!((d.yarn_scale - 1.0).abs() < 1e-6, "YaRN is not yet supported on the CUDA backend (the rope kernel does plain RoPE); use the Metal backend or port the YaRN blend.");
     gpu_transpose_perm_forward(ctx, input, output, d.batch, d.seq, d.n_heads, d.head_dim);
     gpu_rope(
         ctx,
@@ -1756,6 +1757,7 @@ pub fn gpu_transpose_rope_backward(
     grad_in: &GpuBuffer,
     d: TrRopeDims,
 ) {
+    assert!((d.yarn_scale - 1.0).abs() < 1e-6, "YaRN is not yet supported on the CUDA backend; use the Metal backend or port the YaRN blend.");
     gpu_rope_backward(
         ctx,
         grad_out,

@@ -153,6 +153,9 @@ struct TrainArgs {
     /// Block-sparse attention block length. Default 64.
     #[arg(long, default_value = "64")]
     block_size: usize,
+    /// YaRN RoPE context-extension factor (1.0 = off). e.g. 2.0 extends context 2x via NTK-by-parts.
+    #[arg(long, default_value = "1.0")]
+    yarn_scale: f32,
     /// Selective state-space (Mamba-2/SSD) mixer in every block instead of attention. O(N) sequence mixing.
     #[arg(long)]
     ssm: bool,
@@ -739,6 +742,7 @@ fn main() {
                 mla_latent_dim,
                 block_sparse_top_k,
                 block_size,
+                yarn_scale,
                 ssm,
                 rwkv,
                 linear_attn,
@@ -811,6 +815,12 @@ fn main() {
                     "Unknown model size: '{}'. Use: tiny, small, medium, large, xl, max, huge, 8b, custom",
                     size
                 )),
+            };
+
+            let model_config = if yarn_scale != 1.0 {
+                model_config.with_yarn(yarn_scale)
+            } else {
+                model_config
             };
 
             eprintln!("Config: {}", model_config.summary());
