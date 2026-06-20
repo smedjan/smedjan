@@ -6,7 +6,7 @@
 //!
 //! A 98M model trained on Claude-generated data >>> 98M trained on raw web text.
 
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 
 /// Configuration for API-based data generation.
 pub struct DistillConfig {
@@ -17,6 +17,53 @@ pub struct DistillConfig {
     pub n_samples: usize,
     pub max_tokens: usize,
     pub temperature: f32,
+}
+
+impl DistillConfig {
+    pub fn validate(&self) -> std::io::Result<()> {
+        validate_non_empty("api_url", &self.api_url)?;
+        validate_non_empty("model", &self.model)?;
+        validate_non_empty("output_path", &self.output_path)?;
+        validate_positive_usize("n_samples", self.n_samples)?;
+        validate_positive_usize("max_tokens", self.max_tokens)?;
+        validate_finite_non_negative("temperature", self.temperature)?;
+        if (self.api_url.contains("anthropic.com") || self.api_url.contains("openai.com"))
+            && self.api_key.is_empty()
+        {
+            return Err(invalid_input(
+                "api_key must not be empty for Claude/OpenAI distillation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_non_empty(field: &str, value: &str) -> std::io::Result<()> {
+    if value.is_empty() {
+        Err(invalid_input(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_usize(field: &str, value: usize) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_finite_non_negative(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and >= 0")))
+    }
 }
 
 /// A prompt template for generating diverse training data.
@@ -98,6 +145,7 @@ pub fn default_templates() -> Vec<PromptTemplate> {
 /// For Claude: use api_url = "https://api.anthropic.com/v1/messages"
 /// For OpenAI: use api_url = "https://api.openai.com/v1/chat/completions"
 pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> {
+    config.validate()?;
     let templates = default_templates();
     let mut output = std::fs::File::create(&config.output_path)?;
     let mut total_pairs = 0;
@@ -339,4 +387,51 @@ fn find_json_string_end(s: &str) -> Option<usize> {
         }
     }
     None // unterminated string
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> DistillConfig {
+        DistillConfig {
+            api_url: "http://localhost:11434/api/generate".to_string(),
+            api_key: String::new(),
+            model: "qwen2.5:7b".to_string(),
+            output_path: "distill.jsonl".to_string(),
+            n_samples: 1,
+            max_tokens: 32,
+            temperature: 0.7,
+        }
+    }
+
+    #[test]
+    fn distill_config_rejects_invalid_runtime_values() {
+        fn expect_invalid<F>(needle: &str, mutate: F)
+        where
+            F: FnOnce(&mut DistillConfig),
+        {
+            let mut cfg = valid_config();
+            mutate(&mut cfg);
+            let err = cfg
+                .validate()
+                .expect_err("invalid distillation config should fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(needle),
+                "expected error containing '{needle}', got '{err}'"
+            );
+        }
+
+        expect_invalid("api_url", |c| c.api_url.clear());
+        expect_invalid("model", |c| c.model.clear());
+        expect_invalid("output_path", |c| c.output_path.clear());
+        expect_invalid("n_samples", |c| c.n_samples = 0);
+        expect_invalid("max_tokens", |c| c.max_tokens = 0);
+        expect_invalid("temperature", |c| c.temperature = f32::INFINITY);
+        expect_invalid("api_key", |c| {
+            c.api_url = "https://api.openai.com/v1/chat/completions".to_string();
+            c.api_key.clear();
+        });
+    }
 }

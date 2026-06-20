@@ -7,6 +7,7 @@ use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN};
 use rand::seq::SliceRandom;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,7 +41,7 @@ impl SftDataset {
                 continue;
             }
 
-            let (prompt, response) = parse_jsonl_line(line, line_num);
+            let (prompt, response) = parse_jsonl_line(line, line_num)?;
 
             let formatted_prompt = format!("User: {}\nAssistant: ", prompt);
             let prompt_tokens = tokenizer.encode(&formatted_prompt);
@@ -75,28 +76,32 @@ impl SftDataset {
             );
         }
 
+        if examples.is_empty() {
+            return Err(invalid_data("SFT dataset is empty"));
+        }
+
         Ok(Self { examples })
     }
 }
 
 /// Minimal JSON parser for `{"prompt": "...", "response": "..."}` lines.
 /// Avoids adding a serde dependency. Handles escaped quotes within strings.
-fn parse_jsonl_line(line: &str, line_num: usize) -> (String, String) {
-    let prompt = extract_json_string(line, "prompt").unwrap_or_else(|| {
-        panic!(
+fn parse_jsonl_line(line: &str, line_num: usize) -> std::io::Result<(String, String)> {
+    let prompt = extract_json_string(line, "prompt").ok_or_else(|| {
+        invalid_data(format!(
             "SFT JSONL line {} missing \"prompt\" field: {}",
             line_num + 1,
             &line[..line.len().min(80)]
-        )
+        ))
     });
-    let response = extract_json_string(line, "response").unwrap_or_else(|| {
-        panic!(
+    let response = extract_json_string(line, "response").ok_or_else(|| {
+        invalid_data(format!(
             "SFT JSONL line {} missing \"response\" field: {}",
             line_num + 1,
             &line[..line.len().min(80)]
-        )
+        ))
     });
-    (prompt, response)
+    Ok((prompt?, response?))
 }
 
 /// Extract a string value for a given key from a JSON object string.
@@ -192,27 +197,46 @@ pub struct SftDataLoader {
 }
 
 impl SftDataLoader {
-    pub fn new(dataset: SftDataset, batch_size: usize, max_seq_len: usize) -> Self {
-        let n = dataset.examples.len();
-        assert!(
-            n >= batch_size,
-            "SFT dataset has {} examples but batch_size is {}",
-            n,
-            batch_size
-        );
+    pub fn new(
+        dataset: SftDataset,
+        batch_size: usize,
+        max_seq_len: usize,
+    ) -> std::io::Result<Self> {
+        let max_tokens = max_seq_len
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("seq_len + 1 overflows usize"))?;
+        let original_examples = dataset.examples.len();
+        let examples: Vec<SftExample> = dataset
+            .examples
+            .into_iter()
+            .filter(|example| example.tokens.len().min(max_tokens) > example.response_start)
+            .collect();
+        let n = examples.len();
+        if n < batch_size {
+            return Err(invalid_data(format!(
+                "SFT dataset has {n} usable examples at seq_len {max_seq_len} but batch_size is {batch_size}"
+            )));
+        }
+        if n < original_examples {
+            eprintln!(
+                "SFT dataset: skipped {} examples whose responses are fully truncated at seq_len {}",
+                original_examples - n,
+                max_seq_len
+            );
+        }
 
         let mut order: Vec<usize> = (0..n).collect();
         let mut rng = rand::thread_rng();
         order.shuffle(&mut rng);
 
-        Self {
-            examples: dataset.examples,
+        Ok(Self {
+            examples,
             order,
             position: 0,
             batch_size,
             max_seq_len,
             epoch: 0,
-        }
+        })
     }
 
     /// Get next batch: (input_tokens, target_tokens, loss_mask).
@@ -316,6 +340,76 @@ impl SftConfig {
             checkpoint_interval: 500,
         }
     }
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        validate_non_empty("checkpoint_path", &self.checkpoint_path)?;
+        validate_non_empty("tokenizer_path", &self.tokenizer_path)?;
+        validate_non_empty("data_path", &self.data_path)?;
+        validate_non_empty("output_dir", &self.output_dir)?;
+        validate_positive_usize("batch_size", self.batch_size)?;
+        validate_positive_usize("seq_len", self.seq_len)?;
+        validate_positive_u32("total_steps", self.total_steps)?;
+        validate_positive_u32("log_interval", self.log_interval)?;
+        validate_positive_u32("checkpoint_interval", self.checkpoint_interval)?;
+        validate_finite_non_negative("max_lr", self.max_lr)?;
+        validate_finite_non_negative("weight_decay", self.weight_decay)?;
+        validate_finite_positive("max_grad_norm", self.max_grad_norm)?;
+        self.seq_len
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("seq_len + 1 overflows usize"))?;
+        self.batch_size
+            .checked_mul(self.seq_len)
+            .ok_or_else(|| invalid_input("batch_size * seq_len overflows usize"))?;
+        Ok(())
+    }
+}
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn validate_non_empty(field: &str, value: &str) -> std::io::Result<()> {
+    if value.is_empty() {
+        Err(invalid_input(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_usize(field: &str, value: usize) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_positive_u32(field: &str, value: u32) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_finite_positive(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and > 0")))
+    }
+}
+
+fn validate_finite_non_negative(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and >= 0")))
+    }
 }
 
 /// Apply a loss mask to the cross-entropy gradient buffer.
@@ -365,10 +459,17 @@ fn apply_loss_mask(
 
 /// Run supervised fine-tuning on a pre-trained checkpoint.
 pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result<()> {
+    config.validate()?;
     eprintln!("=== AndreAI Supervised Fine-Tuning ===");
 
     // Load pre-trained checkpoint
     let (model, pretrain_step) = checkpoint::load_checkpoint(ctx, &config.checkpoint_path)?;
+    if config.seq_len > model.config.max_seq_len {
+        return Err(invalid_input(format!(
+            "seq_len {} exceeds checkpoint max_seq_len {}",
+            config.seq_len, model.config.max_seq_len
+        )));
+    }
     eprintln!(
         "Loaded pre-trained model: step {}, {}M params, {} layers, d_model={}, {} heads",
         pretrain_step,
@@ -379,9 +480,17 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
     );
 
     // Load tokenizer and SFT dataset
-    let tokenizer = BpeTokenizer::load(&config.tokenizer_path).expect("Failed to load tokenizer");
+    let tokenizer = BpeTokenizer::load(&config.tokenizer_path).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!(
+                "Failed to load tokenizer '{}': {}",
+                config.tokenizer_path, e
+            ),
+        )
+    })?;
     let dataset = SftDataset::load(&config.data_path, &tokenizer)?;
-    let mut data_loader = SftDataLoader::new(dataset, config.batch_size, config.seq_len);
+    let mut data_loader = SftDataLoader::new(dataset, config.batch_size, config.seq_len)?;
 
     eprintln!(
         "SFT: batch_size={}, seq_len={}, total_steps={}, lr={:.1e}",
@@ -462,7 +571,9 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
                 loss_val, step
             );
             eprintln!("Try: lower --lr or check SFT data quality.");
-            break;
+            return Err(Error::other(format!(
+                "SFT loss became non-finite at step {step}: {loss_val}"
+            )));
         }
 
         // Logging
@@ -669,5 +780,76 @@ mod tests {
         // Malformed: incomplete hex digits
         let json = r#"{"text": "bad \u00z9"}"#;
         assert_eq!(extract_json_string(json, "text"), None);
+    }
+
+    #[test]
+    fn sft_config_rejects_invalid_runtime_values() {
+        fn expect_invalid<F>(needle: &str, mutate: F)
+        where
+            F: FnOnce(&mut SftConfig),
+        {
+            let mut cfg = SftConfig::default_sft("checkpoint.bin", "tokenizer.bin", "sft.jsonl");
+            mutate(&mut cfg);
+            let err = cfg.validate().expect_err("invalid SFT config should fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(needle),
+                "expected error containing '{needle}', got '{err}'"
+            );
+        }
+
+        expect_invalid("checkpoint_path", |c| c.checkpoint_path.clear());
+        expect_invalid("batch_size", |c| c.batch_size = 0);
+        expect_invalid("seq_len", |c| c.seq_len = 0);
+        expect_invalid("total_steps", |c| c.total_steps = 0);
+        expect_invalid("log_interval", |c| c.log_interval = 0);
+        expect_invalid("checkpoint_interval", |c| c.checkpoint_interval = 0);
+        expect_invalid("max_lr", |c| c.max_lr = f32::NAN);
+        expect_invalid("max_grad_norm", |c| c.max_grad_norm = 0.0);
+        expect_invalid("batch_size * seq_len", |c| {
+            c.batch_size = usize::MAX;
+            c.seq_len = 2;
+        });
+    }
+
+    #[test]
+    fn sft_dataset_reports_malformed_jsonl_without_panic() {
+        let dir = std::env::temp_dir().join("andreai_sft_bad_jsonl_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl_path = dir.join("bad.jsonl");
+        std::fs::write(&jsonl_path, r#"{"prompt":"hello"}"#).unwrap();
+        let tok = BpeTokenizer::train(b"hello response User: Assistant:", 300);
+
+        let err = match SftDataset::load(jsonl_path.to_str().unwrap(), &tok) {
+            Ok(_) => panic!("missing response should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("missing \"response\""),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sft_dataloader_rejects_fully_truncated_responses() {
+        let dataset = SftDataset {
+            examples: vec![SftExample {
+                tokens: vec![BOS_TOKEN, 42, EOS_TOKEN],
+                response_start: 2,
+            }],
+        };
+
+        let err = match SftDataLoader::new(dataset, 1, 1) {
+            Ok(_) => panic!("fully truncated response should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("usable examples"),
+            "unexpected error: {err}"
+        );
     }
 }

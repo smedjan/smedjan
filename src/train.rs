@@ -1293,7 +1293,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     loss_val, step
                 );
                 eprintln!("Try: lower --lr, increase --warmup, or check data quality.");
-                break;
+                return Err(Error::other(format!(
+                    "training loss became non-finite at step {step}: {loss_val}"
+                )));
             }
             // Auto-detect loss spikes: if loss > 2× EMA, warn (may need lower LR)
             if ema_loss > 0.0 && loss_val > ema_loss * 2.0 && step > config.warmup_steps {

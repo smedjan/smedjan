@@ -14,6 +14,9 @@ DATASET="$OUT/dataset.bin"
 BAD_TOKENIZER="$OUT/bad-tokenizer.bin"
 BAD_CHECKPOINT="$OUT/bad-checkpoint.bin"
 BAD_SHARD="$OUT/bad-shard.bin"
+SFT_JSONL="$OUT/sft.jsonl"
+DPO_JSONL="$OUT/dpo.jsonl"
+DPO_BIN="$OUT/dpo.bin"
 
 rm -rf "$OUT"
 mkdir -p "$LOG_DIR"
@@ -141,6 +144,77 @@ run_train() {
   echo "PASS: train:$name"
 }
 
+run_sft() {
+  local name=$1
+  local ckpt=$2
+  local out_dir="$OUT/$name"
+  local log="$LOG_DIR/$name.log"
+  echo "---- sft:$name ----"
+  if "$BIN" sft \
+    --checkpoint "$ckpt" \
+    --tokenizer "$TOKENIZER" \
+    --data "$SFT_JSONL" \
+    --steps 1 \
+    --warmup 0 \
+    --lr 0.0001 \
+    --batch-size 2 \
+    --seq-len 64 \
+    --output-dir "$out_dir" > "$log" 2>&1; then
+    :
+  else
+    echo "FAIL: sft:$name (see $log)"
+    tail -80 "$log"
+    exit 1
+  fi
+  if grep -E 'FATAL|loss is (NaN|inf|-inf)|non-finite' "$log" >/dev/null; then
+    echo "FAIL: sft:$name emitted a fatal/non-finite loss signal"
+    tail -80 "$log"
+    exit 1
+  fi
+  if [[ ! -s "$out_dir/sft_final.bin" ]]; then
+    echo "FAIL: sft:$name did not write final checkpoint"
+    tail -80 "$log"
+    exit 1
+  fi
+  echo "PASS: sft:$name"
+}
+
+run_dpo() {
+  local name=$1
+  local ckpt=$2
+  local out_dir="$OUT/$name"
+  local log="$LOG_DIR/$name.log"
+  echo "---- dpo:$name ----"
+  if "$BIN" dpo \
+    --checkpoint "$ckpt" \
+    --ref-checkpoint "$ckpt" \
+    --tokenizer "$TOKENIZER" \
+    --dataset "$DPO_BIN" \
+    --steps 1 \
+    --warmup 0 \
+    --lr 0.000001 \
+    --beta 0.1 \
+    --max-seq-len 64 \
+    --output-dir "$out_dir" > "$log" 2>&1; then
+    :
+  else
+    echo "FAIL: dpo:$name (see $log)"
+    tail -80 "$log"
+    exit 1
+  fi
+  if grep -E 'FATAL|loss is (NaN|inf|-inf)|non-finite' "$log" >/dev/null; then
+    echo "FAIL: dpo:$name emitted a fatal/non-finite loss signal"
+    tail -80 "$log"
+    exit 1
+  fi
+  if [[ ! -s "$out_dir/dpo_final.bin" ]]; then
+    echo "FAIL: dpo:$name did not write final checkpoint"
+    tail -80 "$log"
+    exit 1
+  fi
+  echo "PASS: dpo:$name"
+}
+
 run_resume_train() {
   local name=$1; shift
   local base="$OUT/${name}_base"
@@ -234,6 +308,17 @@ printf '\001\002\003' > "$BAD_SHARD"
 
 run_reject_logged mix_zero_weight "data mixing weights must sum to > 0" "$BIN" mix --shards "$DATASET:0" --output "$OUT/mix-zero.bin"
 run_reject_logged mix_malformed_shard "byte length must be a multiple of 4" "$BIN" mix --shards "$BAD_SHARD:1" --output "$OUT/mix-bad.bin"
+cat > "$SFT_JSONL" <<'SFT'
+{"prompt":"Say hello.","response":"Hello."}
+{"prompt":"Name the runtime.","response":"AndreAI runs local training."}
+SFT
+cat > "$DPO_JSONL" <<'DPO'
+{"prompt":"Say hello.","chosen":"Hello.","rejected":"Goodbye."}
+DPO
+run_reject_logged sft_invalid_seq_len "seq_len must be greater than 0" "$BIN" sft --checkpoint "$BAD_CHECKPOINT" --tokenizer "$TOKENIZER" --data "$SFT_JSONL" --seq-len 0
+run_reject_logged dpo_invalid_beta "beta must be finite and > 0" "$BIN" dpo --checkpoint "$BAD_CHECKPOINT" --ref-checkpoint "$BAD_CHECKPOINT" --tokenizer "$TOKENIZER" --dataset "$OUT/missing-dpo.bin" --beta 0
+run_reject_logged distill_zero_samples "n_samples must be greater than 0" "$BIN" distill --output "$OUT/distill-zero.jsonl" --n-samples 0
+run_reject_logged distill_missing_api_key "api_key must not be empty" "$BIN" distill --api-url https://api.openai.com/v1/chat/completions --model gpt-4o --output "$OUT/distill-openai.jsonl" --n-samples 1
 run_reject_logged train_missing_dataset "Failed to verify dataset" "$BIN" train --dataset "$OUT/missing-dataset.bin" --tokenizer "$TOKENIZER" --size tiny --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_missing_dataset"
 run_reject_logged train_unknown_size "Unknown model size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size definitely-not-real --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_unknown_size"
 run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size custom --layers 1 --heads 1 --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_custom_missing_dim"
@@ -244,6 +329,9 @@ run_reject_train invalid_grad_accum "grad_accum_steps must be greater than 0" --
 run_reject_train invalid_dropout "dropout must be finite and in [0, 1)" --dropout 1
 run_reject_train invalid_moe_top_k "--top-k-experts must be in 1..=--n-experts" --n-experts 2 --top-k-experts 0
 run_train adamw
+run_sft sft_tiny "$OUT/adamw/final.bin"
+run_logged dpo_prepare "$BIN" dpo-prepare --input "$DPO_JSONL" --output "$DPO_BIN" --tokenizer "$TOKENIZER"
+run_dpo dpo_tiny "$OUT/adamw/final.bin"
 run_resume_train adamw_resume
 run_train checkpoint_fused --gradient-checkpointing --fused-ce
 run_train hybrid_normuon --optimizer hybrid --normuon

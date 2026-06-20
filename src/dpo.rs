@@ -7,7 +7,7 @@ use crate::optim::{AdamW, CosineWarmupScheduler};
 use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN};
 use memmap2::Mmap;
 use rand::seq::SliceRandom;
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -45,7 +45,9 @@ impl DpoDataset {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        assert!(mmap.len() >= 4, "DPO dataset file too small");
+        if mmap.len() < 4 {
+            return Err(invalid_data("DPO dataset file too small"));
+        }
         let num_pairs = read_u32(&mmap, 0) as usize;
 
         // Build offset index by scanning through the file
@@ -55,20 +57,17 @@ impl DpoDataset {
         for i in 0..num_pairs {
             offsets.push(pos);
 
-            // prompt
-            assert!(pos + 4 <= mmap.len(), "Truncated DPO dataset at pair {}", i);
-            let prompt_len = read_u32(&mmap, pos) as usize;
-            pos += 4 + prompt_len * 4;
+            pos = advance_token_section(&mmap, pos, i, "prompt")?;
+            pos = advance_token_section(&mmap, pos, i, "chosen")?;
+            pos = advance_token_section(&mmap, pos, i, "rejected")?;
+        }
 
-            // chosen
-            assert!(pos + 4 <= mmap.len(), "Truncated DPO dataset at pair {}", i);
-            let chosen_len = read_u32(&mmap, pos) as usize;
-            pos += 4 + chosen_len * 4;
-
-            // rejected
-            assert!(pos + 4 <= mmap.len(), "Truncated DPO dataset at pair {}", i);
-            let rejected_len = read_u32(&mmap, pos) as usize;
-            pos += 4 + rejected_len * 4;
+        if pos != mmap.len() {
+            return Err(invalid_data(format!(
+                "DPO dataset has {} trailing bytes after {} pairs",
+                mmap.len().saturating_sub(pos),
+                num_pairs
+            )));
         }
 
         eprintln!(
@@ -107,8 +106,9 @@ impl DpoDataset {
         );
         let prompt_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        let prompt_end = checked_token_end(pos, prompt_len, mmap_len, "prompt tokens", idx);
         assert!(
-            pos + prompt_len * 4 <= mmap_len,
+            prompt_end <= mmap_len,
             "get_pair({}): prompt tokens ({}) at offset {} exceed mmap ({})",
             idx,
             prompt_len,
@@ -116,7 +116,7 @@ impl DpoDataset {
             mmap_len
         );
         let prompt = read_u32_slice(&self.mmap, pos, prompt_len);
-        pos += prompt_len * 4;
+        pos = prompt_end;
 
         // --- chosen ---
         assert!(
@@ -128,8 +128,9 @@ impl DpoDataset {
         );
         let chosen_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        let chosen_end = checked_token_end(pos, chosen_len, mmap_len, "chosen tokens", idx);
         assert!(
-            pos + chosen_len * 4 <= mmap_len,
+            chosen_end <= mmap_len,
             "get_pair({}): chosen tokens ({}) at offset {} exceed mmap ({})",
             idx,
             chosen_len,
@@ -137,7 +138,7 @@ impl DpoDataset {
             mmap_len
         );
         let chosen = read_u32_slice(&self.mmap, pos, chosen_len);
-        pos += chosen_len * 4;
+        pos = chosen_end;
 
         // --- rejected ---
         assert!(
@@ -149,8 +150,9 @@ impl DpoDataset {
         );
         let rejected_len = read_u32(&self.mmap, pos) as usize;
         pos += 4;
+        let rejected_end = checked_token_end(pos, rejected_len, mmap_len, "rejected tokens", idx);
         assert!(
-            pos + rejected_len * 4 <= mmap_len,
+            rejected_end <= mmap_len,
             "get_pair({}): rejected tokens ({}) at offset {} exceed mmap ({})",
             idx,
             rejected_len,
@@ -158,7 +160,7 @@ impl DpoDataset {
             mmap_len
         );
         let rejected = read_u32_slice(&self.mmap, pos, rejected_len);
-        let _ = pos; // suppress unused after last read
+        let _ = rejected_end;
 
         PreferencePair {
             prompt,
@@ -170,6 +172,45 @@ impl DpoDataset {
     /// Number of preference pairs in the dataset.
     pub fn len(&self) -> usize {
         self.num_pairs
+    }
+
+    /// Validate that every pair can be used by the DPO training loop without
+    /// truncating all response tokens or indexing beyond the model vocabulary.
+    pub fn validate_for_training(
+        &self,
+        max_seq_len: usize,
+        vocab_size: usize,
+    ) -> std::io::Result<()> {
+        if self.num_pairs == 0 {
+            return Err(invalid_data("DPO dataset is empty"));
+        }
+        for idx in 0..self.num_pairs {
+            let pair = self.get_pair(idx);
+            validate_token_section(idx, "prompt", &pair.prompt, vocab_size)?;
+            validate_token_section(idx, "chosen", &pair.chosen, vocab_size)?;
+            validate_token_section(idx, "rejected", &pair.rejected, vocab_size)?;
+
+            if pair.prompt.is_empty() {
+                return Err(invalid_data(format!("DPO pair {idx} has an empty prompt")));
+            }
+            if pair.chosen.is_empty() {
+                return Err(invalid_data(format!(
+                    "DPO pair {idx} has an empty chosen response"
+                )));
+            }
+            if pair.rejected.is_empty() {
+                return Err(invalid_data(format!(
+                    "DPO pair {idx} has an empty rejected response"
+                )));
+            }
+            if pair.prompt.len() >= max_seq_len {
+                return Err(invalid_data(format!(
+                    "DPO pair {idx} prompt length {} leaves no room for responses at max_seq_len {max_seq_len}",
+                    pair.prompt.len()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -193,15 +234,96 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 /// Read a slice of u32 values from a byte slice.
 /// Panics if the requested range exceeds the slice length.
 fn read_u32_slice(data: &[u8], offset: usize, len: usize) -> Vec<u32> {
-    let required_bytes = len * 4;
+    let required_bytes = len.checked_mul(4).unwrap_or_else(|| {
+        panic!("read_u32_slice: len {} overflows byte count", len);
+    });
+    let end = offset.checked_add(required_bytes).unwrap_or_else(|| {
+        panic!(
+            "read_u32_slice: offset {} + {} bytes overflows usize",
+            offset, required_bytes
+        );
+    });
     assert!(
-        offset + required_bytes <= data.len(),
+        end <= data.len(),
         "read_u32_slice: offset {} + {} bytes exceeds mmap length {}",
         offset,
         required_bytes,
         data.len(),
     );
     (0..len).map(|i| read_u32(data, offset + i * 4)).collect()
+}
+
+fn checked_token_end(
+    offset: usize,
+    len: usize,
+    mmap_len: usize,
+    section: &str,
+    pair_idx: usize,
+) -> usize {
+    let required_bytes = len.checked_mul(4).unwrap_or_else(|| {
+        panic!("get_pair({pair_idx}): {section} length {len} overflows byte count");
+    });
+    let end = offset.checked_add(required_bytes).unwrap_or_else(|| {
+        panic!(
+            "get_pair({pair_idx}): {section} offset {offset} + {required_bytes} bytes overflows usize"
+        );
+    });
+    assert!(
+        end <= mmap_len,
+        "get_pair({pair_idx}): {section} ({len}) at offset {offset} exceed mmap ({mmap_len})"
+    );
+    end
+}
+
+fn advance_token_section(
+    data: &[u8],
+    offset: usize,
+    pair_idx: usize,
+    section: &str,
+) -> std::io::Result<usize> {
+    let len_end = offset.checked_add(4).ok_or_else(|| {
+        invalid_data(format!(
+            "DPO dataset offset overflow at pair {pair_idx} {section}"
+        ))
+    })?;
+    if len_end > data.len() {
+        return Err(invalid_data(format!(
+            "Truncated DPO dataset at pair {pair_idx} {section} length"
+        )));
+    }
+    let token_len = read_u32(data, offset) as usize;
+    let token_bytes = token_len.checked_mul(4).ok_or_else(|| {
+        invalid_data(format!(
+            "DPO dataset pair {pair_idx} {section} length {token_len} overflows byte count"
+        ))
+    })?;
+    let end = len_end.checked_add(token_bytes).ok_or_else(|| {
+        invalid_data(format!(
+            "DPO dataset pair {pair_idx} {section} byte range overflows usize"
+        ))
+    })?;
+    if end > data.len() {
+        return Err(invalid_data(format!(
+            "Truncated DPO dataset at pair {pair_idx} {section} tokens"
+        )));
+    }
+    Ok(end)
+}
+
+fn validate_token_section(
+    pair_idx: usize,
+    section: &str,
+    tokens: &[u32],
+    vocab_size: usize,
+) -> std::io::Result<()> {
+    for (token_idx, &token) in tokens.iter().enumerate() {
+        if token as usize >= vocab_size {
+            return Err(invalid_data(format!(
+                "DPO pair {pair_idx} {section} token {token_idx} has id {token}, outside model vocab_size {vocab_size}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +503,71 @@ impl DpoConfig {
             checkpoint_interval: 500,
         }
     }
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        validate_non_empty("checkpoint_path", &self.checkpoint_path)?;
+        validate_non_empty("ref_checkpoint_path", &self.ref_checkpoint_path)?;
+        validate_non_empty("tokenizer_path", &self.tokenizer_path)?;
+        validate_non_empty("data_path", &self.data_path)?;
+        validate_non_empty("output_dir", &self.output_dir)?;
+        validate_finite_positive("beta", self.beta)?;
+        validate_finite_non_negative("learning_rate", self.learning_rate)?;
+        validate_positive_usize("max_seq_len", self.max_seq_len)?;
+        validate_positive_u32("total_steps", self.total_steps)?;
+        validate_positive_u32("log_interval", self.log_interval)?;
+        validate_positive_u32("checkpoint_interval", self.checkpoint_interval)?;
+        validate_finite_non_negative("weight_decay", self.weight_decay)?;
+        validate_finite_positive("max_grad_norm", self.max_grad_norm)?;
+        Ok(())
+    }
+}
+
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn validate_non_empty(field: &str, value: &str) -> std::io::Result<()> {
+    if value.is_empty() {
+        Err(invalid_input(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_usize(field: &str, value: usize) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_positive_u32(field: &str, value: u32) -> std::io::Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be greater than 0")))
+    }
+}
+
+fn validate_finite_positive(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and > 0")))
+    }
+}
+
+fn validate_finite_non_negative(field: &str, value: f32) -> std::io::Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_input(format!("{field} must be finite and >= 0")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +582,7 @@ impl DpoConfig {
 /// Loss: L_DPO = -log sigmoid(beta * (log_ratio_chosen - log_ratio_rejected))
 /// where log_ratio = log pi(y|x) - log pi_ref(y|x)
 pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result<()> {
+    config.validate()?;
     eprintln!("=== AndreAI Direct Preference Optimization ===");
 
     // Load policy model (will be updated)
@@ -417,21 +605,36 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
     );
 
     // Verify models have the same architecture
-    assert_eq!(
-        policy_model.config.vocab_size, ref_model.config.vocab_size,
-        "Policy and reference models must have the same vocab_size"
-    );
-    assert_eq!(
-        policy_model.config.d_model, ref_model.config.d_model,
-        "Policy and reference models must have the same d_model"
-    );
-    assert_eq!(
-        policy_model.config.n_layers, ref_model.config.n_layers,
-        "Policy and reference models must have the same n_layers"
-    );
+    if policy_model.config.vocab_size != ref_model.config.vocab_size {
+        return Err(invalid_input(
+            "Policy and reference models must have the same vocab_size",
+        ));
+    }
+    if policy_model.config.d_model != ref_model.config.d_model {
+        return Err(invalid_input(
+            "Policy and reference models must have the same d_model",
+        ));
+    }
+    if policy_model.config.n_layers != ref_model.config.n_layers {
+        return Err(invalid_input(
+            "Policy and reference models must have the same n_layers",
+        ));
+    }
+    if policy_model.config.n_heads != ref_model.config.n_heads {
+        return Err(invalid_input(
+            "Policy and reference models must have the same n_heads",
+        ));
+    }
+    if config.max_seq_len > policy_model.config.max_seq_len {
+        return Err(invalid_input(format!(
+            "max_seq_len {} exceeds checkpoint max_seq_len {}",
+            config.max_seq_len, policy_model.config.max_seq_len
+        )));
+    }
 
     // Load dataset
     let dataset = DpoDataset::load(&config.data_path)?;
+    dataset.validate_for_training(config.max_seq_len, policy_model.config.vocab_size as usize)?;
     let mut data_loader = DpoDataLoader::new(dataset, config.max_seq_len);
 
     eprintln!("Tokenizer: {}", config.tokenizer_path);
@@ -659,7 +862,9 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
                     loss_val, step
                 );
                 eprintln!("Try: lower --lr or --beta.");
-                break;
+                return Err(Error::other(format!(
+                    "DPO loss became non-finite at step {step}: {loss_val}"
+                )));
             }
 
             let step_time = step_start.elapsed().as_secs_f32();
@@ -824,27 +1029,30 @@ pub fn prepare_dpo_dataset(
             continue;
         }
 
-        let prompt_str = extract_json_string(line, "prompt").unwrap_or_else(|| {
-            panic!(
+        let prompt_str = extract_json_string(line, "prompt").ok_or_else(|| {
+            invalid_data(format!(
                 "DPO JSONL line {} missing \"prompt\" field: {}",
                 line_num + 1,
                 &line[..line.len().min(80)]
-            )
+            ))
         });
-        let chosen_str = extract_json_string(line, "chosen").unwrap_or_else(|| {
-            panic!(
+        let chosen_str = extract_json_string(line, "chosen").ok_or_else(|| {
+            invalid_data(format!(
                 "DPO JSONL line {} missing \"chosen\" field: {}",
                 line_num + 1,
                 &line[..line.len().min(80)]
-            )
+            ))
         });
-        let rejected_str = extract_json_string(line, "rejected").unwrap_or_else(|| {
-            panic!(
+        let rejected_str = extract_json_string(line, "rejected").ok_or_else(|| {
+            invalid_data(format!(
                 "DPO JSONL line {} missing \"rejected\" field: {}",
                 line_num + 1,
                 &line[..line.len().min(80)]
-            )
+            ))
         });
+        let prompt_str = prompt_str?;
+        let chosen_str = chosen_str?;
+        let rejected_str = rejected_str?;
 
         // Tokenize with BOS prefix on prompt
         let formatted_prompt = format!("User: {}\nAssistant: ", prompt_str);
@@ -862,30 +1070,18 @@ pub fn prepare_dpo_dataset(
 
     // Write binary format
     let mut file = std::fs::File::create(output_path)?;
-    let num_pairs = pairs.len() as u32;
+    if pairs.is_empty() {
+        return Err(invalid_data("DPO preference JSONL is empty"));
+    }
+
+    let num_pairs = u32::try_from(pairs.len())
+        .map_err(|_| invalid_data("DPO preference pair count exceeds u32::MAX"))?;
     file.write_all(&num_pairs.to_le_bytes())?;
 
     for (prompt, chosen, rejected) in &pairs {
-        // prompt
-        let prompt_len = prompt.len() as u32;
-        file.write_all(&prompt_len.to_le_bytes())?;
-        for &t in prompt {
-            file.write_all(&t.to_le_bytes())?;
-        }
-
-        // chosen
-        let chosen_len = chosen.len() as u32;
-        file.write_all(&chosen_len.to_le_bytes())?;
-        for &t in chosen {
-            file.write_all(&t.to_le_bytes())?;
-        }
-
-        // rejected
-        let rejected_len = rejected.len() as u32;
-        file.write_all(&rejected_len.to_le_bytes())?;
-        for &t in rejected {
-            file.write_all(&t.to_le_bytes())?;
-        }
+        write_token_section(&mut file, prompt)?;
+        write_token_section(&mut file, chosen)?;
+        write_token_section(&mut file, rejected)?;
     }
 
     eprintln!(
@@ -896,6 +1092,16 @@ pub fn prepare_dpo_dataset(
     );
 
     Ok(pairs.len())
+}
+
+fn write_token_section(file: &mut std::fs::File, tokens: &[u32]) -> std::io::Result<()> {
+    let len = u32::try_from(tokens.len())
+        .map_err(|_| invalid_data("DPO token section length exceeds u32::MAX"))?;
+    file.write_all(&len.to_le_bytes())?;
+    for &token in tokens {
+        file.write_all(&token.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 /// Extract a string value for a given key from a JSON object string.
@@ -1082,6 +1288,94 @@ mod tests {
     }
 
     #[test]
+    fn dpo_config_rejects_invalid_runtime_values() {
+        fn expect_invalid<F>(needle: &str, mutate: F)
+        where
+            F: FnOnce(&mut DpoConfig),
+        {
+            let mut cfg =
+                DpoConfig::default_dpo("policy.bin", "reference.bin", "tokenizer.bin", "prefs.bin");
+            mutate(&mut cfg);
+            let err = cfg.validate().expect_err("invalid DPO config should fail");
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(needle),
+                "expected error containing '{needle}', got '{err}'"
+            );
+        }
+
+        expect_invalid("checkpoint_path", |c| c.checkpoint_path.clear());
+        expect_invalid("ref_checkpoint_path", |c| c.ref_checkpoint_path.clear());
+        expect_invalid("beta", |c| c.beta = 0.0);
+        expect_invalid("learning_rate", |c| c.learning_rate = f32::NAN);
+        expect_invalid("max_seq_len", |c| c.max_seq_len = 0);
+        expect_invalid("total_steps", |c| c.total_steps = 0);
+        expect_invalid("log_interval", |c| c.log_interval = 0);
+        expect_invalid("checkpoint_interval", |c| c.checkpoint_interval = 0);
+        expect_invalid("max_grad_norm", |c| c.max_grad_norm = 0.0);
+    }
+
+    #[test]
+    fn dpo_dataset_load_reports_truncation_without_panic() {
+        let dir = std::env::temp_dir().join("andreai_dpo_truncated_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("truncated.bin");
+
+        let mut file = std::fs::File::create(&bin_path).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&7u32.to_le_bytes()).unwrap();
+        drop(file);
+
+        let err = match DpoDataset::load(bin_path.to_str().unwrap()) {
+            Ok(_) => panic!("truncated DPO dataset should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("Truncated DPO dataset"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dpo_dataset_validation_rejects_unusable_pairs() {
+        let dir = std::env::temp_dir().join("andreai_dpo_validate_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("prefs.bin");
+
+        let mut file = std::fs::File::create(&bin_path).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        write_tokens(&mut file, &[1, 2]);
+        write_tokens(&mut file, &[999]);
+        write_tokens(&mut file, &[3]);
+        drop(file);
+
+        let dataset = DpoDataset::load(bin_path.to_str().unwrap()).unwrap();
+        let err = dataset
+            .validate_for_training(8, 10)
+            .expect_err("out-of-vocab DPO token should fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("outside model vocab_size"),
+            "unexpected error: {err}"
+        );
+
+        let err = dataset
+            .validate_for_training(2, 1000)
+            .expect_err("prompt that fills max_seq_len should fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("leaves no room"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_dpo_jsonl_prepare_roundtrip() {
         let dir = std::env::temp_dir().join("andreai_dpo_jsonl_test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1126,6 +1420,30 @@ mod tests {
         // Chosen and rejected should end with EOS
         assert_eq!(*p0.chosen.last().unwrap(), EOS_TOKEN);
         assert_eq!(*p0.rejected.last().unwrap(), EOS_TOKEN);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dpo_prepare_reports_malformed_jsonl_without_panic() {
+        let dir = std::env::temp_dir().join("andreai_dpo_bad_jsonl_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl_path = dir.join("bad.jsonl");
+        let bin_path = dir.join("bad.bin");
+        std::fs::write(&jsonl_path, r#"{"prompt":"hello","chosen":"hi"}"#).unwrap();
+        let tok = BpeTokenizer::train(b"hello hi rejected User: Assistant:", 300);
+
+        let err = prepare_dpo_dataset(
+            jsonl_path.to_str().unwrap(),
+            bin_path.to_str().unwrap(),
+            &tok,
+        )
+        .expect_err("missing rejected field should fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("missing \"rejected\""),
+            "unexpected error: {err}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
