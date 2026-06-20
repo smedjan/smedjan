@@ -954,25 +954,32 @@ mod suite {
         let lengths = [128usize, 256];
         let depths = [0.0f32, 0.5, 1.0];
         let set = crate::eval::longctx_eval_set(&tok, &lengths, &depths);
-        assert_eq!(set.len(), 3 * lengths.len() * depths.len());
+        assert_eq!(set.len(), 4 * lengths.len() * depths.len());
         for ex in &set {
             let (probe, lpart) = ex
                 .category
                 .split_once("_L")
                 .expect("category form <probe>_L<len>");
             assert!(
-                ["niah", "multikey", "vartrace"].contains(&probe),
+                ["niah", "multikey", "vartrace", "freqagg"].contains(&probe),
                 "unexpected probe {probe}"
             );
             let len: usize = lpart.parse().expect("numeric length suffix");
             assert!(lengths.contains(&len), "length {len} not requested");
             assert!(!ex.expected.is_empty(), "empty expected answer");
-            assert!(
-                ex.prompt.contains(&ex.expected),
-                "needle {} must be embedded in its {} prompt",
-                ex.expected,
-                ex.category
-            );
+            if probe == "freqagg" {
+                // Aggregation answer is derived, not a literal needle in the prompt.
+                ex.expected
+                    .parse::<usize>()
+                    .expect("freqagg expected is a count");
+            } else {
+                assert!(
+                    ex.prompt.contains(&ex.expected),
+                    "needle {} must be embedded in its {} prompt",
+                    ex.expected,
+                    ex.category
+                );
+            }
             let n_tok = tok.encode(&ex.prompt).len();
             assert!(
                 n_tok >= len / 2,
@@ -3087,6 +3094,68 @@ mod suite {
         assert!(
             gv.iter().all(|x| x.is_finite()),
             "non-finite grad on w_q under yarn-on (backward must carry the forward yarn)"
+        );
+    }
+
+    #[test]
+    fn yarn_attn_mscale_is_one_off_and_grows_on() {
+        let ctx = test_ctx();
+        // Default (yarn off) -> mscale exactly 1.0 (attention bit-identical).
+        let off = crate::attention::MultiHeadAttention::new(&ctx, 64, 4, 2, 10000.0);
+        assert_eq!(off.yarn_attn_mscale(), 1.0, "yarn-off mscale must be 1.0");
+        // yarn_scale = 2.0 -> 0.1*ln(2)+1.
+        let mut on = crate::attention::MultiHeadAttention::new(&ctx, 64, 4, 2, 10000.0);
+        on.yarn_scale = 2.0;
+        let expect = 0.1 * 2f32.ln() + 1.0;
+        assert!(
+            (on.yarn_attn_mscale() - expect).abs() < 1e-6,
+            "yarn-on mscale {} != {expect}",
+            on.yarn_attn_mscale()
+        );
+    }
+
+    #[test]
+    fn cross_entropy_per_sample_reweights_unequal_sequences() {
+        let ctx = test_ctx();
+        // 4 rows = seq A (row 0, confident -> ~0 CE) + seq B (rows 1..3, uniform -> ~ln5 CE).
+        let vocab = 5usize;
+        let mut data = vec![0f32; 4 * vocab];
+        data[0] = 10.0; // row 0 strongly predicts target 0
+        let targets = vec![0u32, 1, 2, 3];
+        let logits = Tensor::from_slice(&ctx, &data, vec![4, vocab]);
+        let per_token = crate::loss::cross_entropy_loss(&ctx, &logits, &targets)
+            .0
+            .to_vec()[0];
+        let per_sample_uneven =
+            crate::loss::cross_entropy_loss_per_sample(&ctx, &logits, &targets, &[1, 3])
+                .0
+                .to_vec()[0];
+        let per_sample_even =
+            crate::loss::cross_entropy_loss_per_sample(&ctx, &logits, &targets, &[2, 2])
+                .0
+                .to_vec()[0];
+        assert!(
+            (per_token - per_sample_uneven).abs() > 1e-3,
+            "per-sample [1,3] ({per_sample_uneven}) must differ from per-token ({per_token})"
+        );
+        assert!(
+            (per_token - per_sample_even).abs() < 1e-4,
+            "equal-length [2,2] ({per_sample_even}) must equal per-token ({per_token})"
+        );
+    }
+
+    #[test]
+    fn gradcheck_cross_entropy_per_sample() {
+        let ctx = test_ctx();
+        let targets = vec![0u32, 1, 2, 3];
+        grad_check(
+            &ctx,
+            &[(gc_vec(4 * 5, 0), vec![4, 5])],
+            &|t| crate::loss::cross_entropy_loss_per_sample(&ctx, &t[0], &targets, &[1, 3]).0,
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "cross_entropy_per_sample",
         );
     }
 

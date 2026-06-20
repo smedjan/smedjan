@@ -43,6 +43,107 @@ pub fn cross_entropy_loss_with_workspace(
     cross_entropy_loss_impl(ctx, logits, targets, Some(ws))
 }
 
+/// Sample-level cross-entropy: average CE per *sequence*, then across sequences -- instead of the
+/// default per-token mean. `seq_lens` partitions the `[n_tokens, vocab]` rows into sequences (it
+/// must sum to n_tokens). With variable-length sequences packed in one batch this stops a long
+/// example from dominating a short one (the UltraLong / DeepSeek-V3 long-context CPT trick). For
+/// equal-length sequences it is bit-identical to `cross_entropy_loss`. The CE kernel emits
+/// grad = (softmax - onehot)/n_tokens per row; per-sample reweights each row by n_tokens/(n_seq*len)
+/// so the gradient stays exact (finite-difference-checked in tests).
+#[allow(dead_code)]
+pub fn cross_entropy_loss_per_sample(
+    ctx: &Arc<MetalContext>,
+    logits: &Tensor,
+    targets: &[u32],
+    seq_lens: &[usize],
+) -> (Tensor, crate::gpu::Buf) {
+    let logits_shape = &logits.shape;
+    assert_eq!(logits_shape.len(), 2, "logits must be [n_tokens, vocab]");
+    let n_tokens = logits_shape[0];
+    let vocab = logits_shape[1];
+    assert_eq!(
+        targets.len(),
+        n_tokens,
+        "targets length must match n_tokens"
+    );
+    let n_seq = seq_lens.len();
+    assert!(n_seq > 0, "need at least one sequence");
+    assert_eq!(
+        seq_lens.iter().sum::<usize>(),
+        n_tokens,
+        "seq_lens must sum to n_tokens"
+    );
+
+    // Per-row weights. per-sample loss = mean_s( mean_{t in s} ce_t ) = sum_row ce_row * w_loss[row]
+    // with w_loss[row] = 1/(n_seq * len_of_seq(row)). The kernel grad is (softmax-onehot)/n_tokens
+    // per row, so scaling row by r_grad = n_tokens * w_loss turns it into (softmax-onehot)*w_loss.
+    let mut w_loss = vec![0f32; n_tokens];
+    let mut r_grad = vec![0f32; n_tokens];
+    let nf = n_tokens as f32;
+    let mut row = 0usize;
+    for &len in seq_lens {
+        assert!(len > 0, "sequence length must be positive");
+        let w = 1.0 / (n_seq as f32 * len as f32);
+        for _ in 0..len {
+            w_loss[row] = w;
+            r_grad[row] = nf * w;
+            row += 1;
+        }
+    }
+
+    let targets_buf = ctx.buffer_from_u32_slice(targets);
+    let losses_buf = ctx.alloc_buffer(n_tokens * 4);
+    let grad_logits_buf = ctx.alloc_buffer(n_tokens * vocab * 4);
+    compute::gpu_cross_entropy(
+        ctx,
+        &logits.buffer,
+        &targets_buf,
+        &losses_buf,
+        &grad_logits_buf,
+        n_tokens as u32,
+        vocab as u32,
+    );
+
+    // Reweight gradient rows in place: (softmax-onehot)/n_tokens -> (softmax-onehot)*w_loss.
+    let r_grad_buf = Tensor::from_slice(ctx, &r_grad, vec![n_tokens]).buffer;
+    compute::gpu_scale_rows(
+        ctx,
+        &grad_logits_buf,
+        &r_grad_buf,
+        &grad_logits_buf,
+        n_tokens as u32,
+        vocab as u32,
+    );
+
+    // Loss scalar = sum_row losses[row] * w_loss[row].
+    let w_loss_buf = Tensor::from_slice(ctx, &w_loss, vec![n_tokens]).buffer;
+    let weighted = ctx.alloc_buffer(n_tokens * 4);
+    compute::gpu_mul(ctx, &losses_buf, &w_loss_buf, &weighted, n_tokens as u32);
+    let scalar_buf = ctx.alloc_buffer(4);
+    compute::gpu_reduce_sum(ctx, &weighted, &scalar_buf, n_tokens as u32);
+
+    let loss_id = autograd::next_id();
+    let loss = Tensor {
+        id: loss_id,
+        buffer: scalar_buf,
+        shape: vec![1],
+        requires_grad: true,
+        ctx: Arc::clone(ctx),
+    };
+    if autograd::is_recording() {
+        autograd::record(TapeEntry {
+            op: Op::CrossEntropy,
+            inputs: vec![logits.id],
+            output: loss_id,
+            input_buffers: vec![logits.buffer.clone()],
+            output_buffer: loss.buffer.clone(),
+            shapes: vec![logits.shape.clone(), vec![1]],
+            cached: Some(grad_logits_buf.clone()),
+        });
+    }
+    (loss, grad_logits_buf)
+}
+
 fn cross_entropy_loss_impl(
     ctx: &Arc<MetalContext>,
     logits: &Tensor,

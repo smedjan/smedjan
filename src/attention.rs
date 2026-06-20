@@ -565,6 +565,18 @@ impl MultiHeadAttention {
     /// reconstructs K/V from the FULL cached latent (K=c@W_uk, V=c@W_uv), RoPEs at absolute positions,
     /// and attends the new tokens' queries causally. Cache stores `c` ([batch,total,d_c]) — 10–50×
     /// smaller than storing K/V. Mathematically equal to the prefill MLA forward (linearity + causal).
+    /// YaRN attention temperature (mscale): when context is YaRN-extended (yarn_scale > 1), softmax
+    /// logits are scaled by 0.1*ln(s)+1 to counter the entropy drift from interpolated RoPE
+    /// positions (YaRN, Peng et al. §3.3). yarn_scale <= 1 returns 1.0 -> default path bit-identical.
+    #[inline]
+    pub(crate) fn yarn_attn_mscale(&self) -> f32 {
+        if self.yarn_scale > 1.0 {
+            0.1 * self.yarn_scale.ln() + 1.0
+        } else {
+            1.0
+        }
+    }
+
     fn mla_cached_forward(&self, x: &Tensor, cache: &mut KvCache) -> Tensor {
         let batch = x.shape[0];
         let new_seq = x.shape[1];
@@ -622,6 +634,16 @@ impl MultiHeadAttention {
             k.rms_norm(&self.qk_norm_weight, 1e-6)
         } else {
             k
+        };
+
+        // YaRN attention temperature: fold mscale into Q (MLA decode is softmax attention).
+        let q = {
+            let ms = self.yarn_attn_mscale();
+            if ms != 1.0 {
+                q.scale(ms)
+            } else {
+                q
+            }
         };
 
         // GQA expand K/V heads to match Q heads.
@@ -765,6 +787,22 @@ impl MultiHeadAttention {
             k.rms_norm(&self.qk_norm_weight, 1e-6)
         } else {
             k
+        };
+
+        // YaRN attention temperature: fold mscale into Q so every softmax mixer (dense/flash/GQA/
+        // block-sparse/MLA-train) gets it uniformly. Non-softmax mixers must NOT be scaled.
+        let q = {
+            let ms = self.yarn_attn_mscale();
+            if ms != 1.0
+                && !matches!(
+                    self.attn_kind,
+                    AttnKind::Linear | AttnKind::Ssm | AttnKind::Rwkv
+                )
+            {
+                q.scale(ms)
+            } else {
+                q
+            }
         };
 
         // Handle KV cache (inference only — no tape needed)

@@ -545,3 +545,33 @@ Every piece of training data gets:
 - Full provenance chain: any token can be traced back to its source document
 
 This isn't just good practice — it's legal protection. We can prove exactly what the model was trained on.
+
+## Context-Length Extension (YaRN staged CPT)
+
+Long context is reached by *extending* a base-length model, never by training cold at the target
+length. (This is the disclosed SubQ / UltraLong / DeepSeek-V3 recipe; SSA itself is withheld.)
+
+**Staircase.** Each rung is a short continued-pretraining (CPT) pass, then the context bumps up:
+
+- `base -> 2x -> 4x -> 8x` (andreai today: 512 -> 1K -> 2K -> 4K), set per rung with
+  `--yarn-scale <factor>`. `with_yarn` applies per-frequency NTK-by-parts RoPE interpolation
+  (extrapolate high-freq dims, interpolate low-freq) **plus** the `0.1*ln(s)+1` attention-temperature
+  *mscale* folded into Q, so the softmax doesn't over-sharpen at the interpolated positions.
+- Keep **most** tokens at the *penultimate* length; only a slice trains at the new max. Long
+  sequences are expensive and the model mainly needs to learn the *new positions*, not relearn
+  language from scratch.
+
+**Capability preservation (their section 4.2 -- the honest caution).** Long-context CPT *displaces*
+reasoning: "retrieval improved while knowledge-intensive evaluations regressed." Cheap insurance,
+applied every rung:
+
+- **Replay.** Interleave short / general-domain data through every extension rung. Document packing
+  *without* cross-document attention (`datapipe::pack_sequences` + `seg_ids`, masked by
+  `Tensor::causal_doc_mask`) keeps the short replay examples cheap to batch alongside long ones.
+- **Sample-level loss.** Aggregate cross-entropy per *sample*, not per token
+  (`loss::cross_entropy_loss_per_sample`), so a 4K example doesn't drown the short replay examples
+  sharing its batch.
+- **Gate on both evals after each rung -- no regression ships:**
+  - `andreai eval --longctx` -- NIAH / multikey / vartrace / freqagg swept over length: did
+    retrieval *and* reasoning-at-length improve, and where does each `AttnKind` fall off?
+  - the 8-category tool-use eval -- did general capability hold (no reasoning displacement)?

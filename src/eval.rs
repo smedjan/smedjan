@@ -468,6 +468,8 @@ fn build_context(
 /// - `niah`     : one needle in filler at varied depth -- pure retrieval.
 /// - `multikey` : K keyed needles, retrieve one specific key -- retrieval under distractors.
 /// - `vartrace` : X1=v; X2=X1; X3=X2 chain, ask X3 -- multi-hop reasoning a pure retriever fails.
+/// - `freqagg`  : count K identical events scattered through filler -- aggregation over the whole
+///   context, which single-needle retrieval cannot answer.
 ///
 /// `lengths` are target token counts; `depths` are fractional insertion points in [0,1].
 pub fn longctx_eval_set(
@@ -561,6 +563,30 @@ pub fn longctx_eval_set(
                     ),
                     expected: value,
                     category: format!("vartrace_L{len}"),
+                });
+            }
+
+            // Frequency aggregation -- count repeated events across the whole context. A single-
+            // needle retriever fails; the model must aggregate over the full length.
+            {
+                let count = 2 + (idx % 4); // 2..=5 occurrences
+                idx += 1;
+                let span = depths_spread(count);
+                let needles: Vec<(f32, String)> = (0..count)
+                    .map(|k| {
+                        (
+                            (depth + span[k]).clamp(0.0, 1.0),
+                            "The signal beacon flashed once. ".to_string(),
+                        )
+                    })
+                    .collect();
+                let context = build_context(FILLER, &filler_tokens, len, &needles);
+                examples.push(EvalExample {
+                    prompt: format!(
+                        "{context}\n\nQuestion: how many times did the signal beacon flash? Answer with a single number.\nAnswer:"
+                    ),
+                    expected: count.to_string(),
+                    category: format!("freqagg_L{len}"),
                 });
             }
         }

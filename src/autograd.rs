@@ -633,7 +633,23 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
         Op::CrossEntropy => {
             if let Some(grad_logits) = &entry.cached {
                 let size: usize = entry.shapes[0].iter().product();
-                accumulate_grad(ctx, entry.inputs[0], grad_logits.clone(), size);
+                let upstream = MetalContext::read_buffer(out_grad, 1)[0];
+                let scale_cached_grad = |grad: &crate::gpu::Buf, size: usize| {
+                    if upstream == 1.0 {
+                        grad.clone()
+                    } else {
+                        let scaled = ctx.alloc_buffer(size * 4);
+                        compute::gpu_copy(ctx, grad, &scaled, size as u32);
+                        compute::gpu_scale(ctx, &scaled, size as u32, upstream);
+                        scaled
+                    }
+                };
+                accumulate_grad(
+                    ctx,
+                    entry.inputs[0],
+                    scale_cached_grad(grad_logits, size),
+                    size,
+                );
                 if entry.inputs.len() == 2 {
                     let weight_size: usize = entry.shapes[1].iter().product();
                     let grad_weight = entry
@@ -641,7 +657,12 @@ fn dispatch_backward_op(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &c
                         .get(2)
                         .expect("fused cross-entropy backward needs tied-weight gradient")
                         .clone();
-                    accumulate_grad(ctx, entry.inputs[1], grad_weight, weight_size);
+                    accumulate_grad(
+                        ctx,
+                        entry.inputs[1],
+                        scale_cached_grad(&grad_weight, weight_size),
+                        weight_size,
+                    );
                 }
             }
         }
