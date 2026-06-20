@@ -5171,11 +5171,49 @@ mod suite {
         grad_check(
             &ctx,
             &[(gc_vec(4 * 8, 0), vec![4, 8])],
-            &|t| crate::attention::fused_transpose_rope(&t[0], 1, 4, 2, 4, 0, 10000.0, 1.0, 0.0),
+            &|t| {
+                crate::attention::fused_transpose_rope(
+                    &t[0],
+                    1,
+                    4,
+                    2,
+                    4,
+                    0,
+                    crate::attention::RopeParams::plain(10000.0),
+                )
+            },
             GC_EPS,
             GC_ABS,
             GC_REL,
             "fused_transpose_rope",
+        );
+    }
+
+    #[test]
+    fn gradcheck_fused_transpose_rope_yarn() {
+        let ctx = test_ctx();
+        grad_check(
+            &ctx,
+            &[(gc_vec(4 * 16, 0), vec![4, 16])],
+            &|t| {
+                crate::attention::fused_transpose_rope(
+                    &t[0],
+                    1,
+                    4,
+                    2,
+                    8,
+                    0,
+                    crate::attention::RopeParams {
+                        theta: 10000.0,
+                        yarn_scale: 4.0,
+                        yarn_orig_max: 2048.0,
+                    },
+                )
+            },
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "fused_transpose_rope_yarn",
         );
     }
 
@@ -5692,15 +5730,60 @@ mod suite {
         let ctx = test_ctx();
         let (batch, seq, nh, hd) = (1usize, 8usize, 2usize, 16usize);
         let t = Tensor::randn(&ctx, vec![batch * seq, nh * hd], 1.0);
-        let off = crate::attention::fused_transpose_rope(&t, batch, seq, nh, hd, 0, 10000.0, 1.0, 2048.0).to_vec();
-        let off2 = crate::attention::fused_transpose_rope(&t, batch, seq, nh, hd, 0, 10000.0, 1.0, 2048.0).to_vec();
-        let on = crate::attention::fused_transpose_rope(&t, batch, seq, nh, hd, 0, 10000.0, 4.0, 2048.0).to_vec();
+        let off = crate::attention::fused_transpose_rope(
+            &t,
+            batch,
+            seq,
+            nh,
+            hd,
+            0,
+            crate::attention::RopeParams {
+                theta: 10000.0,
+                yarn_scale: 1.0,
+                yarn_orig_max: 2048.0,
+            },
+        )
+        .to_vec();
+        let off2 = crate::attention::fused_transpose_rope(
+            &t,
+            batch,
+            seq,
+            nh,
+            hd,
+            0,
+            crate::attention::RopeParams {
+                theta: 10000.0,
+                yarn_scale: 1.0,
+                yarn_orig_max: 2048.0,
+            },
+        )
+        .to_vec();
+        let on = crate::attention::fused_transpose_rope(
+            &t,
+            batch,
+            seq,
+            nh,
+            hd,
+            0,
+            crate::attention::RopeParams {
+                theta: 10000.0,
+                yarn_scale: 4.0,
+                yarn_orig_max: 2048.0,
+            },
+        )
+        .to_vec();
         for (a, b) in off.iter().zip(&off2) {
             assert_eq!(a.to_bits(), b.to_bits(), "yarn-off must be deterministic");
         }
-        assert!(off.iter().all(|x| x.is_finite()) && on.iter().all(|x| x.is_finite()), "rope output must be finite");
+        assert!(
+            off.iter().all(|x| x.is_finite()) && on.iter().all(|x| x.is_finite()),
+            "rope output must be finite"
+        );
         let diff: f32 = off.iter().zip(&on).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-3, "yarn_scale=4 must change the rope rotation, total diff={diff}");
+        assert!(
+            diff > 1e-3,
+            "yarn_scale=4 must change the rope rotation, total diff={diff}"
+        );
     }
 
     #[test]

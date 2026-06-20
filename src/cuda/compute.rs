@@ -362,7 +362,7 @@ pub struct TrRopeDims {
     pub head_dim: u32,
     pub offset: u32,
     pub theta: f32,
-    pub yarn_scale: f32,    // YaRN: ignored on CUDA (plain rope) until the kernel is ported.
+    pub yarn_scale: f32, // YaRN: ignored on CUDA (plain rope) until the kernel is ported.
     pub yarn_orig_max: f32,
 }
 

@@ -595,9 +595,7 @@ impl MultiHeadAttention {
             self.n_heads,
             hd,
             old_len as u32,
-            self.rope_theta,
-            1.0,
-            0.0,
+            RopeParams::plain(self.rope_theta),
         );
         let k = fused_transpose_rope(
             &k_all,
@@ -606,9 +604,7 @@ impl MultiHeadAttention {
             self.n_kv_heads,
             hd,
             0,
-            self.rope_theta,
-            1.0,
-            0.0,
+            RopeParams::plain(self.rope_theta),
         );
         let v = transpose_bsh_to_bhs(&v_all, batch, total, self.n_kv_heads, hd);
         let q = if self.d_model >= 512 {
@@ -738,9 +734,7 @@ impl MultiHeadAttention {
             self.n_heads,
             self.head_dim,
             offset,
-            self.rope_theta,
-            1.0,
-            0.0,
+            RopeParams::plain(self.rope_theta),
         );
         let k = fused_transpose_rope(
             &k,
@@ -749,9 +743,7 @@ impl MultiHeadAttention {
             self.n_kv_heads,
             self.head_dim,
             offset,
-            self.rope_theta,
-            1.0,
-            0.0,
+            RopeParams::plain(self.rope_theta),
         );
         // V only needs transpose (no RoPE)
         let v = transpose_bsh_to_bhs(&v, batch, seq_len, self.n_kv_heads, self.head_dim);
@@ -1052,6 +1044,23 @@ impl MultiHeadAttention {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RopeParams {
+    pub theta: f32,
+    pub yarn_scale: f32,
+    pub yarn_orig_max: f32,
+}
+
+impl RopeParams {
+    pub(crate) fn plain(theta: f32) -> Self {
+        Self {
+            theta,
+            yarn_scale: 1.0,
+            yarn_orig_max: 0.0,
+        }
+    }
+}
+
 /// Transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim]
 /// Records a tape entry so gradients flow through.
 /// Fused transpose [batch*seq, n_heads*head_dim] → [batch*n_heads, seq, head_dim] + RoPE.
@@ -1063,9 +1072,7 @@ pub(crate) fn fused_transpose_rope(
     n_heads: usize,
     head_dim: usize,
     offset: u32,
-    theta: f32,
-    yarn_scale: f32,
-    yarn_orig_max: f32,
+    rope: RopeParams,
 ) -> Tensor {
     let bh = batch * n_heads;
     let size = bh * seq_len * head_dim;
@@ -1081,9 +1088,9 @@ pub(crate) fn fused_transpose_rope(
             n_heads: n_heads as u32,
             head_dim: head_dim as u32,
             offset,
-            theta,
-            yarn_scale,
-            yarn_orig_max,
+            theta: rope.theta,
+            yarn_scale: rope.yarn_scale,
+            yarn_orig_max: rope.yarn_orig_max,
         },
     );
 
@@ -1104,7 +1111,9 @@ pub(crate) fn fused_transpose_rope(
                 n_heads,
                 head_dim,
                 offset,
-                theta,
+                theta: rope.theta,
+                yarn_scale: rope.yarn_scale,
+                yarn_orig_max: rope.yarn_orig_max,
             },
             inputs: vec![t.id],
             output: out_id,
