@@ -817,7 +817,15 @@ fn main() {
                 )),
             };
 
-            let model_config = if yarn_scale != 1.0 {
+            if !yarn_scale.is_finite() || yarn_scale < 1.0 {
+                exit_with_message("--yarn-scale must be finite and >= 1.0");
+            }
+            let scaled_max_seq = (model_config.max_seq_len as f64) * (yarn_scale as f64);
+            if !scaled_max_seq.is_finite() || scaled_max_seq > (usize::MAX as f64) {
+                exit_with_message("--yarn-scale makes max_seq_len overflow");
+            }
+
+            let model_config = if (yarn_scale - 1.0).abs() > f32::EPSILON {
                 model_config.with_yarn(yarn_scale)
             } else {
                 model_config

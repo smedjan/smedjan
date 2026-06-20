@@ -88,12 +88,12 @@ run_reject_train() {
     tail -60 "$log"
     exit 1
   fi
-  if ! grep -q "$pattern" "$log"; then
+  if ! grep -Fq -- "$pattern" "$log"; then
     echo "FAIL: reject:$name did not report '$pattern'"
     tail -60 "$log"
     exit 1
   fi
-  if grep -q "panicked at" "$log"; then
+  if grep -Fq "panicked at" "$log"; then
     echo "FAIL: reject:$name reported via panic"
     tail -60 "$log"
     exit 1
@@ -233,6 +233,7 @@ run_reject_logged train_unknown_size "Unknown model size" "$BIN" train --dataset
 run_reject_logged train_custom_missing_dim "--dim required for custom size" "$BIN" train --dataset "$DATASET" --tokenizer "$TOKENIZER" --size custom --layers 1 --heads 1 --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_custom_missing_dim"
 run_reject_train invalid_optimizer "unsupported optimizer" --optimizer definitely-not-real
 run_reject_train invalid_lr_schedule "unsupported lr_schedule" --lr-schedule lunar
+run_reject_train invalid_yarn_scale "--yarn-scale must be finite and >= 1.0" --yarn-scale 0
 run_train adamw
 run_resume_train adamw_resume
 run_train checkpoint_fused --gradient-checkpointing --fused-ce

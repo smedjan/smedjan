@@ -337,9 +337,18 @@ impl ModelConfig {
     /// than `with_rope_scaling`). `factor = desired_context / max_seq_len`.
     pub fn with_yarn(&self, factor: f32) -> Self {
         let mut config = self.clone();
+        assert!(
+            factor.is_finite() && factor >= 1.0,
+            "YaRN factor must be finite and >= 1.0"
+        );
+        let scaled_max_seq = (config.max_seq_len as f64) * (factor as f64);
+        assert!(
+            scaled_max_seq.is_finite() && scaled_max_seq <= (usize::MAX as f64),
+            "YaRN factor makes max_seq_len overflow"
+        );
         config.yarn_scale = factor;
         config.yarn_orig_max_seq = config.max_seq_len;
-        config.max_seq_len = (config.max_seq_len as f32 * factor) as usize;
+        config.max_seq_len = scaled_max_seq as usize;
         config
     }
 }
