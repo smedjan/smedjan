@@ -5578,6 +5578,27 @@ mod suite {
     /// here. The linear-attention math + gradients are proven on the isolated core by the
     /// linear_attention::* unit tests.)
     #[test]
+    fn hf_safetensors_roundtrips_an_andreai_model() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 32);
+        let model = Transformer::new(&ctx, cfg.clone());
+        let path = "/tmp/andreai_hf_roundtrip.safetensors";
+        crate::safetensors::export_hf_safetensors(path, &model).expect("export_hf");
+        let loaded = crate::safetensors::import_hf_safetensors(&ctx, path, cfg).expect("import_hf");
+        let a = model.parameters();
+        let b = loaded.parameters();
+        assert_eq!(a.len(), b.len(), "param count");
+        for (i, (pa, pb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(pa.shape, pb.shape, "tensor {i} shape");
+            let (va, vb) = (pa.to_vec(), pb.to_vec());
+            for (x, y) in va.iter().zip(vb.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "tensor {i} (HF transpose+permute not an exact inverse)");
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn linear_attn_model_trains_stably() {
         let ctx = test_ctx();
         let vocab = 48u32;
