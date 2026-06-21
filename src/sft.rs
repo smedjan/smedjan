@@ -91,14 +91,14 @@ fn parse_jsonl_line(line: &str, line_num: usize) -> std::io::Result<(String, Str
         invalid_data(format!(
             "SFT JSONL line {} missing \"prompt\" field: {}",
             line_num + 1,
-            &line[..line.len().min(80)]
+            crate::truncate_on_char_boundary(line, 80)
         ))
     });
     let response = extract_json_string(line, "response").ok_or_else(|| {
         invalid_data(format!(
             "SFT JSONL line {} missing \"response\" field: {}",
             line_num + 1,
-            &line[..line.len().min(80)]
+            crate::truncate_on_char_boundary(line, 80)
         ))
     });
     Ok((prompt?, response?))

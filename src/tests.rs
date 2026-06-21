@@ -937,6 +937,21 @@ mod suite {
     }
 
     #[test]
+    fn truncate_on_char_boundary_never_splits_utf8() {
+        // ASCII: exact byte cut.
+        assert_eq!(crate::truncate_on_char_boundary("hello world", 5), "hello");
+        // Shorter than the limit: returned unchanged.
+        assert_eq!(crate::truncate_on_char_boundary("hi", 80), "hi");
+        // Multibyte char straddling the cut: back off to the previous boundary, never panic.
+        let s = "aa\u{20ac}bb"; // € occupies bytes 2..5
+        assert_eq!(crate::truncate_on_char_boundary(s, 3), "aa");
+        assert_eq!(crate::truncate_on_char_boundary(s, 4), "aa");
+        assert_eq!(crate::truncate_on_char_boundary(s, 5), "aa\u{20ac}");
+        // First char multibyte, cut lands inside it: empty, not a panic.
+        assert_eq!(crate::truncate_on_char_boundary("\u{20ac}", 1), "");
+    }
+
+    #[test]
     fn quantized_loader_rejects_malformed_tensor_metadata() {
         use std::io::Write;
 

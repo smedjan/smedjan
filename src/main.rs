@@ -60,6 +60,20 @@ fn result_or_exit<T, E: Display>(result: Result<T, E>, context: impl Display) ->
     }
 }
 
+/// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8 character.
+/// For human-readable previews of untrusted text in error/log messages: a plain
+/// `&s[..max_bytes]` panics when the cut lands inside a multibyte char.
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn option_or_exit<T>(option: Option<T>, message: impl Display) -> T {
     match option {
         Some(value) => value,
@@ -702,6 +716,11 @@ fn main() {
             vocab_size,
             output,
         } => {
+            if vocab_size <= 259 {
+                exit_with_message(format!(
+                    "tokenizer --vocab-size must be greater than 259 (256 byte tokens + 3 special tokens), got {vocab_size}"
+                ));
+            }
             eprintln!("Training BPE tokenizer: vocab_size={}", vocab_size);
             let corpus = result_or_exit(std::fs::read(&input), "Failed to read input file");
             let tok = tokenizer::BpeTokenizer::train(&corpus, vocab_size);
@@ -1667,6 +1686,16 @@ fn main() {
             threshold,
             min_quality,
         } => {
+            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                exit_with_message(format!(
+                    "dedup --threshold must be finite and in [0, 1], got {threshold}"
+                ));
+            }
+            if !min_quality.is_finite() || !(0.0..=1.0).contains(&min_quality) {
+                exit_with_message(format!(
+                    "dedup --min-quality must be finite and in [0, 1], got {min_quality}"
+                ));
+            }
             let docs: Vec<String> =
                 result_or_exit(std::fs::read_to_string(&input), "Failed to read input")
                     .lines()

@@ -219,7 +219,7 @@ pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> 
                 Err(e) => {
                     eprintln!(
                         "  API error for '{}': {}",
-                        &prompt[..prompt.len().min(40)],
+                        crate::truncate_on_char_boundary(prompt, 40),
                         e
                     );
                 }
@@ -283,7 +283,7 @@ fn call_claude_api(
     }
     Err(format!(
         "Failed to parse Claude response: {}",
-        &response[..response.len().min(200)]
+        crate::truncate_on_char_boundary(&response, 200)
     ))
 }
 
@@ -332,7 +332,7 @@ fn call_openai_api(
     }
     Err(format!(
         "Failed to parse OpenAI response: {}",
-        &response[..response.len().min(200)]
+        crate::truncate_on_char_boundary(&response, 200)
     ))
 }
 
@@ -368,7 +368,7 @@ fn call_ollama_api(
     }
     Err(format!(
         "Failed to parse Ollama response: {}",
-        &response[..response.len().min(200)]
+        crate::truncate_on_char_boundary(&response, 200)
     ))
 }
 

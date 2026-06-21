@@ -1033,21 +1033,21 @@ pub fn prepare_dpo_dataset(
             invalid_data(format!(
                 "DPO JSONL line {} missing \"prompt\" field: {}",
                 line_num + 1,
-                &line[..line.len().min(80)]
+                crate::truncate_on_char_boundary(line, 80)
             ))
         });
         let chosen_str = extract_json_string(line, "chosen").ok_or_else(|| {
             invalid_data(format!(
                 "DPO JSONL line {} missing \"chosen\" field: {}",
                 line_num + 1,
-                &line[..line.len().min(80)]
+                crate::truncate_on_char_boundary(line, 80)
             ))
         });
         let rejected_str = extract_json_string(line, "rejected").ok_or_else(|| {
             invalid_data(format!(
                 "DPO JSONL line {} missing \"rejected\" field: {}",
                 line_num + 1,
-                &line[..line.len().min(80)]
+                crate::truncate_on_char_boundary(line, 80)
             ))
         });
         let prompt_str = prompt_str?;

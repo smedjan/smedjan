@@ -81,6 +81,12 @@ pub fn prepare_dataset(
 ) -> std::io::Result<usize> {
     let text = std::fs::read_to_string(input_path)?;
     let tokens = tokenizer.encode(&text);
+    if tokens.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("input '{input_path}' tokenized to 0 tokens; nothing to write"),
+        ));
+    }
 
     let byte_data: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
     let mut file = File::create(output_path)?;
@@ -248,6 +254,12 @@ pub fn verify_dataset_gpu(
 
     let dataset = Dataset::load(dataset_path)?;
     let count = sample_size.min(dataset.len());
+    if count == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "dataset is empty (0 tokens); cannot train on it",
+        ));
+    }
     let tokens = dataset.get_tokens(0, count);
 
     // Round-trip through Metal GPU buffer

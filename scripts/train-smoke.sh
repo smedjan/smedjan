@@ -341,11 +341,21 @@ run_reject_logged generate_bad_top_p "--top-p must be finite and in (0, 1]" "$BI
 run_reject_logged generate_bad_max_tokens "--max-tokens must be greater than 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --max-tokens 0
 run_reject_logged generate_bad_draft_tokens "--draft-tokens must be greater than 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --speculative --draft-tokens 0
 run_reject_logged tokenizer_missing_input "Failed to read input file" "$BIN" tokenizer --input "$OUT/missing-corpus.txt" --vocab-size 260 --output "$OUT/missing-tokenizer.bin"
+run_reject_logged tokenizer_small_vocab "greater than 259" "$BIN" tokenizer --input "$CORPUS" --vocab-size 100 --output "$OUT/small-vocab-tokenizer.bin"
 run_reject_logged prepare_missing_tokenizer "Failed to load tokenizer" "$BIN" prepare --input "$CORPUS" --tokenizer "$OUT/missing-tokenizer.bin" --output "$OUT/missing-dataset.bin"
 printf 'not-a-tokenizer' > "$BAD_TOKENIZER"
 run_reject_logged prepare_bad_tokenizer "not a valid tokenizer file" "$BIN" prepare --input "$CORPUS" --tokenizer "$BAD_TOKENIZER" --output "$OUT/bad-tokenizer-dataset.bin"
 run_logged tokenizer "$BIN" tokenizer --input "$CORPUS" --vocab-size 260 --output "$TOKENIZER"
 run_logged prepare "$BIN" prepare --input "$CORPUS" --tokenizer "$TOKENIZER" --output "$DATASET"
+: > "$OUT/empty-corpus.txt"
+run_reject_logged prepare_empty_corpus "tokenized to 0 tokens" "$BIN" prepare --input "$OUT/empty-corpus.txt" --tokenizer "$TOKENIZER" --output "$OUT/empty-prepared.bin"
+: > "$OUT/empty-dataset.bin"
+run_reject_logged train_empty_dataset "dataset is empty" "$BIN" train --dataset "$OUT/empty-dataset.bin" --tokenizer "$TOKENIZER" --size tiny --batch-size 2 --seq-len 16 --steps 1 --warmup 1 --lr 0.001 --checkpoint-dir "$OUT/train_empty_dataset"
+run_reject_logged dedup_bad_threshold "must be finite and in [0, 1]" "$BIN" dedup --input "$CORPUS" --output "$OUT/dedup-bad.txt" --threshold 1.5
+# Malformed DPO line >80 bytes with a multibyte char straddling byte 80 — the error
+# preview must not split the UTF-8 char (regression for the &line[..80] panic).
+printf '{"prompt":"%s\xe2\x82\xacxx","chosen":"ok"}\n' "$(printf 'a%.0s' $(seq 1 67))" > "$OUT/dpo-multibyte.jsonl"
+run_reject_logged dpo_prepare_multibyte 'missing "rejected" field' "$BIN" dpo-prepare --input "$OUT/dpo-multibyte.jsonl" --output "$OUT/dpo-mb.bin" --tokenizer "$TOKENIZER"
 printf '\001\002\003' > "$BAD_SHARD"
 
 run_reject_logged mix_zero_weight "data mixing weights must sum to > 0" "$BIN" mix --shards "$DATASET:0" --output "$OUT/mix-zero.bin"
