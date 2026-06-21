@@ -5091,6 +5091,13 @@ mod suite {
     #[test]
     fn batched_generation_is_self_consistent() {
         let ctx = test_ctx();
+        // Hermetic matmul path (mirrors grad_check): a prior test in the full suite can leave the
+        // simdgroup/bf16 flags or the fp16 cache in a state that drifts this forward and flips the
+        // near-tie argmax of this randomly-initialised model. Pin the precise deterministic path so
+        // the batched and single-sequence forwards run the identical kernel and agree exactly.
+        compute::set_simdgroup_matmul(false);
+        compute::set_bf16_matmul(false);
+        Tensor::clear_f16_cache();
         let vocab = 280u32;
         let v = vocab as usize;
         let model = Transformer::new(&ctx, ModelConfig::custom(vocab, 64, 4, 2, 2.67, 64));
@@ -5885,6 +5892,23 @@ mod suite {
             GC_ABS,
             GC_REL,
             "relu",
+        );
+    }
+
+    #[test]
+    fn gradcheck_embedding() {
+        let ctx = test_ctx();
+        // weight [vocab=5, embed_dim=3]; token 1 appears TWICE so the backward must scatter-ADD
+        // (accumulate) into row 1, and unreferenced rows (2, 4) must receive exactly zero grad.
+        let tokens = [1u32, 3, 1, 0];
+        grad_check(
+            &ctx,
+            &[(gc_vec(15, 0), vec![5, 3])],
+            &|t| crate::model::embed_lookup(&t[0], &tokens),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "embedding",
         );
     }
 

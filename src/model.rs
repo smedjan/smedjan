@@ -1295,55 +1295,10 @@ impl Transformer {
         seg_ids: Option<&crate::gpu::Buf>,
     ) -> Tensor {
         let d = self.config.d_model;
-        let v = self.config.vocab_size as usize;
         let n_tokens = batch * seq_len;
 
-        // Embedding lookup (optionally factored)
-        let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_dim = if self.embed_rank > 0 {
-            self.embed_rank
-        } else {
-            d
-        };
-        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
-        compute::gpu_embedding_lookup(
-            &self.ctx,
-            &tokens_buf,
-            &self.embedding.buffer,
-            &embed_out_buf,
-            n_tokens as u32,
-            embed_dim as u32,
-        );
-
-        // Record embedding on tape
-        let tokens_id = autograd::next_id();
-        let embed_out_id = autograd::next_id();
-        if autograd::is_recording() {
-            autograd::record(TapeEntry {
-                op: Op::Embedding,
-                inputs: vec![tokens_id, self.embedding.id],
-                output: embed_out_id,
-                input_buffers: vec![
-                    crate::gpu::u32_to_buf(tokens_buf),
-                    self.embedding.buffer.clone(),
-                ],
-                output_buffer: embed_out_buf.clone(),
-                shapes: vec![
-                    vec![n_tokens],
-                    vec![v, embed_dim],
-                    vec![n_tokens, embed_dim],
-                ],
-                cached: None,
-            });
-        }
-
-        let embed_tensor = Tensor {
-            id: embed_out_id,
-            buffer: embed_out_buf,
-            shape: vec![n_tokens, embed_dim],
-            requires_grad: true,
-            ctx: Arc::clone(&self.ctx),
-        };
+        // Embedding lookup (optionally factored) — see `embed_lookup`.
+        let embed_tensor = embed_lookup(&self.embedding, tokens);
 
         // Project factored embedding to full d_model
         let h_flat = if self.embed_rank > 0 {
@@ -1428,50 +1383,8 @@ impl Transformer {
         let d = self.config.d_model;
         let n_tokens = batch * seq_len;
 
-        let tokens_buf = self.ctx.buffer_from_u32_slice(tokens);
-        let embed_dim = if self.embed_rank > 0 {
-            self.embed_rank
-        } else {
-            d
-        };
-        let embed_out_buf = self.ctx.alloc_buffer(n_tokens * embed_dim * 4);
-        compute::gpu_embedding_lookup(
-            &self.ctx,
-            &tokens_buf,
-            &self.embedding.buffer,
-            &embed_out_buf,
-            n_tokens as u32,
-            embed_dim as u32,
-        );
-
-        let tokens_id = autograd::next_id();
-        let embed_out_id = autograd::next_id();
-        if autograd::is_recording() {
-            autograd::record(TapeEntry {
-                op: Op::Embedding,
-                inputs: vec![tokens_id, self.embedding.id],
-                output: embed_out_id,
-                input_buffers: vec![
-                    crate::gpu::u32_to_buf(tokens_buf),
-                    self.embedding.buffer.clone(),
-                ],
-                output_buffer: embed_out_buf.clone(),
-                shapes: vec![
-                    vec![n_tokens],
-                    vec![self.config.vocab_size as usize, embed_dim],
-                    vec![n_tokens, embed_dim],
-                ],
-                cached: None,
-            });
-        }
-
-        let embed_tensor = Tensor {
-            id: embed_out_id,
-            buffer: embed_out_buf,
-            shape: vec![n_tokens, embed_dim],
-            requires_grad: true,
-            ctx: Arc::clone(&self.ctx),
-        };
+        // Embedding lookup (optionally factored) — see `embed_lookup`.
+        let embed_tensor = embed_lookup(&self.embedding, tokens);
 
         let h_flat = if self.embed_rank > 0 {
             embed_tensor.matmul(&self.embed_proj)
@@ -1697,6 +1610,52 @@ impl Transformer {
         (0..self.config.n_layers)
             .map(|_| KvCache::with_capacity(&self.ctx, batch_heads, max_seq, head_dim))
             .collect()
+    }
+}
+
+/// Embedding lookup: gather rows of `weight` (`[vocab, embed_dim]`) at `tokens`, producing
+/// `[n_tokens, embed_dim]`, and record the scatter-add backward on the tape. Shared by the
+/// prefill (`forward`) and `forward_hidden` paths so the single `Op::Embedding` record lives in
+/// one place — and is finite-difference grad-checkable in isolation (scatter-add into the
+/// embedding weight is the same class that hid the block-sparse `d_src` pre-zero bug).
+pub(crate) fn embed_lookup(weight: &Tensor, tokens: &[u32]) -> Tensor {
+    let ctx = &weight.ctx;
+    let n_tokens = tokens.len();
+    let vocab = weight.shape[0];
+    let embed_dim = weight.shape[1];
+    let tokens_buf = ctx.buffer_from_u32_slice(tokens);
+    let embed_out_buf = ctx.alloc_buffer(n_tokens * embed_dim * 4);
+    compute::gpu_embedding_lookup(
+        ctx,
+        &tokens_buf,
+        &weight.buffer,
+        &embed_out_buf,
+        n_tokens as u32,
+        embed_dim as u32,
+    );
+    let tokens_id = autograd::next_id();
+    let embed_out_id = autograd::next_id();
+    if autograd::is_recording() {
+        autograd::record(TapeEntry {
+            op: Op::Embedding,
+            inputs: vec![tokens_id, weight.id],
+            output: embed_out_id,
+            input_buffers: vec![crate::gpu::u32_to_buf(tokens_buf), weight.buffer.clone()],
+            output_buffer: embed_out_buf.clone(),
+            shapes: vec![
+                vec![n_tokens],
+                vec![vocab, embed_dim],
+                vec![n_tokens, embed_dim],
+            ],
+            cached: None,
+        });
+    }
+    Tensor {
+        id: embed_out_id,
+        buffer: embed_out_buf,
+        shape: vec![n_tokens, embed_dim],
+        requires_grad: true,
+        ctx: Arc::clone(ctx),
     }
 }
 
