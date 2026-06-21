@@ -379,6 +379,9 @@ run_reject_logged grow_indivisible "must be divisible by --heads" "$BIN" grow --
 run_reject_logged grow_shrink_dim "must be >= source d_model" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 64 --heads 4 --layers 4
 run_reject_logged grow_fewer_layers "must be >= source layers" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 256 --heads 4 --layers 2
 run_grow_smokes "$OUT/adamw/final.bin"
+run_reject_logged bench_zero_seq "greater than 0" "$BIN" bench --size tiny --seq-len 0 --batch-size 2 --warmup 0 --iters 1
+run_reject_logged bench_zero_batch "greater than 0" "$BIN" bench --size tiny --seq-len 16 --batch-size 0 --warmup 0 --iters 1
+run_reject_logged bench_zero_iters "greater than 0" "$BIN" bench --size tiny --seq-len 16 --batch-size 2 --warmup 0 --iters 0
 run_sft sft_tiny "$OUT/adamw/final.bin"
 run_logged dpo_prepare "$BIN" dpo-prepare --input "$DPO_JSONL" --output "$DPO_BIN" --tokenizer "$TOKENIZER"
 run_dpo dpo_tiny "$OUT/adamw/final.bin"

@@ -1712,6 +1712,12 @@ fn main() {
         } => {
             use std::time::Instant;
 
+            if batch_size == 0 || seq_len == 0 || iters == 0 {
+                exit_with_message(
+                    "bench requires --batch-size, --seq-len, and --iters to all be greater than 0",
+                );
+            }
+
             let vocab: u32 = 8192;
             let mut config = match size.as_str() {
                 "tiny" => model::ModelConfig::tiny(vocab),
