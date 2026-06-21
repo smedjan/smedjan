@@ -5636,6 +5636,40 @@ mod suite {
     }
 
     #[test]
+    fn speculative_greedy_matches_plain_greedy() {
+        // Speculative decoding must produce the EXACT same output as plain greedy from the main
+        // model (the draft only proposes; the main verifies). Use the same model as draft+main and
+        // a pure-greedy config (temp 0, every sampler filter OFF) — the no-penalty regime where the
+        // accept criterion (raw argmax) and the emitted token (select_token) coincide.
+        let ctx = test_ctx();
+        compute::set_simdgroup_matmul(false);
+        compute::set_bf16_matmul(false);
+        Tensor::clear_f16_cache();
+        let model = Transformer::new(&ctx, ModelConfig::custom(96, 64, 4, 2, 2.67, 64));
+        let tok = BpeTokenizer::train(
+            b"the quick brown fox jumps over the lazy dog near a river ",
+            320,
+        );
+        let cfg = crate::generate::SamplingConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_tokens: 16,
+            repetition_penalty: 1.0,
+            min_p: 0.0,
+            typical_p: 1.0,
+            no_repeat_ngram_size: 0,
+        };
+        let plain = crate::generate::generate(&ctx, &model, &tok, "the quick", &cfg);
+        let spec =
+            crate::generate::generate_speculative(&ctx, &model, &model, &tok, "the quick", &cfg, 4);
+        assert_eq!(
+            plain, spec,
+            "speculative greedy must equal plain greedy in the no-penalty regime"
+        );
+    }
+
+    #[test]
     fn gradcheck_scaled_causal_softmax() {
         let ctx = test_ctx();
         // Fused scale + causal mask + softmax over [bh, seq, seq]. Masked (upper-tri) score grads must

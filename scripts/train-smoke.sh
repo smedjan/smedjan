@@ -404,6 +404,11 @@ run_train ssm --ssm
 run_train block_sparse --block-sparse-top-k 1 --block-size 4
 run_train linear_period --linear-attn-period 2
 run_train yarn --yarn-scale 2.0
+run_train shared_layers --shared-layers
+run_train mtp --n-predict 2
+run_train stochastic_depth --stochastic-depth 0.15
+run_train lowrank_ffn --lowrank 8
+run_train sliding_window --sliding-window 8
 run_train moe_preset --n-experts 2 --top-k-experts 1
 if ! grep -Fq "n_experts=2, top_k_experts=1" "$LOG_DIR/moe_preset.log"; then
   echo "FAIL: train:moe_preset did not build the requested MoE preset"

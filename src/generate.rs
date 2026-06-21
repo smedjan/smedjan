@@ -874,7 +874,9 @@ fn generate_speculative_inner<F>(
 
             *total_accepted += n_accepted;
 
-            if n_accepted == n_drafted {
+            // The accepted drafts can already fill the token budget (n_drafted == remaining); the
+            // bonus would then overshoot config.max_tokens (plain greedy stops at exactly that).
+            if n_accepted == n_drafted && generated.len() < config.max_tokens {
                 // All draft tokens were accepted — we get a bonus token from the
                 // main model's prediction at position n_drafted (the last logit row)
                 let bonus_offset = n_drafted * main_vocab;
