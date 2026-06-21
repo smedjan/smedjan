@@ -5814,6 +5814,81 @@ mod suite {
     }
 
     #[test]
+    fn gradcheck_broadcast_rows() {
+        let ctx = test_ctx();
+        // 1-D [4] broadcast to [3, 4]; backward is the column-sum reduce.
+        grad_check(
+            &ctx,
+            &[(gc_vec(4, 0), vec![4])],
+            &|t| t[0].broadcast_rows(3),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "broadcast_rows",
+        );
+    }
+
+    #[test]
+    fn gradcheck_concat_parts() {
+        let ctx = test_ctx();
+        // Concatenate two [4] tensors into [8]; backward splits the grad back into the two parts.
+        grad_check(
+            &ctx,
+            &[(gc_vec(4, 0), vec![4]), (gc_vec(4, 9), vec![4])],
+            &|t| Tensor::concat_flat(&[&t[0], &t[1]], vec![8]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "concat_parts",
+        );
+    }
+
+    #[test]
+    fn gradcheck_slice_flat() {
+        let ctx = test_ctx();
+        // Slice [2..6) out of [8]; backward scatters grad into those positions and zeros the rest.
+        grad_check(
+            &ctx,
+            &[(gc_vec(8, 3), vec![8])],
+            &|t| t[0].slice_flat(2, 4, vec![4]),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "slice_flat",
+        );
+    }
+
+    #[test]
+    fn gradcheck_exp() {
+        let ctx = test_ctx();
+        grad_check(
+            &ctx,
+            &[(gc_vec(6, 0), vec![2, 3])],
+            &|t| t[0].exp(),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "exp",
+        );
+    }
+
+    #[test]
+    fn gradcheck_relu() {
+        let ctx = test_ctx();
+        // Inputs kept away from 0 so central differences never straddle the kink.
+        let x = vec![1.5, -1.5, 2.0, -0.8, 0.9, -2.1];
+        grad_check(
+            &ctx,
+            &[(x, vec![2, 3])],
+            &|t| t[0].relu(),
+            GC_EPS,
+            GC_ABS,
+            GC_REL,
+            "relu",
+        );
+    }
+
+    #[test]
     fn gradcheck_silu() {
         let ctx = test_ctx();
         grad_check(
