@@ -2127,14 +2127,15 @@ extern "C" __global__ void compute_inv_rms(const float* input, float* inv_rms, u
     if (tid == 0) inv_rms[row] = rsqrtf(sh[0] / (float)cols + eps);
 }
 
-// ===== Sliding-window causal mask: -inf for future (k>q+offset) OR too-far-back (k<q+offset-window) =====
+// ===== Sliding-window causal mask: a query attends to exactly `window` keys [q_pos-window+1, q_pos];
+// -inf for future (k>q_pos) OR too-far-back (k+window<=q_pos). Additive form is underflow-safe. =====
 extern "C" __global__ void causal_mask_window(float* scores, unsigned int batch_heads, unsigned int seq_q,
     unsigned int seq_k, unsigned int offset, unsigned int window) {
     unsigned int bh = blockIdx.x, q = blockIdx.y, k = blockIdx.z * blockDim.x + threadIdx.x;
     if (bh >= batch_heads || q >= seq_q || k >= seq_k) return;
     unsigned int q_pos = q + offset;
     bool future = k > q_pos;
-    bool too_far = (window > 0) && (q_pos >= window) && (k < q_pos - window);
+    bool too_far = (window > 0) && (k + window <= q_pos);
     if (future || too_far) scores[bh * seq_q * seq_k + q * seq_k + k] = __int_as_float(0xff800000);
 }
 "#;

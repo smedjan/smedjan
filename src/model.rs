@@ -26,7 +26,7 @@ pub struct ModelConfig {
     pub shared_layers: bool, // ALBERT: share weights across all layers (1 unique layer, N iterations)
     pub n_predict: usize, // Multi-token prediction: 0=standard, N=predict next N+1 tokens (Meta 2024)
     pub stochastic_depth: f32, // Layer drop rate: 0.0=off, 0.1=10% max drop rate for deepest layer
-    pub sliding_window: usize, // Sliding window attention: 0=full causal, >0=window size. Saves O(n²)→O(n*w) memory.
+    pub sliding_window: usize, // Sliding-window attention: 0=full causal; w>0 = each query attends to exactly w keys [q-w+1, q] (Mistral semantics). Saves O(n²)→O(n*w) memory.
     pub fp16_activations: bool, // Store inter-layer activations in FP16 during forward. Halves activation memory.
     pub linear_attn: bool, // Replace softmax attention with O(N) linear (kernel) attention in EVERY block.
     pub linear_attn_period: usize, // Hybrid topology: if >0, every Nth layer (idx+1 % N == 0) is linear, the

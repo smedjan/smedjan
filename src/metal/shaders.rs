@@ -1967,7 +1967,9 @@ kernel void causal_mask(
 
     uint q_pos = q + params.offset;
     bool future = k > q_pos;
-    bool too_far = (params.window > 0) && (q_pos >= params.window) && (k < q_pos - params.window);
+    // Sliding window: a query attends to exactly `window` keys [q_pos-window+1, q_pos]; older keys
+    // (k + window <= q_pos) are masked. The additive form is underflow-safe (no q_pos - window).
+    bool too_far = (params.window > 0) && (k + params.window <= q_pos);
     if (future || too_far) {
         scores[bh * params.seq_q * params.seq_k + q * params.seq_k + k] = -INFINITY;
     }

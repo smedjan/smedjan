@@ -5604,6 +5604,38 @@ mod suite {
     // class that hid the Flash partial-block bug). All are on the hot attention/training path.
 
     #[test]
+    fn causal_mask_window_keeps_exactly_window_keys() {
+        let ctx = test_ctx();
+        let seq = 6usize;
+        let window = 2u32;
+        let offset = 0u32;
+        // Zero scores: kept positions stay 0.0, masked positions become -inf.
+        let scores = Tensor::from_slice(&ctx, &vec![0.0f32; seq * seq], vec![1, seq, seq]);
+        let masked = scores.causal_mask_window(offset, window).to_vec();
+        for q in 0..seq {
+            for k in 0..seq {
+                let q_pos = q as u32 + offset;
+                // Standard causal sliding window (Mistral): query attends to exactly `window` keys
+                // [q-window+1, q]; everything future or older than that is masked.
+                let future = k as u32 > q_pos;
+                let too_old = (k as u32) + window <= q_pos;
+                let v = masked[q * seq + k];
+                if future || too_old {
+                    assert!(
+                        v == f32::NEG_INFINITY,
+                        "expected mask at q={q} k={k} (window={window}), got {v}"
+                    );
+                } else {
+                    assert!(
+                        v == 0.0,
+                        "expected keep at q={q} k={k} (window={window}), got {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gradcheck_scaled_causal_softmax() {
         let ctx = test_ctx();
         // Fused scale + causal mask + softmax over [bh, seq, seq]. Masked (upper-tri) score grads must
