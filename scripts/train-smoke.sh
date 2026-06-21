@@ -243,6 +243,20 @@ run_conversion_smokes() {
   fi
 }
 
+run_grow_smokes() {
+  # Source is the tiny-size checkpoint (d_model=128, heads=4, layers=4).
+  local ckpt=$1
+  local grown="$OUT/grown.bin"
+  echo "---- grow:grow_tiny ----"
+  run_logged grow_tiny "$BIN" grow --checkpoint "$ckpt" --output "$grown" --dim 256 --heads 4 --layers 6
+  if [[ ! -s "$grown" ]]; then
+    echo "FAIL: grow:grow_tiny did not write $grown"
+    exit 1
+  fi
+  echo "---- grow:info_grown ----"
+  run_logged grow_info "$BIN" info --checkpoint "$grown"
+}
+
 run_resume_train() {
   local name=$1; shift
   local base="$OUT/${name}_base"
@@ -360,6 +374,11 @@ run_reject_train invalid_moe_top_k "--top-k-experts must be in 1..=--n-experts" 
 run_train adamw
 run_reject_logged export_gguf_invalid_quant "unsupported GGUF quantization" "$BIN" export-gguf --checkpoint "$OUT/adamw/final.bin" --output "$OUT/invalid.gguf" --quant q5
 run_conversion_smokes "$OUT/adamw/final.bin"
+run_reject_logged grow_zero_heads "greater than 0" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 256 --heads 0 --layers 4
+run_reject_logged grow_indivisible "must be divisible by --heads" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 130 --heads 4 --layers 4
+run_reject_logged grow_shrink_dim "must be >= source d_model" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 64 --heads 4 --layers 4
+run_reject_logged grow_fewer_layers "must be >= source layers" "$BIN" grow --checkpoint "$OUT/adamw/final.bin" --output "$OUT/grow-bad.bin" --dim 256 --heads 4 --layers 2
+run_grow_smokes "$OUT/adamw/final.bin"
 run_sft sft_tiny "$OUT/adamw/final.bin"
 run_logged dpo_prepare "$BIN" dpo-prepare --input "$DPO_JSONL" --output "$DPO_BIN" --tokenizer "$TOKENIZER"
 run_dpo dpo_tiny "$OUT/adamw/final.bin"

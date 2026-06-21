@@ -1714,20 +1714,28 @@ pub fn grow_model(
     ctx: &Arc<MetalContext>,
     small: &Transformer,
     large_config: ModelConfig,
-) -> Transformer {
+) -> Result<Transformer, String> {
     let sd = small.config.d_model;
     let ld = large_config.d_model;
     let v = large_config.vocab_size as usize;
 
-    assert!(sd <= ld, "small d_model ({}) must be <= large ({})", sd, ld);
-    assert!(
-        small.config.n_layers <= large_config.n_layers,
-        "small layers must be <= large"
-    );
-    assert_eq!(
-        small.config.vocab_size, large_config.vocab_size,
-        "vocab must match"
-    );
+    if sd > ld {
+        return Err(format!(
+            "target d_model ({ld}) must be >= source d_model ({sd}); grow cannot shrink a model"
+        ));
+    }
+    if small.config.n_layers > large_config.n_layers {
+        return Err(format!(
+            "target layers ({}) must be >= source layers ({}); grow cannot remove layers",
+            large_config.n_layers, small.config.n_layers
+        ));
+    }
+    if small.config.vocab_size != large_config.vocab_size {
+        return Err(format!(
+            "vocab_size must match: source {} vs target {}",
+            small.config.vocab_size, large_config.vocab_size
+        ));
+    }
 
     eprintln!(
         "Growing model: d={} → d={}, layers={} → layers={}",
@@ -2024,7 +2032,7 @@ pub fn grow_model(
         large_config.param_count() as f32 / 1e6
     );
 
-    large
+    Ok(large)
 }
 
 /// Copy a weight matrix block: small [sr, sc] → top-left of large [lr, lc]

@@ -2053,6 +2053,16 @@ fn main() {
             layers,
             heads,
         } => {
+            if dim == 0 || heads == 0 || layers == 0 {
+                exit_with_message(
+                    "grow requires --dim, --heads, and --layers to all be greater than 0",
+                );
+            }
+            if dim % heads != 0 {
+                exit_with_message(format!(
+                    "grow --dim ({dim}) must be divisible by --heads ({heads})"
+                ));
+            }
             let (small_model, step) = result_or_exit(
                 checkpoint::load_checkpoint(&ctx, &checkpoint),
                 "Failed to load small checkpoint",
@@ -2065,7 +2075,10 @@ fn main() {
                 small_model.config.ffn_multiplier,
                 small_model.config.max_seq_len,
             );
-            let grown = model::grow_model(&ctx, &small_model, large_config);
+            let grown = result_or_exit(
+                model::grow_model(&ctx, &small_model, large_config),
+                "Failed to grow model",
+            );
             result_or_exit(
                 checkpoint::save_checkpoint(&output, &grown, step),
                 "Failed to save grown checkpoint",

@@ -892,6 +892,51 @@ mod suite {
     }
 
     #[test]
+    fn grow_model_rejects_invalid_target_geometry() {
+        let ctx = test_ctx();
+        // Source geometry: d_model=128, heads=4, layers=4.
+        let small = Transformer::new(&ctx, ModelConfig::custom(32, 128, 4, 4, 2.0, 16));
+
+        // Shrinking d_model must error, not panic. (`.err()` drops the Ok Transformer,
+        // which is not Debug, so `expect_err` cannot be used here.)
+        let shrink = ModelConfig::custom(32, 64, 4, 4, 2.0, 16);
+        let err = crate::model::grow_model(&ctx, &small, shrink)
+            .err()
+            .expect("shrinking d_model should fail");
+        assert!(
+            err.contains("must be >= source d_model"),
+            "unexpected error: {err}"
+        );
+
+        // Removing layers must error, not panic.
+        let fewer = ModelConfig::custom(32, 256, 4, 2, 2.0, 16);
+        let err = crate::model::grow_model(&ctx, &small, fewer)
+            .err()
+            .expect("removing layers should fail");
+        assert!(
+            err.contains("must be >= source layers"),
+            "unexpected error: {err}"
+        );
+
+        // Mismatched vocab must error, not panic.
+        let revocab = ModelConfig::custom(64, 256, 4, 6, 2.0, 16);
+        let err = crate::model::grow_model(&ctx, &small, revocab)
+            .err()
+            .expect("mismatched vocab should fail");
+        assert!(
+            err.contains("vocab_size must match"),
+            "unexpected error: {err}"
+        );
+
+        // A valid grow (bigger d_model, more layers) succeeds.
+        let bigger = ModelConfig::custom(32, 256, 4, 6, 2.0, 16);
+        assert!(
+            crate::model::grow_model(&ctx, &small, bigger).is_ok(),
+            "valid grow should succeed"
+        );
+    }
+
+    #[test]
     fn quantized_loader_rejects_malformed_tensor_metadata() {
         use std::io::Write;
 
