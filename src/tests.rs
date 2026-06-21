@@ -937,6 +937,28 @@ mod suite {
     }
 
     #[test]
+    fn load_checkpoint_rejects_corrupt_geometry() {
+        use std::io::{Seek, SeekFrom, Write};
+        let ctx = test_ctx();
+        let model = Transformer::new(&ctx, ModelConfig::custom(32, 64, 4, 2, 2.0, 16));
+        let path = std::env::temp_dir().join("andreai_corrupt_geom.bin");
+        crate::checkpoint::save_checkpoint(path.to_str().unwrap(), &model, 0).unwrap();
+        // n_kv_heads lives at byte offset 44: MAGIC(4) + VERSION(4) + step(4) + 8 config fields × 4.
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(44)).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        drop(f);
+        let err = crate::checkpoint::load_checkpoint(&ctx, path.to_str().unwrap())
+            .err()
+            .expect("checkpoint with n_kv_heads=0 must be rejected, not panic");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("n_kv_heads"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn truncate_on_char_boundary_never_splits_utf8() {
         // ASCII: exact byte cut.
         assert_eq!(crate::truncate_on_char_boundary("hello world", 5), "hello");

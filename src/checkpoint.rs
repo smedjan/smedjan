@@ -747,6 +747,40 @@ fn read_config(file: &mut std::fs::File, version: u32) -> std::io::Result<ModelC
         (1.0, 0)
     };
 
+    // Reject geometrically-impossible configs from a corrupt or crafted checkpoint before any
+    // consumer (attention head_dim, `info`'s n_heads/n_kv_heads, GPU buffer shapes) divides by
+    // these and panics.
+    if vocab_size == 0 || d_model == 0 || n_heads == 0 || n_kv_heads == 0 || n_layers == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "checkpoint config has a zero dimension (vocab={vocab_size}, d_model={d_model}, n_heads={n_heads}, n_kv_heads={n_kv_heads}, n_layers={n_layers})"
+            ),
+        ));
+    }
+    if !d_model.is_multiple_of(n_heads) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("checkpoint d_model ({d_model}) is not divisible by n_heads ({n_heads})"),
+        ));
+    }
+    if n_kv_heads > n_heads || !n_heads.is_multiple_of(n_kv_heads) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "checkpoint n_heads ({n_heads}) must be a positive multiple of n_kv_heads ({n_kv_heads})"
+            ),
+        ));
+    }
+    if n_experts == 0 || top_k_experts == 0 || top_k_experts > n_experts {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "checkpoint MoE config invalid (n_experts={n_experts}, top_k_experts={top_k_experts})"
+            ),
+        ));
+    }
+
     Ok(ModelConfig {
         vocab_size,
         d_model,
