@@ -17,18 +17,18 @@ pub struct ModelInfo {
     pub step: u32,
 }
 
-/// High-level API for using AndreAI as a library.
+/// High-level API for using Smedjan as a library.
 ///
 /// Encapsulates model loading, tokenization, and generation into a single
 /// struct suitable for embedding into other Rust projects.
-pub struct AndreAI {
+pub struct Smedjan {
     ctx: Arc<MetalContext>,
     model: Transformer,
     tokenizer: BpeTokenizer,
     step: u32,
 }
 
-impl AndreAI {
+impl Smedjan {
     /// Load a model from checkpoint and tokenizer files.
     ///
     /// The checkpoint can be either a standard `.bin` checkpoint or a

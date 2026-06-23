@@ -1,14 +1,14 @@
 #!/bin/bash
-# AndreAI Training Monitor
+# Smedjan Training Monitor
 # Checks training progress and alerts on completion/failure
 # Usage: ./scripts/monitor.sh [interval_seconds]
 # Default: checks every 60 seconds
 
 INTERVAL=${1:-60}
-PROJ="/Users/Andrei/projects/andreai"
+PROJ="${SMEDJAN_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 CKPT_DIR="$PROJ/data/checkpoints"
 
-echo "=== AndreAI Training Monitor ==="
+echo "=== Smedjan Training Monitor ==="
 echo "Checking every ${INTERVAL}s. Ctrl+C to stop."
 echo ""
 
@@ -16,7 +16,7 @@ last_ckpt_count=0
 
 while true; do
     # Check if training process is running
-    pid=$(pgrep -f "andreai train" 2>/dev/null | head -1)
+    pid=$(pgrep -f "smedjan train" 2>/dev/null | head -1)
 
     if [ -z "$pid" ]; then
         echo "[$(date +%H:%M:%S)] Training NOT running."
@@ -29,13 +29,13 @@ while true; do
 
             # Run quick eval
             echo "[$(date +%H:%M:%S)] Running eval..."
-            "$PROJ/target/release/andreai" eval \
+            "$PROJ/target/release/smedjan" eval \
                 --checkpoint "$CKPT_DIR/final.bin" \
                 --tokenizer "$PROJ/data/tokenizer_v2.bin" 2>/dev/null | grep -E "Exact|Partial|Total"
 
             echo ""
             echo "Next steps:"
-            echo "  1. Run SFT: andreai sft --checkpoint data/checkpoints/final.bin --tokenizer data/tokenizer_v2.bin --data data/sft_combined.jsonl --steps 5000 --lr 2e-5"
+            echo "  1. Run SFT: smedjan sft --checkpoint data/checkpoints/final.bin --tokenizer data/tokenizer_v2.bin --data data/sft_combined.jsonl --steps 5000 --lr 2e-5"
             echo "  2. Or run full pipeline: ./scripts/train_pipeline.sh"
             break
         else

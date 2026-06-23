@@ -1,4 +1,4 @@
-//! CUDA GPU backend for AndreAI.
+//! CUDA GPU backend for Smedjan.
 //!
 //! Provides the same public API as the Metal backend:
 //! - `CudaContext` (aliased as `MetalContext` for compatibility)
@@ -96,7 +96,7 @@ impl MetalContext {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(kernels::ALL_KERNELS, opts)
             .expect("Failed to compile CUDA kernels");
         device
-            .load_ptx(ptx, "andreai", &kernels::KERNEL_NAMES)
+            .load_ptx(ptx, "smedjan", &kernels::KERNEL_NAMES)
             .expect("Failed to load CUDA kernels");
 
         Arc::new(Self { device })

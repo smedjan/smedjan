@@ -460,7 +460,7 @@ fn apply_loss_mask(
 /// Run supervised fine-tuning on a pre-trained checkpoint.
 pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result<()> {
     config.validate()?;
-    eprintln!("=== AndreAI Supervised Fine-Tuning ===");
+    eprintln!("=== Smedjan Supervised Fine-Tuning ===");
 
     // Load pre-trained checkpoint
     let (model, pretrain_step) = checkpoint::load_checkpoint(ctx, &config.checkpoint_path)?;
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn sft_dataset_reports_malformed_jsonl_without_panic() {
-        let dir = std::env::temp_dir().join("andreai_sft_bad_jsonl_test");
+        let dir = std::env::temp_dir().join("smedjan_sft_bad_jsonl_test");
         std::fs::create_dir_all(&dir).unwrap();
         let jsonl_path = dir.join("bad.jsonl");
         std::fs::write(&jsonl_path, r#"{"prompt":"hello"}"#).unwrap();

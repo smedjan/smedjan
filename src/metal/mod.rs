@@ -75,7 +75,7 @@ thread_local! {
     /// the fix for silent gradient corruption that surfaced as loss divergence at seq_len ≥ 256
     /// (the pooled attention-backward buffers aliased a still-pending dispatch). Toggleable so the
     /// `bufsan` differential test can compare against the old unsafe behaviour; production keeps it
-    /// on. `ANDREAI_NO_POOL` (full bypass) remains as the even-stronger diagnostic.
+    /// on. `SMEDJAN_NO_POOL` (full bypass) remains as the even-stronger diagnostic.
     static QUARANTINE: Cell<bool> = const { Cell::new(true) };
 }
 
@@ -420,7 +420,7 @@ impl MetalContext {
         })
     }
 
-    /// Diagnostic: when `ANDREAI_NO_POOL` is set in the environment, every `alloc_buffer`
+    /// Diagnostic: when `SMEDJAN_NO_POOL` is set in the environment, every `alloc_buffer`
     /// bypasses the size-keyed reuse pool and returns a brand-new buffer. This removes
     /// intra-batch buffer aliasing (the #1 known GPU-correctness hazard: a pooled buffer
     /// recycled then re-handed-out while a still-pending dispatch needs it) as a variable
@@ -429,7 +429,7 @@ impl MetalContext {
     fn pool_disabled() -> bool {
         use std::sync::OnceLock;
         static D: OnceLock<bool> = OnceLock::new();
-        *D.get_or_init(|| std::env::var("ANDREAI_NO_POOL").is_ok())
+        *D.get_or_init(|| std::env::var("SMEDJAN_NO_POOL").is_ok())
     }
 
     /// Allocate a shared-mode Metal buffer (CPU + GPU accessible, zero-copy on M1).

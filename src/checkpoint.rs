@@ -4,7 +4,7 @@ use crate::optim::AdamW;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::sync::Arc;
 
-/// Magic bytes for AndreAI checkpoint files.
+/// Magic bytes for Smedjan checkpoint files.
 const MAGIC: &[u8; 4] = b"AMDL";
 const VERSION: u32 = 14; // v14: YaRN RoPE config. v13: AMDT step is next training step to run. v12: sliding_window. v11: explicit optimizer-param count (0 for non-AdamW). v10: block-sparse. v9: MLA. v8: rwkv. v7: ssm. v6: linear_attn_period. v5: linear_attn. v4: ReLoRA base weights
 const MAX_TENSOR_DIMS: usize = 8;
@@ -184,7 +184,7 @@ pub fn save_training_state(
 ) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
 
-    // Header: AMDT (AndreAI Model Training state)
+    // Header: AMDT (Smedjan Model Training state)
     file.write_all(b"AMDT")?;
     file.write_all(&VERSION.to_le_bytes())?;
     file.write_all(&next_step.to_le_bytes())?;
@@ -244,7 +244,7 @@ pub fn load_training_state(ctx: &Arc<MetalContext>, path: &str) -> std::io::Resu
     file.read_exact(&mut buf4)?;
     if &buf4 != b"AMDT" {
         return Err(invalid_checkpoint_data(format!(
-            "not a valid AndreAI training state file: expected AMDT magic, got {:02x?}",
+            "not a valid Smedjan training state file: expected AMDT magic, got {:02x?}",
             buf4
         )));
     }
@@ -427,7 +427,7 @@ pub fn load_opt_sidecar(path: &str) -> std::io::Result<Option<OptSidecar>> {
     read_exact_count(&mut file, &mut buf4, &mut consumed)?;
     if &buf4 != b"AOPT" {
         return Err(invalid_checkpoint_data(format!(
-            "not a valid AndreAI optimizer sidecar: expected AOPT magic, got {:02x?}",
+            "not a valid Smedjan optimizer sidecar: expected AOPT magic, got {:02x?}",
             buf4
         )));
     }
@@ -483,7 +483,7 @@ pub fn load_checkpoint(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(
     file.read_exact(&mut buf4)?;
     if &buf4 != MAGIC {
         return Err(invalid_checkpoint_data(format!(
-            "not a valid AndreAI checkpoint: expected AMDL magic, got {:02x?}",
+            "not a valid Smedjan checkpoint: expected AMDL magic, got {:02x?}",
             buf4
         )));
     }

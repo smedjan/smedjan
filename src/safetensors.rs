@@ -1,10 +1,10 @@
-//! safetensors I/O for AndreAI models (zero deps; hand-written). Layout: 8-byte little-endian
+//! safetensors I/O for Smedjan models (zero deps; hand-written). Layout: 8-byte little-endian
 //! header length, a JSON header `{ "<name>": {dtype, shape, data_offsets:[begin,end]}, ... }`, then
 //! the raw tensor blob. Tensors are written in `model.parameters()` order (trainable, then ReLoRA
-//! base) under positional names `p{i}`, mirroring `checkpoint::save_checkpoint`, so an AndreAI model
+//! base) under positional names `p{i}`, mirroring `checkpoint::save_checkpoint`, so an Smedjan model
 //! round-trips through safetensors. `import_safetensors` rebuilds the model from a caller-supplied
 //! config (the same flow a foreign HF import uses, sourcing config from the model's config.json) and
-//! overwrites each parameter in order. Foreign HF->AndreAI name remap + [out,in]->[in,out] transpose
+//! overwrites each parameter in order. Foreign HF->Smedjan name remap + [out,in]->[in,out] transpose
 //! + RoPE permutation layer on top of this format machinery.
 #![allow(dead_code)] // export/import are exercised by the round-trip test; CLI + foreign import wire them next.
 
@@ -305,7 +305,7 @@ fn offsets_field(entry: &Json, name: &str) -> std::io::Result<(usize, usize)> {
     Ok((start, end))
 }
 
-/// Export an AndreAI model to a `.safetensors` file (F32). Tensors are named `p{i}` in
+/// Export an Smedjan model to a `.safetensors` file (F32). Tensors are named `p{i}` in
 /// `parameters()`-then-`base_parameters()` order, the same order `import_safetensors` walks.
 pub fn export_safetensors(path: &str, model: &Transformer) -> std::io::Result<()> {
     let params = model.parameters();
@@ -335,7 +335,7 @@ pub fn export_safetensors(path: &str, model: &Transformer) -> std::io::Result<()
         header.push(',');
     }
     header.push_str(&format!(
-        "\"__metadata__\":{{\"format\":\"andreai-safetensors-v1\",\"n_tensors\":\"{}\"}}}}",
+        "\"__metadata__\":{{\"format\":\"smedjan-safetensors-v1\",\"n_tensors\":\"{}\"}}}}",
         all.len()
     ));
 
@@ -422,13 +422,13 @@ pub fn import_safetensors(
 }
 
 // ============================================================================
-// Foreign HF-Llama interop: load external safetensors weights as an AndreAI model INIT (for the
-// SubQ-style retrofit / continued-training flow), and export an AndreAI model back to HF-Llama
-// layout. Faithful HF *inference* parity is NOT the goal and is not reachable here — AndreAI applies
+// Foreign HF-Llama interop: load external safetensors weights as an Smedjan model INIT (for the
+// SubQ-style retrofit / continued-training flow), and export an Smedjan model back to HF-Llama
+// layout. Faithful HF *inference* parity is NOT the goal and is not reachable here — Smedjan applies
 // a fixed QK-norm for d_model>=512 and uses interleaved RoPE where HF-Llama uses half-split; those
 // divergences are adapted away by continued training. Shapes are mapped exactly: Linear weights
 // transpose ([out,in]<->[in,out]) and Q/K rows are permuted per head between HF half-split and
-// AndreAI interleaved RoPE order. The round-trip test proves the transforms are exact inverses.
+// Smedjan interleaved RoPE order. The round-trip test proves the transforms are exact inverses.
 // Supports the standard Llama-arch shape only (Softmax attn, dense FFN, full-rank, tied head).
 // ============================================================================
 
@@ -447,7 +447,7 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 /// Permute the rows of a `[n_heads*head_dim, in_dim]` matrix between HF half-split RoPE order and
-/// AndreAI interleaved-pair order, per head. `half_to_interleaved=true` maps HF->AndreAI
+/// Smedjan interleaved-pair order, per head. `half_to_interleaved=true` maps HF->Smedjan
 /// (row j -> 2j, row j+hd/2 -> 2j+1); `false` is the inverse.
 fn rope_permute_rows(
     data: &[f32],
@@ -546,7 +546,7 @@ fn ensure_standard(config: &ModelConfig, n_params: usize) -> std::io::Result<()>
     Ok(())
 }
 
-/// Export an AndreAI model to HF-Llama-named safetensors (inverse transforms of the importer).
+/// Export an Smedjan model to HF-Llama-named safetensors (inverse transforms of the importer).
 pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result<()> {
     let c = &model.config;
     let p = model.parameters();
@@ -617,7 +617,7 @@ pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result
     Ok(())
 }
 
-/// Import HF-Llama safetensors as an AndreAI model init (build from `config`, map every weight).
+/// Import HF-Llama safetensors as an Smedjan model init (build from `config`, map every weight).
 pub fn import_hf_safetensors(
     ctx: &Arc<MetalContext>,
     path: &str,
@@ -722,7 +722,7 @@ pub fn import_hf_safetensors(
                 nh * hd,
             ),
         )?;
-        // p[base + 4] = qk_norm: left at the AndreAI default (HF has none)
+        // p[base + 4] = qk_norm: left at the Smedjan default (HF has none)
         put(
             p[base + 5],
             &transpose_2d(
@@ -760,7 +760,7 @@ pub fn import_hf_safetensors(
         )?;
     }
     eprintln!(
-        "HF safetensors imported as AndreAI init: {} layers from {}",
+        "HF safetensors imported as Smedjan init: {} layers from {}",
         c.n_layers, path
     );
     Ok(model)

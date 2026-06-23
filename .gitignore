@@ -1,11 +1,20 @@
+# Build
 /target
+
+# Datasets and generated artifacts (sample SFT data is kept)
 /data
 !/data/sft_*.jsonl
 *.bin
 *.sha256
 checkpoints/
-.DS_Store
-src/metal/compute_head.tmp
 corpus.txt
 tok.bin
 dataset.bin
+
+# Logs and scratch
+logs/
+*.log
+src/metal/compute_head.tmp
+
+# OS
+.DS_Store

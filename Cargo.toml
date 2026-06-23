@@ -1,5 +1,5 @@
 [package]
-name = "andreai"
+name = "smedjan"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Rust AI engine — own architecture, own training, own tokenizer"

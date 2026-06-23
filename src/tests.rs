@@ -706,9 +706,9 @@ mod suite {
 
     #[test]
     fn datapipe_mix_rejects_invalid_weights_and_malformed_shards() {
-        let valid_path = std::path::PathBuf::from("/tmp/andreai_mix_valid.bin");
-        let bad_path = std::path::PathBuf::from("/tmp/andreai_mix_bad.bin");
-        let output_path = std::path::PathBuf::from("/tmp/andreai_mix_out.bin");
+        let valid_path = std::path::PathBuf::from("/tmp/smedjan_mix_valid.bin");
+        let bad_path = std::path::PathBuf::from("/tmp/smedjan_mix_bad.bin");
+        let output_path = std::path::PathBuf::from("/tmp/smedjan_mix_out.bin");
         let tokens: Vec<u32> = (0..32).collect();
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         std::fs::write(&valid_path, bytes).expect("write valid shard");
@@ -859,8 +859,8 @@ mod suite {
     #[test]
     fn quantize_checkpoint_rejects_invalid_bits_before_io() {
         let err = crate::quantize::quantize_checkpoint(
-            "/tmp/andreai_missing_checkpoint_for_bad_bits.bin",
-            "/tmp/andreai_bad_bits.qbin",
+            "/tmp/smedjan_missing_checkpoint_for_bad_bits.bin",
+            "/tmp/smedjan_bad_bits.qbin",
             3,
         )
         .expect_err("unsupported quantization bits should fail");
@@ -875,7 +875,7 @@ mod suite {
     fn export_gguf_rejects_invalid_quantization_without_output() {
         let ctx = test_ctx();
         let model = Transformer::new(&ctx, ModelConfig::custom(32, 32, 4, 1, 2.0, 16));
-        let path = std::env::temp_dir().join("andreai_invalid_quant.gguf");
+        let path = std::env::temp_dir().join("smedjan_invalid_quant.gguf");
         std::fs::remove_file(&path).ok();
 
         let err = crate::quantize::export_gguf(&model, path.to_str().unwrap(), "q5")
@@ -941,7 +941,7 @@ mod suite {
         use std::io::{Seek, SeekFrom, Write};
         let ctx = test_ctx();
         let model = Transformer::new(&ctx, ModelConfig::custom(32, 64, 4, 2, 2.0, 16));
-        let path = std::env::temp_dir().join("andreai_corrupt_geom.bin");
+        let path = std::env::temp_dir().join("smedjan_corrupt_geom.bin");
         crate::checkpoint::save_checkpoint(path.to_str().unwrap(), &model, 0).unwrap();
         // n_kv_heads lives at byte offset 44: MAGIC(4) + VERSION(4) + step(4) + 8 config fields × 4.
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -980,7 +980,7 @@ mod suite {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(32, 32, 4, 1, 2.0, 16);
         let model = Transformer::new(&ctx, cfg.clone());
-        let path = std::env::temp_dir().join("andreai_malformed_quantized.qbin");
+        let path = std::env::temp_dir().join("smedjan_malformed_quantized.qbin");
         let mut file = std::fs::File::create(&path).unwrap();
 
         file.write_all(b"AMQZ").unwrap();
@@ -1044,7 +1044,7 @@ mod suite {
         let corpus = b"the quick brown fox jumps over the lazy dog again and again";
         let tok = BpeTokenizer::train(corpus, 300);
 
-        let path = "/tmp/andreai_test_tokenizer.bin";
+        let path = "/tmp/smedjan_test_tokenizer.bin";
         tok.save(path).expect("Failed to save tokenizer");
         let tok2 = BpeTokenizer::load(path).expect("Failed to load tokenizer");
 
@@ -1067,7 +1067,7 @@ mod suite {
 
     #[test]
     fn tokenizer_load_rejects_malformed_files() {
-        let bad_magic_path = "/tmp/andreai_test_bad_tokenizer_magic.bin";
+        let bad_magic_path = "/tmp/smedjan_test_bad_tokenizer_magic.bin";
         std::fs::write(bad_magic_path, b"NOPE").expect("write bad tokenizer magic");
         let err = match BpeTokenizer::load(bad_magic_path) {
             Ok(_) => panic!("bad tokenizer magic should fail"),
@@ -1079,7 +1079,7 @@ mod suite {
             "unexpected error: {err}"
         );
 
-        let bad_version_path = "/tmp/andreai_test_bad_tokenizer_version.bin";
+        let bad_version_path = "/tmp/smedjan_test_bad_tokenizer_version.bin";
         let mut bad_version = Vec::new();
         bad_version.extend_from_slice(b"ABPE");
         bad_version.extend_from_slice(&99u32.to_le_bytes());
@@ -1094,7 +1094,7 @@ mod suite {
             "unexpected error: {err}"
         );
 
-        let truncated_path = "/tmp/andreai_test_truncated_tokenizer.bin";
+        let truncated_path = "/tmp/smedjan_test_truncated_tokenizer.bin";
         let mut truncated = Vec::new();
         truncated.extend_from_slice(b"ABPE");
         truncated.extend_from_slice(&1u32.to_le_bytes());
@@ -4348,11 +4348,11 @@ mod suite {
     /// logits, backprop a finite gradient into the latent down-projection W_dkv, and train stably
     /// (clipped, warmed-up Muon steps never go non-finite). Mirrors linear_attn_model_trains_stably.
     #[test]
-    fn safetensors_roundtrips_an_andreai_model() {
+    fn safetensors_roundtrips_an_smedjan_model() {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
         let model = Transformer::new(&ctx, cfg.clone());
-        let path = "/tmp/andreai_safetensors_roundtrip.safetensors";
+        let path = "/tmp/smedjan_safetensors_roundtrip.safetensors";
         crate::safetensors::export_safetensors(path, &model).expect("export");
         let loaded = crate::safetensors::import_safetensors(&ctx, path, cfg).expect("import");
         let a = model.parameters();
@@ -4425,7 +4425,7 @@ mod suite {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(48, 64, 4, 2, 2.67, 64);
 
-        let trailing_path = "/tmp/andreai_safetensors_trailing_header.safetensors";
+        let trailing_path = "/tmp/smedjan_safetensors_trailing_header.safetensors";
         write_test_safetensors(trailing_path, "{} junk", &[]);
         let err = expect_import_err(
             crate::safetensors::import_safetensors(&ctx, trailing_path, cfg.clone()),
@@ -4436,7 +4436,7 @@ mod suite {
             "unexpected error: {err}"
         );
 
-        let huge_header_path = "/tmp/andreai_safetensors_huge_header.safetensors";
+        let huge_header_path = "/tmp/smedjan_safetensors_huge_header.safetensors";
         {
             use std::io::Write;
             let mut file =
@@ -4453,8 +4453,8 @@ mod suite {
             "unexpected error: {err}"
         );
 
-        let good_path = "/tmp/andreai_safetensors_numeric_good.safetensors";
-        let bad_path = "/tmp/andreai_safetensors_numeric_bad.safetensors";
+        let good_path = "/tmp/smedjan_safetensors_numeric_good.safetensors";
+        let bad_path = "/tmp/smedjan_safetensors_numeric_bad.safetensors";
         let model = Transformer::new(&ctx, cfg.clone());
         crate::safetensors::export_safetensors(good_path, &model).expect("export good");
         let (header, blob) = read_test_safetensors(good_path);
@@ -4865,7 +4865,7 @@ mod suite {
         let orig_params: Vec<Vec<f32>> = model.parameters().iter().map(|p| p.to_vec()).collect();
 
         // Save
-        let tmp_path = "/tmp/andreai_test_ckpt.bin";
+        let tmp_path = "/tmp/smedjan_test_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp_path, &model, 42).expect("save failed");
 
         // Load
@@ -5437,7 +5437,7 @@ mod suite {
     #[test]
     fn checkpoint_load_rejects_malformed_headers() {
         let ctx = test_ctx();
-        let bad_magic_path = "/tmp/andreai_test_bad_checkpoint_magic.bin";
+        let bad_magic_path = "/tmp/smedjan_test_bad_checkpoint_magic.bin";
         std::fs::write(bad_magic_path, b"NOPE").expect("write bad checkpoint magic");
         let err = match crate::checkpoint::load_checkpoint(&ctx, bad_magic_path) {
             Ok(_) => panic!("bad checkpoint magic should fail"),
@@ -5445,11 +5445,11 @@ mod suite {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("not a valid AndreAI checkpoint"),
+            err.to_string().contains("not a valid Smedjan checkpoint"),
             "unexpected error: {err}"
         );
 
-        let bad_version_path = "/tmp/andreai_test_bad_checkpoint_version.bin";
+        let bad_version_path = "/tmp/smedjan_test_bad_checkpoint_version.bin";
         let mut bad_version = Vec::new();
         bad_version.extend_from_slice(b"AMDL");
         bad_version.extend_from_slice(&99u32.to_le_bytes());
@@ -6314,11 +6314,11 @@ mod suite {
     /// here. The linear-attention math + gradients are proven on the isolated core by the
     /// linear_attention::* unit tests.)
     #[test]
-    fn hf_safetensors_roundtrips_an_andreai_model() {
+    fn hf_safetensors_roundtrips_an_smedjan_model() {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 32);
         let model = Transformer::new(&ctx, cfg.clone());
-        let path = "/tmp/andreai_hf_roundtrip.safetensors";
+        let path = "/tmp/smedjan_hf_roundtrip.safetensors";
         crate::safetensors::export_hf_safetensors(path, &model).expect("export_hf");
         let loaded = crate::safetensors::import_hf_safetensors(&ctx, path, cfg).expect("import_hf");
         let a = model.parameters();
@@ -6343,9 +6343,9 @@ mod suite {
         let ctx = test_ctx();
         let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 32);
         let model = Transformer::new(&ctx, cfg.clone());
-        let good_path = "/tmp/andreai_hf_malformed_good.safetensors";
-        let bad_shape_path = "/tmp/andreai_hf_bad_shape.safetensors";
-        let ragged_path = "/tmp/andreai_hf_ragged_bytes.safetensors";
+        let good_path = "/tmp/smedjan_hf_malformed_good.safetensors";
+        let bad_shape_path = "/tmp/smedjan_hf_bad_shape.safetensors";
+        let ragged_path = "/tmp/smedjan_hf_ragged_bytes.safetensors";
         let q_key = "\"model.layers.0.self_attn.q_proj.weight\":";
 
         crate::safetensors::export_hf_safetensors(good_path, &model).expect("export_hf");
@@ -6562,7 +6562,7 @@ mod suite {
         );
         autograd::zero_grads();
 
-        let tmp = "/tmp/andreai_ssm_ckpt.bin";
+        let tmp = "/tmp/smedjan_ssm_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 9).expect("save failed");
         let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert!(
@@ -6618,7 +6618,7 @@ mod suite {
         }
         autograd::zero_grads();
 
-        let tmp = "/tmp/andreai_rwkv_ckpt.bin";
+        let tmp = "/tmp/smedjan_rwkv_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 11).expect("save failed");
         let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert!(
@@ -6673,7 +6673,7 @@ mod suite {
         autograd::zero_grads();
 
         // Checkpoint roundtrip preserves the schedule and reconstructs the same mixer per layer.
-        let tmp = "/tmp/andreai_hybrid_ckpt.bin";
+        let tmp = "/tmp/smedjan_hybrid_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 3).expect("save failed");
         let (loaded, _) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert_eq!(loaded.config.linear_attn_period, 2);
@@ -6691,7 +6691,7 @@ mod suite {
         let model = Transformer::new(&ctx, cfg);
         assert!(model.config.linear_attn);
 
-        let tmp = "/tmp/andreai_linear_attn_ckpt.bin";
+        let tmp = "/tmp/smedjan_linear_attn_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 7).expect("save failed");
         let (loaded, step) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert_eq!(step, 7);
@@ -6717,7 +6717,7 @@ mod suite {
         assert_eq!(model.blocks[0].attn.yarn_scale, 2.0);
         assert_eq!(model.blocks[0].attn.yarn_orig_max, 64.0);
 
-        let tmp = "/tmp/andreai_yarn_ckpt.bin";
+        let tmp = "/tmp/smedjan_yarn_ckpt.bin";
         crate::checkpoint::save_checkpoint(tmp, &model, 14).expect("save failed");
         let (loaded, step) = crate::checkpoint::load_checkpoint(&ctx, tmp).expect("load failed");
         assert_eq!(step, 14);
@@ -6758,7 +6758,7 @@ mod suite {
             MetalContext::read_buffer(&optimizer.params[0].v, optimizer.params[0].size);
 
         // Save
-        let tmp_path = "/tmp/andreai_test_state.bin";
+        let tmp_path = "/tmp/smedjan_test_state.bin";
         crate::checkpoint::save_training_state(tmp_path, &model, &optimizer, 42, 100000)
             .expect("save state failed");
 
@@ -6813,7 +6813,7 @@ mod suite {
     #[test]
     fn training_state_load_rejects_malformed_headers_and_sidecars() {
         let ctx = test_ctx();
-        let bad_magic_path = "/tmp/andreai_test_bad_state_magic.bin";
+        let bad_magic_path = "/tmp/smedjan_test_bad_state_magic.bin";
         std::fs::write(bad_magic_path, b"NOPE").expect("write bad state magic");
         let err = match crate::checkpoint::load_training_state(&ctx, bad_magic_path) {
             Ok(_) => panic!("bad training state magic should fail"),
@@ -6822,11 +6822,11 @@ mod suite {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string()
-                .contains("not a valid AndreAI training state file"),
+                .contains("not a valid Smedjan training state file"),
             "unexpected error: {err}"
         );
 
-        let bad_version_path = "/tmp/andreai_test_bad_state_version.bin";
+        let bad_version_path = "/tmp/smedjan_test_bad_state_version.bin";
         let mut bad_version = Vec::new();
         bad_version.extend_from_slice(b"AMDT");
         bad_version.extend_from_slice(&99u32.to_le_bytes());
@@ -6842,7 +6842,7 @@ mod suite {
             "unexpected error: {err}"
         );
 
-        let bad_sidecar_magic_path = "/tmp/andreai_test_bad_sidecar_magic.opt";
+        let bad_sidecar_magic_path = "/tmp/smedjan_test_bad_sidecar_magic.opt";
         std::fs::write(bad_sidecar_magic_path, b"NOPE").expect("write bad sidecar magic");
         let err = match crate::checkpoint::load_opt_sidecar(bad_sidecar_magic_path) {
             Ok(_) => panic!("bad optimizer sidecar magic should fail"),
@@ -6851,11 +6851,11 @@ mod suite {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string()
-                .contains("not a valid AndreAI optimizer sidecar"),
+                .contains("not a valid Smedjan optimizer sidecar"),
             "unexpected error: {err}"
         );
 
-        let truncated_sidecar_path = "/tmp/andreai_test_truncated_sidecar.opt";
+        let truncated_sidecar_path = "/tmp/smedjan_test_truncated_sidecar.opt";
         let mut truncated = Vec::new();
         truncated.extend_from_slice(b"AOPT");
         truncated.extend_from_slice(&128u32.to_le_bytes());
@@ -7229,7 +7229,7 @@ mod suite {
     #[test]
     fn data_loader_basic() {
         // Create a small test dataset
-        let tmp_path = "/tmp/andreai_test_data.bin";
+        let tmp_path = "/tmp/smedjan_test_data.bin";
         let tokens: Vec<u32> = (0..1024).collect();
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         std::fs::write(tmp_path, &bytes).expect("write test data");
@@ -7253,7 +7253,7 @@ mod suite {
 
     #[test]
     fn dataset_rejects_partial_u32_file() {
-        let tmp_path = "/tmp/andreai_test_bad_data.bin";
+        let tmp_path = "/tmp/smedjan_test_bad_data.bin";
         std::fs::write(tmp_path, [1u8, 2, 3]).expect("write malformed dataset");
 
         let err = match crate::data::Dataset::load(tmp_path) {
@@ -7271,7 +7271,7 @@ mod suite {
 
     #[test]
     fn data_loader_rejects_invalid_batch_geometry() {
-        let missing_path = "/tmp/andreai_missing_data_loader.bin";
+        let missing_path = "/tmp/smedjan_missing_data_loader.bin";
 
         let err = match crate::data::DataLoader::new(missing_path, 0, 8) {
             Ok(_) => panic!("zero batch_size should fail"),
@@ -7300,7 +7300,7 @@ mod suite {
 
     #[test]
     fn data_loader_rejects_too_small_dataset() {
-        let tmp_path = "/tmp/andreai_test_tiny_data.bin";
+        let tmp_path = "/tmp/smedjan_test_tiny_data.bin";
         let tokens: Vec<u32> = (0..8).collect();
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         std::fs::write(tmp_path, &bytes).expect("write tiny dataset");
@@ -7320,7 +7320,7 @@ mod suite {
 
     #[test]
     fn data_mixer_rejects_invalid_source_weights() {
-        let tmp_path = "/tmp/andreai_test_mixer_data.bin";
+        let tmp_path = "/tmp/smedjan_test_mixer_data.bin";
         let tokens: Vec<u32> = (0..64).collect();
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         std::fs::write(tmp_path, bytes).expect("write mixer dataset");

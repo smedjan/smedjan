@@ -4,7 +4,7 @@ use crate::model::{ModelConfig, Transformer};
 use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::sync::Arc;
 
-/// Magic bytes for quantized AndreAI checkpoint files.
+/// Magic bytes for quantized Smedjan checkpoint files.
 const QMAGIC: &[u8; 4] = b"AMQZ";
 const QVERSION: u32 = 1;
 
@@ -157,7 +157,7 @@ pub fn dequantize(qt: &QuantizedTensor) -> Vec<f32> {
 
 /// Quantize an entire model checkpoint and save as a `.qbin` file.
 ///
-/// Reads a standard AndreAI checkpoint, quantizes every tensor to the
+/// Reads a standard Smedjan checkpoint, quantizes every tensor to the
 /// specified bit width (4 or 8), and writes the result.
 pub fn quantize_checkpoint(input_path: &str, output_path: &str, bits: u8) -> std::io::Result<()> {
     validate_quant_bits(bits)?;
@@ -244,7 +244,7 @@ pub fn load_quantized(ctx: &Arc<MetalContext>, path: &str) -> std::io::Result<(T
     if &buf4 != QMAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Not a valid quantized AndreAI checkpoint",
+            "Not a valid quantized Smedjan checkpoint",
         ));
     }
 
@@ -607,7 +607,7 @@ fn read_quantized_tensor(
 }
 
 /// Export model to GGUF format for llama.cpp inference.
-/// Maps AndreAI tensor layout to GGUF's expected naming convention.
+/// Maps Smedjan tensor layout to GGUF's expected naming convention.
 /// Supports F32 and Q8_0 quantization types.
 pub fn export_gguf(
     model: &Transformer,
@@ -632,7 +632,7 @@ pub fn export_gguf(
     // Metadata KV pairs
     let metadata = vec![
         ("general.architecture", "llama"),
-        ("general.name", "andreai"),
+        ("general.name", "smedjan"),
     ];
     let n_kv = metadata.len() as u64 + 10; // base metadata + config values
     file.write_all(&n_kv.to_le_bytes())?;
@@ -758,7 +758,7 @@ fn write_gguf_f32(file: &mut std::fs::File, key: &str, val: f32) -> std::io::Res
     file.write_all(&val.to_le_bytes())
 }
 
-/// Map AndreAI tensor indices to GGUF-compatible names (llama architecture).
+/// Map Smedjan tensor indices to GGUF-compatible names (llama architecture).
 fn get_gguf_tensor_names(config: &ModelConfig) -> Vec<String> {
     let mut names = Vec::new();
     // Embedding
@@ -848,7 +848,7 @@ pub fn export_safetensors(model: &Transformer, output_path: &str) -> std::io::Re
         offset += nbytes;
     }
     // Add __metadata__
-    header.push_str(",\"__metadata__\":{\"format\":\"andreai\",\"description\":\"AndreAI model\"}");
+    header.push_str(",\"__metadata__\":{\"format\":\"smedjan\",\"description\":\"Smedjan model\"}");
     header.push('}');
 
     let header_bytes = header.as_bytes();

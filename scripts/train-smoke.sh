@@ -4,9 +4,9 @@
 set -euo pipefail
 export CARGO_INCREMENTAL=0
 
-REPO="${ANDREAI_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-OUT="${ANDREAI_TRAIN_SMOKE_DIR:-$REPO/target/ci-train-smoke}"
-BIN="$REPO/target/release/andreai"
+REPO="${SMEDJAN_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+OUT="${SMEDJAN_TRAIN_SMOKE_DIR:-$REPO/target/ci-train-smoke}"
+BIN="$REPO/target/release/smedjan"
 LOG_DIR="$OUT/logs"
 CORPUS="$OUT/corpus.txt"
 TOKENIZER="$OUT/tokenizer.bin"
@@ -23,11 +23,11 @@ rm -rf "$OUT"
 mkdir -p "$LOG_DIR"
 
 cat > "$CORPUS" <<'CORPUS'
-AndreAI trains compact language models on local Metal GPUs.
+Smedjan trains compact language models on local Metal GPUs.
 The runtime must keep losses finite, write checkpoints, and exercise optimizer state.
 Short smoke runs cover dense attention, fused CE, gradient checkpointing, BitNet, SSM, block sparse routing, and hybrid Muon.
 The corpus repeats enough structure for the tiny tokenizer and dataset pipeline.
-AndreAI trains compact language models on local Metal GPUs.
+Smedjan trains compact language models on local Metal GPUs.
 The runtime must keep losses finite, write checkpoints, and exercise optimizer state.
 Short smoke runs cover dense attention, fused CE, gradient checkpointing, BitNet, SSM, block sparse routing, and hybrid Muon.
 The corpus repeats enough structure for the tiny tokenizer and dataset pipeline.
@@ -226,7 +226,7 @@ run_conversion_smokes() {
   fi
 
   echo "---- convert:generate_qbin ----"
-  run_logged generate_qbin "$BIN" generate --checkpoint "$QBIN" --tokenizer "$TOKENIZER" --prompt "AndreAI" --max-tokens 1 --temperature 0
+  run_logged generate_qbin "$BIN" generate --checkpoint "$QBIN" --tokenizer "$TOKENIZER" --prompt "Smedjan" --max-tokens 1 --temperature 0
 
   echo "---- convert:export_gguf ----"
   run_logged export_gguf "$BIN" export-gguf --checkpoint "$ckpt" --output "$OUT/model.gguf" --quant f32
@@ -333,7 +333,7 @@ cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
 
 run_logged build cargo build --release --no-default-features --features metal
 printf 'not-a-checkpoint' > "$BAD_CHECKPOINT"
-run_reject_logged info_bad_checkpoint "not a valid AndreAI checkpoint" "$BIN" info --checkpoint "$BAD_CHECKPOINT"
+run_reject_logged info_bad_checkpoint "not a valid Smedjan checkpoint" "$BIN" info --checkpoint "$BAD_CHECKPOINT"
 run_reject_logged eval_bad_longctx_length "invalid --longctx-lengths entry 'abc'" "$BIN" eval --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --longctx --longctx-lengths abc --longctx-depths 0.5
 run_reject_logged eval_bad_longctx_depth "--longctx-depths entries must be finite and in [0, 1]" "$BIN" eval --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --longctx --longctx-lengths 64 --longctx-depths 1.5
 run_reject_logged generate_bad_temperature "--temperature must be finite and >= 0" "$BIN" generate --checkpoint "$BAD_CHECKPOINT" --tokenizer "$OUT/missing-tokenizer.bin" --temperature=-1
@@ -362,7 +362,7 @@ run_reject_logged mix_zero_weight "data mixing weights must sum to > 0" "$BIN" m
 run_reject_logged mix_malformed_shard "byte length must be a multiple of 4" "$BIN" mix --shards "$BAD_SHARD:1" --output "$OUT/mix-bad.bin"
 cat > "$SFT_JSONL" <<'SFT'
 {"prompt":"Say hello.","response":"Hello."}
-{"prompt":"Name the runtime.","response":"AndreAI runs local training."}
+{"prompt":"Name the runtime.","response":"Smedjan runs local training."}
 SFT
 cat > "$DPO_JSONL" <<'DPO'
 {"prompt":"Say hello.","chosen":"Hello.","rejected":"Goodbye."}

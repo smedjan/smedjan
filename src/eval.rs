@@ -1,4 +1,4 @@
-//! Evaluation harness for AndreAI.
+//! Evaluation harness for Smedjan.
 //! Measures model quality against domain-specific benchmarks.
 
 use crate::generate::{self, SamplingConfig};

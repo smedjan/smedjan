@@ -583,7 +583,7 @@ fn validate_finite_non_negative(field: &str, value: f32) -> std::io::Result<()> 
 /// where log_ratio = log pi(y|x) - log pi_ref(y|x)
 pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result<()> {
     config.validate()?;
-    eprintln!("=== AndreAI Direct Preference Optimization ===");
+    eprintln!("=== Smedjan Direct Preference Optimization ===");
 
     // Load policy model (will be updated)
     let (policy_model, pretrain_step) = checkpoint::load_checkpoint(ctx, &config.checkpoint_path)?;
@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_dpo_binary_dataset_roundtrip() {
-        let dir = std::env::temp_dir().join("andreai_dpo_test");
+        let dir = std::env::temp_dir().join("smedjan_dpo_test");
         std::fs::create_dir_all(&dir).unwrap();
         let bin_path = dir.join("test_prefs.bin");
 
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn dpo_dataset_load_reports_truncation_without_panic() {
-        let dir = std::env::temp_dir().join("andreai_dpo_truncated_test");
+        let dir = std::env::temp_dir().join("smedjan_dpo_truncated_test");
         std::fs::create_dir_all(&dir).unwrap();
         let bin_path = dir.join("truncated.bin");
 
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn dpo_dataset_validation_rejects_unusable_pairs() {
-        let dir = std::env::temp_dir().join("andreai_dpo_validate_test");
+        let dir = std::env::temp_dir().join("smedjan_dpo_validate_test");
         std::fs::create_dir_all(&dir).unwrap();
         let bin_path = dir.join("prefs.bin");
 
@@ -1377,7 +1377,7 @@ mod tests {
 
     #[test]
     fn test_dpo_jsonl_prepare_roundtrip() {
-        let dir = std::env::temp_dir().join("andreai_dpo_jsonl_test");
+        let dir = std::env::temp_dir().join("smedjan_dpo_jsonl_test");
         std::fs::create_dir_all(&dir).unwrap();
         let jsonl_path = dir.join("prefs.jsonl");
         let bin_path = dir.join("prefs.bin");
@@ -1426,7 +1426,7 @@ mod tests {
 
     #[test]
     fn dpo_prepare_reports_malformed_jsonl_without_panic() {
-        let dir = std::env::temp_dir().join("andreai_dpo_bad_jsonl_test");
+        let dir = std::env::temp_dir().join("smedjan_dpo_bad_jsonl_test");
         std::fs::create_dir_all(&dir).unwrap();
         let jsonl_path = dir.join("bad.jsonl");
         let bin_path = dir.join("bad.bin");

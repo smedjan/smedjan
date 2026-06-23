@@ -1,13 +1,13 @@
 #!/bin/bash
-# AndreAI Full Training Pipeline
+# Smedjan Full Training Pipeline
 # Runs: pre-train → eval → SFT → eval → quantize
 # Usage: ./scripts/train_pipeline.sh
 # Logs to: logs/pipeline_$(date).log
 
 set -euo pipefail
 
-PROJ="/Users/Andrei/projects/andreai"
-BIN="$PROJ/target/release/andreai"
+PROJ="${SMEDJAN_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+BIN="$PROJ/target/release/smedjan"
 DATA="$PROJ/data"
 LOG_DIR="$PROJ/logs"
 CKPT_DIR="$DATA/checkpoints"

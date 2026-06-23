@@ -1,4 +1,4 @@
-/// Metal Shader Language (MSL) kernel sources for AndreAI.
+/// Metal Shader Language (MSL) kernel sources for Smedjan.
 /// All GPU compute happens through these shaders.
 /// Optimized for Apple M1: 8-core GPU, 32KB threadgroup memory per core, 128 ALUs/core.
 /// Tiled matrix multiplication: C = A @ B

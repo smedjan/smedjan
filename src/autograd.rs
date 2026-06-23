@@ -1129,7 +1129,7 @@ fn backward_gather_blocks(
     // gpu_gather_blocks_backward SCATTER-ADDS (atomic_fetch_add) into d_src, so it must start zeroed
     // — alloc_buffer returns a POOLED buffer with stale contents, which the scatter accumulates onto
     // → corrupt K/V gradients (block-sparse training stayed pinned at init; clean only under
-    // ANDREAI_NO_POOL, where fresh OS pages happen to be zero). Every other scatter-add backward
+    // SMEDJAN_NO_POOL, where fresh OS pages happen to be zero). Every other scatter-add backward
     // (flash dk/dv, embedding) pre-zeros the same way; this one was missing it.
     compute::gpu_fill(ctx, &d_src, src_size as u32, 0.0);
     compute::gpu_gather_blocks_backward(ctx, out_grad, &crate::gpu::buf_as_u32(sel), &d_src, dims);

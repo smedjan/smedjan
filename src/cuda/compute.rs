@@ -44,7 +44,7 @@ pub fn gpu_matmul(
 ) {
     let tile = 32u32;
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    let f = ctx.device.get_func("andreai", "matmul_tiled").unwrap();
+    let f = ctx.device.get_func("smedjan", "matmul_tiled").unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 
@@ -61,7 +61,7 @@ pub fn gpu_matmul_trans_b(
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
     let f = ctx
         .device
-        .get_func("andreai", "matmul_tiled_trans_b")
+        .get_func("smedjan", "matmul_tiled_trans_b")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
@@ -79,7 +79,7 @@ pub fn gpu_matmul_trans_a(
     let cfg = launch_cfg_3d(n.div_ceil(tile), k.div_ceil(tile), 1, 64);
     let f = ctx
         .device
-        .get_func("andreai", "matmul_trans_a_tiled")
+        .get_func("smedjan", "matmul_trans_a_tiled")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, k, n)) }.unwrap();
 }
@@ -100,7 +100,7 @@ pub fn gpu_softmax(
 ) {
     let tpg = next_power_of_2_clamped(cols as u64) as u32;
     let cfg = launch_cfg_2d(rows, 1, tpg, 1);
-    let f = ctx.device.get_func("andreai", "softmax").unwrap();
+    let f = ctx.device.get_func("smedjan", "softmax").unwrap();
     unsafe { f.launch(cfg, (input, output, rows, cols)) }.unwrap();
 }
 
@@ -115,7 +115,7 @@ pub fn gpu_rms_norm(
 ) {
     let tpg = next_power_of_2_clamped(cols as u64) as u32;
     let cfg = launch_cfg_2d(rows, 1, tpg, 1);
-    let f = ctx.device.get_func("andreai", "rms_norm").unwrap();
+    let f = ctx.device.get_func("smedjan", "rms_norm").unwrap();
     unsafe { f.launch(cfg, (input, weight, output, rows, cols, eps)) }.unwrap();
 }
 
@@ -123,37 +123,37 @@ pub fn gpu_rms_norm(
 
 pub fn gpu_add(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "add_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "add_kernel").unwrap();
     unsafe { f.launch(cfg, (a, b, c, size)) }.unwrap();
 }
 
 pub fn gpu_add_inplace(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "add_inplace").unwrap();
+    let f = ctx.device.get_func("smedjan", "add_inplace").unwrap();
     unsafe { f.launch(cfg, (a, b, size)) }.unwrap();
 }
 
 pub fn gpu_mul(ctx: &Arc<MetalContext>, a: &GpuBuffer, b: &GpuBuffer, c: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "mul_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "mul_kernel").unwrap();
     unsafe { f.launch(cfg, (a, b, c, size)) }.unwrap();
 }
 
 pub fn gpu_scale(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, scale: f32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "scale_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "scale_kernel").unwrap();
     unsafe { f.launch(cfg, (data, size, scale)) }.unwrap();
 }
 
 pub fn gpu_fill(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, value: f32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "fill_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "fill_kernel").unwrap();
     unsafe { f.launch(cfg, (data, size, value)) }.unwrap();
 }
 
 pub fn gpu_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "copy_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "copy_kernel").unwrap();
     unsafe { f.launch(cfg, (src, dst, size)) }.unwrap();
 }
 
@@ -165,7 +165,7 @@ pub fn gpu_silu_gate(
     size: u32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "silu_gate").unwrap();
+    let f = ctx.device.get_func("smedjan", "silu_gate").unwrap();
     unsafe { f.launch(cfg, (gate, up, output, size)) }.unwrap();
 }
 
@@ -182,7 +182,7 @@ pub fn gpu_rope(
 ) {
     let pairs = head_dim / 2;
     let cfg = launch_cfg_3d(total_rows, seq_len, 1, pairs);
-    let f = ctx.device.get_func("andreai", "rope").unwrap();
+    let f = ctx.device.get_func("smedjan", "rope").unwrap();
     unsafe { f.launch(cfg, (data, total_rows, seq_len, head_dim, offset, theta)) }.unwrap();
 }
 
@@ -199,7 +199,7 @@ pub fn gpu_cross_entropy(
 ) {
     let tpg = next_power_of_2_clamped(vocab as u64) as u32;
     let cfg = launch_cfg_2d(batch, 1, tpg, 1);
-    let f = ctx.device.get_func("andreai", "cross_entropy").unwrap();
+    let f = ctx.device.get_func("smedjan", "cross_entropy").unwrap();
     unsafe { f.launch(cfg, (logits, targets, losses, grad, batch, vocab)) }.unwrap();
     // Loss is the mean over batch; scale grad by 1/batch to match (Metal does this in-kernel).
     // Done here in Rust because the in-kernel `batch` was unreliable for this scale under nvrtc.
@@ -209,7 +209,7 @@ pub fn gpu_cross_entropy(
 pub fn gpu_reduce_sum(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let tpg = next_power_of_2_clamped(size as u64) as u32;
     let cfg = launch_cfg(tpg, 1);
-    let f = ctx.device.get_func("andreai", "reduce_sum").unwrap();
+    let f = ctx.device.get_func("smedjan", "reduce_sum").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -236,7 +236,7 @@ pub fn gpu_adamw_update(
     hp: &AdamWHyperparams,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "adamw_update").unwrap();
+    let f = ctx.device.get_func("smedjan", "adamw_update").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -270,7 +270,7 @@ pub fn gpu_embedding_lookup(
     dim: u32,
 ) {
     let cfg = launch_cfg_3d(seq_len, dim.div_ceil(256), 1, 256);
-    let f = ctx.device.get_func("andreai", "embedding_lookup").unwrap();
+    let f = ctx.device.get_func("smedjan", "embedding_lookup").unwrap();
     unsafe { f.launch(cfg, (table, tokens, output, seq_len, dim)) }.unwrap();
 }
 
@@ -284,7 +284,7 @@ pub fn gpu_cast_f32_to_f16(
 ) {
     let n_words = size.div_ceil(2); // 2 halves packed per 4-byte word
     let cfg = launch_cfg(256, n_words.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "cast_f32_to_f16").unwrap();
+    let f = ctx.device.get_func("smedjan", "cast_f32_to_f16").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -298,7 +298,7 @@ pub fn gpu_l2_norm_check_into(
 ) {
     let tpg = next_power_of_2_clamped(size as u64) as u32;
     let cfg = launch_cfg(tpg, 1);
-    let f = ctx.device.get_func("andreai", "l2_norm_check").unwrap();
+    let f = ctx.device.get_func("smedjan", "l2_norm_check").unwrap();
     unsafe { f.launch(cfg, (data, output, size)) }.unwrap();
 }
 
@@ -318,7 +318,7 @@ pub fn gpu_buffer_copy(
     count: u32,
 ) {
     let cfg = launch_cfg(256, count.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "buffer_copy").unwrap();
+    let f = ctx.device.get_func("smedjan", "buffer_copy").unwrap();
     unsafe { f.launch(cfg, (src, dst, src_offset, dst_offset, count)) }.unwrap();
 }
 
@@ -332,7 +332,7 @@ pub fn gpu_causal_mask(
     offset: u32,
 ) {
     let cfg = launch_cfg_3d(batch_heads, seq_q, seq_k.div_ceil(256), 256);
-    let f = ctx.device.get_func("andreai", "causal_mask").unwrap();
+    let f = ctx.device.get_func("smedjan", "causal_mask").unwrap();
     unsafe { f.launch(cfg, (scores, batch_heads, seq_q, seq_k, offset)) }.unwrap();
 }
 
@@ -513,7 +513,7 @@ pub fn gpu_matmul_fp32(
 ) {
     let tile = 32u32;
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    let f = ctx.device.get_func("andreai", "matmul_tiled_fp32").unwrap();
+    let f = ctx.device.get_func("smedjan", "matmul_tiled_fp32").unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 
@@ -528,7 +528,7 @@ pub fn gpu_matmul_bf16(
 ) {
     let tile = 32u32;
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    let f = ctx.device.get_func("andreai", "matmul_tiled_bf16").unwrap();
+    let f = ctx.device.get_func("smedjan", "matmul_tiled_bf16").unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 
@@ -590,7 +590,7 @@ pub fn gpu_cast_f16_to_f32(
 ) {
     let n_words = size.div_ceil(2); // unpack 2 halves per 4-byte word (matches cast_f32_to_f16)
     let cfg = launch_cfg(256, n_words.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "cast_f16_to_f32").unwrap();
+    let f = ctx.device.get_func("smedjan", "cast_f16_to_f32").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -607,7 +607,7 @@ pub fn gpu_matmul_f16(
     k: u32,
 ) {
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), 1, 64);
-    let f = ctx.device.get_func("andreai", "matmul_tiled_f16").unwrap();
+    let f = ctx.device.get_func("smedjan", "matmul_tiled_f16").unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 pub fn gpu_matmul_trans_b_f16(
@@ -622,7 +622,7 @@ pub fn gpu_matmul_trans_b_f16(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), 1, 64);
     let f = ctx
         .device
-        .get_func("andreai", "matmul_tiled_trans_b_f16")
+        .get_func("smedjan", "matmul_tiled_trans_b_f16")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
@@ -638,7 +638,7 @@ pub fn gpu_matmul_trans_a_f16(
     let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), 1, 64);
     let f = ctx
         .device
-        .get_func("andreai", "matmul_trans_a_tiled_f16")
+        .get_func("smedjan", "matmul_trans_a_tiled_f16")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, k, n)) }.unwrap();
 }
@@ -653,7 +653,7 @@ pub fn gpu_batched_matmul_f16(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled_f16")
+        .get_func("smedjan", "batched_matmul_tiled_f16")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -668,7 +668,7 @@ pub fn gpu_batched_matmul_trans_b_f16(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled_trans_b_f16")
+        .get_func("smedjan", "batched_matmul_tiled_trans_b_f16")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -683,7 +683,7 @@ pub fn gpu_batched_matmul_trans_a_f16(
     let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled_trans_a_f16")
+        .get_func("smedjan", "batched_matmul_tiled_trans_a_f16")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
 }
@@ -699,7 +699,7 @@ pub fn gpu_batched_matmul(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled")
+        .get_func("smedjan", "batched_matmul_tiled")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -745,7 +745,7 @@ pub fn gpu_batched_matmul_trans_b(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled_trans_b")
+        .get_func("smedjan", "batched_matmul_tiled_trans_b")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -821,7 +821,7 @@ pub fn gpu_batched_matmul_trans_a(
     let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("andreai", "batched_matmul_tiled_trans_a")
+        .get_func("smedjan", "batched_matmul_tiled_trans_a")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
 }
@@ -836,7 +836,7 @@ pub fn gpu_rms_norm_residual(
     d: RmsResDims,
 ) {
     let cfg = launch_cfg_2d(d.rows, 1, next_power_of_2_clamped(d.cols as u64) as u32, 1);
-    let f = ctx.device.get_func("andreai", "rms_norm_residual").unwrap();
+    let f = ctx.device.get_func("smedjan", "rms_norm_residual").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -872,7 +872,7 @@ pub fn gpu_rope_backward(
     theta: f32,
 ) {
     let cfg = launch_cfg_3d(total_rows, seq_len, 1, head_dim / 2);
-    let f = ctx.device.get_func("andreai", "rope_backward").unwrap();
+    let f = ctx.device.get_func("smedjan", "rope_backward").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -903,7 +903,7 @@ pub fn gpu_rope_backward_copy(
 
 pub fn gpu_silu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "silu").unwrap();
+    let f = ctx.device.get_func("smedjan", "silu").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -960,7 +960,7 @@ pub fn gpu_adamw_8bit_update(
     };
     let n_blocks = size.div_ceil(ADAM8_BLOCK as u32);
     let cfg = launch_cfg(ADAM8_BLOCK as u32, n_blocks); // one block (256 threads) per param-block
-    let f = ctx.device.get_func("andreai", "adamw_8bit_update").unwrap();
+    let f = ctx.device.get_func("smedjan", "adamw_8bit_update").unwrap();
     unsafe { f.launch(cfg, (param, grad, m_q, v_q, m_scale, v_scale, p)) }.unwrap();
 }
 
@@ -984,7 +984,7 @@ pub fn gpu_flash_attention_forward(
     let cfg = launch_cfg_3d(batch_heads, q_blocks, 1, 32); // grid (bh, q_blocks), 32 threads/block (one per query row)
     let f = ctx
         .device
-        .get_func("andreai", "flash_attention_forward")
+        .get_func("smedjan", "flash_attention_forward")
         .unwrap();
     unsafe {
         f.launch(
@@ -1017,7 +1017,7 @@ pub fn gpu_flash_attn_precompute_d(
     let cfg = launch_cfg(256, total_rows.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "flash_attn_precompute_d")
+        .get_func("smedjan", "flash_attn_precompute_d")
         .unwrap();
     unsafe { f.launch(cfg, (d_out, output, d_buf, total_rows, head_dim)) }.unwrap();
 }
@@ -1067,7 +1067,7 @@ pub fn gpu_flash_attention_backward(ctx: &Arc<MetalContext>, b: FlashBwdBufs, d:
     let cfg = launch_cfg_3d(batch_heads, q_blocks, 1, 32);
     let f = ctx
         .device
-        .get_func("andreai", "flash_attention_backward")
+        .get_func("smedjan", "flash_attention_backward")
         .unwrap();
     unsafe { f.launch(cfg, (q, k, v, output, d_out, d_buf, dq, dk, dv, p)) }.unwrap();
 }
@@ -1082,7 +1082,7 @@ pub fn gpu_ternary_matmul(
     k: u32,
 ) {
     let cfg = launch_cfg_2d(n.div_ceil(16), m.div_ceil(16), 16, 16);
-    let f = ctx.device.get_func("andreai", "ternary_matmul").unwrap();
+    let f = ctx.device.get_func("smedjan", "ternary_matmul").unwrap();
     unsafe { f.launch(cfg, (a, w_packed, c, m, n, k)) }.unwrap();
 }
 
@@ -1094,7 +1094,7 @@ pub fn gpu_ternary_absmean(
     cols: u32,
 ) {
     let cfg = launch_cfg(256, cols.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "ternary_absmean").unwrap();
+    let f = ctx.device.get_func("smedjan", "ternary_absmean").unwrap();
     unsafe { f.launch(cfg, (weights, absmean, rows, cols)) }.unwrap();
 }
 
@@ -1108,7 +1108,7 @@ pub fn gpu_ternary_pack(
 ) {
     let packed_rows = rows.div_ceil(16);
     let cfg = launch_cfg_2d(cols.div_ceil(16), packed_rows.div_ceil(16), 16, 16);
-    let f = ctx.device.get_func("andreai", "ternary_pack").unwrap();
+    let f = ctx.device.get_func("smedjan", "ternary_pack").unwrap();
     unsafe { f.launch(cfg, (weights, absmean, packed, rows, cols)) }.unwrap();
 }
 
@@ -1127,7 +1127,7 @@ pub fn gpu_lion_update(
         weight_decay,
     } = p;
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "lion_update").unwrap();
+    let f = ctx.device.get_func("smedjan", "lion_update").unwrap();
     unsafe { f.launch(cfg, (param, grad, m, size, lr, beta1, beta2, weight_decay)) }.unwrap();
 }
 
@@ -1149,7 +1149,7 @@ pub fn gpu_sophia_update(
         weight_decay,
     } = p;
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "sophia_update").unwrap();
+    let f = ctx.device.get_func("smedjan", "sophia_update").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -1180,7 +1180,7 @@ pub fn gpu_scale_rows(
     cols: u32,
 ) {
     let cfg = launch_cfg(256, (rows * cols).div_ceil(256));
-    let f = ctx.device.get_func("andreai", "scale_rows").unwrap();
+    let f = ctx.device.get_func("smedjan", "scale_rows").unwrap();
     unsafe { f.launch(cfg, (input, scales, output, rows, cols)) }.unwrap();
 }
 
@@ -1193,7 +1193,7 @@ pub fn gpu_row_dot_reduce(
     cols: u32,
 ) {
     let cfg = launch_cfg(256, rows.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "row_dot_reduce").unwrap();
+    let f = ctx.device.get_func("smedjan", "row_dot_reduce").unwrap();
     unsafe { f.launch(cfg, (a, b, output, rows, cols)) }.unwrap();
 }
 
@@ -1206,7 +1206,7 @@ pub fn gpu_moe_gather(
     dim: u32,
 ) {
     let cfg = launch_cfg_2d(n_routed.div_ceil(16), dim.div_ceil(16), 16, 16);
-    let f = ctx.device.get_func("andreai", "moe_gather").unwrap();
+    let f = ctx.device.get_func("smedjan", "moe_gather").unwrap();
     unsafe { f.launch(cfg, (input, indices, gathered, n_routed, dim)) }.unwrap();
 }
 
@@ -1220,7 +1220,7 @@ pub fn gpu_moe_scatter_add(
     dim: u32,
 ) {
     let cfg = launch_cfg_2d(n_routed.div_ceil(16), dim.div_ceil(16), 16, 16);
-    let f = ctx.device.get_func("andreai", "moe_scatter_add").unwrap();
+    let f = ctx.device.get_func("smedjan", "moe_scatter_add").unwrap();
     unsafe { f.launch(cfg, (expert_out, indices, weights, combined, n_routed, dim)) }.unwrap();
 }
 
@@ -1236,7 +1236,7 @@ pub fn gpu_causal_mask_window(
     let cfg = launch_cfg_3d(batch_heads, seq_q, seq_k.div_ceil(256), 256);
     let f = ctx
         .device
-        .get_func("andreai", "causal_mask_window")
+        .get_func("smedjan", "causal_mask_window")
         .unwrap();
     unsafe { f.launch(cfg, (scores, batch_heads, seq_q, seq_k, offset, window)) }.unwrap();
 }
@@ -1250,7 +1250,7 @@ pub fn gpu_causal_doc_mask(
     n_heads: u32,
 ) {
     let cfg = launch_cfg_3d(batch_heads, seq, seq.div_ceil(256), 256);
-    let f = ctx.device.get_func("andreai", "causal_doc_mask").unwrap();
+    let f = ctx.device.get_func("smedjan", "causal_doc_mask").unwrap();
     unsafe { f.launch(cfg, (scores, seg_ids, batch_heads, seq, n_heads)) }.unwrap();
 }
 
@@ -1269,7 +1269,7 @@ pub fn gpu_block_mean_keys(
     } = d;
     let total = bh * nb * hd;
     let cfg = launch_cfg(256, total.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "block_mean_keys").unwrap();
+    let f = ctx.device.get_func("smedjan", "block_mean_keys").unwrap();
     unsafe { f.launch(cfg, (k, out, bh, seq, hd, nb, block_size)) }.unwrap();
 }
 
@@ -1290,7 +1290,7 @@ pub fn gpu_block_sparse_mask(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "block_sparse_topk_mask")
+        .get_func("smedjan", "block_sparse_topk_mask")
         .unwrap();
     unsafe { f.launch(cfg, (scores, block_scores, bh, seq, nb, block_size, top_k)) }.unwrap();
 }
@@ -1312,7 +1312,7 @@ pub fn gpu_gather_blocks(
     } = d;
     let total = bh * nb * k_sel * block * hd;
     let cfg = launch_cfg(256, total.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "gather_blocks").unwrap();
+    let f = ctx.device.get_func("smedjan", "gather_blocks").unwrap();
     unsafe { f.launch(cfg, (src, sel, out, bh, nb, seq, hd, block, k_sel)) }.unwrap();
 }
 
@@ -1336,7 +1336,7 @@ pub fn gpu_gather_blocks_backward(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "gather_blocks_backward")
+        .get_func("smedjan", "gather_blocks_backward")
         .unwrap();
     unsafe { f.launch(cfg, (d_out, sel, d_src, bh, nb, seq, hd, block, k_sel)) }.unwrap();
 }
@@ -1354,7 +1354,7 @@ pub fn gpu_gather_causal_mask(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "gather_causal_mask")
+        .get_func("smedjan", "gather_causal_mask")
         .unwrap();
     unsafe { f.launch(cfg, (scores, sel, bh_nb, nb, block, k_sel)) }.unwrap();
 }
@@ -1368,7 +1368,7 @@ pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 
 pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, output: &GpuBuffer) {
     let tpg = next_power_of_2_clamped(size as u64) as u32;
     let cfg = launch_cfg(tpg, 1);
-    let f = ctx.device.get_func("andreai", "l2_norm_check").unwrap();
+    let f = ctx.device.get_func("smedjan", "l2_norm_check").unwrap();
     unsafe { f.launch(cfg, (data, output, size)) }.unwrap();
 }
 
@@ -1380,7 +1380,7 @@ pub fn gpu_silu_backward(
     size: u32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "silu_backward").unwrap();
+    let f = ctx.device.get_func("smedjan", "silu_backward").unwrap();
     unsafe { f.launch(cfg, (input, grad_output, grad_input, size)) }.unwrap();
 }
 
@@ -1396,7 +1396,7 @@ pub fn gpu_silu_gate_backward(
     let cfg = launch_cfg(256, size.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "silu_gate_backward")
+        .get_func("smedjan", "silu_gate_backward")
         .unwrap();
     unsafe { f.launch(cfg, (gate, up, grad_output, grad_gate, grad_up, size)) }.unwrap();
 }
@@ -1416,7 +1416,7 @@ pub fn gpu_rms_norm_backward(
         next_power_of_2_clamped(params.cols as u64) as u32,
         1,
     );
-    let f = ctx.device.get_func("andreai", "rms_norm_backward").unwrap();
+    let f = ctx.device.get_func("smedjan", "rms_norm_backward").unwrap();
     let clamp_on: u32 = if rmsnorm_clamp_enabled() { 1 } else { 0 };
     unsafe {
         f.launch(
@@ -1446,7 +1446,7 @@ pub fn gpu_softmax_backward(
     cols: u32,
 ) {
     let cfg = launch_cfg_2d(rows, 1, next_power_of_2_clamped(cols as u64) as u32, 1);
-    let f = ctx.device.get_func("andreai", "softmax_backward").unwrap();
+    let f = ctx.device.get_func("smedjan", "softmax_backward").unwrap();
     unsafe { f.launch(cfg, (softmax_out, grad_output, grad_input, rows, cols)) }.unwrap();
 }
 
@@ -1464,7 +1464,7 @@ pub fn gpu_embedding_backward(
     let cfg = launch_cfg_3d(n_tokens, dim.div_ceil(256), 1, 256);
     let f = ctx
         .device
-        .get_func("andreai", "embedding_backward")
+        .get_func("smedjan", "embedding_backward")
         .unwrap();
     unsafe { f.launch(cfg, (tokens, grad_output, grad_embeddings, n_tokens, dim)) }.unwrap();
 }
@@ -1478,7 +1478,7 @@ pub fn gpu_transpose_2d(
 ) {
     let total = rows * cols;
     let cfg = launch_cfg(256, total.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "transpose_2d").unwrap();
+    let f = ctx.device.get_func("smedjan", "transpose_2d").unwrap();
     unsafe { f.launch(cfg, (input, output, rows, cols)) }.unwrap();
 }
 
@@ -1495,7 +1495,7 @@ pub fn gpu_transpose_perm_backward(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "transpose_perm_backward")
+        .get_func("smedjan", "transpose_perm_backward")
         .unwrap();
     // Contract (matches Metal): 1st buffer param = source [bh,seq,hd] (read), 2nd = dest [b,s,d] (write).
     // The kernel reads arg0, writes arg1 — so pass (grad_in, grad_out) in that order.
@@ -1515,7 +1515,7 @@ pub fn gpu_transpose_perm_forward(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "transpose_perm_forward")
+        .get_func("smedjan", "transpose_perm_forward")
         .unwrap();
     unsafe { f.launch(cfg, (input, output, batch, seq, n_heads, head_dim)) }.unwrap();
 }
@@ -1529,7 +1529,7 @@ pub fn gpu_gradient_mask(
 ) {
     let total = positions * vocab_size;
     let cfg = launch_cfg(256, total.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "gradient_mask").unwrap();
+    let f = ctx.device.get_func("smedjan", "gradient_mask").unwrap();
     unsafe { f.launch(cfg, (grad, mask, total, vocab_size)) }.unwrap();
 }
 
@@ -1550,7 +1550,7 @@ pub fn gpu_strided_batch_copy(
     let cfg = launch_cfg_2d(bh, copy_len.div_ceil(256), 256, 1);
     let f = ctx
         .device
-        .get_func("andreai", "strided_batch_copy")
+        .get_func("smedjan", "strided_batch_copy")
         .unwrap();
     // src/dst row = head; per-head linear copy of (src_seq_len*dim) elems, dim-scaled strides/offset.
     unsafe {
@@ -1584,7 +1584,7 @@ pub fn gpu_compact_strided_copy(
     let cfg = launch_cfg_2d(bh, copy_len.div_ceil(256), 256, 1);
     let f = ctx
         .device
-        .get_func("andreai", "compact_strided_copy")
+        .get_func("smedjan", "compact_strided_copy")
         .unwrap();
     // gather strided src rows into compact dst; row = head, dim-scaled strides.
     unsafe {
@@ -1600,7 +1600,7 @@ pub fn gpu_argmax(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> u32 {
     let result = ctx.buffer_from_u32_slice(&[0u32]);
     let threads = next_power_of_2_clamped(size as u64) as u32;
     let cfg = launch_cfg(threads, 1); // single block, grid-stride over size
-    let f = ctx.device.get_func("andreai", "argmax").unwrap();
+    let f = ctx.device.get_func("smedjan", "argmax").unwrap();
     unsafe { f.launch(cfg, (data, result.as_ref(), size)) }.unwrap();
     MetalContext::read_buffer_u32(result.as_ref(), 1)[0]
 }
@@ -1614,7 +1614,7 @@ pub fn gpu_temperature_scale(
 ) {
     let inv_temperature = 1.0 / temperature;
     let cfg = launch_cfg(256, count.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "temperature_scale").unwrap();
+    let f = ctx.device.get_func("smedjan", "temperature_scale").unwrap();
     unsafe { f.launch(cfg, (data, offset, count, inv_temperature)) }.unwrap();
 }
 
@@ -1632,7 +1632,7 @@ pub fn gpu_kl_divergence(
         next_power_of_2_clamped(d.vocab_size as u64) as u32,
         1,
     );
-    let f = ctx.device.get_func("andreai", "kl_divergence").unwrap();
+    let f = ctx.device.get_func("smedjan", "kl_divergence").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -1783,7 +1783,7 @@ pub fn gpu_compute_inv_rms(
 ) {
     let tpg = next_power_of_2_clamped(cols as u64) as u32;
     let cfg = launch_cfg(tpg, rows); // one block per row
-    let f = ctx.device.get_func("andreai", "compute_inv_rms").unwrap();
+    let f = ctx.device.get_func("smedjan", "compute_inv_rms").unwrap();
     unsafe { f.launch(cfg, (input, inv_rms, rows, cols, eps)) }.unwrap();
 }
 
@@ -1804,13 +1804,13 @@ pub fn gpu_fused_norm_matmul(
 
 pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "axpy").unwrap();
+    let f = ctx.device.get_func("smedjan", "axpy").unwrap();
     unsafe { f.launch(cfg, (y, x, size, alpha)) }.unwrap();
 }
 
 pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "relu").unwrap();
+    let f = ctx.device.get_func("smedjan", "relu").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -1822,13 +1822,13 @@ pub fn gpu_broadcast_rows(
     cols: u32,
 ) {
     let cfg = launch_cfg(256, (rows * cols).div_ceil(256));
-    let f = ctx.device.get_func("andreai", "broadcast_rows").unwrap();
+    let f = ctx.device.get_func("smedjan", "broadcast_rows").unwrap();
     unsafe { f.launch(cfg, (vec, out, rows, cols)) }.unwrap();
 }
 
 pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "exp_kernel").unwrap();
+    let f = ctx.device.get_func("smedjan", "exp_kernel").unwrap();
     unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
 }
 
@@ -1840,7 +1840,7 @@ pub fn gpu_relu_backward(
     size: u32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "relu_backward").unwrap();
+    let f = ctx.device.get_func("smedjan", "relu_backward").unwrap();
     unsafe { f.launch(cfg, (input, grad_output, grad_input, size)) }.unwrap();
 }
 
@@ -1852,7 +1852,7 @@ pub fn gpu_ema_update(
     decay: f32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "ema_update").unwrap();
+    let f = ctx.device.get_func("smedjan", "ema_update").unwrap();
     unsafe { f.launch(cfg, (ema, src, size, decay)) }.unwrap();
 }
 
@@ -1865,7 +1865,7 @@ pub fn gpu_logsumexp(
 ) {
     let tpg = next_power_of_2_clamped(cols as u64) as u32;
     let cfg = launch_cfg(tpg, rows); // one block per row
-    let f = ctx.device.get_func("andreai", "logsumexp").unwrap();
+    let f = ctx.device.get_func("smedjan", "logsumexp").unwrap();
     unsafe { f.launch(cfg, (input, output, rows, cols)) }.unwrap();
 }
 
@@ -1885,7 +1885,7 @@ pub fn gpu_muon_frob_normalize(ctx: &Arc<MetalContext>, m: &GpuBuffer, x: &GpuBu
     let cfg = launch_cfg(threads, 1);
     let f = ctx
         .device
-        .get_func("andreai", "muon_frob_normalize")
+        .get_func("smedjan", "muon_frob_normalize")
         .unwrap();
     unsafe { f.launch(cfg, (m, x, size)) }.unwrap();
 }
@@ -1899,7 +1899,7 @@ pub fn gpu_inv_sqrt_bc(
     eps: f32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "inv_sqrt_bc").unwrap();
+    let f = ctx.device.get_func("smedjan", "inv_sqrt_bc").unwrap();
     unsafe { f.launch(cfg, (v, out, size, bias_correction, eps)) }.unwrap();
 }
 
@@ -1911,13 +1911,13 @@ pub fn gpu_cautious_mask(
     size: u32,
 ) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "cautious_mask").unwrap();
+    let f = ctx.device.get_func("smedjan", "cautious_mask").unwrap();
     unsafe { f.launch(cfg, (update, grad, keep, size)) }.unwrap();
 }
 
 pub fn gpu_cautious_scale(ctx: &Arc<MetalContext>, x: &GpuBuffer, kept_sum: &GpuBuffer, size: u32) {
     let cfg = launch_cfg(256, size.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "cautious_scale").unwrap();
+    let f = ctx.device.get_func("smedjan", "cautious_scale").unwrap();
     unsafe { f.launch(cfg, (x, kept_sum, size)) }.unwrap();
 }
 
@@ -1931,7 +1931,7 @@ pub fn gpu_concat_cols(
     col_offset: u32,
 ) {
     let cfg = launch_cfg(256, (rows * src_cols).div_ceil(256));
-    let f = ctx.device.get_func("andreai", "concat_cols").unwrap();
+    let f = ctx.device.get_func("smedjan", "concat_cols").unwrap();
     unsafe { f.launch(cfg, (src, dst, rows, src_cols, dst_cols, col_offset)) }.unwrap();
 }
 
@@ -1945,7 +1945,7 @@ pub fn gpu_slice_cols(
     col_offset: u32,
 ) {
     let cfg = launch_cfg(256, (rows * dst_cols).div_ceil(256));
-    let f = ctx.device.get_func("andreai", "slice_cols").unwrap();
+    let f = ctx.device.get_func("smedjan", "slice_cols").unwrap();
     unsafe { f.launch(cfg, (src, dst, rows, src_cols, dst_cols, col_offset)) }.unwrap();
 }
 
@@ -1960,7 +1960,7 @@ pub fn gpu_repeat_kv(
 ) {
     let total = n_kv_total * group_size * seq_len * head_dim;
     let cfg = launch_cfg(256, total.div_ceil(256));
-    let f = ctx.device.get_func("andreai", "repeat_kv").unwrap();
+    let f = ctx.device.get_func("smedjan", "repeat_kv").unwrap();
     unsafe {
         f.launch(
             cfg,
@@ -1983,7 +1983,7 @@ pub fn gpu_repeat_kv_backward(
     let cfg = launch_cfg(256, total.div_ceil(256));
     let f = ctx
         .device
-        .get_func("andreai", "repeat_kv_backward")
+        .get_func("smedjan", "repeat_kv_backward")
         .unwrap();
     unsafe {
         f.launch(

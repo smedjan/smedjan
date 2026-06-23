@@ -370,7 +370,7 @@ impl TrainConfig {
 pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<()> {
     config.validate()?;
 
-    eprintln!("=== AndreAI Training ===");
+    eprintln!("=== Smedjan Training ===");
     eprintln!(
         "Model: {}M params, {} layers, d_model={}, {} heads",
         config.model_config.param_count() as f32 / 1e6,
@@ -834,12 +834,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         // micro-steps, a pooled buffer the running accumulation still references gets reissued by
         // alloc_buffer and overwritten before its consumer runs, silently corrupting the gradient.
         // At seq_len >= 256 this diverged the loss (6.4 -> 7.4) and was clean only under
-        // ANDREAI_NO_POOL; a completion barrier (flush between micro-steps) does NOT fix it because
+        // SMEDJAN_NO_POOL; a completion barrier (flush between micro-steps) does NOT fix it because
         // the buffer is still logically live, not merely mid-dispatch. Guard the loop with the same
         // pool-bypass the recompute path uses (src/autograd.rs) — no intra-accumulation reuse, so no
         // aliasing. Engaged when accumulating (grad_accum_steps > 1) OR when block-sparse attention
         // is configured: the gather/scatter path has its own residual pooled-mode aliasing that
-        // corrupts gradients (block-sparse trained only under ANDREAI_NO_POOL), so bypass the pool
+        // corrupts gradients (block-sparse trained only under SMEDJAN_NO_POOL), so bypass the pool
         // for its whole forward+backward too. Both are forward+backward multi-pass regions; the guard
         // is dropped before the optimizer step, which pools normally.
         let bypass_pool = grad_accum_steps > 1 || config.model_config.block_sparse_top_k > 0;
@@ -1508,7 +1508,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     if !ema_buffers.is_empty() {
         let ema_path = format!("{}/ema_final.bin", config.checkpoint_dir);
         checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, config.total_steps)?;
-        eprintln!("  EMA model saved to ema_final.bin (often better than final.bin — compare with `andreai perplexity`)");
+        eprintln!("  EMA model saved to ema_final.bin (often better than final.bin — compare with `smedjan perplexity`)");
     }
     let elapsed_total = start_time.elapsed();
     let total_time = elapsed_total.as_secs();

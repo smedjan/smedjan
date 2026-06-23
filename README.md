@@ -1,12 +1,12 @@
-# AndreAI
+# Smedjan
 
-Pure Rust LLM training and inference engine. Zero Python. Zero PyTorch. Zero cloud dependency.
+**Pure-Rust LLM training and inference engine. Zero Python. Zero PyTorch. Zero cloud dependency.**
 
-16.4K lines of Rust + GPU kernels. Trains, fine-tunes, aligns, and deploys transformer language models from scratch.
+*Smedjan* is Swedish for "the smithy" — the forge where you make your own tools. The whole stack is here: every line of code, every GPU kernel, every byte of the model. ~45K lines of Rust that train, fine-tune, align, quantize, and serve decoder-only transformer language models from scratch on your own hardware.
 
 ## Why
 
-Own the stack. Every line of code, every GPU kernel, every byte of the model. No frameworks, no runtimes, no dependencies you don't control. Runs on macOS today and NVIDIA CUDA hosts next; AndreOS is a planned native target once its GPU backend lands.
+Own the stack. No frameworks, no runtimes, no dependencies you don't control — the entire dependency tree is a handful of small crates (`clap`, `rand`, `memmap2`, `byteorder`, and the GPU FFI bindings). Train on a laptop, resume on a datacenter GPU, and carry the same checkpoint format between them.
 
 ## Architecture
 
@@ -15,160 +15,41 @@ model.rs / attention.rs     ← Transformer (RoPE, GQA, SwiGLU, weight-tied lm_h
 tensor.rs                   ← GPU tensor operations
 autograd.rs                 ← Tape-based reverse-mode autodiff
       ↓ (backend-agnostic above this line)
-metal/   cuda/               ← GPU backends (compile-time selected)
+metal/   cuda/              ← GPU backends (compile-time selected)
 ```
 
 **Two GPU backends, one codebase:**
 
 ```bash
-cargo build --release                                    # Metal (macOS/Apple Silicon)
-cargo build --release --features cuda --no-default-features    # CUDA (NVIDIA)
+cargo build --release                                          # Metal (macOS / Apple Silicon)
+cargo build --release --no-default-features --features cuda    # CUDA (NVIDIA)
 ```
 
-Checkpoints are portable across supported backends. Train on Mac, resume on H100, and carry the same checkpoint format into future backends.
+Checkpoints are portable across supported backends. Train on a Mac, resume on an H100, keep the same checkpoint format.
 
-## Features
+## Install
 
-### Training Pipeline
+Requires a recent stable Rust toolchain ([rustup](https://rustup.rs)).
 
-| Stage | Command | Description |
-|-------|---------|-------------|
-| Pre-train | `andreai train` | Train from scratch on raw text |
-| Distill | `andreai train --teacher-checkpoint teacher.bin` | Knowledge distillation (KL + CE) |
-| SFT | `andreai sft` | Supervised fine-tuning on instruction data |
-| DPO | `andreai dpo` | Direct Preference Optimization (alignment) |
-| Evaluate | `andreai eval` | Benchmark across 8 categories |
-
-### Inference
-
-| Feature | Command |
-|---------|---------|
-| Generate | `andreai generate --checkpoint model.bin --prompt "Hello"` |
-| Speculative | `andreai generate --speculative --draft-checkpoint draft.bin` |
-| Streaming | `andreai generate --stream` |
-
-### Data Pipeline
-
-| Command | Description |
-|---------|-------------|
-| `andreai tokenizer` | Train BPE tokenizer on corpus |
-| `andreai prepare` | Convert text to binary training format |
-| `andreai process` | Quality filtering, deduplication |
-| `andreai mix` | Mix datasets with custom ratios |
-| `andreai dpo-prepare` | Convert JSONL preference pairs to binary |
-
-### Model
-
-- **Architecture**: Decoder-only transformer with pre-norm (RMSNorm)
-- **Attention**: Multi-Head or Grouped Query (GQA) via `--kv-heads`
-- **Activation**: SwiGLU feed-forward
-- **Position**: Rotary Position Embeddings (RoPE) with NTK-aware scaling
-- **Weight tying**: Embedding matrix shared with language model head
-- **Sizes**: 2M (tiny) to 6.5B (8b), plus fully custom via `--size custom --dim --layers --heads`
-
-### Optimization
-
-- **FP16 mixed precision**: Half-precision shared memory + FP16 input matmuls with float accumulator
-- **Gradient accumulation**: `--grad-accum N` (effective_batch = batch_size * N)
-- **Gradient checkpointing**: `--gradient-checkpointing` (trade compute for memory)
-- **AdamW** with cosine warmup scheduler and optional warm restarts (`--lr-restart`)
-- **Gradient clipping** with NaN/Inf detection and zeroing
-
-### Production
-
-- **Checkpoint resume**: `--resume state_5000.bin` (saves optimizer state + model + step)
-- **Validation loss**: `--val-dataset val.bin` (eval every checkpoint interval)
-- **Early stopping**: Stops after 3 intervals without validation improvement
-- **Training CSV log**: `{checkpoint_dir}/train.csv` with step, loss, lr, tok/s, tokens
-- **Quantization**: `andreai quantize` (Q4/Q8 post-training)
-
-## Performance
-
-Throughput (removed: broken benchmark):
-
-| Machine | Original | Optimized | Speedup |
-|---------|----------|-----------|---------|
-| Mac mini M1 | benchmark removed (broken bench era) |
-| MacBook Air M3 | benchmark removed (broken bench era) |
-| **Combined** | **294 tok/s** | **~1,550 sustained** | **5.3x** |
-
-Key optimizations:
-- Batched matmul shaders (96 GPU dispatches → 6 per attention layer)
-- FP16 mixed precision (half shared memory + half input reads)
-- Merged forward+backward GPU command batch
-- Clamped FP16 casts (prevents NaN from half overflow)
-- RoPE sincos single instruction
-
-98M Chinchilla-optimal training (2B tokens): ~15 days on both machines.
-
-## GPU Kernels
-
-46 CUDA + 35 Metal kernels covering:
-
-**Compute**: tiled matmul (6 variants), batched matmul (6 variants), FP16-input matmul (6 variants)
-
-**Normalization**: softmax, RMS norm, fused residual+RMS norm
-
-**Activation**: SiLU, SiLU-gate (fused), RoPE forward/backward
-
-**Training**: cross-entropy loss, KL divergence (distillation), AdamW update, gradient clipping (L2 norm + NaN check)
-
-**Inference**: argmax, temperature scaling, causal masking, KV cache operations
-
-**Utility**: FP16 cast (with clamp), transpose permutation, embedding lookup/backward, buffer copy
-
-All kernels use FP16 shared memory with float accumulator (mixed precision).
-
-## File Structure
-
-```
-src/
-  main.rs          (749)   15 CLI commands
-  model.rs         (488)   Transformer architecture, 8 presets + custom
-  attention.rs     (484)   Multi-head attention, GQA, KV cache
-  tensor.rs        (830)   GPU tensor operations
-  autograd.rs      (901)   Tape-based autodiff, gradient checkpointing
-  train.rs         (428)   Training loop, grad accum, validation, resume
-  generate.rs      (632)   Inference, speculative decoding
-  dpo.rs          (1171)   Direct Preference Optimization
-  sft.rs           (633)   Supervised fine-tuning
-  loss.rs          (171)   Cross-entropy + distillation loss
-  optim.rs         (165)   AdamW, cosine warmup with restarts
-  checkpoint.rs    (317)   Save/load model + optimizer state
-  tokenizer.rs     (370)   BPE train/encode/decode
-  data.rs          (239)   Mmap dataset, DataLoader
-  datapipe.rs      (480)   Quality filter, dedup, mixing
-  eval.rs          (365)   Benchmark (8 categories)
-  quantize.rs      (506)   Q4/Q8 quantization
-  api.rs           (115)   Rust embedding/integration API
-  tests.rs        (1463)   81 tests
-  gpu.rs            (16)   Backend feature gate
-
-  metal/                   macOS Metal backend
-    shaders.rs    (2505)   35 MSL kernels
-    compute.rs    (1165)   Dispatch functions
-    mod.rs         (469)   MetalContext, buffer pool, command batching
-
-  cuda/                    NVIDIA CUDA backend
-    kernels.rs    (1128)   46 CUDA kernels
-    compute.rs     (207)   Dispatch functions
-    mod.rs         (107)   CudaContext (cudarc)
-
+```bash
+git clone https://github.com/<your-account>/smedjan.git
+cd smedjan
+cargo build --release        # builds ./target/release/smedjan
 ```
 
-**16,416 lines total. 81 tests. 56 commits.**
+On macOS the Metal backend is the default and needs no extra setup. For CUDA you need the CUDA toolkit (12.x) installed; build with `--no-default-features --features cuda`.
 
 ## Quick Start
 
 ```bash
-# Train a tokenizer
-andreai tokenizer --input corpus.txt --vocab-size 8192 --output tokenizer.bin
+# Train a BPE tokenizer
+smedjan tokenizer --input corpus.txt --vocab-size 8192 --output tokenizer.bin
 
 # Prepare training data
-andreai prepare --input corpus.txt --tokenizer tokenizer.bin --output train.bin
+smedjan prepare --input corpus.txt --tokenizer tokenizer.bin --output train.bin
 
 # Train a model
-andreai train \
+smedjan train \
   --dataset train.bin \
   --tokenizer tokenizer.bin \
   --size medium \
@@ -178,24 +59,20 @@ andreai train \
   --lr 3e-4 \
   --checkpoint-dir checkpoints/
 
-# Resume after crash
-andreai train \
-  --dataset train.bin \
-  --tokenizer tokenizer.bin \
-  --size medium \
-  --steps 50000 \
-  --resume checkpoints/state_25000.bin
+# Resume after a crash (restores model + optimizer state + step)
+smedjan train --dataset train.bin --tokenizer tokenizer.bin --size medium \
+  --steps 50000 --resume checkpoints/state_25000.bin
 
 # Generate text
-andreai generate \
+smedjan generate \
   --checkpoint checkpoints/final.bin \
   --tokenizer tokenizer.bin \
   --prompt "The" \
   --stream
 
 # DPO alignment
-andreai dpo-prepare --input prefs.jsonl --output prefs.bin --tokenizer tokenizer.bin
-andreai dpo \
+smedjan dpo-prepare --input prefs.jsonl --output prefs.bin --tokenizer tokenizer.bin
+smedjan dpo \
   --checkpoint checkpoints/sft_final.bin \
   --ref-checkpoint checkpoints/sft_final.bin \
   --dataset prefs.bin \
@@ -203,6 +80,124 @@ andreai dpo \
   --beta 0.1
 ```
 
+## Features
+
+### Training pipeline
+
+| Stage | Command | Description |
+|-------|---------|-------------|
+| Pre-train | `smedjan train` | Train from scratch on raw text |
+| Distill | `smedjan train --teacher-checkpoint teacher.bin` | Knowledge distillation (KL + CE) |
+| SFT | `smedjan sft` | Supervised fine-tuning on instruction data |
+| DPO | `smedjan dpo` | Direct Preference Optimization (alignment) |
+| Evaluate | `smedjan eval` | Benchmark across categories |
+
+### Inference
+
+| Feature | Command |
+|---------|---------|
+| Generate | `smedjan generate --checkpoint model.bin --prompt "Hello"` |
+| Speculative | `smedjan generate --speculative --draft-checkpoint draft.bin` |
+| Streaming | `smedjan generate --stream` |
+
+### Data pipeline
+
+| Command | Description |
+|---------|-------------|
+| `smedjan tokenizer` | Train a BPE tokenizer on a corpus |
+| `smedjan prepare` | Convert text to binary training format |
+| `smedjan process` | Quality filtering and deduplication |
+| `smedjan mix` | Mix datasets with custom ratios |
+| `smedjan dpo-prepare` | Convert JSONL preference pairs to binary |
+
+### Model
+
+- **Architecture**: Decoder-only transformer, pre-norm (RMSNorm)
+- **Attention**: Multi-Head or Grouped-Query (GQA) via `--kv-heads`; also Linear, SSM (Mamba-2/SSD), RWKV, MLA, and block-sparse mixers
+- **Activation**: SwiGLU feed-forward; Mixture-of-Experts routing available
+- **Position**: Rotary Position Embeddings (RoPE) with NTK-aware and YaRN scaling
+- **Weight tying**: Embedding matrix shared with the language-model head
+- **Sizes**: tiny (2M) through 6.5B, plus fully custom via `--size custom --dim --layers --heads`
+
+### Optimization
+
+- **Mixed precision**: FP16 / BF16 input matmuls with float accumulators
+- **Gradient accumulation**: `--grad-accum N` (effective batch = batch × N)
+- **Gradient checkpointing**: `--gradient-checkpointing` (trade compute for memory)
+- **Optimizers**: AdamW (cosine warmup, optional warm restarts), Muon / NorMuon, hybrid per-parameter-group, BitNet ternary training
+- **Gradient clipping** with NaN/Inf detection and zeroing
+
+### Interop & production
+
+- **Checkpoint resume**: `--resume state_5000.bin` (model + optimizer state + step)
+- **Validation & early stopping**: `--val-dataset val.bin`, stops after N intervals without improvement
+- **Quantization**: `smedjan quantize` (Q4 / Q8 post-training)
+- **safetensors I/O**: zero-dependency import/export, including an HF-Llama weight remap for continued-training retrofits
+- **GGUF export**: produces `llama.cpp`-compatible files
+
+## Performance
+
+Throughput (removed: broken benchmark):
+
+| Machine | Baseline | Optimized | Speedup |
+|---------|----------|-----------|---------|
+| Mac mini M1 | benchmark removed (broken bench era) |
+| MacBook Air M3 | benchmark removed (broken bench era) |
+
+Key optimizations: batched matmul shaders (96 GPU dispatches → 6 per attention layer), FP16 mixed precision, a merged forward+backward GPU command batch, clamped FP16 casts, and single-instruction RoPE sincos.
+
+## Module map
+
+```
+src/
+  main.rs        CLI entry point and subcommands
+  model.rs       Transformer architecture, presets + custom sizes
+  attention.rs   Attention + alternative mixers (GQA, Linear, SSM, RWKV, MLA, block-sparse)
+  tensor.rs      GPU tensor operations
+  autograd.rs    Tape-based autodiff, gradient checkpointing
+  train.rs       Training loop, grad accum, validation, resume
+  generate.rs    Inference, sampling, speculative decoding
+  dpo.rs         Direct Preference Optimization
+  sft.rs         Supervised fine-tuning
+  loss.rs        Cross-entropy + distillation loss
+  optim.rs       AdamW, Muon/NorMuon, schedulers
+  checkpoint.rs  Save/load model + optimizer state
+  tokenizer.rs   BPE train / encode / decode
+  data.rs        Mmap dataset + DataLoader
+  datapipe.rs    Quality filtering, dedup, mixing
+  eval.rs        Benchmark harness
+  quantize.rs    Q4/Q8 quantization, GGUF export
+  safetensors.rs safetensors + HF-Llama interop
+  api.rs         Rust embedding/integration API
+
+  metal/         macOS Metal backend (MSL kernels, dispatch, buffer pool)
+  cuda/          NVIDIA CUDA backend (cudarc)
+```
+
+~45K lines of Rust, 260+ tests.
+
+## Testing
+
+The test suite runs against the GPU backend, so it must be run on real hardware:
+
+```bash
+# macOS / Apple Silicon
+cargo test --release
+
+# GPU tests that touch shared device state run serially
+cargo test --release -- --include-ignored --test-threads=1
+
+# NVIDIA
+cargo test --release --no-default-features --features cuda
+```
+
+## Roadmap
+
+- Faithful HF inference parity (config.json → model, bf16 weight loading)
+- CUDA backward parity for the remaining specialized kernels
+- Chunked O(N) RWKV forward (the SSM chunked path already exists)
+- Further long-context evaluation (NIAH / RULER) on trained checkpoints
+
 ## License
 
-Private. All rights reserved.
+[MIT](LICENSE) © Andrei Dodu

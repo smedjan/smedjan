@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Mac GPU CI gate for andreai (Metal). Runs the §5 verification protocol, formatting
+# Mac GPU CI gate for smedjan (Metal). Runs the §5 verification protocol, formatting
 # gates, CUDA compile parity, train smokes, and the buffer-pool sanitizer suite — the
 # GPU-correctness gate that the host-only workflow previously lacked. Intended to run
 # on an always-on Apple-Silicon Mac (mini) via launchd/cron, or by hand on air. Exits
 # non-zero with a one-line summary on any failure.
 #
-#   ANDREAI_REPO      repo path        (default: $HOME/projects/andreai)
-#   ANDREAI_CI_PULL   1 = fetch+reset to origin/main before testing (default: 0 = test tree)
-#   ANDREAI_CI_LOG    per-gate log dir (default: /tmp/andreai-ci)
-#   ANDREAI_CI_LOCK   host-wide GPU lock dir (default: /tmp/andreai-mac-gpu-ci.lock)
+#   SMEDJAN_REPO      repo path        (default: $HOME/projects/smedjan)
+#   SMEDJAN_CI_PULL   1 = fetch+reset to origin/main before testing (default: 0 = test tree)
+#   SMEDJAN_CI_LOG    per-gate log dir (default: /tmp/smedjan-ci)
+#   SMEDJAN_CI_LOCK   host-wide GPU lock dir (default: /tmp/smedjan-mac-gpu-ci.lock)
 set -uo pipefail
 export CARGO_INCREMENTAL=0
 
-REPO="${ANDREAI_REPO:-$HOME/projects/andreai}"
-PULL="${ANDREAI_CI_PULL:-0}"
+REPO="${SMEDJAN_REPO:-$HOME/projects/smedjan}"
+PULL="${SMEDJAN_CI_PULL:-0}"
 FEAT=(--no-default-features --features metal)
-LOG_DIR="${ANDREAI_CI_LOG:-/tmp/andreai-ci}"
-LOCK_DIR="${ANDREAI_CI_LOCK:-/tmp/andreai-mac-gpu-ci.lock}"
-LOCK_WAIT_SECS="${ANDREAI_CI_LOCK_WAIT_SECS:-14400}"
+LOG_DIR="${SMEDJAN_CI_LOG:-/tmp/smedjan-ci}"
+LOCK_DIR="${SMEDJAN_CI_LOCK:-/tmp/smedjan-mac-gpu-ci.lock}"
+LOCK_WAIT_SECS="${SMEDJAN_CI_LOCK_WAIT_SECS:-14400}"
 mkdir -p "$LOG_DIR"
 ts() { date +%Y-%m-%dT%H:%M:%S; }
 cd "$REPO" || { echo "FAIL: repo $REPO not found"; exit 2; }
@@ -55,7 +55,7 @@ if [[ "$PULL" == "1" ]]; then
     || { echo "FAIL: git sync to origin/main"; exit 2; }
 fi
 HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
-echo "== andreai Mac CI @ $(ts) — $HEAD =="
+echo "== smedjan Mac CI @ $(ts) — $HEAD =="
 
 NAMES=(); RESULTS=()
 gate() { # name  command...

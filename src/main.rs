@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand};
 use std::fmt::Display;
 
 #[derive(Parser)]
-#[command(name = "andreai", about = "AndreAI — Pure Rust AI Engine")]
+#[command(name = "smedjan", about = "Smedjan — Pure Rust AI Engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -703,7 +703,7 @@ fn main() {
     let cli = Cli::parse();
     let ctx = crate::gpu::MetalContext::new();
 
-    eprintln!("AndreAI v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("Smedjan v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("Metal device: {}", ctx.device_name());
 
     // Hardware matrix units (simdgroup MMA): bit-identical, ~+27% inference / +31% training. On by
@@ -1158,7 +1158,7 @@ fn main() {
                 "Failed to load checkpoint",
             );
             let c = &model.config;
-            println!("AndreAI Model Checkpoint");
+            println!("Smedjan Model Checkpoint");
             println!("  Step: {}", step);
             println!("  Parameters: {}M", c.param_count() as f32 / 1e6);
             println!("  Vocab size: {}", c.vocab_size);
@@ -1204,7 +1204,7 @@ fn main() {
         }
 
         Commands::Sizes { vocab_size } => {
-            println!("AndreAI Model Sizes (vocab={})", vocab_size);
+            println!("Smedjan Model Sizes (vocab={})", vocab_size);
             println!();
             let presets: Vec<(&str, model::ModelConfig)> = vec![
                 ("tiny", model::ModelConfig::tiny(vocab_size)),
@@ -1766,7 +1766,7 @@ fn main() {
             let params = config.param_count();
             let fused_eligible = config.n_experts <= 1 && !config.bitnet && d <= 256 && ff <= 1024;
 
-            eprintln!("=== AndreAI Benchmark ===");
+            eprintln!("=== Smedjan Benchmark ===");
             eprintln!(
                 "Model: {}M params, d={}, ff={}, {}L, {}H, lowrank={}",
                 params as f64 / 1e6,
