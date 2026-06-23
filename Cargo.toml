@@ -8,6 +8,8 @@ repository = "https://github.com/andrei-dodu/smedjan"
 readme = "README.md"
 keywords = ["llm", "transformer", "machine-learning", "metal", "cuda"]
 categories = ["science", "command-line-utilities"]
+# Dev/CI-only files are kept in the git repo but excluded from the published crate.
+exclude = ["/data", "/scripts", "/checkpoints", "/logs", "*.bin", "*.log", "corpus.txt", "tok.bin", "dataset.bin"]
 
 [features]
 default = ["metal"]
