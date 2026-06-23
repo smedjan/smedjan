@@ -2,7 +2,12 @@
 name = "smedjan"
 version = "0.1.0"
 edition = "2021"
-description = "Pure Rust AI engine — own architecture, own training, own tokenizer"
+description = "Pure Rust LLM training and inference engine — own architecture, own training, own tokenizer; Metal and CUDA backends, zero Python."
+license = "MIT"
+repository = "https://github.com/xmaryo/smedjan"
+readme = "README.md"
+keywords = ["llm", "transformer", "machine-learning", "metal", "cuda"]
+categories = ["science", "command-line-utilities"]
 
 [features]
 default = ["metal"]
