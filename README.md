@@ -32,7 +32,7 @@ Checkpoints are portable across supported backends. Train on a Mac, resume on an
 Requires a recent stable Rust toolchain ([rustup](https://rustup.rs)).
 
 ```bash
-git clone https://github.com/andrei-dodu/smedjan.git
+git clone https://github.com/smedjan/smedjan.git
 cd smedjan
 cargo build --release        # builds ./target/release/smedjan
 ```
