@@ -335,9 +335,9 @@ fn decode_to_f32(bytes: &[u8], dtype: &str, numel: usize, name: &str) -> std::io
             "{name}: dtype {dtype} unsupported (only F32, BF16, F16)"
         ))
     })?;
-    let expect = numel.checked_mul(elem).ok_or_else(|| {
-        invalid(format!("{name}: tensor byte length overflows usize"))
-    })?;
+    let expect = numel
+        .checked_mul(elem)
+        .ok_or_else(|| invalid(format!("{name}: tensor byte length overflows usize")))?;
     if bytes.len() != expect {
         return Err(invalid(format!(
             "{name}: {} bytes for {numel} {dtype} elements (expected {expect})",
@@ -479,7 +479,9 @@ pub fn import_safetensors(
             .and_then(|d| d.as_str())
             .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
         let elem = dtype_elem_bytes(dtype).ok_or_else(|| {
-            invalid(format!("{name}: dtype {dtype} unsupported (only F32, BF16, F16)"))
+            invalid(format!(
+                "{name}: dtype {dtype} unsupported (only F32, BF16, F16)"
+            ))
         })?;
         let shape = shape_field(entry, &name)?;
         if shape != p.shape {
@@ -489,9 +491,10 @@ pub fn import_safetensors(
             )));
         }
         let (start, end) = offsets_field(entry, &name)?;
-        let expect = p.numel().checked_mul(elem).ok_or_else(|| {
-            invalid(format!("{name}: tensor byte length overflows usize"))
-        })?;
+        let expect = p
+            .numel()
+            .checked_mul(elem)
+            .ok_or_else(|| invalid(format!("{name}: tensor byte length overflows usize")))?;
         if start > end || end > blob.len() || end - start != expect {
             return Err(invalid(format!(
                 "{name}: byte range [{start},{end}) invalid (expected {expect} bytes, blob {})",
@@ -731,10 +734,14 @@ pub fn config_from_hf_json(path: &str) -> std::io::Result<ModelConfig> {
             .ok_or_else(|| invalid(format!("config.json: missing/invalid integer '{k}'")))
     };
     let opt_u = |k: &str, dflt: usize| -> usize {
-        json.get(k).and_then(|v| v.as_u64()).map_or(dflt, |n| n as usize)
+        json.get(k)
+            .and_then(|v| v.as_u64())
+            .map_or(dflt, |n| n as usize)
     };
     let opt_f = |k: &str, dflt: f32| -> f32 {
-        json.get(k).and_then(|v| v.as_f64()).map_or(dflt, |n| n as f32)
+        json.get(k)
+            .and_then(|v| v.as_f64())
+            .map_or(dflt, |n| n as f32)
     };
 
     if let Some(mt) = json.get("model_type").and_then(|v| v.as_str()) {
@@ -805,7 +812,9 @@ pub fn import_hf_safetensors(
             .and_then(|x| x.as_str())
             .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
         let elem = dtype_elem_bytes(dtype).ok_or_else(|| {
-            invalid(format!("{name}: dtype {dtype} unsupported (only F32, BF16, F16)"))
+            invalid(format!(
+                "{name}: dtype {dtype} unsupported (only F32, BF16, F16)"
+            ))
         })?;
         let shape = shape_field(e, name)?;
         if shape != expect_shape {
@@ -816,9 +825,9 @@ pub fn import_hf_safetensors(
         }
         let numel = shape_numel(expect_shape, name)?;
         let (s, en) = offsets_field(e, name)?;
-        let expect_bytes = numel.checked_mul(elem).ok_or_else(|| {
-            invalid(format!("{name}: tensor byte length overflows usize"))
-        })?;
+        let expect_bytes = numel
+            .checked_mul(elem)
+            .ok_or_else(|| invalid(format!("{name}: tensor byte length overflows usize")))?;
         if s > en || en > blob.len() || en - s != expect_bytes {
             return Err(invalid(format!(
                 "{name}: byte range [{s},{en}) invalid (expected {expect_bytes} bytes, blob {})",
@@ -940,7 +949,7 @@ mod dtype_tests {
         assert_eq!(bf16_to_f32(0xC000), -2.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
         assert_eq!(bf16_to_f32(0x4049), f32::from_bits(0x4049u32 << 16)); // ~3.14
-        // Range: bf16 keeps f32's 8-bit exponent, so values far above the f16 max survive.
+                                                                          // Range: bf16 keeps f32's 8-bit exponent, so values far above the f16 max survive.
         let big = bf16_to_f32(0x7149); // ~1e30
         assert!(big > 1e29, "bf16 must preserve large exponent: {big}");
     }
@@ -966,14 +975,32 @@ mod dtype_tests {
     #[test]
     fn decode_dispatches_and_validates_length() {
         // F32 passthrough.
-        let f32_bytes: Vec<u8> = [1.0f32, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
-        assert_eq!(decode_to_f32(&f32_bytes, "F32", 2, "t").unwrap(), vec![1.0, -2.0]);
+        let f32_bytes: Vec<u8> = [1.0f32, -2.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_to_f32(&f32_bytes, "F32", 2, "t").unwrap(),
+            vec![1.0, -2.0]
+        );
         // BF16 widening.
-        let bf16_bytes: Vec<u8> = [0x3F80u16, 0xC000].iter().flat_map(|h| h.to_le_bytes()).collect();
-        assert_eq!(decode_to_f32(&bf16_bytes, "BF16", 2, "t").unwrap(), vec![1.0, -2.0]);
+        let bf16_bytes: Vec<u8> = [0x3F80u16, 0xC000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_to_f32(&bf16_bytes, "BF16", 2, "t").unwrap(),
+            vec![1.0, -2.0]
+        );
         // F16 widening.
-        let f16_bytes: Vec<u8> = [0x3C00u16, 0x3800].iter().flat_map(|h| h.to_le_bytes()).collect();
-        assert_eq!(decode_to_f32(&f16_bytes, "F16", 2, "t").unwrap(), vec![1.0, 0.5]);
+        let f16_bytes: Vec<u8> = [0x3C00u16, 0x3800]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_to_f32(&f16_bytes, "F16", 2, "t").unwrap(),
+            vec![1.0, 0.5]
+        );
         // Wrong byte length is rejected (2 elems of bf16 = 4 bytes, not 8).
         assert!(decode_to_f32(&[0u8; 8], "BF16", 2, "t").is_err());
         // Unsupported dtype is rejected.

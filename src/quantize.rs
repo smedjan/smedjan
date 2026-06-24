@@ -1050,7 +1050,10 @@ mod gguf_block_tests {
         let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
         for (i, &xi) in x.iter().enumerate() {
             let deq = (out[2 + i] as i8) as f32 * d;
-            assert!((deq - xi).abs() <= amax / 127.0 + 1e-5, "q8_0 [{i}] {xi} -> {deq}");
+            assert!(
+                (deq - xi).abs() <= amax / 127.0 + 1e-5,
+                "q8_0 [{i}] {xi} -> {deq}"
+            );
         }
     }
 
@@ -1065,8 +1068,14 @@ mod gguf_block_tests {
         for j in 0..16 {
             let lo = (out[2 + j] & 0x0f) as i32 - 8;
             let hi = (out[2 + j] >> 4) as i32 - 8;
-            assert!((lo as f32 * d - x[j]).abs() <= 1.5 * d.abs() + amax * 0.03, "q4_0 lo[{j}]");
-            assert!((hi as f32 * d - x[j + 16]).abs() <= 1.5 * d.abs() + amax * 0.03, "q4_0 hi[{j}]");
+            assert!(
+                (lo as f32 * d - x[j]).abs() <= 1.5 * d.abs() + amax * 0.03,
+                "q4_0 lo[{j}]"
+            );
+            assert!(
+                (hi as f32 * d - x[j + 16]).abs() <= 1.5 * d.abs() + amax * 0.03,
+                "q4_0 hi[{j}]"
+            );
         }
     }
 

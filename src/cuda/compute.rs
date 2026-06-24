@@ -88,6 +88,110 @@ fn cublas_sgemm(
     }
 }
 
+/// f32→bf16 cast: pack two bf16 per 32-bit word (see the `cast_f32_to_bf16` kernel). `output` must
+/// hold `size.div_ceil(2)` words (i.e. allocate `size * 2` bytes).
+pub fn gpu_cast_f32_to_bf16(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    output: &GpuBuffer,
+    size: u32,
+) {
+    let n_words = size.div_ceil(2); // 2 bf16 packed per 4-byte word
+    let cfg = launch_cfg(256, n_words.div_ceil(256));
+    let f = ctx.device.get_func("smedjan", "cast_f32_to_bf16").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
+
+/// bf16 tensor-core GEMM: cast A,B to bf16 (pooled scratch), then `cublasGemmEx` with bf16 inputs,
+/// fp32 output, fp32 accumulate, tensor-op algo — ~2× TF32 GEMM throughput on Ada at fp32-stable
+/// accumulation. Same row-major→col-major operand swap as `cublas_sgemm`.
+#[allow(clippy::too_many_arguments)]
+fn cublas_gemm_bf16(
+    ctx: &Arc<MetalContext>,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_a: bool,
+    trans_b: bool,
+) {
+    use cudarc::cublas::result;
+    use cudarc::cublas::sys::{
+        cublasComputeType_t as Compute, cublasGemmAlgo_t as Algo, cublasOperation_t as Op,
+        cudaDataType_t as Dt,
+    };
+    use cudarc::driver::DevicePtr;
+    use std::ffi::c_void;
+    let a_elems = (m * k) as usize; // element count is m*k regardless of trans_a
+    let b_elems = (k * n) as usize;
+    let a_bf16 = ctx.alloc_buffer(a_elems * 2); // 2 bytes per bf16
+    let b_bf16 = ctx.alloc_buffer(b_elems * 2);
+    gpu_cast_f32_to_bf16(ctx, a, &a_bf16, a_elems as u32);
+    gpu_cast_f32_to_bf16(ctx, b, &b_bf16, b_elems as u32);
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let a_ptr = *a_bf16.device_ptr() as *const c_void;
+    let b_ptr = *b_bf16.device_ptr() as *const c_void;
+    let c_ptr = *c.device_ptr() as *mut c_void;
+    let (op_b, ldb) = if trans_b {
+        (Op::CUBLAS_OP_T, k as i32)
+    } else {
+        (Op::CUBLAS_OP_N, n as i32)
+    };
+    let (op_a, lda) = if trans_a {
+        (Op::CUBLAS_OP_T, m as i32)
+    } else {
+        (Op::CUBLAS_OP_N, k as i32)
+    };
+    unsafe {
+        result::gemm_ex(
+            *ctx.cublas_fast.handle(),
+            op_b,
+            op_a,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32 as *const c_void,
+            b_ptr,
+            Dt::CUDA_R_16BF,
+            ldb,
+            a_ptr,
+            Dt::CUDA_R_16BF,
+            lda,
+            &beta as *const f32 as *const c_void,
+            c_ptr,
+            Dt::CUDA_R_32F,
+            n as i32,
+            Compute::CUBLAS_COMPUTE_32F,
+            Algo::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+        .expect("cublas gemm_ex bf16");
+    }
+}
+
+/// Fast-path GEMM dispatcher. bf16 tensor cores when opted in (training/inference forward+backward,
+/// simdgroup on), else the TF32/precise cuBLAS SGEMM picked by `cublas_for` (precise = gradchecks).
+#[allow(clippy::too_many_arguments)]
+fn cublas_gemm(
+    ctx: &Arc<MetalContext>,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_a: bool,
+    trans_b: bool,
+) {
+    if bf16_gemm_enabled() && simdgroup_matmul_enabled() {
+        cublas_gemm_bf16(ctx, a, b, c, m, n, k, trans_a, trans_b);
+    } else {
+        cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, trans_a, trans_b);
+    }
+}
+
 pub fn gpu_matmul(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -183,8 +287,8 @@ pub fn gpu_matmul_trans_b(
     n: u32,
     k: u32,
 ) {
-    // Precise cuBLAS C = A · B^T.
-    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, true);
+    // C = A · B^T (grad-input in backward, some forward). bf16 tensor cores when opted in, else TF32.
+    cublas_gemm(ctx, a, b, c, m, n, k, false, true);
 }
 
 pub fn gpu_matmul_trans_a(
@@ -661,7 +765,8 @@ pub fn gpu_matmul_simdgroup(
     n: u32,
     k: u32,
 ) {
-    gpu_matmul_fp32(ctx, a, b, c, m, n, k)
+    // Fast-path NN GEMM (FFN/projection forward). bf16 tensor cores when opted in, else TF32.
+    cublas_gemm(ctx, a, b, c, m, n, k, false, false);
 }
 
 pub fn gpu_matmul_simdgroup_f16(
@@ -2153,6 +2258,18 @@ pub fn set_bf16_matmul(on: bool) -> bool {
 }
 pub fn bf16_matmul_enabled() -> bool {
     BF16_MATMUL.with(|c| c.get())
+}
+thread_local! {
+    // Distinct from BF16_MATMUL (the old simdgroup-OFF tiled bf16 fallback): this routes the fast
+    // path (simdgroup ON) through cublasGemmEx bf16 tensor cores instead of TF32 — ~2× GEMM
+    // throughput on Ada, fp32 accumulate so training stays stable. Off by default; opt in per run.
+    static BF16_GEMM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn set_bf16_gemm(on: bool) -> bool {
+    BF16_GEMM.with(|c| c.replace(on))
+}
+pub fn bf16_gemm_enabled() -> bool {
+    BF16_GEMM.with(|c| c.get())
 }
 thread_local! {
     static RMSNORM_CLAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };

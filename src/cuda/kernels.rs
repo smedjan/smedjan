@@ -40,6 +40,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "embedding_lookup",
     "cast_f32_to_f16",
     "cast_f16_to_f32",
+    "cast_f32_to_bf16",
     "transpose_perm_forward",
     "transpose_perm_backward",
     "transpose_2d",
@@ -722,6 +723,20 @@ extern "C" __global__ void cast_f16_to_f32(const unsigned int* input, float* out
     unsigned int packed = input[i];
     output[2 * i] = __half2float(__ushort_as_half((unsigned short)(packed & 0xFFFF)));
     if (2 * i + 1 < size) output[2 * i + 1] = __half2float(__ushort_as_half((unsigned short)(packed >> 16)));
+}
+
+// f32 -> bf16, two bf16 packed little-endian per 32-bit word (element 2i in the low half), matching
+// the contiguous __nv_bfloat16 layout cublasGemmEx reads. No clamp: bf16 shares fp32's exponent
+// range, only the mantissa narrows to 7 bits (round-to-nearest-even via __float2bfloat16).
+extern "C" __global__ void cast_f32_to_bf16(const float* input, unsigned int* output, unsigned int size) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; // packed-word index
+    unsigned int n_words = (size + 1) / 2;
+    if (i >= n_words) return;
+    unsigned int lo_idx = 2 * i, hi_idx = 2 * i + 1;
+    unsigned short lo = __bfloat16_as_ushort(__float2bfloat16(input[lo_idx]));
+    unsigned short hi = 0;
+    if (hi_idx < size) hi = __bfloat16_as_ushort(__float2bfloat16(input[hi_idx]));
+    output[i] = ((unsigned int)hi << 16) | (unsigned int)lo;
 }
 
 // ============================================================

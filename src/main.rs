@@ -728,6 +728,14 @@ fn main() {
     // default for every command; `bench` and `train` force it from their own flags below.
     crate::gpu::compute::set_simdgroup_matmul(true);
 
+    // Opt-in bf16 tensor-core GEMM on CUDA (fast path): ~2× TF32 GEMM throughput on Ada, fp32
+    // accumulate. Gated by env so it can be A/B'd against TF32 without a rebuild.
+    #[cfg(feature = "cuda")]
+    if std::env::var("SMEDJAN_BF16_GEMM").is_ok() {
+        crate::gpu::compute::set_bf16_gemm(true);
+        eprintln!("Matmul: bf16 tensor-core GEMM enabled (SMEDJAN_BF16_GEMM)");
+    }
+
     match cli.command {
         Commands::Tokenizer {
             input,
@@ -1569,7 +1577,10 @@ fn main() {
                 format!("{}/model.safetensors", model_dir.trim_end_matches('/'))
             });
             if !std::path::Path::new(&weights_path).exists() {
-                let index = format!("{}/model.safetensors.index.json", model_dir.trim_end_matches('/'));
+                let index = format!(
+                    "{}/model.safetensors.index.json",
+                    model_dir.trim_end_matches('/')
+                );
                 if std::path::Path::new(&index).exists() {
                     exit_with_error(
                         "HF import",

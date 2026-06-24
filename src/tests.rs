@@ -6416,13 +6416,15 @@ mod suite {
         // Truncate each f32 to bf16 (high 16 bits) — what bf16 exporters do.
         let bf16_blob: Vec<u8> = blob
             .chunks_exact(4)
-            .flat_map(|b| ((u32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 16) as u16).to_le_bytes())
+            .flat_map(|b| {
+                ((u32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 16) as u16).to_le_bytes()
+            })
             .collect();
         let bf16_header = retype_and_halve_offsets(&header, "BF16");
         write_test_safetensors(bf16_path, &bf16_header, &bf16_blob);
 
-        let from_f32 =
-            crate::safetensors::import_hf_safetensors(&ctx, f32_path, cfg.clone()).expect("import f32");
+        let from_f32 = crate::safetensors::import_hf_safetensors(&ctx, f32_path, cfg.clone())
+            .expect("import f32");
         let from_bf16 =
             crate::safetensors::import_hf_safetensors(&ctx, bf16_path, cfg).expect("import bf16");
 
@@ -6555,9 +6557,17 @@ mod suite {
             let path = format!("/tmp/smedjan_align_{quant}.gguf");
             crate::quantize::export_gguf(&model, &path, quant).expect("export gguf");
             let (alignment, offsets) = read_gguf_alignment_and_offsets(&path);
-            assert_eq!(alignment, Some(32), "{quant}: general.alignment KV must be 32");
+            assert_eq!(
+                alignment,
+                Some(32),
+                "{quant}: general.alignment KV must be 32"
+            );
             for (i, off) in offsets.iter().enumerate() {
-                assert_eq!(off % 32, 0, "{quant}: tensor {i} offset {off} not 32-aligned");
+                assert_eq!(
+                    off % 32,
+                    0,
+                    "{quant}: tensor {i} offset {off} not 32-aligned"
+                );
             }
             std::fs::remove_file(&path).ok();
         }

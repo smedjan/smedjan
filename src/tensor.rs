@@ -461,7 +461,13 @@ impl Tensor {
                 // fp16 cast). Metal: hardware simdgroup MMA on fp16 inputs.
                 #[cfg(feature = "cuda")]
                 compute::gpu_matmul_simdgroup(
-                    &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
+                    &self.ctx,
+                    &self.buffer,
+                    &other.buffer,
+                    &out_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
                 );
                 #[cfg(feature = "metal")]
                 {
@@ -486,7 +492,13 @@ impl Tensor {
                 // precise fp32 path (gradchecks / simdgroup-off): no fp16 cast, so finite-difference
                 // perturbations register and gradients are not corrupted by fp16 rounding.
                 compute::gpu_matmul(
-                    &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
+                    &self.ctx,
+                    &self.buffer,
+                    &other.buffer,
+                    &out_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
                 );
             }
         } else if batch_a == batch_b {
@@ -743,7 +755,13 @@ impl Tensor {
             // precise fp32 path (gradchecks / simdgroup-off): no fp16 cast, so finite-difference
             // perturbations register and gradients are not corrupted by fp16 rounding.
             compute::gpu_matmul_trans_b(
-                &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
+                &self.ctx,
+                &self.buffer,
+                &other.buffer,
+                &out_buf,
+                m as u32,
+                n as u32,
+                k as u32,
             );
         }
 

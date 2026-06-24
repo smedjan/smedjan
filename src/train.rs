@@ -828,8 +828,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut peak_tok_s = 0.0f32;
     let mut best_train_loss = f32::INFINITY;
     let mut prev_loss = 0.0f32; // for gradient noise estimation
-    // Rolling window of recent logged losses, rendered as a Unicode sparkline in the progress line.
-    let mut loss_window: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(21);
+                                // Rolling window of recent logged losses, rendered as a Unicode sparkline in the progress line.
+    let mut loss_window: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(21);
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     // Persistent, UNPOOLED loss-readout buffer (allocated once, never recycled, never aliases a live
