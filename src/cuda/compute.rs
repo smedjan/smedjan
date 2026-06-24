@@ -520,8 +520,13 @@ pub fn gpu_l2_norm_check_into(
     size: u32,
     output: &GpuBuffer,
 ) {
-    let tpg = next_power_of_2_clamped(size as u64) as u32;
-    let cfg = launch_cfg(tpg, 1);
+    // The kernel atomic-accumulates into output ([sum_sq, nan_flag]); pre-zero it, then launch
+    // enough blocks to saturate the GPU. The old launch_cfg(tpg,1) ran the whole reduction on a
+    // single block/SM and was ~50% of CUDA training time on a 4090 (122 of these per step).
+    gpu_fill(ctx, output, 2, 0.0);
+    let threads = 256u32;
+    let blocks = size.div_ceil(threads).clamp(1, 1024);
+    let cfg = launch_cfg(threads, blocks);
     let f = ctx.device.get_func("smedjan", "l2_norm_check").unwrap();
     unsafe { f.launch(cfg, (data, output, size)) }.unwrap();
 }
@@ -1574,8 +1579,12 @@ pub fn gpu_l2_norm(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32) -> f32 
 }
 
 pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, output: &GpuBuffer) {
-    let tpg = next_power_of_2_clamped(size as u64) as u32;
-    let cfg = launch_cfg(tpg, 1);
+    // Same multi-block atomic-reduction contract as gpu_l2_norm_check_into: pre-zero, then
+    // saturate the GPU instead of running on a single block.
+    gpu_fill(ctx, output, 2, 0.0);
+    let threads = 256u32;
+    let blocks = size.div_ceil(threads).clamp(1, 1024);
+    let cfg = launch_cfg(threads, blocks);
     let f = ctx.device.get_func("smedjan", "l2_norm_check").unwrap();
     unsafe { f.launch(cfg, (data, output, size)) }.unwrap();
 }

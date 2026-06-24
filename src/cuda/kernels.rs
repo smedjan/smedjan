@@ -743,12 +743,18 @@ extern "C" __global__ void cast_f32_to_bf16(const float* input, unsigned int* ou
 // L2 norm check (for gradient clipping)
 // ============================================================
 extern "C" __global__ void l2_norm_check(const float* data, float* output, unsigned int size) {
+    // Multi-block grid-stride reduction. Each block reduces its slice in shared memory, then
+    // atomically accumulates into a PRE-ZEROED output ([sum_sq, nan_flag]). This saturates the
+    // whole GPU; the old single-block launch (launch_cfg(tpg,1)) serialized multi-million-element
+    // gradient norms onto one SM and cost ~50% of CUDA training time on a 4090.
     __shared__ float shared_ss[256];
     __shared__ float shared_nan[256];
     int tid = threadIdx.x;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
     float local_ss = 0.0f;
     float local_nan = 0.0f;
-    for (int i = tid; i < size; i += blockDim.x) {
+    for (unsigned int i = gid; i < size; i += stride) {
         float v = data[i];
         if (isnan(v) || isinf(v)) local_nan = 1.0f;
         else local_ss += v * v;
@@ -764,8 +770,8 @@ extern "C" __global__ void l2_norm_check(const float* data, float* output, unsig
         __syncthreads();
     }
     if (tid == 0) {
-        output[0] = shared_ss[0];
-        output[1] = shared_nan[0];
+        atomicAdd(&output[0], shared_ss[0]);
+        if (shared_nan[0] > 0.0f) output[1] = 1.0f; // benign race: writers only ever store 1
     }
 }
 
