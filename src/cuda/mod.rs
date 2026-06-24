@@ -109,7 +109,7 @@ impl MetalContext {
         let cublas_fast =
             cudarc::cublas::CudaBlas::new(device.clone()).expect("Failed to init cuBLAS (fast)");
         unsafe {
-            cudarc::cublas::sys::cublasSetMathMode(
+            cudarc::cublas::sys::lib().cublasSetMathMode(
                 *cublas_fast.handle(),
                 cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
             );

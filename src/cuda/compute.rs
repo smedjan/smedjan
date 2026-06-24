@@ -49,7 +49,8 @@ fn cublas_sgemm(
     trans_a: bool,
     trans_b: bool,
 ) {
-    use cudarc::cublas::sys::{cublasOperation_t as Op, cublasSgemm_v2};
+    use cudarc::cublas::result;
+    use cudarc::cublas::sys::cublasOperation_t as Op;
     use cudarc::driver::DevicePtr;
     let alpha = 1.0f32;
     let beta = 0.0f32;
@@ -59,7 +60,7 @@ fn cublas_sgemm(
     let (op_b, ldb) = if trans_b { (Op::CUBLAS_OP_T, k as i32) } else { (Op::CUBLAS_OP_N, n as i32) };
     let (op_a, lda) = if trans_a { (Op::CUBLAS_OP_T, m as i32) } else { (Op::CUBLAS_OP_N, k as i32) };
     unsafe {
-        cublasSgemm_v2(
+        result::sgemm(
             *blas.handle(),
             op_b,
             op_a,
@@ -74,7 +75,8 @@ fn cublas_sgemm(
             &beta as *const f32,
             c_ptr,
             n as i32,
-        );
+        )
+        .expect("cublas sgemm");
     }
 }
 
