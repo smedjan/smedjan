@@ -1,8 +1,13 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="Smedjan" width="128" height="128">
+  <a href="https://smedjan.dev"><img src="https://raw.githubusercontent.com/smedjan/smedjan/main/docs/banner.png" alt="SMEDJAN — pure-Rust LLM engine. Own the stack." width="840"></a>
 </p>
 
-<h1 align="center">SMEDJAN</h1>
+<p align="center">
+  <a href="https://crates.io/crates/smedjan"><img src="https://img.shields.io/crates/v/smedjan?style=flat-square&amp;color=ff7a2f&amp;labelColor=0d1014" alt="crates.io"></a>
+  <a href="https://crates.io/crates/smedjan"><img src="https://img.shields.io/crates/d/smedjan?style=flat-square&amp;color=ff7a2f&amp;labelColor=0d1014" alt="downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/smedjan?style=flat-square&amp;color=ff7a2f&amp;labelColor=0d1014" alt="MIT license"></a>
+  <a href="https://smedjan.dev"><img src="https://img.shields.io/badge/site-smedjan.dev-ff7a2f?style=flat-square&amp;labelColor=0d1014" alt="website"></a>
+</p>
 
 <p align="center"><strong>Pure-Rust LLM training and inference engine — zero Python, zero PyTorch, zero cloud.</strong></p>
 
@@ -148,14 +153,14 @@ smedjan dpo \
 
 ## Performance
 
-Measured with `smedjan bench` on an Apple M1 Mac mini (16 GB) — batch 4, sequence length 128. Real throughput, not theoretical peaks:
+Measured with `smedjan bench` on an Apple M1 Mac mini (16 GB) — batch 4, sequence length 128, hardware simdgroup-MMA path (the default). Real throughput, not theoretical peaks:
 
 | Preset | Inference (forward) | Decode (1 tok, KV cache) | Train (fwd+bwd) |
 |--------|--------------------:|-------------------------:|----------------:|
-| `small` (7.2M · d256/6L) | 20,300 tok/s | 154 tok/s | 3,329 tok/s |
-| `medium` (45M · d512/12L) | 4,386 tok/s | 57 tok/s | 901 tok/s |
+| `small` (7.2M · d256/6L) | 22,900 tok/s | 173 tok/s | 4,400 tok/s |
+| `medium` (45M · d512/12L) | 5,090 tok/s | 65 tok/s | 1,150 tok/s |
 
-The hardware simdgroup-MMA matmul path (on by default) runs ~1.2–1.3× the scalar fallback on `medium`: training 760 → 901 tok/s, inference 3,323 → 4,386 tok/s. Other Metal-pass wins: batched matmul shaders, FP16 mixed precision with float accumulators, a merged forward+backward command batch, and single-instruction RoPE sincos. Reproduce on your own hardware with `smedjan bench --size <preset>`.
+The hardware simdgroup-MMA matmul path is on by default (bit-identical to the scalar kernels) and runs ~1.3–1.4× faster — on `medium`, inference 3,600 → 5,090 tok/s and training 785 → 1,150 tok/s. Measure the scalar fallback with `smedjan bench --no-simdgroup-matmul`. Other Metal-pass wins: batched matmul shaders, FP16 mixed precision with float accumulators, a merged forward+backward command batch, and single-instruction RoPE sincos. Reproduce on your own hardware with `smedjan bench --size <preset>`.
 
 ## Module map
 
@@ -163,13 +168,17 @@ The hardware simdgroup-MMA matmul path (on by default) runs ~1.2–1.3× the sca
 src/
   main.rs        CLI entry point and subcommands
   model.rs       Transformer architecture, presets + custom sizes
-  attention.rs   Attention + alternative mixers (GQA, Linear, SSM, RWKV, MLA, block-sparse)
+  attention.rs   Multi-head & grouped-query attention, RoPE, KV cache
+  linear_attention.rs · ssm.rs · rwkv.rs · mla.rs
+                 Alternative sequence mixers (Linear, Mamba-2/SSD, RWKV, MLA, block-sparse)
   tensor.rs      GPU tensor operations
+  gpu.rs         Backend-agnostic GPU dispatch facade
   autograd.rs    Tape-based autodiff, gradient checkpointing
   train.rs       Training loop, grad accum, validation, resume
   generate.rs    Inference, sampling, speculative decoding
   dpo.rs         Direct Preference Optimization
   sft.rs         Supervised fine-tuning
+  distill.rs     Knowledge distillation (KL + CE teacher transfer)
   loss.rs        Cross-entropy + distillation loss
   optim.rs       AdamW, Muon/NorMuon, schedulers
   checkpoint.rs  Save/load model + optimizer state

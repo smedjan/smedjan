@@ -232,7 +232,7 @@ struct TrainArgs {
     /// e.g. 4 → "3 softmax : 1 linear". Ignored when --ssm/--rwkv/--linear-attn replace every block.
     #[arg(long, default_value = "0")]
     linear_attn_period: usize,
-    /// Low-rank FFN training: decompose W=[d,ff] into U=[d,r]×V=[r,ff]. 0=full rank.
+    /// Low-rank FFN training: decompose W=`[d,ff]` into U=`[d,r]`×V=`[r,ff]`. 0=full rank.
     #[arg(long, default_value = "0")]
     lowrank: usize,
     /// ALBERT: share weights across all layers (1 unique layer, N iterations)
@@ -498,7 +498,7 @@ enum Commands {
         /// Long-context suite: comma-separated target context lengths in tokens.
         #[arg(long, default_value = "256,512,1024")]
         longctx_lengths: String,
-        /// Long-context suite: comma-separated needle depths in [0,1].
+        /// Long-context suite: comma-separated needle depths in `[0,1]`.
         #[arg(long, default_value = "0.0,0.5,1.0")]
         longctx_depths: String,
     },
@@ -693,9 +693,10 @@ enum Commands {
         /// Number of timed iterations
         #[arg(long, default_value = "20")]
         iters: usize,
-        /// Route matmuls through the hardware simdgroup MMA units (bit-identical; measures the fast path).
-        #[arg(long)]
-        simdgroup_matmul: bool,
+        /// Disable the hardware simdgroup MMA matmul path (ON by default, matching `train` and the
+        /// engine default; bit-identical). Use only to measure the scalar-MAC fallback.
+        #[arg(long = "no-simdgroup-matmul")]
+        no_simdgroup_matmul: bool,
     },
 }
 
@@ -1737,9 +1738,10 @@ fn main() {
             lowrank,
             warmup,
             iters,
-            simdgroup_matmul,
+            no_simdgroup_matmul,
         } => {
             use std::time::Instant;
+            let simdgroup_matmul = !no_simdgroup_matmul;
 
             if batch_size == 0 || seq_len == 0 || iters == 0 {
                 exit_with_message(

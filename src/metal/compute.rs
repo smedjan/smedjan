@@ -67,7 +67,7 @@ macro_rules! dispatch_threads_sync {
     }};
 }
 
-/// C = A @ B where A:[M,K], B:[K,N], C:[M,N]
+/// C = A @ B where A:`[M,K]`, B:`[K,N]`, C:`[M,N]`
 pub fn gpu_matmul(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -210,7 +210,7 @@ pub fn gpu_matmul_simdgroup_f16(
     dispatch_sync!(ctx, "matmul_simdgroup_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// simdgroup MMA: C(f32) = A(f32) @ B(f32)ᵀ — A:[M,K], B:[N,K], C:[M,N]. Fast backward drop-in for
+/// simdgroup MMA: C(f32) = A(f32) @ B(f32)ᵀ — A:`[M,K]`, B:`[N,K]`, C:`[M,N]`. Fast backward drop-in for
 /// gpu_matmul_trans_b (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate — same
 /// precision as the scalar trans_b (which also casts to half), MMA inner loop instead of scalar MACs.
 pub fn gpu_matmul_trans_b_simdgroup(
@@ -236,7 +236,7 @@ pub fn gpu_matmul_trans_b_simdgroup(
     dispatch_sync!(ctx, "matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:[M,K], B:[M,N], C:[K,N]. Fast backward drop-in for
+/// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:`[M,K]`, B:`[M,N]`, C:`[K,N]`. Fast backward drop-in for
 /// gpu_matmul_trans_a (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate.
 pub fn gpu_matmul_trans_a_simdgroup(
     ctx: &Arc<MetalContext>,
@@ -422,7 +422,7 @@ pub fn gpu_matmul_trans_a_f16(
     );
 }
 
-/// C = A @ B^T where A:[M,K], B:[N,K], C:[M,N]
+/// C = A @ B^T where A:`[M,K]`, B:`[N,K]`, C:`[M,N]`
 pub fn gpu_matmul_trans_b(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -666,7 +666,7 @@ pub fn gpu_batched_matmul_trans_a_f16(
     dispatch_sync!(ctx, "batched_matmul_tiled_trans_a_f16", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Batched C[b] = A[b] @ B[b] for all b in [0, batch). Single GPU dispatch.
+/// Batched C`[b]` = A`[b]` @ B`[b]` for all b in [0, batch). Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, K, N], C: [batch, M, N]
 pub fn gpu_batched_matmul(
     ctx: &Arc<MetalContext>,
@@ -729,7 +729,7 @@ pub fn gpu_batched_matmul_simdgroup(
     dispatch_sync!(ctx, "batched_matmul_simdgroup", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Batched simdgroup matmul with B transposed: C[b] = A[b] @ B[b]^T.
+/// Batched simdgroup matmul with B transposed: C`[b]` = A`[b]` @ B`[b]`^T.
 pub fn gpu_batched_matmul_trans_b_simdgroup(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -757,8 +757,8 @@ pub fn gpu_batched_matmul_trans_b_simdgroup(
     dispatch_sync!(ctx, "batched_matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Batched simdgroup matmul with A transposed: C[b] = A[b]ᵀ @ B[b]. A:[batch,M,K], B:[batch,M,N],
-/// C:[batch,K,N]; contraction over M. Fast backward drop-in for gpu_batched_matmul_trans_a.
+/// Batched simdgroup matmul with A transposed: C`[b]` = A`[b]`ᵀ @ B`[b]`. A:`[batch,M,K]`, B:`[batch,M,N]`,
+/// C:`[batch,K,N]`; contraction over M. Fast backward drop-in for gpu_batched_matmul_trans_a.
 pub fn gpu_batched_matmul_trans_a_simdgroup(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -786,7 +786,7 @@ pub fn gpu_batched_matmul_trans_a_simdgroup(
     dispatch_sync!(ctx, "batched_matmul_simdgroup_trans_a", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Batched C[b] = A[b] @ B[b]^T for all b. Single GPU dispatch.
+/// Batched C`[b]` = A`[b]` @ B`[b]`^T for all b. Single GPU dispatch.
 /// A: [batch, M, K], B: [batch, N, K], C: [batch, M, N]
 pub fn gpu_batched_matmul_trans_b(
     ctx: &Arc<MetalContext>,
@@ -820,7 +820,7 @@ pub fn gpu_batched_matmul_trans_b(
     );
 }
 
-/// GQA-aware batched C[b] = A[b] @ B[b/group_size]^T. Eliminates repeat_kv copy.
+/// GQA-aware batched C`[b]` = A`[b]` @ B`[b/group_size]`^T. Eliminates repeat_kv copy.
 /// A: [batch_q, M, K], B: [batch_kv, N, K], C: [batch_q, M, N]
 /// batch_q = batch * n_heads, batch_kv = batch * n_kv_heads, group_size = n_heads / n_kv_heads
 pub fn gpu_batched_matmul_gqa_trans_b(
@@ -863,7 +863,7 @@ pub fn gpu_batched_matmul_gqa_trans_b(
     dispatch_sync!(ctx, "batched_matmul_gqa_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// GQA-aware batched C[b] = A[b] @ B[b/group_size]. Eliminates repeat_kv copy.
+/// GQA-aware batched C`[b]` = A`[b]` @ B`[b/group_size]`. Eliminates repeat_kv copy.
 pub fn gpu_batched_matmul_gqa(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -904,8 +904,8 @@ pub fn gpu_batched_matmul_gqa(
     dispatch_sync!(ctx, "batched_matmul_gqa", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
-/// Batched C[b] = A[b]^T @ B[b] for all b. Single GPU dispatch.
-/// A: [batch, M, K] (transposed to [K,M]), B: [batch, M, N], C: [batch, K, N]
+/// Batched C`[b]` = A`[b]`^T @ B`[b]` for all b. Single GPU dispatch.
+/// A: `[batch, M, K]` (transposed to `[K,M]`), B: `[batch, M, N]`, C: `[batch, K, N]`
 pub fn gpu_batched_matmul_trans_a(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -1315,7 +1315,7 @@ pub fn gpu_cross_entropy(
     );
 }
 
-/// Reduce sum: output[0] = sum(input)
+/// Reduce sum: output`[0]` = sum(input)
 pub fn gpu_reduce_sum(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     #[repr(C)]
     struct Params {
@@ -1542,7 +1542,7 @@ pub fn gpu_flash_attention_forward(
     );
 }
 
-/// Precompute D[i] = sum_j(dO[i][j] * O[i][j]) for Flash Attention backward.
+/// Precompute D`[i]` = sum_j(dO`[i]``[j]` * O`[i]``[j]`) for Flash Attention backward.
 pub fn gpu_flash_attn_precompute_d(
     ctx: &Arc<MetalContext>,
     d_out: &GpuBuffer,
@@ -1760,7 +1760,7 @@ pub fn gpu_sophia_update(
     );
 }
 
-/// Scale each row by a different scalar: output[r][c] = input[r][c] * scales[r]
+/// Scale each row by a different scalar: output`[r]``[c]` = input`[r]``[c]` * scales`[r]`
 pub fn gpu_scale_rows(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -1778,7 +1778,7 @@ pub fn gpu_scale_rows(
     );
 }
 
-/// Row-wise dot reduce: output[r] = sum_c(a[r][c] * b[r][c]). Single dispatch.
+/// Row-wise dot reduce: output`[r]` = sum_c(a`[r]``[c]` * b`[r]``[c]`). Single dispatch.
 pub fn gpu_row_dot_reduce(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -1931,7 +1931,7 @@ pub struct BlockMeanDims {
     pub block_size: u32,
 }
 
-/// Block-mean keys for block-sparse attention: K[bh,seq,hd] → out[bh,nb,hd].
+/// Block-mean keys for block-sparse attention: K`[bh,seq,hd]` → out`[bh,nb,hd]`.
 pub fn gpu_block_mean_keys(
     ctx: &Arc<MetalContext>,
     k: &GpuBuffer,
@@ -1980,8 +1980,8 @@ pub struct BlockSparseDims {
     pub top_k: u32,
 }
 
-/// Top-k block-sparse attention mask: masks dense scores[bh,seq,seq] in place to the own block +
-/// top-k past blocks per query (block_scores[bh,seq,nb]). Includes the causal mask.
+/// Top-k block-sparse attention mask: masks dense scores`[bh,seq,seq]` in place to the own block +
+/// top-k past blocks per query (block_scores`[bh,seq,nb]`). Includes the causal mask.
 pub fn gpu_block_sparse_mask(
     ctx: &Arc<MetalContext>,
     scores: &GpuBuffer,
@@ -2178,7 +2178,7 @@ pub fn gpu_l2_norm_into(ctx: &Arc<MetalContext>, data: &GpuBuffer, size: u32, ou
 }
 
 /// Compute L2 norm (sum of squares) and NaN/Inf check into a pre-allocated output buffer.
-/// Output buffer must hold 2 floats: [0] = sum_of_squares, [1] = has_nan_or_inf (1.0 or 0.0).
+/// Output buffer must hold 2 floats: `[0]` = sum_of_squares, `[1]` = has_nan_or_inf (1.0 or 0.0).
 /// Returns raw sum_sq (not sqrt) for accumulation across multiple params.
 pub fn gpu_l2_norm_check_into(
     ctx: &Arc<MetalContext>,
@@ -2451,7 +2451,7 @@ pub fn gpu_embedding_backward(
     );
 }
 
-/// GPU 2D matrix transpose: out[j,i] = in[i,j]. in:[rows,cols], out:[cols,rows]
+/// GPU 2D matrix transpose: out`[j,i]` = in`[i,j]`. in:`[rows,cols]`, out:`[cols,rows]`
 pub fn gpu_transpose_2d(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -2478,7 +2478,7 @@ pub fn gpu_transpose_2d(
     );
 }
 
-/// C = A^T @ B where A:[M,K] row-major, B:[M,N], C:[K,N]
+/// C = A^T @ B where A:`[M,K]` row-major, B:`[M,N]`, C:`[K,N]`
 pub fn gpu_matmul_trans_a(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -2619,8 +2619,8 @@ pub fn gpu_transpose_perm_forward(
     );
 }
 
-/// Apply gradient mask: zero out rows where mask[pos] == 0.
-/// grad: [positions, vocab_size], mask: [positions] as u32 (0 or 1).
+/// Apply gradient mask: zero out rows where mask`[pos]` == 0.
+/// grad: `[positions, vocab_size]`, mask: `[positions]` as u32 (0 or 1).
 pub fn gpu_gradient_mask(
     ctx: &Arc<MetalContext>,
     grad: &GpuBuffer,
@@ -2783,7 +2783,7 @@ pub fn gpu_temperature_scale(
 
 /// KL divergence: KL(softmax(teacher/T) || softmax(student/T))
 /// teacher_logits, student_logits: [batch, vocab] flat f32 buffers
-/// losses: [batch] per-sample KL divergence
+/// losses: `[batch]` per-sample KL divergence
 /// grad_student: [batch * vocab] raw gradient w.r.t. student logits: (1/T) * (q - p) / batch
 pub fn gpu_kl_divergence(
     ctx: &Arc<MetalContext>,
@@ -3053,7 +3053,7 @@ pub fn gpu_transpose_rope_backward(
     );
 }
 
-/// Pre-compute inv_rms per row: inv_rms[i] = 1/sqrt(mean(A[i]^2) + eps)
+/// Pre-compute inv_rms per row: inv_rms`[i]` = 1/sqrt(mean(A`[i]`^2) + eps)
 pub fn gpu_compute_inv_rms(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -3113,7 +3113,7 @@ pub fn gpu_fused_norm_matmul(
     );
 }
 
-/// AXPY: y[i] += alpha * x[i]. Fused scale+add in 1 dispatch.
+/// AXPY: y`[i]` += alpha * x`[i]`. Fused scale+add in 1 dispatch.
 pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32, alpha: f32) {
     #[repr(C)]
     struct Params {
@@ -3128,7 +3128,7 @@ pub fn gpu_axpy(ctx: &Arc<MetalContext>, y: &GpuBuffer, x: &GpuBuffer, size: u32
     dispatch_sync!(ctx, "axpy", grid, tg, 0 => y, 1 => x, 2 => &params_buf);
 }
 
-/// ReLU: output[i] = max(input[i], 0)
+/// ReLU: output`[i]` = max(input`[i]`, 0)
 pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
     #[repr(C)]
     struct Params {
@@ -3142,7 +3142,7 @@ pub fn gpu_relu(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, 
     dispatch_sync!(ctx, "relu", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
 }
 
-/// Broadcast a `[cols]` vector to `[rows, cols]` (out[r*cols+c] = vec[c]). Direct copy.
+/// Broadcast a `[cols]` vector to `[rows, cols]` (out`[r*cols+c]` = vec`[c]`). Direct copy.
 pub fn gpu_broadcast_rows(
     ctx: &Arc<MetalContext>,
     vec: &GpuBuffer,
@@ -3198,7 +3198,7 @@ pub fn gpu_relu_backward(
     dispatch_sync!(ctx, "relu_backward", grid, tg, 0 => input, 1 => grad_output, 2 => grad_input, 3 => &params_buf);
 }
 
-/// EMA update: ema[i] = decay * ema[i] + (1-decay) * src[i]. Single dispatch for all elements.
+/// EMA update: ema`[i]` = decay * ema`[i]` + (1-decay) * src`[i]`. Single dispatch for all elements.
 pub fn gpu_ema_update(
     ctx: &Arc<MetalContext>,
     ema: &GpuBuffer,
@@ -3240,7 +3240,7 @@ pub fn gpu_cautious_mask(
     dispatch_sync!(ctx, "cautious_mask", grid, tg, 0 => update, 1 => grad, 2 => keep, 3 => &params_buf);
 }
 
-/// Cautious renormalization: x *= size / (kept_sum[0] + 1), restoring update magnitude after masking.
+/// Cautious renormalization: x *= size / (kept_sum`[0]` + 1), restoring update magnitude after masking.
 /// `kept_sum` is a 1-element GPU buffer (e.g. from gpu_reduce_sum on the keep-mask) — no CPU readback.
 pub fn gpu_cautious_scale(ctx: &Arc<MetalContext>, x: &GpuBuffer, kept_sum: &GpuBuffer, size: u32) {
     #[repr(C)]
@@ -3255,7 +3255,7 @@ pub fn gpu_cautious_scale(ctx: &Arc<MetalContext>, x: &GpuBuffer, kept_sum: &Gpu
     dispatch_sync!(ctx, "cautious_scale", grid, tg, 0 => x, 1 => kept_sum, 2 => &params_buf);
 }
 
-/// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j]))). Numerically stable.
+/// LogSumExp per row: output`[i]` = log(sum_j(exp(input`[i*cols + j]`))). Numerically stable.
 pub fn gpu_logsumexp(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
@@ -3276,7 +3276,7 @@ pub fn gpu_logsumexp(
     dispatch_sync!(ctx, "logsumexp", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
 }
 
-/// Out-of-place scale: dst[i] = src[i] * factor. Replaces copy+scale_inplace (2→1 dispatch).
+/// Out-of-place scale: dst`[i]` = src`[i]` * factor. Replaces copy+scale_inplace (2→1 dispatch).
 pub fn gpu_scale_copy(
     ctx: &Arc<MetalContext>,
     src: &GpuBuffer,
@@ -3314,7 +3314,7 @@ pub fn gpu_muon_frob_normalize(ctx: &Arc<MetalContext>, m: &GpuBuffer, x: &GpuBu
     dispatch_sync!(ctx, "muon_frob_normalize", grid, tg, 0 => m, 1 => x, 2 => &params_buf);
 }
 
-/// NorMuon per-neuron scale: out[i] = 1/(sqrt(v[i]·bias_correction) + eps), elementwise over [size].
+/// NorMuon per-neuron scale: out`[i]` = 1/(sqrt(v`[i]`·bias_correction) + eps), elementwise over `[size]`.
 pub fn gpu_inv_sqrt_bc(
     ctx: &Arc<MetalContext>,
     v: &GpuBuffer,

@@ -477,8 +477,8 @@ kernel void matmul_simdgroup_f16(
 /// simdgroup_matrix C(fp32) = A(fp32) @ B(fp32)ᵀ on the hardware MMA units — the fast backward
 /// drop-in for `matmul_tiled_trans_b` (dA = dC @ Wᵀ). fp32 in / fp32 out, fp16 MMA fragments (same
 /// precision as the scalar trans_b, which also casts to half + clamps in the tile load). 64×64 tile
-/// / 4 simdgroups (the layout that measured fastest). A:[M,K] row-major, B:[N,K] row-major (read
-/// transposed: Bᵀ[k,n]=B[n,k]), C:[M,N]. Edges zero-padded.
+/// / 4 simdgroups (the layout that measured fastest). A:`[M,K]` row-major, B:`[N,K]` row-major (read
+/// transposed: Bᵀ`[k,n]`=B`[n,k]`), C:`[M,N]`. Edges zero-padded.
 pub const MATMUL_SIMDGROUP_TRANS_B: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -560,8 +560,8 @@ kernel void matmul_simdgroup_trans_b(
 
 /// simdgroup_matrix C(fp32) = A(fp32)ᵀ @ B(fp32) on the hardware MMA units — the fast backward
 /// drop-in for `matmul_trans_a_tiled` (dB = Aᵀ @ dC). fp32 in / fp32 out, fp16 MMA fragments. 64×64
-/// tile / 4 simdgroups. A:[M,K] row-major (read transposed: Aᵀ[k,m]=A[m,k]), B:[M,N] row-major,
-/// C:[K,N]. Contraction is over M. Params are {M(=contraction), K(=out rows), N(=out cols)}.
+/// tile / 4 simdgroups. A:`[M,K]` row-major (read transposed: Aᵀ`[k,m]`=A`[m,k]`), B:`[M,N]` row-major,
+/// C:`[K,N]`. Contraction is over M. Params are {M(=contraction), K(=out rows), N(=out cols)}.
 pub const MATMUL_SIMDGROUP_TRANS_A: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -641,10 +641,10 @@ kernel void matmul_simdgroup_trans_a(
 }
 "#;
 
-/// Batched simdgroup-matrix matmul: C[b] = A[b] @ B[b] on the hardware MMA units (extends the
+/// Batched simdgroup-matrix matmul: C`[b]` = A`[b]` @ B`[b]` on the hardware MMA units (extends the
 /// simdgroup fast path beyond the batch==1 projections to the batched attention matmuls). fp32 in /
 /// fp32 out, half MMA fragments (same precision as batched_matmul_tiled). 64×64 tile / 4 simdgroups,
-/// batch in grid.z. A[b]:[M,K], B[b]:[K,N], C[b]:[M,N].
+/// batch in grid.z. A`[b]`:`[M,K]`, B`[b]`:`[K,N]`, C`[b]`:`[M,N]`.
 pub const BATCHED_MATMUL_SIMDGROUP: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -711,8 +711,8 @@ kernel void batched_matmul_simdgroup(
 }
 "#;
 
-/// Batched simdgroup matmul with B transposed: C[b] = A[b] @ B[b]^T. A[b]:[M,K], B[b]:[N,K],
-/// C[b]:[M,N]. Same MMA tiling; B is staged with transposed indexing (Bs[kk][nn] = B[nn][k0+kk]).
+/// Batched simdgroup matmul with B transposed: C`[b]` = A`[b]` @ B`[b]`^T. A`[b]`:`[M,K]`, B`[b]`:`[N,K]`,
+/// C`[b]`:`[M,N]`. Same MMA tiling; B is staged with transposed indexing (Bs`[kk]``[nn]` = B`[nn]``[k0+kk]`).
 pub const BATCHED_MATMUL_SIMDGROUP_TRANS_B: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -780,10 +780,10 @@ kernel void batched_matmul_simdgroup_trans_b(
 }
 "#;
 
-/// Batched simdgroup MMA with A transposed: C[b](fp32) = A[b]ᵀ @ B[b]. The fast backward drop-in for
+/// Batched simdgroup MMA with A transposed: `C[b]` (fp32) = A`[b]`ᵀ @ B`[b]`. The fast backward drop-in for
 /// `batched_matmul_tiled_trans_a` (attention dQ/dK/dV + block-sparse gather backward). fp32 in/out,
-/// fp16 fragments, 64×64 tile / 4 simdgroups, batch in grid.z. A:[batch,M,K], B:[batch,M,N],
-/// C:[batch,K,N]; contraction over M. Params `{M(=contraction), K(=out rows), N(=out cols), batch}`
+/// fp16 fragments, 64×64 tile / 4 simdgroups, batch in grid.z. A:`[batch,M,K]`, B:`[batch,M,N]`,
+/// C:`[batch,K,N]`; contraction over M. Params `{M(=contraction), K(=out rows), N(=out cols), batch}`
 /// — same order as the scalar trans_a (a K/N swap silently corrupts non-square output).
 pub const BATCHED_MATMUL_SIMDGROUP_TRANS_A: &str = r#"
 #include <metal_stdlib>
@@ -856,7 +856,7 @@ kernel void batched_matmul_simdgroup_trans_a(
 }
 "#;
 
-/// Narrow matmul for small N (≤32): C = A @ B where A:[M,K], B:[K,N], C:[M,N].
+/// Narrow matmul for small N (≤32): C = A @ B where A:`[M,K]`, B:`[K,N]`, C:`[M,N]`.
 /// TILE_M=32, TILE_N=16, 32 threads. Each thread computes 4×4 subtile.
 /// Eliminates 50% wasted compute when N=16 with the standard 32-wide tile.
 pub const MATMUL_NARROW: &str = r#"
@@ -1548,9 +1548,9 @@ kernel void rms_norm_residual(
 }
 "#;
 
-/// Fused SiLU-gate: output[i] = silu(gate[i]) * up[i]
+/// Fused SiLU-gate: output`[i]` = silu(gate`[i]`) * up`[i]`
 /// Saves one kernel dispatch and one temporary buffer vs separate silu + mul.
-/// AXPY: y[i] += alpha * x[i]. Fused scale+add in 1 dispatch (was 2).
+/// AXPY: y`[i]` += alpha * x`[i]`. Fused scale+add in 1 dispatch (was 2).
 pub const AXPY: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1568,7 +1568,7 @@ kernel void axpy(
 }
 "#;
 
-/// ReLU activation: output[i] = max(input[i], 0). Used for ReMoE routing.
+/// ReLU activation: output`[i]` = max(input`[i]`, 0). Used for ReMoE routing.
 pub const RELU: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1624,7 +1624,7 @@ kernel void exp_fwd(
 }
 "#;
 
-/// Broadcast a `[cols]` vector to `[rows, cols]`: out[r*cols + c] = vec[c]. A direct copy,
+/// Broadcast a `[cols]` vector to `[rows, cols]`: out`[r*cols + c]` = vec`[c]`. A direct copy,
 /// avoiding the wasted tiled-matmul machinery of an `ones[rows,1] @ vec[1,cols]` outer product.
 pub const BROADCAST_ROWS: &str = r#"
 #include <metal_stdlib>
@@ -1668,7 +1668,7 @@ kernel void silu_gate(
 "#;
 
 /// Fused cross-entropy loss: log-softmax + NLL
-/// logits: [batch, vocab], targets: [batch] (as uint)
+/// logits: `[batch, vocab]`, targets: `[batch]` (as uint)
 /// Output: scalar loss (single float), plus grad_output: [batch, vocab] = softmax - one_hot
 pub const CROSS_ENTROPY: &str = r#"
 #include <metal_stdlib>
@@ -1978,7 +1978,7 @@ kernel void causal_mask(
 
 /// Block-diagonal causal mask for SEQUENCE PACKING (varlen). When multiple short sequences are
 /// packed into one row, a token must attend only WITHIN its own segment (and causally). Given a
-/// per-position segment id, mask score[q,k] to -inf when k is in the future (k > q) OR when k and q
+/// per-position segment id, mask score`[q,k]` to -inf when k is in the future (k > q) OR when k and q
 /// are in different segments. Eliminates the padding waste of one-sequence-per-row at the cost of
 /// this segment check. (seq_q == seq_k; no KV-cache offset on the packed training path.)
 pub const CAUSAL_DOC_MASK: &str = r#"
@@ -2012,7 +2012,7 @@ kernel void causal_doc_mask(
 "#;
 
 /// Block-mean keys for block-sparse attention: average K over each contiguous block of positions.
-/// K:[bh, seq, hd] → out:[bh, nb, hd], out[bh,blk,d] = mean_{i in block blk} K[bh,i,d].
+/// K:`[bh, seq, hd]` → out:`[bh, nb, hd]`, out`[bh,blk,d]` = mean_{i in block blk} K`[bh,i,d]`.
 pub const BLOCK_MEAN_KEYS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2081,7 +2081,7 @@ kernel void block_sparse_topk_mask(
 /// pair `bnq = bh*nb + qb`, copy its `K_SEL` selected key/value blocks (indices in `sel`) into a
 /// compact buffer so attention computes ONLY over the selected positions (vs masking the full O(n²)
 /// scores). Sentinel `sel >= nb` → zero-filled (a padding block, later fully masked).
-/// src: [bh, seq, hd]; sel: [bh*nb*K_SEL] u32; out: [bh*nb, K_SEL*block, hd].
+/// src: `[bh, seq, hd]`; sel: `[bh*nb*K_SEL]` u32; out: `[bh*nb, K_SEL*block, hd]`.
 pub const GATHER_BLOCKS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2115,7 +2115,7 @@ kernel void gather_blocks(
 
 /// Backward (scatter-add transpose) of `gather_blocks`. For each element of the compact
 /// gradient `d_out` (= dKsel/dVsel, [bh*nb, k_sel*block, hd]) add it back to the SOURCE
-/// position it was gathered from: dK[bh, sel[bnq,slot]*block + w, hd] += dKsel[bnq, slot*block+w, hd].
+/// position it was gathered from: dK`[bh, sel[bnq,slot]`*block + w, hd] += dKsel`[bnq, slot*block+w, hd]`.
 /// Multiple query-blocks may select the same source block, so the accumulation MUST be
 /// atomic. Sentinel/out-of-range slots gathered 0 in the forward → scatter nowhere here.
 /// `d_src` must be pre-zeroed by the caller.
@@ -2154,7 +2154,7 @@ kernel void gather_blocks_backward(
 
 /// Causal mask for the gathered block-sparse scores. scores: [bh*nb, block, K_SEL*block]. For query
 /// row `r` of query-block `qb` (global pos qb*block+r) and gathered key column `slot*block+w`
-/// (global pos sel[slot]*block+w), keep iff the key is real (slot in range) and causal
+/// (global pos sel`[slot]`*block+w), keep iff the key is real (slot in range) and causal
 /// (key_global <= query_global); else -inf.
 pub const GATHER_CAUSAL_MASK: &str = r#"
 #include <metal_stdlib>
@@ -2229,7 +2229,7 @@ kernel void l2_norm(
 "#;
 
 /// Gradient clipping: compute L2 norm (sum of squares) and check for NaN/Inf
-/// Output buffer: [0] = sum_of_squares, [1] = has_nan_or_inf (1.0 or 0.0)
+/// Output buffer: `[0]` = sum_of_squares, `[1]` = has_nan_or_inf (1.0 or 0.0)
 /// Unlike L2_NORM which returns sqrt(sum_sq), this returns raw sum_sq for
 /// accumulation across multiple parameter buffers before a single sqrt.
 pub const L2_NORM_CHECK: &str = r#"
@@ -2275,7 +2275,7 @@ kernel void l2_norm_check(
 }
 "#;
 
-/// Scale buffer in-place: data[i] *= scale
+/// Scale buffer in-place: data`[i]` *= scale
 pub const SCALE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2296,7 +2296,7 @@ kernel void scale(
 }
 "#;
 
-/// Out-of-place scale: dst[i] = src[i] * scale. Replaces copy+scale (2 dispatches → 1).
+/// Out-of-place scale: dst`[i]` = src`[i]` * scale. Replaces copy+scale (2 dispatches → 1).
 pub const SCALE_COPY: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2364,9 +2364,9 @@ kernel void muon_frob_normalize(
 }
 "#;
 
-/// NorMuon per-neuron normalization factor: out[i] = 1 / (sqrt(v[i] * bias_correction) + eps).
+/// NorMuon per-neuron normalization factor: out`[i]` = 1 / (sqrt(v`[i]` * bias_correction) + eps).
 /// `v` is the per-row running second moment; `bias_correction` = 1/(1-beta2^t). Elementwise over the
-/// [rows] vector. Feeds scale_rows to normalize the orthogonalized update per output neuron.
+/// `[rows]` vector. Feeds scale_rows to normalize the orthogonalized update per output neuron.
 pub const INV_SQRT_BC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2387,9 +2387,9 @@ kernel void inv_sqrt_bc(
 "#;
 
 /// Fill buffer with a constant value
-/// LogSumExp per row: output[i] = log(sum_j(exp(input[i*cols + j])))
-/// Numerically stable: output[i] = max + log(sum(exp(x - max)))
-/// EMA update: ema[i] = decay * ema[i] + (1-decay) * src[i]
+/// LogSumExp per row: output`[i]` = log(sum_j(exp(input`[i*cols + j]`)))
+/// Numerically stable: output`[i]` = max + log(sum(exp(x - max)))
+/// EMA update: ema`[i]` = decay * ema`[i]` + (1-decay) * src`[i]`
 pub const EMA_UPDATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2437,7 +2437,7 @@ kernel void cautious_mask(
 }
 "#;
 
-/// Cautious renormalization: x[i] *= size / (kept_sum[0] + 1). Restores the update magnitude after
+/// Cautious renormalization: x`[i]` *= size / (kept_sum`[0]` + 1). Restores the update magnitude after
 /// `cautious_mask` zeroed the disagreeing components, so the cautious update is LR-neutral vs the
 /// uncautious one. Reads the kept-count from a GPU buffer — no CPU readback (no command-batch flush).
 pub const CAUTIOUS_SCALE: &str = r#"
@@ -2872,8 +2872,8 @@ kernel void transpose_2d(
 }
 "#;
 
-/// C = A^T @ B where A:[M,K] stored row-major, B:[M,N], C:[K,N]
-/// A^T is [K,M], so C[i,j] = sum_m A[m,i] * B[m,j]
+/// C = A^T @ B where A:`[M,K]` stored row-major, B:`[M,N]`, C:`[K,N]`
+/// A^T is `[K,M]`, so C`[i,j]` = sum_m A`[m,i]` * B`[m,j]`
 /// Tiled version: 32x32 output tiles, 64 threads per group, each thread computes 4x4.
 pub const MATMUL_TRANS_A: &str = r#"
 #include <metal_stdlib>
@@ -3220,7 +3220,7 @@ kernel void transpose_rope_backward(
 "#;
 
 /// Gradient masking: zero out entire rows in a [positions, vocab] gradient matrix.
-/// mask[pos] == 0 → zero out grad[pos * vocab .. (pos+1) * vocab].
+/// mask`[pos]` == 0 → zero out grad`[pos * vocab .. (pos+1) * vocab]`.
 /// Used in SFT to mask loss on prompt tokens (only response tokens get gradients).
 pub const GRADIENT_MASK: &str = r#"
 #include <metal_stdlib>
@@ -3369,7 +3369,7 @@ kernel void argmax(
 "#;
 
 /// Temperature scaling: divide logits by temperature in-place.
-/// data[i] = data[i] / temperature for i in [offset, offset + count).
+/// data`[i]` = data`[i]` / temperature for i in [offset, offset + count).
 /// Operates on a sub-range so we can scale only the last token's logits.
 pub const TEMPERATURE_SCALE: &str = r#"
 #include <metal_stdlib>
@@ -3391,7 +3391,7 @@ kernel void temperature_scale(
 }
 "#;
 
-/// Batched tiled matrix multiplication: C[b] = A[b] @ B[b]
+/// Batched tiled matrix multiplication: C`[b]` = A`[b]` @ B`[b]`
 /// A: [B, M, K], B: [B, K, N], C: [B, M, N]
 /// Uses group_id.z as the batch index. Single dispatch for all batch elements.
 /// Same tiled algorithm as matmul_tiled (32x32 tiles, 64 threads, 4x4 per thread).
@@ -3491,7 +3491,7 @@ kernel void batched_matmul_tiled(
 }
 "#;
 
-/// Batched tiled matmul with B transposed: C[b] = A[b] @ B[b]^T
+/// Batched tiled matmul with B transposed: C`[b]` = A`[b]` @ B`[b]`^T
 /// A: [B, M, K], B: [B, N, K], C: [B, M, N]
 /// Uses group_id.z as the batch index. Single dispatch for all batch elements.
 pub const BATCHED_MATMUL_TILED_TRANS_B: &str = r#"
@@ -3591,7 +3591,7 @@ kernel void batched_matmul_tiled_trans_b(
 }
 "#;
 
-/// GQA-aware batched matmul trans_b: C[b] = A[b] @ B[b/group_size]^T
+/// GQA-aware batched matmul trans_b: C`[b]` = A`[b]` @ B`[b/group_size]`^T
 /// A: [B*n_heads, M, K], B: [B*n_kv_heads, N, K], C: [B*n_heads, M, N]
 /// Each Q head reads from K/V head = q_head / group_size.
 /// When group_size=1 this is identical to standard batched_matmul_trans_b.
@@ -3665,7 +3665,7 @@ kernel void batched_matmul_gqa_trans_b(
 }
 "#;
 
-/// GQA-aware batched matmul: C[b] = A[b] @ B[b/group_size]
+/// GQA-aware batched matmul: C`[b]` = A`[b]` @ B`[b/group_size]`
 /// A: [B*n_heads, M, K], B: [B*n_kv_heads, K, N], C: [B*n_heads, M, N]
 pub const BATCHED_MATMUL_GQA: &str = r#"
 #include <metal_stdlib>
@@ -3736,9 +3736,9 @@ kernel void batched_matmul_gqa(
 }
 "#;
 
-/// Batched tiled matmul with A transposed: C[b] = A[b]^T @ B[b]
+/// Batched tiled matmul with A transposed: C`[b]` = A`[b]`^T @ B`[b]`
 /// A: [B, M, K] (row-major), B: [B, M, N], C: [B, K, N]
-/// A^T is [K, M], so C[b][i,j] = sum_m A[b][m,i] * B[b][m,j]
+/// A^T is `[K, M]`, so C`[b]``[i,j]` = sum_m A`[b]``[m,i]` * B`[b]``[m,j]`
 /// Uses group_id.z as the batch index. Single dispatch for all batch elements.
 /// Used in backward pass for computing dB = A^T @ dC.
 pub const KL_DIVERGENCE: &str = r#"
@@ -4406,7 +4406,7 @@ kernel void batched_matmul_tiled_trans_a_f16(
 /// Halves device memory bandwidth vs v1 (which read K/V per-thread from device).
 ///
 /// Q,K,V: [batch_heads, seq, head_dim], O: [batch_heads, seq_q, head_dim]
-/// Shared memory: K_shared[FA_BC][head_dim] + V_shared[FA_BC][head_dim] as half
+/// Shared memory: K_shared`[FA_BC]``[head_dim]` + V_shared`[FA_BC]``[head_dim]` as half
 /// For head_dim=64: 32×64×2×2 = 8KB total (fits 32KB limit).
 pub const FLASH_ATTENTION_FORWARD: &str = r#"
 #include <metal_stdlib>
@@ -4562,7 +4562,7 @@ kernel void flash_attention_forward(
 /// Inputs: Q, K, V, O (forward output), dO (gradient of output)
 /// Outputs: dQ, dK, dV
 ///
-/// Also needs D[i] = rowsum(dO[i] * O[i]) precomputed per query row.
+/// Also needs D`[i]` = rowsum(dO`[i]` * O`[i]`) precomputed per query row.
 /// This is passed as a separate buffer.
 pub const FLASH_ATTENTION_BACKWARD: &str = r#"
 #include <metal_stdlib>
@@ -4745,10 +4745,10 @@ kernel void flash_attention_backward(
 /// Fuses the per-token gather, expert output scaling, and scatter-add into one kernel.
 ///
 /// For each (token, expert) assignment:
-///   output[token] += weight * expert_output[slot]
+///   output`[token]` += weight * expert_output`[slot]`
 ///
-/// token_indices: [n_routed] — which token each slot corresponds to
-/// weights: [n_routed] — router weight for each routed token
+/// token_indices: `[n_routed]` — which token each slot corresponds to
+/// weights: `[n_routed]` — router weight for each routed token
 /// expert_output: [n_routed, dim] — expert FFN output
 /// combined_output: [n_tokens, dim] — accumulated output (scatter-add target)
 pub const MOE_SCATTER_ADD: &str = r#"
@@ -4781,7 +4781,7 @@ kernel void moe_scatter_add(
 "#;
 
 /// MoE token gather: collect tokens assigned to one expert into contiguous buffer.
-/// token_indices: [n_routed] — which tokens to gather
+/// token_indices: `[n_routed]` — which tokens to gather
 /// input: [n_tokens, dim] — full input tensor
 /// gathered: [n_routed, dim] — gathered tokens for this expert
 pub const MOE_GATHER: &str = r#"
@@ -4871,7 +4871,7 @@ kernel void ternary_matmul(
 "#;
 
 /// Quantize float weights to ternary {-1, 0, +1} using absmean threshold.
-/// w_ternary[i] = sign(w[i]) * round(|w[i]| / mean(|w|))
+/// w_ternary`[i]` = sign(w`[i]`) * round(|w`[i]`| / mean(|w|))
 /// Packed as 2 bits per weight, 16 weights per u32.
 pub const TERNARY_QUANTIZE: &str = r#"
 #include <metal_stdlib>
@@ -4930,8 +4930,8 @@ kernel void ternary_pack(
 "#;
 
 /// Scale each row of a matrix by a different scalar.
-/// input: [rows, cols], scales: [rows], output: [rows, cols]
-/// output[r][c] = input[r][c] * scales[r]
+/// input: `[rows, cols]`, scales: `[rows]`, output: `[rows, cols]`
+/// output`[r]``[c]` = input`[r]``[c]` * scales`[r]`
 pub const SCALE_ROWS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4951,8 +4951,8 @@ kernel void scale_rows(
 }
 "#;
 
-/// Row-wise dot product and reduce: output[r] = sum_c(a[r][c] * b[r][c])
-/// Used for scale_rows backward: d_scales[r] = dot(d_out[r], input[r])
+/// Row-wise dot product and reduce: output`[r]` = sum_c(a`[r]``[c]` * b`[r]``[c]`)
+/// Used for scale_rows backward: d_scales`[r]` = dot(d_out`[r]`, input`[r]`)
 pub const ROW_DOT_REDUCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

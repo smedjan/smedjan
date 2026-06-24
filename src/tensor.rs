@@ -285,8 +285,8 @@ impl Tensor {
         out_scaled
     }
 
-    /// Per-row scaling: output[r][c] = self[r][c] * scales[r]
-    /// self: [rows, cols], scales: [rows] → [rows, cols]
+    /// Per-row scaling: output`[r]``[c]` = self`[r]``[c]` * scales`[r]`
+    /// self: `[rows, cols]`, scales: `[rows]` → `[rows, cols]`
     /// On autograd tape — gradients flow to both input and scales.
     pub fn scale_rows(&self, scales: &Tensor) -> Tensor {
         assert_eq!(self.shape.len(), 2, "scale_rows requires 2D tensor");
@@ -1389,7 +1389,7 @@ impl Tensor {
 
     /// Fused RMSNorm + Matmul: computes rms_norm(self, weight, eps) @ b in 2 dispatches
     /// instead of 3 (norm + matmul). Eliminates the intermediate normalized buffer.
-    /// self: [M, K], weight: [K], b: [K, N] → output: [M, N]
+    /// self: `[M, K]`, weight: `[K]`, b: `[K, N]` → output: `[M, N]`
     pub fn fused_norm_matmul(&self, weight: &Tensor, b: &Tensor, eps: f32) -> Tensor {
         assert_eq!(self.shape.len(), 2);
         let m = self.shape[0];
@@ -1787,7 +1787,7 @@ impl Tensor {
         out
     }
 
-    /// Batched matrix multiplication: self[b] @ other[b] for each batch element.
+    /// Batched matrix multiplication: self`[b]` @ other`[b]` for each batch element.
     /// self: [B, M, K], other: [B, K, N] → result: [B, M, N]
     /// Records a single Op::BatchedMatmul tape entry.
     pub fn batched_matmul(&self, other: &Tensor) -> Tensor {
@@ -1864,7 +1864,7 @@ impl Tensor {
         out
     }
 
-    /// Batched matrix multiply with B transposed: self[b] @ other[b]^T for each batch element.
+    /// Batched matrix multiply with B transposed: self`[b]` @ other`[b]`^T for each batch element.
     /// self: [B, M, K], other: [B, N, K] → result: [B, M, N]
     /// Records a single Op::BatchedMatmulTransB tape entry.
     pub fn batched_matmul_trans_b(&self, other: &Tensor) -> Tensor {
@@ -1947,7 +1947,7 @@ impl Tensor {
         out
     }
 
-    /// Batched matrix multiply with A transposed: self[b]^T @ other[b] for each batch.
+    /// Batched matrix multiply with A transposed: self`[b]`^T @ other`[b]` for each batch.
     /// self: [B, M, K], other: [B, M, N] → result: [B, K, N] (contracts the M dimension).
     /// This is the outer-product-sum `Σ_m self[b,m,:] ⊗ other[b,m,:]` — exactly the
     /// running-state update `Kᵀ V` used by linear-attention / SSM recurrences.

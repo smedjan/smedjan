@@ -11,7 +11,7 @@
 //! ```
 //!
 //! This module provides the **masked reference** implementation. It materialises the
-//! [N,N] score matrix (so it is O(N²) memory like softmax attention — the genuine
+//! `[N,N]` score matrix (so it is O(N²) memory like softmax attention — the genuine
 //! O(N) chunked recurrence lands in Stage B and is validated *against* this form).
 //! Crucially it is composed **entirely from existing differentiable tensor ops**, so
 //! the autograd tape supplies the backward pass for free — no hand-written backward

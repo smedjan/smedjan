@@ -407,7 +407,7 @@ impl DpoDataLoader {
 /// tokens: the full input sequence (prompt + response).
 /// prompt_len: index where the response begins.
 ///
-/// For each position i >= prompt_len, we compute log_softmax(logits[i-1])[tokens[i]],
+/// For each position i >= prompt_len, we compute log_softmax(logits`[i-1]`)`[tokens[i]`],
 /// because logits[i-1] predicts the token at position i.
 ///
 /// Returns the sum of per-token log probabilities (a negative number).
@@ -906,10 +906,10 @@ pub fn dpo_train(ctx: &Arc<MetalContext>, config: &DpoConfig) -> std::io::Result
 /// Compute the gradient of the DPO loss w.r.t. model logits.
 ///
 /// For each response position i (>= prompt_len), the gradient of log P(t_i | context)
-/// w.r.t. logits[i-1] is: (1{j == t_i} - softmax(logits[i-1])[j])
+/// w.r.t. logits`[i-1]` is: (1{j == t_i} - softmax(logits`[i-1]`)`[j]`)
 ///
 /// Multiplied by the DPO gradient scale (grad_scale), this gives:
-///   d_logits[i-1][j] = grad_scale * (1{j == t_i} - softmax(logits[i-1])[j])
+///   d_logits`[i-1]``[j]` = grad_scale * (1{j == t_i} - softmax(logits`[i-1]`)`[j]`)
 ///
 /// Prompt positions get zero gradient.
 fn compute_dpo_logit_gradients(

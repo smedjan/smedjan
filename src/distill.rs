@@ -141,9 +141,9 @@ pub fn default_templates() -> Vec<PromptTemplate> {
 /// Generate a JSONL file of prompt-response pairs using an API.
 /// Each line: {"prompt": "...", "response": "...", "category": "..."}
 ///
-/// For local models (Ollama): use api_url = "http://localhost:11434/api/generate"
-/// For Claude: use api_url = "https://api.anthropic.com/v1/messages"
-/// For OpenAI: use api_url = "https://api.openai.com/v1/chat/completions"
+/// For local models (Ollama): use `api_url = "http://localhost:11434/api/generate"`
+/// For Claude: use `api_url = "https://api.anthropic.com/v1/messages"`
+/// For OpenAI: use `api_url = "https://api.openai.com/v1/chat/completions"`
 pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> {
     config.validate()?;
     let templates = default_templates();

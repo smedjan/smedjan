@@ -1419,7 +1419,7 @@ impl Transformer {
     }
 
     /// Forward with multi-token prediction: returns (main_logits, [extra_logits...]).
-    /// Each extra_logits[k] predicts token at position t+k+2 (shifted by k+1 from main).
+    /// Each extra_logits`[k]` predicts token at position t+k+2 (shifted by k+1 from main).
     /// When n_predict=0, extra vec is empty (standard next-token prediction).
     pub fn forward_mtp(
         &self,

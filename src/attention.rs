@@ -563,7 +563,7 @@ impl MultiHeadAttention {
 
     /// MLA incremental decode caching the latent `c` (not K/V). Appends `c_new` to the latent cache,
     /// reconstructs K/V from the FULL cached latent (K=c@W_uk, V=c@W_uv), RoPEs at absolute positions,
-    /// and attends the new tokens' queries causally. Cache stores `c` ([batch,total,d_c]) — 10–50×
+    /// and attends the new tokens' queries causally. Cache stores `c` (`[batch,total,d_c]`) — 10–50×
     /// smaller than storing K/V. Mathematically equal to the prefill MLA forward (linearity + causal).
     /// YaRN attention temperature (mscale): when context is YaRN-extended (yarn_scale > 1), softmax
     /// logits are scaled by 0.1*ln(s)+1 to counter the entropy drift from interpolated RoPE
@@ -1432,7 +1432,7 @@ fn concat_seq(a: &Tensor, b: &Tensor, bh: usize, len_a: usize, len_b: usize, dim
 /// Output: [n_heads_total, seq, head_dim] where n_heads_total = batch * n_heads
 ///
 /// Each KV head is repeated `group_size` times contiguously:
-///   output[h] = input[h / group_size]
+///   output`[h]` = input`[h / group_size]`
 ///
 /// This is a GPU buffer copy operation — each KV head's [seq, head_dim] block
 /// is copied `group_size` times into the output.

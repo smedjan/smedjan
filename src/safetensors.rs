@@ -4,7 +4,7 @@
 //! base) under positional names `p{i}`, mirroring `checkpoint::save_checkpoint`, so an Smedjan model
 //! round-trips through safetensors. `import_safetensors` rebuilds the model from a caller-supplied
 //! config (the same flow a foreign HF import uses, sourcing config from the model's config.json) and
-//! overwrites each parameter in order. Foreign HF->Smedjan name remap + [out,in]->[in,out] transpose
+//! overwrites each parameter in order. Foreign HF->Smedjan name remap + `[out,in]`->`[in,out]` transpose
 //! + RoPE permutation layer on top of this format machinery.
 #![allow(dead_code)] // export/import are exercised by the round-trip test; CLI + foreign import wire them next.
 

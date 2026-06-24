@@ -310,7 +310,7 @@ pub fn verify_dataset_gpu(
 
 /// Multi-source data mixer: samples from multiple datasets with configurable weights.
 /// Useful for mixing code, text, math data in specific proportions.
-/// weights[i] = relative probability of sampling from source i.
+/// weights`[i]` = relative probability of sampling from source i.
 pub struct DataMixer {
     loaders: Vec<DataLoader>,
     weights: Vec<f32>,

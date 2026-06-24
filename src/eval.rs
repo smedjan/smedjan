@@ -471,7 +471,7 @@ fn build_context(
 /// - `freqagg`  : count K identical events scattered through filler -- aggregation over the whole
 ///   context, which single-needle retrieval cannot answer.
 ///
-/// `lengths` are target token counts; `depths` are fractional insertion points in [0,1].
+/// `lengths` are target token counts; `depths` are fractional insertion points in `[0,1]`.
 pub fn longctx_eval_set(
     tokenizer: &BpeTokenizer,
     lengths: &[usize],

@@ -74,13 +74,13 @@ pub enum Op {
     ConcatParts {
         part_sizes: Vec<usize>,
     },
-    /// Batched matrix multiply: A[b] @ B[b] for each batch element.
+    /// Batched matrix multiply: A`[b]` @ B`[b]` for each batch element.
     /// A: [B, M, K], B: [B, K, N] → C: [B, M, N]
     BatchedMatmul,
-    /// Batched matrix multiply with B transposed: A[b] @ B[b]^T for each batch element.
+    /// Batched matrix multiply with B transposed: A`[b]` @ B`[b]`^T for each batch element.
     /// A: [B, M, K], B: [B, N, K] → C: [B, M, N]
     BatchedMatmulTransB,
-    /// Batched matrix multiply with A transposed: A[b]^T @ B[b] for each batch element.
+    /// Batched matrix multiply with A transposed: A`[b]`^T @ B`[b]` for each batch element.
     /// A: [B, M, K], B: [B, M, N] → C: [B, K, N] (contracts M).
     /// dA = B @ dC^T (trans_b), dB = A @ dC (plain) — both existing batched kernels.
     BatchedMatmulTransA,
@@ -100,7 +100,7 @@ pub enum Op {
         seq_len: usize,
         head_dim: usize,
     },
-    /// Per-row scaling: out[r][c] = input[r][c] * scales[r]
+    /// Per-row scaling: out`[r]``[c]` = input`[r]``[c]` * scales`[r]`
     ScaleRows {
         rows: usize,
         cols: usize,
@@ -117,8 +117,8 @@ pub enum Op {
     Relu,
     /// Elementwise exp. Backward: grad_input = grad_output * output (output = exp(input)).
     Exp,
-    /// Broadcast a [cols] vector to [rows, cols]. Backward: grad_input = column-sum of grad_output
-    /// (= ones[1,rows] @ grad_output).
+    /// Broadcast a `[cols]` vector to `[rows, cols]`. Backward: grad_input = column-sum of grad_output
+    /// (= ones`[1,rows]` @ grad_output).
     BroadcastRows {
         rows: usize,
         cols: usize,
@@ -137,7 +137,7 @@ pub enum Op {
         kv_offset: u32,
     },
     /// Block gather for subquadratic block-sparse attention: gather selected source K/V blocks
-    /// into a compact [bh*nb, k_sel*block, hd] buffer. inputs: [src], cached: sel buffer (the
+    /// into a compact `[bh*nb, k_sel*block, hd]` buffer. inputs: `[src]`, cached: sel buffer (the
     /// fixed routing permutation, computed non-differentiably). Backward is a scatter-add
     /// (transpose of the gather): dSrc[bh, sel*block+w, hd] += dOut, accumulated atomically.
     GatherBlocks {
@@ -1382,8 +1382,8 @@ fn backward_concat_parts(
     }
 }
 
-/// BatchedMatmul backward: C[b] = A[b] @ B[b]
-/// dA[b] = dC[b] @ B[b]^T, dB[b] = A[b]^T @ dC[b]
+/// BatchedMatmul backward: C`[b]` = A`[b]` @ B`[b]`
+/// dA`[b]` = dC`[b]` @ B`[b]`^T, dB`[b]` = A`[b]`^T @ dC`[b]`
 fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad: &crate::gpu::Buf) {
     let a_shape = &entry.shapes[0]; // [B, M, K]
     let b_shape = &entry.shapes[1]; // [B, K, N]
@@ -1428,8 +1428,8 @@ fn backward_batched_matmul(ctx: &Arc<MetalContext>, entry: &TapeEntry, out_grad:
     accumulate_grad(ctx, entry.inputs[1], db_total, batches * k * n);
 }
 
-/// BatchedMatmulTransB backward: C[b] = A[b] @ B[b]^T
-/// dA[b] = dC[b] @ B[b], dB[b] = dC[b]^T @ A[b]
+/// BatchedMatmulTransB backward: C`[b]` = A`[b]` @ B`[b]`^T
+/// dA`[b]` = dC`[b]` @ B`[b]`, dB`[b]` = dC`[b]`^T @ A`[b]`
 fn backward_batched_matmul_trans_b(
     ctx: &Arc<MetalContext>,
     entry: &TapeEntry,
