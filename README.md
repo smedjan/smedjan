@@ -162,6 +162,10 @@ Measured with `smedjan bench` on an Apple M1 Mac mini (16 GB) — batch 4, seque
 
 The hardware simdgroup-MMA matmul path is on by default (bit-identical to the scalar kernels) and runs ~1.3–1.4× faster — on `medium`, inference 3,600 → 5,090 tok/s and training 785 → 1,150 tok/s. Measure the scalar fallback with `smedjan bench --no-simdgroup-matmul`. Other Metal-pass wins: batched matmul shaders, FP16 mixed precision with float accumulators, a merged forward+backward command batch, and single-instruction RoPE sincos. Reproduce on your own hardware with `smedjan bench --size <preset>`.
 
+### NVIDIA (CUDA)
+
+On an RTX 4090 the matmul path runs on cuBLAS TF32 tensor cores. Forward inference reaches ~70,000 tok/s on a 214M model — about 4× the initial portable kernels — and a multi-block gradient-norm reduction roughly halved per-step GPU time, lifting checkpointed training throughput ~1.6× (`medium`, batch 16, seq 256). The full 269-test suite passes on **both** Metal and CUDA, and checkpoints are portable between them. Build with `--no-default-features --features cuda`.
+
 ## Module map
 
 ```
@@ -215,7 +219,6 @@ cargo test --release --no-default-features --features cuda
 
 - Faithful **bit-exact** HF *inference* parity (half-split RoPE, fixed QK-norm). The `config.json` → model + F32/BF16/F16 import path already works for continued training (`smedjan import-hf`); reproducing HF inference to the bit is the remaining piece.
 - Turnkey `llama.cpp` inference from an exported GGUF (embed the tokenizer vocab + the same RoPE/QK-norm parity as above; the GGML weight blocks themselves are already correct)
-- CUDA backward parity for the remaining specialized kernels (the Metal path is the most exercised)
 - Chunked O(N) RWKV forward (the SSM chunked path already exists) — RWKV already trains via the stable materialised WKV
 - Stronger long-context (NIAH / RULER) curves on better-trained checkpoints (the eval harness ships: `smedjan eval --longctx`)
 
