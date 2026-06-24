@@ -93,6 +93,59 @@ pub fn gpu_matmul(
     cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, false);
 }
 
+/// cuBLAS strided-batched SGEMM: `C[b] = opA(A[b]) · opB(B[b])` over `batch` independent matrices.
+/// Per-batch element strides are m*k / k*n / m*n in the cuBLAS (m,n,k) frame regardless of transpose.
+#[allow(clippy::too_many_arguments)]
+fn cublas_sgemm_batched(
+    blas: &cudarc::cublas::CudaBlas,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    batch: u32,
+    trans_a: bool,
+    trans_b: bool,
+) {
+    use cudarc::cublas::result;
+    use cudarc::cublas::sys::cublasOperation_t as Op;
+    use cudarc::driver::DevicePtr;
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let a_ptr = *a.device_ptr() as *const f32;
+    let b_ptr = *b.device_ptr() as *const f32;
+    let c_ptr = *c.device_ptr() as *mut f32;
+    let (op_b, ldb) = if trans_b { (Op::CUBLAS_OP_T, k as i32) } else { (Op::CUBLAS_OP_N, n as i32) };
+    let (op_a, lda) = if trans_a { (Op::CUBLAS_OP_T, m as i32) } else { (Op::CUBLAS_OP_N, k as i32) };
+    let stride_a = (m as i64) * (k as i64);
+    let stride_b = (k as i64) * (n as i64);
+    let stride_c = (m as i64) * (n as i64);
+    unsafe {
+        result::sgemm_strided_batched(
+            *blas.handle(),
+            op_b,
+            op_a,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32,
+            b_ptr,
+            ldb,
+            stride_b,
+            a_ptr,
+            lda,
+            stride_a,
+            &beta as *const f32,
+            c_ptr,
+            n as i32,
+            stride_c,
+            batch as i32,
+        )
+        .expect("cublas strided-batched sgemm");
+    }
+}
+
 pub fn gpu_matmul_trans_b(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -102,14 +155,8 @@ pub fn gpu_matmul_trans_b(
     n: u32,
     k: u32,
 ) {
-    let tile = 32u32;
-    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    // precise (fp32) trans_b — the fp16 fast path is gpu_matmul_trans_b_f16.
-    let f = ctx
-        .device
-        .get_func("smedjan", "matmul_tiled_trans_b_fp32")
-        .unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+    // Precise cuBLAS C = A · B^T.
+    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, true);
 }
 
 pub fn gpu_matmul_trans_a(
@@ -557,10 +604,7 @@ pub fn gpu_matmul_fp32(
     n: u32,
     k: u32,
 ) {
-    let tile = 32u32;
-    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    let f = ctx.device.get_func("smedjan", "matmul_tiled_fp32").unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, false);
 }
 
 pub fn gpu_matmul_bf16(
@@ -742,12 +786,7 @@ pub fn gpu_batched_matmul(
     d: BatchedDims,
 ) {
     let BatchedDims { batch, m, n, k } = d;
-    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
-    let f = ctx
-        .device
-        .get_func("smedjan", "batched_matmul_tiled_fp32")
-        .unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, m, n, k, batch, false, false);
 }
 
 pub fn gpu_batched_matmul_simdgroup(
@@ -788,12 +827,7 @@ pub fn gpu_batched_matmul_trans_b(
     d: BatchedDims,
 ) {
     let BatchedDims { batch, m, n, k } = d;
-    let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
-    let f = ctx
-        .device
-        .get_func("smedjan", "batched_matmul_tiled_trans_b_fp32")
-        .unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
+    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, m, n, k, batch, false, true);
 }
 
 pub fn gpu_batched_matmul_gqa_trans_b(
@@ -864,12 +898,8 @@ pub fn gpu_batched_matmul_trans_a(
     d: BatchedDims,
 ) {
     let BatchedDims { batch, m, n, k } = d;
-    let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
-    let f = ctx
-        .device
-        .get_func("smedjan", "batched_matmul_tiled_trans_a_fp32")
-        .unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
+    // C[k,n] = A[m,k]^T · B[m,n]: contraction over m, output rows k (matches the kernel it replaces).
+    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, k, n, m, batch, true, false);
 }
 
 pub fn gpu_rms_norm_residual(
