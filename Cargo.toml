@@ -1,6 +1,6 @@
 [package]
 name = "smedjan"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Andrei Dodu <me@andreidodu.se>"]
 description = "Pure Rust LLM training and inference engine — own architecture, own training, own tokenizer; Metal and CUDA backends, zero Python."
