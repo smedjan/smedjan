@@ -11,7 +11,32 @@ pub mod compute;
 pub mod kernels;
 
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Global size-keyed free list of recycled device buffers (key = element count == n_floats).
+///
+/// Why this is aliasing-safe without Metal's generation/quarantine machinery: CUDA executes all of
+/// our kernels in issue order on a single (default) stream. A buffer is only returned here once its
+/// last Rust-side reference drops (`Arc::strong_count == 1`), so no later code holds it; and because
+/// every reissue's zeroing memset and every subsequent kernel are queued on the same stream *after*
+/// whatever last read the buffer, the GPU can't reorder a stale read past the reuse. That ordering
+/// is exactly what Metal's deferred command-buffer model lacks, which is why this needs no quarantine.
+static BUFFER_POOL: OnceLock<Mutex<HashMap<usize, Vec<CudaSlice<f32>>>>> = OnceLock::new();
+/// (hits, misses) since process start — surfaced by `pool_stats()` for the training/bench readout.
+static POOL_HITS: AtomicUsize = AtomicUsize::new(0);
+static POOL_MISSES: AtomicUsize = AtomicUsize::new(0);
+/// >0 while any `PoolBypassGuard` is live (checkpoint recompute / grad-accum): allocations come
+/// fresh and recycles are dropped, mirroring the Metal bypass. Process-global is sound because the
+/// GPU compute path is single-threaded.
+static POOL_BYPASS: AtomicUsize = AtomicUsize::new(0);
+/// Cap per size bucket, mirroring Metal, so idle VRAM can't grow unbounded across varied seq lengths.
+const POOL_BUCKET_CAP: usize = 64;
+
+fn buffer_pool() -> &'static Mutex<HashMap<usize, Vec<CudaSlice<f32>>>> {
+    BUFFER_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// GPU buffer type for CUDA — wraps a device memory allocation.
 pub type GpuBuffer = CudaSlice<f32>;
@@ -124,23 +149,54 @@ impl MetalContext {
         })
     }
 
-    /// Allocate a GPU buffer (device memory).
+    /// Allocate a GPU buffer (device memory). Checks the recycle pool first (unless bypassed),
+    /// falling back to a fresh `cudaMalloc`. Returns zeroed memory either way, preserving the
+    /// long-standing contract — the win is replacing a per-op cudaMalloc syscall (driver lock +
+    /// page setup) with a same-stream memset of an already-mapped allocation in the steady state.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
-        Arc::new(
+                                               // Pop a recycled same-size buffer under the lock, then release it before touching the GPU.
+        let reused = if POOL_BYPASS.load(Ordering::Relaxed) == 0 {
+            let mut pool = buffer_pool().lock().unwrap();
+            pool.get_mut(&n_floats).and_then(|list| list.pop())
+        } else {
+            None
+        };
+        let buf = if let Some(mut slice) = reused {
             self.device
-                .alloc_zeros::<f32>(n_floats)
-                .expect("Failed to allocate CUDA buffer"),
-        )
+                .memset_zeros(&mut slice)
+                .expect("Failed to zero recycled CUDA buffer");
+            POOL_HITS.fetch_add(1, Ordering::Relaxed);
+            Arc::new(slice)
+        } else {
+            POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+            Arc::new(
+                self.device
+                    .alloc_zeros::<f32>(n_floats)
+                    .expect("Failed to allocate CUDA buffer"),
+            )
+        };
+        // This device address is about to be written fresh. A previous tensor that lived here may
+        // still have an fp16/ternary conversion cached under this same pointer (those caches clear
+        // only after the optimizer step), and the pool deliberately reissues the same address — so
+        // without this a later `cast_to_f16` could return the previous tensor's data. Mirrors Metal.
+        crate::tensor::Tensor::invalidate_conversion_cache(buf_addr(&buf));
+        buf
     }
 
     /// Create buffer from f32 slice (host→device copy).
     pub fn buffer_from_slice(&self, data: &[f32]) -> Buf {
-        Arc::new(
+        let buf = Arc::new(
             self.device
                 .htod_sync_copy(data)
                 .expect("Failed to copy to device"),
-        )
+        );
+        // Same staleness hazard as alloc_buffer: this fresh allocation may land on the address of a
+        // just-freed buffer whose fp16/ternary conversion is still cached, so drop any stale entry.
+        // (Metal's harness caught this as a perturbed from_slice input silently read through a cached
+        // fp16 cast → numeric gradient of exactly 0.)
+        crate::tensor::Tensor::invalidate_conversion_cache(buf_addr(&buf));
+        buf
     }
 
     /// Create buffer from u32 slice.
@@ -207,14 +263,38 @@ impl MetalContext {
         (x as u32, y as u32, z as u32)
     }
 
-    /// Recycle buffer (no-op for CUDA — Arc drop handles deallocation).
-    pub fn recycle_buffer(_buf: Buf) {
-        // Drop handles deallocation
+    /// Return a buffer to the recycle pool for same-size reuse. Only pools buffers with no other
+    /// live reference (`Arc::strong_count == 1`) — reissuing a still-shared buffer would alias a
+    /// tensor still in use. Clone-recycle sites (which Metal's deferred model tolerates) carry an
+    /// extra refcount and so fall through to a plain `Arc` drop (`cudaFree`) here, which is correct.
+    pub fn recycle_buffer(buf: Buf) {
+        if POOL_BYPASS.load(Ordering::Relaxed) > 0 {
+            return; // bypassed region: drop instead of pooling
+        }
+        if let Ok(slice) = Arc::try_unwrap(buf) {
+            let n_floats = slice.len();
+            let mut pool = buffer_pool().lock().unwrap();
+            let list = pool.entry(n_floats).or_default();
+            if list.len() < POOL_BUCKET_CAP {
+                list.push(slice);
+            }
+            // bucket full → drop (cudaFree) to bound idle VRAM
+        }
     }
 
-    /// Pool stats for compatibility; CUDA allocation is delegated to cudarc.
+    /// Pool statistics: (hits, misses) since process start.
     pub fn pool_stats() -> (usize, usize) {
-        (0, 0)
+        (
+            POOL_HITS.load(Ordering::Relaxed),
+            POOL_MISSES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Drop every pooled buffer and reset stats (e.g. between training runs to free VRAM).
+    pub fn clear_pool() {
+        buffer_pool().lock().unwrap().clear();
+        POOL_HITS.store(0, Ordering::Relaxed);
+        POOL_MISSES.store(0, Ordering::Relaxed);
     }
 
     // Alloc-logging is a Metal buffer-pool diagnostic; no-op on CUDA.
@@ -250,16 +330,24 @@ impl MetalContext {
     fn auto_flush_batch() {}
 }
 
-/// No-op on CUDA: there is no thread-local buffer pool to bypass (cudarc owns allocation).
-/// Mirrors metal's RAII PoolBypassGuard so shared checkpoint-recompute code compiles unchanged.
+/// RAII guard that suspends buffer pooling for its lifetime. While any guard is live, `alloc_buffer`
+/// allocates fresh and `recycle_buffer` drops instead of pooling. Used around checkpoint recompute
+/// and grad-accum, where reissuing a pooled buffer the outer backward still references would corrupt
+/// gradients. Mirrors the Metal guard so shared code compiles and behaves identically.
 pub struct PoolBypassGuard;
 impl PoolBypassGuard {
     pub fn new() -> Self {
+        POOL_BYPASS.fetch_add(1, Ordering::Relaxed);
         PoolBypassGuard
     }
 }
 impl Default for PoolBypassGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+impl Drop for PoolBypassGuard {
+    fn drop(&mut self) {
+        POOL_BYPASS.fetch_sub(1, Ordering::Relaxed);
     }
 }

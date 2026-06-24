@@ -57,8 +57,16 @@ fn cublas_sgemm(
     let a_ptr = *a.device_ptr() as *const f32;
     let b_ptr = *b.device_ptr() as *const f32;
     let c_ptr = *c.device_ptr() as *mut f32;
-    let (op_b, ldb) = if trans_b { (Op::CUBLAS_OP_T, k as i32) } else { (Op::CUBLAS_OP_N, n as i32) };
-    let (op_a, lda) = if trans_a { (Op::CUBLAS_OP_T, m as i32) } else { (Op::CUBLAS_OP_N, k as i32) };
+    let (op_b, ldb) = if trans_b {
+        (Op::CUBLAS_OP_T, k as i32)
+    } else {
+        (Op::CUBLAS_OP_N, n as i32)
+    };
+    let (op_a, lda) = if trans_a {
+        (Op::CUBLAS_OP_T, m as i32)
+    } else {
+        (Op::CUBLAS_OP_N, k as i32)
+    };
     unsafe {
         result::sgemm(
             *blas.handle(),
@@ -116,8 +124,16 @@ fn cublas_sgemm_batched(
     let a_ptr = *a.device_ptr() as *const f32;
     let b_ptr = *b.device_ptr() as *const f32;
     let c_ptr = *c.device_ptr() as *mut f32;
-    let (op_b, ldb) = if trans_b { (Op::CUBLAS_OP_T, k as i32) } else { (Op::CUBLAS_OP_N, n as i32) };
-    let (op_a, lda) = if trans_a { (Op::CUBLAS_OP_T, m as i32) } else { (Op::CUBLAS_OP_N, k as i32) };
+    let (op_b, ldb) = if trans_b {
+        (Op::CUBLAS_OP_T, k as i32)
+    } else {
+        (Op::CUBLAS_OP_N, n as i32)
+    };
+    let (op_a, lda) = if trans_a {
+        (Op::CUBLAS_OP_T, m as i32)
+    } else {
+        (Op::CUBLAS_OP_N, k as i32)
+    };
     let stride_a = (m as i64) * (k as i64);
     let stride_b = (k as i64) * (n as i64);
     let stride_c = (m as i64) * (n as i64);
@@ -1829,7 +1845,9 @@ pub fn gpu_transpose_rope(
     gpu_transpose_perm_forward(ctx, input, output, d.batch, d.seq, d.n_heads, d.head_dim);
     let total_rows = d.batch * d.n_heads;
     if (d.yarn_scale - 1.0).abs() < 1e-6 {
-        gpu_rope(ctx, output, total_rows, d.seq, d.head_dim, d.offset, d.theta);
+        gpu_rope(
+            ctx, output, total_rows, d.seq, d.head_dim, d.offset, d.theta,
+        );
     } else {
         // YaRN NTK-by-parts RoPE (rope_yarn kernel).
         let cfg = launch_cfg_3d(total_rows, d.seq, 1, d.head_dim / 2);
@@ -1837,7 +1855,16 @@ pub fn gpu_transpose_rope(
         unsafe {
             f.launch(
                 cfg,
-                (output, total_rows, d.seq, d.head_dim, d.offset, d.theta, d.yarn_scale, d.yarn_orig_max),
+                (
+                    output,
+                    total_rows,
+                    d.seq,
+                    d.head_dim,
+                    d.offset,
+                    d.theta,
+                    d.yarn_scale,
+                    d.yarn_orig_max,
+                ),
             )
         }
         .unwrap();
@@ -1852,15 +1879,30 @@ pub fn gpu_transpose_rope_backward(
 ) {
     let total_rows = d.batch * d.n_heads;
     if (d.yarn_scale - 1.0).abs() < 1e-6 {
-        gpu_rope_backward(ctx, grad_out, total_rows, d.seq, d.head_dim, d.offset, d.theta);
+        gpu_rope_backward(
+            ctx, grad_out, total_rows, d.seq, d.head_dim, d.offset, d.theta,
+        );
     } else {
         // YaRN backward (rope_yarn_backward kernel), in-place on grad_out.
         let cfg = launch_cfg_3d(total_rows, d.seq, 1, d.head_dim / 2);
-        let f = ctx.device.get_func("smedjan", "rope_yarn_backward").unwrap();
+        let f = ctx
+            .device
+            .get_func("smedjan", "rope_yarn_backward")
+            .unwrap();
         unsafe {
             f.launch(
                 cfg,
-                (grad_out, grad_out, total_rows, d.seq, d.head_dim, d.offset, d.theta, d.yarn_scale, d.yarn_orig_max),
+                (
+                    grad_out,
+                    grad_out,
+                    total_rows,
+                    d.seq,
+                    d.head_dim,
+                    d.offset,
+                    d.theta,
+                    d.yarn_scale,
+                    d.yarn_orig_max,
+                ),
             )
         }
         .unwrap();
