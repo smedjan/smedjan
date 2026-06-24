@@ -300,13 +300,12 @@ pub fn gpu_matmul_trans_a(
     k: u32,
     n: u32,
 ) {
-    let tile = 32u32;
-    let cfg = launch_cfg_3d(n.div_ceil(tile), k.div_ceil(tile), 1, 64);
-    let f = ctx
-        .device
-        .get_func("smedjan", "matmul_trans_a_tiled")
-        .unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, k, n)) }.unwrap();
+    // C[k,n] = A[m,k]^T · B[m,n] — the linear-layer grad-weight GEMM, ~60% of backward and one of
+    // the largest GEMMs in a step (m = batch·seq). Was a hand-rolled tiled kernel (no tensor cores,
+    // the backward bottleneck bf16-on-forward couldn't touch); route it through the same cuBLAS
+    // dispatcher as the already-cuBLAS batched TN: cuBLAS frame M=k, N=n, K=m, trans_a, no trans_b.
+    // TF32 tensor cores by default, bf16 when opted in, strict fp32 for grad-checks (simdgroup off).
+    cublas_gemm(ctx, a, b, c, k, n, m, true, false);
 }
 
 // ===== Softmax / Norm =====
