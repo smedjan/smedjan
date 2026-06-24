@@ -6338,6 +6338,122 @@ mod suite {
         std::fs::remove_file(path).ok();
     }
 
+    /// Retype an all-F32 safetensors header to `new_dtype` and halve every `data_offsets` pair
+    /// (F32 -> 16-bit dtype = half the bytes). Used to forge a bf16 file from the f32 HF export.
+    fn retype_and_halve_offsets(header: &str, new_dtype: &str) -> String {
+        let mut out = String::with_capacity(header.len());
+        let mut i = 0;
+        let f32_key = "\"dtype\":\"F32\"";
+        let off_key = "\"data_offsets\":[";
+        while i < header.len() {
+            if header[i..].starts_with(f32_key) {
+                out.push_str(&format!("\"dtype\":\"{new_dtype}\""));
+                i += f32_key.len();
+            } else if header[i..].starts_with(off_key) {
+                out.push_str(off_key);
+                i += off_key.len();
+                let end = header[i..].find(']').expect("offsets close") + i;
+                let halved: Vec<String> = header[i..end]
+                    .split(',')
+                    .map(|s| (s.trim().parse::<usize>().expect("offset int") / 2).to_string())
+                    .collect();
+                out.push_str(&halved.join(","));
+                i = end;
+            } else {
+                out.push(header.as_bytes()[i] as char); // header is ASCII
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// End-to-end: a BF16 HF file imports to the same model as its F32 twin (within bf16 precision),
+    /// proving the half-width decode path threads correctly through the transpose + RoPE permute.
+    #[test]
+    fn hf_safetensors_imports_bf16_matching_f32() {
+        let ctx = test_ctx();
+        let cfg = ModelConfig::custom(64, 64, 4, 2, 2.67, 32);
+        let model = Transformer::new(&ctx, cfg.clone());
+        let f32_path = "/tmp/smedjan_hf_f32.safetensors";
+        let bf16_path = "/tmp/smedjan_hf_bf16.safetensors";
+        crate::safetensors::export_hf_safetensors(f32_path, &model).expect("export_hf");
+
+        let (header, blob) = read_test_safetensors(f32_path);
+        // Truncate each f32 to bf16 (high 16 bits) — what bf16 exporters do.
+        let bf16_blob: Vec<u8> = blob
+            .chunks_exact(4)
+            .flat_map(|b| ((u32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 16) as u16).to_le_bytes())
+            .collect();
+        let bf16_header = retype_and_halve_offsets(&header, "BF16");
+        write_test_safetensors(bf16_path, &bf16_header, &bf16_blob);
+
+        let from_f32 =
+            crate::safetensors::import_hf_safetensors(&ctx, f32_path, cfg.clone()).expect("import f32");
+        let from_bf16 =
+            crate::safetensors::import_hf_safetensors(&ctx, bf16_path, cfg).expect("import bf16");
+
+        let (a, b) = (from_f32.parameters(), from_bf16.parameters());
+        assert_eq!(a.len(), b.len(), "param count");
+        let mut max_drift = 0f32;
+        for (i, (pa, pb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(pa.shape, pb.shape, "tensor {i} shape");
+            for (x, y) in pa.to_vec().iter().zip(pb.to_vec().iter()) {
+                // bf16 carries 8 mantissa bits => relative error <= 2^-8 (plus a 1.0 floor for tiny values).
+                let tol = 5e-3 * x.abs().max(1.0);
+                assert!((x - y).abs() <= tol, "tensor {i}: bf16 drift {x} vs {y}");
+                max_drift = max_drift.max((x - y).abs());
+            }
+        }
+        eprintln!("bf16 HF import: max abs drift vs f32 = {max_drift:e}");
+        std::fs::remove_file(f32_path).ok();
+        std::fs::remove_file(bf16_path).ok();
+    }
+
+    /// GAP-3 config.json -> ModelConfig: standard Llama fields map, and an FFN size that Smedjan's
+    /// 256-alignment cannot reproduce is rejected rather than silently mis-shaped.
+    #[test]
+    fn config_from_hf_json_maps_llama_fields() {
+        let path = "/tmp/smedjan_hf_config.json";
+        std::fs::write(
+            path,
+            r#"{
+                "model_type": "llama",
+                "hidden_size": 512,
+                "intermediate_size": 1536,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "vocab_size": 32000,
+                "max_position_embeddings": 4096,
+                "rope_theta": 500000.0,
+                "rms_norm_eps": 1e-6
+            }"#,
+        )
+        .unwrap();
+        let cfg = crate::safetensors::config_from_hf_json(path).expect("parse config.json");
+        assert_eq!(cfg.d_model, 512);
+        assert_eq!(cfg.n_heads, 8);
+        assert_eq!(cfg.n_kv_heads, 2);
+        assert_eq!(cfg.n_layers, 4);
+        assert_eq!(cfg.vocab_size, 32000);
+        assert_eq!(cfg.max_seq_len, 4096);
+        assert_eq!(cfg.d_ff(), 1536, "intermediate_size must map exactly");
+        assert!((cfg.rope_theta - 500_000.0).abs() < 1.0);
+        assert!((cfg.norm_eps - 1e-6).abs() < 1e-9);
+
+        // intermediate_size not a multiple of 256 cannot be represented -> hard error.
+        std::fs::write(
+            path,
+            r#"{"hidden_size":512,"intermediate_size":1500,"num_attention_heads":8,"num_hidden_layers":2,"vocab_size":100,"intermediate_size_bad":0}"#,
+        )
+        .unwrap();
+        assert!(
+            crate::safetensors::config_from_hf_json(path).is_err(),
+            "non-256-aligned intermediate_size must be rejected"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn hf_safetensors_import_rejects_wrong_shapes_and_ragged_bytes() {
         let ctx = test_ctx();

@@ -219,10 +219,9 @@ struct TrainArgs {
     /// Selective state-space (Mamba-2/SSD) mixer in every block instead of attention. O(N) sequence mixing.
     #[arg(long)]
     ssm: bool,
-    /// RWKV-style time-mix (per-channel WKV + receptance) in every block instead of attention. O(N).
-    /// Takes precedence over --ssm if both are set. EXPERIMENTAL: the materialised wkv path does not
-    /// currently converge (loss stays flat even at short seq, token-shift omitted) — wired for
-    /// development, not production. --ssm and --linear-attn do train.
+    /// RWKV-6-style time-mix (token-shift + per-channel WKV + receptance) in every block instead of
+    /// attention. O(N). Takes precedence over --ssm if both are set. The WKV uses a numerically-stable
+    /// strict-lower decay form (no exp(i·w) overflow), so it trains at long sequence like --ssm.
     #[arg(long)]
     rwkv: bool,
     /// Linear (kernel) O(N) attention in every block instead of softmax attention.
@@ -554,7 +553,7 @@ enum Commands {
         checkpoint: String,
         #[arg(long, default_value = "model.gguf")]
         output: String,
-        /// Quantization: "f32" or "q8_0"
+        /// Quantization: "f32", "q8_0", or "q4_0" (real GGML blocks; norms stay f32)
         #[arg(long, default_value = "f32")]
         quant: String,
     },
@@ -564,6 +563,20 @@ enum Commands {
         #[arg(long)]
         checkpoint: String,
         #[arg(long, default_value = "model.safetensors")]
+        output: String,
+    },
+
+    /// Import a HuggingFace Llama model (config.json -> ModelConfig, F32/BF16/F16 weights) as a
+    /// Smedjan checkpoint for continued training / SubQ-style retrofit. Not bit-exact HF inference.
+    ImportHf {
+        /// HF model directory containing config.json and model.safetensors
+        #[arg(long)]
+        model_dir: String,
+        /// Override the weights file (defaults to <model_dir>/model.safetensors)
+        #[arg(long)]
+        weights: Option<String>,
+        /// Output Smedjan checkpoint path
+        #[arg(long, default_value = "imported.bin")]
         output: String,
     },
 
@@ -1537,6 +1550,58 @@ fn main() {
             result_or_exit(
                 quantize::export_safetensors(&model, &output),
                 "Safetensors export failed",
+            );
+        }
+
+        Commands::ImportHf {
+            model_dir,
+            weights,
+            output,
+        } => {
+            let cfg_path = format!("{}/config.json", model_dir.trim_end_matches('/'));
+            let weights_path = weights.unwrap_or_else(|| {
+                format!("{}/model.safetensors", model_dir.trim_end_matches('/'))
+            });
+            if !std::path::Path::new(&weights_path).exists() {
+                let index = format!("{}/model.safetensors.index.json", model_dir.trim_end_matches('/'));
+                if std::path::Path::new(&index).exists() {
+                    exit_with_error(
+                        "HF import",
+                        "weights are sharded (model.safetensors.index.json present). Merge the \
+                         shards into a single model.safetensors first, or pass --weights.",
+                    );
+                }
+                exit_with_error(
+                    "HF import",
+                    format!("weights file not found: {weights_path} (pass --weights to override)"),
+                );
+            }
+            let config = result_or_exit(
+                safetensors::config_from_hf_json(&cfg_path),
+                "Failed to parse config.json",
+            );
+            eprintln!(
+                "HF config: d_model={} heads={}/{} layers={} d_ff={} vocab={} max_seq={}",
+                config.d_model,
+                config.n_heads,
+                config.n_kv_heads,
+                config.n_layers,
+                config.d_ff(),
+                config.vocab_size,
+                config.max_seq_len
+            );
+            let model = result_or_exit(
+                safetensors::import_hf_safetensors(&ctx, &weights_path, config),
+                "HF import failed",
+            );
+            result_or_exit(
+                checkpoint::save_checkpoint(&output, &model, 0),
+                "Failed to save imported checkpoint",
+            );
+            eprintln!(
+                "Imported -> {output} ({}M params, step 0). Continue training with: \
+                 smedjan train --resume {output} --data <shard>",
+                model.config.param_count() as f32 / 1e6
             );
         }
 

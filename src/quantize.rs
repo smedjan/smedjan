@@ -371,10 +371,132 @@ fn validate_quant_bits(bits: u8) -> std::io::Result<()> {
 
 fn validate_gguf_quantize_type(quantize_type: &str) -> std::io::Result<()> {
     match quantize_type {
-        "f32" | "q8_0" => Ok(()),
+        "f32" | "q8_0" | "q4_0" => Ok(()),
         other => Err(invalid_input(format!(
-            "unsupported GGUF quantization '{other}'; supported values: f32, q8_0"
+            "unsupported GGUF quantization '{other}'; supported values: f32, q8_0, q4_0"
         ))),
+    }
+}
+
+/// GGML quantization block length (both Q8_0 and Q4_0 quantize 32 values at a time).
+const GGML_QK: usize = 32;
+// GGML tensor type IDs (ggml.h).
+const GGML_TYPE_F32: u32 = 0;
+const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q8_0: u32 = 8;
+
+/// f32 -> IEEE-754 half (round-to-nearest-even). GGML stores each quant block's scale `d` as an
+/// f16, so a faithful GGUF needs this exact encoding. Handles overflow→inf, subnormals, and NaN.
+fn f32_to_f16_bits(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let mant = x & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf / NaN (preserve NaN-ness).
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let mut e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow -> signed zero
+        }
+        // Subnormal: shift in the implicit leading 1 and round to nearest even.
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let round = u32::from(rem > halfway || (rem == halfway && (half & 1) == 1));
+        return sign | (half + round) as u16;
+    }
+    // Normal: narrow the 23-bit mantissa to 10 bits with round-to-nearest-even.
+    let mut half_mant = (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) == 1) {
+        half_mant += 1;
+        if half_mant == 0x0400 {
+            half_mant = 0;
+            e += 1;
+            if e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((e as u16) << 10) | half_mant
+}
+
+/// Quantize one 32-value block to GGML Q8_0 layout: f16 scale `d = amax/127`, then 32 signed
+/// int8 `round(x/d)`. 34 bytes/block. Matches `quantize_row_q8_0_ref` in llama.cpp.
+fn quantize_q8_0_block(x: &[f32], out: &mut Vec<u8>) {
+    let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let d = amax / 127.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    out.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+    for &v in x {
+        out.push(((v * id).round().clamp(-127.0, 127.0) as i8) as u8);
+    }
+}
+
+/// Quantize one 32-value block to GGML Q4_0 layout: f16 scale `d = vmax/-8` (vmax = largest-
+/// magnitude element, signed), then 16 bytes packing two 4-bit quants `clamp(trunc(x/d)+8.5,0,15)`,
+/// pairing element `j` with `j+16`. 18 bytes/block. Matches `quantize_row_q4_0_ref` in llama.cpp.
+fn quantize_q4_0_block(x: &[f32], out: &mut Vec<u8>) {
+    let mut amax = 0f32;
+    let mut vmax = 0f32;
+    for &v in x {
+        if v.abs() > amax {
+            amax = v.abs();
+            vmax = v;
+        }
+    }
+    let d = vmax / -8.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    out.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+    let q: Vec<u8> = x
+        .iter()
+        .map(|&v| (v * id + 8.5).floor().clamp(0.0, 15.0) as u8)
+        .collect();
+    for j in 0..GGML_QK / 2 {
+        out.push(q[j] | (q[j + GGML_QK / 2] << 4));
+    }
+}
+
+/// Whether a tensor is GGML-quantizable: 2-D+ weight matrix whose element count is a whole number
+/// of 32-blocks. 1-D tensors (norms) and ragged shapes stay F32, exactly as llama.cpp's quantizer
+/// keeps them — so a "quantized" GGUF is legitimately mixed-precision.
+fn is_ggml_quantizable(shape: &[usize], numel: usize) -> bool {
+    shape.len() >= 2 && numel % GGML_QK == 0 && numel > 0
+}
+
+/// Encode a tensor's f32 data into `(ggml_type, bytes)` for the requested GGUF quant. Non-quantizable
+/// tensors (and the f32 export) pass through as raw little-endian f32.
+fn encode_gguf_tensor(data: &[f32], shape: &[usize], quantize_type: &str) -> (u32, Vec<u8>) {
+    let numel = data.len();
+    let quantizable = quantize_type != "f32" && is_ggml_quantizable(shape, numel);
+    if !quantizable {
+        let bytes = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        return (GGML_TYPE_F32, bytes);
+    }
+    match quantize_type {
+        "q8_0" => {
+            let mut out = Vec::with_capacity(numel / GGML_QK * 34);
+            for blk in data.chunks_exact(GGML_QK) {
+                quantize_q8_0_block(blk, &mut out);
+            }
+            (GGML_TYPE_Q8_0, out)
+        }
+        "q4_0" => {
+            let mut out = Vec::with_capacity(numel / GGML_QK * 18);
+            for blk in data.chunks_exact(GGML_QK) {
+                quantize_q4_0_block(blk, &mut out);
+            }
+            (GGML_TYPE_Q4_0, out)
+        }
+        _ => unreachable!("validated by validate_gguf_quantize_type"),
     }
 }
 
@@ -612,7 +734,7 @@ fn read_quantized_tensor(
 pub fn export_gguf(
     model: &Transformer,
     output_path: &str,
-    quantize_type: &str, // "f32" or "q8_0"
+    quantize_type: &str, // "f32", "q8_0", or "q4_0"
 ) -> std::io::Result<()> {
     use std::io::Write;
     validate_gguf_quantize_type(quantize_type)?;
@@ -666,68 +788,47 @@ pub fn export_gguf(
         "llama.attention.layer_norm_rms_epsilon",
         config.norm_eps,
     )?;
-    write_gguf_u32(
-        &mut file,
-        "general.file_type",
-        if quantize_type == "q8_0" { 7 } else { 0 },
-    )?;
-
-    // Tensor info headers (name, shape, type, offset)
-    let mut data_offset: u64 = 0;
-    let gguf_type = if quantize_type == "q8_0" { 8u32 } else { 0u32 }; // F32=0, Q8_0=8
-
-    // Pre-quantize all tensors if Q8_0 so we know exact sizes for offset calculation
-    let quantized_data: Vec<Option<QuantizedTensor>> = if quantize_type == "q8_0" {
-        params
-            .iter()
-            .map(|p| {
-                let data = p.to_vec();
-                Some(quantize(&data, &p.shape, 8, 32))
-            })
-            .collect()
-    } else {
-        params.iter().map(|_| None).collect()
+    // llama.cpp ftype enum: ALL_F32=0, MOSTLY_Q4_0=2, MOSTLY_Q8_0=7.
+    let file_type = match quantize_type {
+        "q4_0" => 2u32,
+        "q8_0" => 7u32,
+        _ => 0u32,
     };
+    write_gguf_u32(&mut file, "general.file_type", file_type)?;
 
-    for (i, (param, name)) in params.iter().zip(tensor_names.iter()).enumerate() {
+    // Encode every tensor once into real GGML block bytes (mixed precision: norms/1-D stay F32).
+    let encoded: Vec<(u32, Vec<u8>)> = params
+        .iter()
+        .map(|p| encode_gguf_tensor(&p.to_vec(), &p.shape, quantize_type))
+        .collect();
+
+    // Tensor info headers (name, shape, per-tensor type, offset).
+    let mut data_offset: u64 = 0;
+    for ((param, name), (gguf_type, bytes)) in
+        params.iter().zip(tensor_names.iter()).zip(encoded.iter())
+    {
         write_gguf_string(&mut file, name)?;
         let ndims = param.shape.len() as u32;
         file.write_all(&ndims.to_le_bytes())?;
-        // GGUF stores dimensions in reverse order (innermost first)
+        // GGUF stores dimensions in reverse order (innermost first).
         for &dim in param.shape.iter().rev() {
             file.write_all(&(dim as u64).to_le_bytes())?;
         }
         file.write_all(&gguf_type.to_le_bytes())?;
         file.write_all(&data_offset.to_le_bytes())?;
-        if let Some(ref qt) = quantized_data[i] {
-            // Q8_0: data bytes + scales + zeros
-            data_offset += (qt.data.len() + qt.scales.len() * 4 + qt.zeros.len() * 4) as u64;
-        } else {
-            data_offset += (param.numel() * 4) as u64;
-        }
+        data_offset += bytes.len() as u64;
     }
 
-    // Alignment padding to 32 bytes
+    // Alignment padding to 32 bytes.
     let pos = file.metadata()?.len();
     let aligned = (pos + 31) & !31;
     for _ in pos..aligned {
         file.write_all(&[0u8])?;
     }
 
-    // Tensor data
-    for (i, param) in params.iter().enumerate() {
-        if let Some(ref qt) = quantized_data[i] {
-            // Write quantized data + scales + zeros
-            file.write_all(&qt.data)?;
-            let scale_bytes: Vec<u8> = qt.scales.iter().flat_map(|f| f.to_le_bytes()).collect();
-            file.write_all(&scale_bytes)?;
-            let zero_bytes: Vec<u8> = qt.zeros.iter().flat_map(|f| f.to_le_bytes()).collect();
-            file.write_all(&zero_bytes)?;
-        } else {
-            let data = param.to_vec();
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            file.write_all(&bytes)?;
-        }
+    // Tensor data (GGML block bytes, in the same order as the info headers).
+    for (_, bytes) in &encoded {
+        file.write_all(bytes)?;
     }
 
     let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);
@@ -874,4 +975,102 @@ pub fn export_safetensors(model: &Transformer, output_path: &str) -> std::io::Re
         params.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod gguf_block_tests {
+    use super::*;
+
+    /// Local f16 -> f32 decode (mirrors safetensors::f16_to_f32) so the block tests can verify the
+    /// scale that quantize_q*_0_block writes without reaching across modules.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = (h as u32 & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1f;
+        let mant = h as u32 & 0x3ff;
+        let bits = if exp == 0 {
+            if mant == 0 {
+                sign
+            } else {
+                let mut e = -1i32;
+                let mut m = mant;
+                loop {
+                    e += 1;
+                    m <<= 1;
+                    if m & 0x400 != 0 {
+                        break;
+                    }
+                }
+                sign | (((127 - 15 - e) as u32) << 23) | ((m & 0x3ff) << 13)
+            }
+        } else if exp == 0x1f {
+            sign | (0xff << 23) | (mant << 13)
+        } else {
+            sign | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    #[test]
+    fn f16_encoding_matches_known_values() {
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3C00);
+        assert_eq!(f32_to_f16_bits(0.5), 0x3800);
+        assert_eq!(f32_to_f16_bits(2.0), 0x4000);
+        assert_eq!(f32_to_f16_bits(-2.0), 0xC000);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7BFF);
+        for &v in &[0.1f32, -3.7, 12.25, -0.003, 100.0, 1e-4] {
+            let r = f16_to_f32(f32_to_f16_bits(v));
+            assert!((r - v).abs() <= 1e-2 * v.abs().max(1e-3), "f16 {v} -> {r}");
+        }
+        assert!(f16_to_f32(f32_to_f16_bits(1e30)).is_infinite());
+    }
+
+    #[test]
+    fn q8_0_block_roundtrips_within_tolerance() {
+        let x: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.37).collect();
+        let mut out = Vec::new();
+        quantize_q8_0_block(&x, &mut out);
+        assert_eq!(out.len(), 34, "Q8_0 block = 2 (f16 d) + 32 int8");
+        let d = f16_to_f32(u16::from_le_bytes([out[0], out[1]]));
+        let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        for (i, &xi) in x.iter().enumerate() {
+            let deq = (out[2 + i] as i8) as f32 * d;
+            assert!((deq - xi).abs() <= amax / 127.0 + 1e-5, "q8_0 [{i}] {xi} -> {deq}");
+        }
+    }
+
+    #[test]
+    fn q4_0_block_roundtrips_within_tolerance() {
+        let x: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.21).collect();
+        let mut out = Vec::new();
+        quantize_q4_0_block(&x, &mut out);
+        assert_eq!(out.len(), 18, "Q4_0 block = 2 (f16 d) + 16 packed nibbles");
+        let d = f16_to_f32(u16::from_le_bytes([out[0], out[1]]));
+        let amax = x.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        for j in 0..16 {
+            let lo = (out[2 + j] & 0x0f) as i32 - 8;
+            let hi = (out[2 + j] >> 4) as i32 - 8;
+            assert!((lo as f32 * d - x[j]).abs() <= 1.5 * d.abs() + amax * 0.03, "q4_0 lo[{j}]");
+            assert!((hi as f32 * d - x[j + 16]).abs() <= 1.5 * d.abs() + amax * 0.03, "q4_0 hi[{j}]");
+        }
+    }
+
+    #[test]
+    fn encode_keeps_1d_f32_and_quantizes_matrices() {
+        let norm = vec![1.0f32; 64];
+        let (t, bytes) = encode_gguf_tensor(&norm, &[64], "q8_0");
+        assert_eq!(t, GGML_TYPE_F32, "1-D norm stays F32 (matches llama.cpp)");
+        assert_eq!(bytes.len(), 64 * 4);
+
+        let w: Vec<f32> = (0..64 * 32).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect();
+        let (t8, b8) = encode_gguf_tensor(&w, &[64, 32], "q8_0");
+        assert_eq!(t8, GGML_TYPE_Q8_0);
+        assert_eq!(b8.len(), (64 * 32 / 32) * 34);
+        let (t4, b4) = encode_gguf_tensor(&w, &[64, 32], "q4_0");
+        assert_eq!(t4, GGML_TYPE_Q4_0);
+        assert_eq!(b4.len(), (64 * 32 / 32) * 18);
+        let (tf, bf) = encode_gguf_tensor(&w, &[64, 32], "f32");
+        assert_eq!(tf, GGML_TYPE_F32);
+        assert_eq!(bf.len(), 64 * 32 * 4);
+    }
 }

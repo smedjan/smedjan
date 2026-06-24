@@ -148,8 +148,8 @@ smedjan dpo \
 - **Checkpoint resume**: `--resume state_5000.bin` (model + optimizer state + step)
 - **Validation & early stopping**: `--val-dataset val.bin`, stops after N intervals without improvement
 - **Quantization**: `smedjan quantize` (Q4 / Q8 post-training)
-- **safetensors I/O**: zero-dependency import/export, including an HF-Llama weight remap for continued-training retrofits
-- **GGUF export**: produces `llama.cpp`-compatible files
+- **safetensors I/O**: zero-dependency import/export with F32/BF16/F16 weights, plus `smedjan import-hf` (HuggingFace `config.json` → model) for continued-training retrofits
+- **GGUF export**: real GGML `f32` / `q8_0` / `q4_0` blocks for `llama.cpp` (1-D norm tensors stay f32)
 
 ## Performance
 
@@ -213,10 +213,10 @@ cargo test --release --no-default-features --features cuda
 
 ## Roadmap
 
-- Faithful HF inference parity (config.json → model, bf16 weight loading)
-- CUDA backward parity for the remaining specialized kernels
-- Chunked O(N) RWKV forward (the SSM chunked path already exists)
-- Further long-context evaluation (NIAH / RULER) on trained checkpoints
+- Faithful **bit-exact** HF *inference* parity (half-split RoPE, fixed QK-norm). The `config.json` → model + F32/BF16/F16 import path already works for continued training (`smedjan import-hf`); reproducing HF inference to the bit is the remaining piece.
+- CUDA backward parity for the remaining specialized kernels (the Metal path is the most exercised)
+- Chunked O(N) RWKV forward (the SSM chunked path already exists) — RWKV already trains via the stable materialised WKV
+- Stronger long-context (NIAH / RULER) curves on better-trained checkpoints (the eval harness ships: `smedjan eval --longctx`)
 
 ## License
 

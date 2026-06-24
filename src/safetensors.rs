@@ -53,6 +53,13 @@ impl Json {
             None
         }
     }
+    fn as_f64(&self) -> Option<f64> {
+        if let Json::Num(n) = self {
+            n.parse::<f64>().ok()
+        } else {
+            None
+        }
+    }
     fn as_arr(&self) -> Option<&[Json]> {
         if let Json::Arr(a) = self {
             Some(a)
@@ -268,10 +275,90 @@ fn json_usize(value: &Json, field: impl Into<String>) -> std::io::Result<usize> 
     usize::try_from(n).map_err(|_| invalid(format!("{field}: integer does not fit usize")))
 }
 
-fn tensor_byte_len(numel: usize, name: &str) -> std::io::Result<usize> {
-    numel
-        .checked_mul(4)
-        .ok_or_else(|| invalid(format!("{name}: tensor byte length overflows usize")))
+/// On-disk bytes per element for a supported safetensors dtype. `F32` is native;
+/// `BF16`/`F16` are half-width and converted to f32 on import (`bf16/f16 weight loading`).
+fn dtype_elem_bytes(dtype: &str) -> Option<usize> {
+    match dtype {
+        "F32" => Some(4),
+        "BF16" | "F16" => Some(2),
+        _ => None,
+    }
+}
+
+/// bf16 (truncated f32: sign+8 exp+7 mantissa) -> f32: the bf16 bit pattern is the high 16 bits
+/// of the f32 with the same value, so widening is a left shift. Inf/NaN/subnormals carry through.
+#[inline]
+fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// IEEE-754 half (f16: sign+5 exp+10 mantissa) -> f32, exact for all inputs incl. subnormals,
+/// inf and NaN (no `std` f16, so this is the hand-rolled widening every loader needs).
+#[inline]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let mant = h as u32 & 0x3FF;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign // signed zero
+        } else {
+            // Subnormal: renormalize into f32's normal range.
+            let mut e = -1i32;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x400 != 0 {
+                    break;
+                }
+            }
+            let exp32 = (127 - 15 - e) as u32;
+            sign | (exp32 << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exp == 0x1F {
+        // Inf / NaN: max exponent, mantissa preserved (left-aligned).
+        sign | (0xFF << 23) | (mant << 13)
+    } else {
+        // Normal: rebias exponent 15 -> 127, widen mantissa 10 -> 23 bits.
+        let exp32 = (exp as i32 - 15 + 127) as u32;
+        sign | (exp32 << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Decode a raw tensor byte range (`F32`/`BF16`/`F16`) to `Vec<f32>`, validating that the byte
+/// length matches `numel` at the dtype's element width. Shared by the generic and HF importers.
+fn decode_to_f32(bytes: &[u8], dtype: &str, numel: usize, name: &str) -> std::io::Result<Vec<f32>> {
+    let elem = dtype_elem_bytes(dtype).ok_or_else(|| {
+        invalid(format!(
+            "{name}: dtype {dtype} unsupported (only F32, BF16, F16)"
+        ))
+    })?;
+    let expect = numel.checked_mul(elem).ok_or_else(|| {
+        invalid(format!("{name}: tensor byte length overflows usize"))
+    })?;
+    if bytes.len() != expect {
+        return Err(invalid(format!(
+            "{name}: {} bytes for {numel} {dtype} elements (expected {expect})",
+            bytes.len()
+        )));
+    }
+    Ok(match dtype {
+        "F32" => bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        "BF16" => bytes
+            .chunks_exact(2)
+            .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        "F16" => bytes
+            .chunks_exact(2)
+            .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        _ => unreachable!("dtype validated above"),
+    })
 }
 
 fn shape_numel(shape: &[usize], name: &str) -> std::io::Result<usize> {
@@ -391,11 +478,9 @@ pub fn import_safetensors(
             .get("dtype")
             .and_then(|d| d.as_str())
             .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
-        if dtype != "F32" {
-            return Err(invalid(format!(
-                "{name}: dtype {dtype} unsupported (only F32; bf16/f16 import is a follow-up)"
-            )));
-        }
+        let elem = dtype_elem_bytes(dtype).ok_or_else(|| {
+            invalid(format!("{name}: dtype {dtype} unsupported (only F32, BF16, F16)"))
+        })?;
         let shape = shape_field(entry, &name)?;
         if shape != p.shape {
             return Err(invalid(format!(
@@ -404,14 +489,23 @@ pub fn import_safetensors(
             )));
         }
         let (start, end) = offsets_field(entry, &name)?;
-        let expect = tensor_byte_len(p.numel(), &name)?;
+        let expect = p.numel().checked_mul(elem).ok_or_else(|| {
+            invalid(format!("{name}: tensor byte length overflows usize"))
+        })?;
         if start > end || end > blob.len() || end - start != expect {
             return Err(invalid(format!(
                 "{name}: byte range [{start},{end}) invalid (expected {expect} bytes, blob {})",
                 blob.len()
             )));
         }
-        crate::gpu::buf_write_bytes(&p.buffer, &blob[start..end]);
+        // F32 writes straight through; BF16/F16 widen to f32 first.
+        if dtype == "F32" {
+            crate::gpu::buf_write_bytes(&p.buffer, &blob[start..end]);
+        } else {
+            let widened = decode_to_f32(&blob[start..end], dtype, p.numel(), &name)?;
+            let f32_bytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&p.buffer, &f32_bytes);
+        }
     }
     eprintln!(
         "safetensors imported: {} tensors from {}",
@@ -618,6 +712,76 @@ pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result
 }
 
 /// Import HF-Llama safetensors as an Smedjan model init (build from `config`, map every weight).
+/// Parse a HuggingFace Llama-style `config.json` into a Smedjan `ModelConfig` (dense Softmax-attn
+/// Llama shape). Maps `hidden_size`, `num_attention_heads`, `num_key_value_heads` (MHA if absent),
+/// `num_hidden_layers`, `vocab_size`, `max_position_embeddings`, `rope_theta`, and `rms_norm_eps`,
+/// and derives `ffn_multiplier` from `intermediate_size`. Errors if the 256-aligned FFN hidden dim
+/// cannot reproduce `intermediate_size` exactly (Smedjan rounds FFN hidden up to a multiple of 256).
+///
+/// This builds a model for the SubQ-style retrofit / continued-training flow. Faithful HF *inference*
+/// parity (HF half-split vs Smedjan interleaved RoPE, the fixed QK-norm at d_model>=512) is adapted
+/// away by continued training, not reproduced bit-for-bit — see the interop note above.
+pub fn config_from_hf_json(path: &str) -> std::io::Result<ModelConfig> {
+    let bytes = std::fs::read(path)?;
+    let json = parse_header(&bytes)?;
+    let req_u = |k: &str| -> std::io::Result<usize> {
+        json.get(k)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| invalid(format!("config.json: missing/invalid integer '{k}'")))
+    };
+    let opt_u = |k: &str, dflt: usize| -> usize {
+        json.get(k).and_then(|v| v.as_u64()).map_or(dflt, |n| n as usize)
+    };
+    let opt_f = |k: &str, dflt: f32| -> f32 {
+        json.get(k).and_then(|v| v.as_f64()).map_or(dflt, |n| n as f32)
+    };
+
+    if let Some(mt) = json.get("model_type").and_then(|v| v.as_str()) {
+        if mt != "llama" && mt != "mistral" {
+            eprintln!(
+                "warning: config.json model_type='{mt}' (expected llama/mistral); mapping the standard \
+                 Llama-arch fields — non-Llama architectures may not import faithfully."
+            );
+        }
+    }
+
+    let hidden = req_u("hidden_size")?;
+    let n_heads = req_u("num_attention_heads")?;
+    if hidden == 0 || n_heads == 0 {
+        return Err(invalid(
+            "config.json: hidden_size and num_attention_heads must be > 0",
+        ));
+    }
+    let n_kv_heads = opt_u("num_key_value_heads", n_heads); // MHA when absent
+    let n_layers = req_u("num_hidden_layers")?;
+    let inter = req_u("intermediate_size")?;
+    let vocab = req_u("vocab_size")? as u32;
+    let max_seq = opt_u("max_position_embeddings", 2048);
+    let ffn_multiplier = inter as f32 / hidden as f32;
+
+    let mut config = ModelConfig::custom_gqa(
+        vocab,
+        hidden,
+        n_heads,
+        n_kv_heads,
+        n_layers,
+        ffn_multiplier,
+        max_seq,
+    );
+    config.rope_theta = opt_f("rope_theta", 10000.0);
+    config.norm_eps = opt_f("rms_norm_eps", 1e-5);
+
+    let dff = config.d_ff();
+    if dff != inter {
+        return Err(invalid(format!(
+            "config.json intermediate_size={inter} is not representable: Smedjan aligns FFN hidden to \
+             a multiple of 256 (would build {dff}). Only multiples of 256 are supported."
+        )));
+    }
+    Ok(config)
+}
+
 pub fn import_hf_safetensors(
     ctx: &Arc<MetalContext>,
     path: &str,
@@ -640,11 +804,9 @@ pub fn import_hf_safetensors(
             .get("dtype")
             .and_then(|x| x.as_str())
             .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
-        if dtype != "F32" {
-            return Err(invalid(format!(
-                "{name}: dtype {dtype} unsupported (convert to F32; bf16/f16 is a follow-up)"
-            )));
-        }
+        let elem = dtype_elem_bytes(dtype).ok_or_else(|| {
+            invalid(format!("{name}: dtype {dtype} unsupported (only F32, BF16, F16)"))
+        })?;
         let shape = shape_field(e, name)?;
         if shape != expect_shape {
             return Err(invalid(format!(
@@ -652,18 +814,18 @@ pub fn import_hf_safetensors(
                 shape, expect_shape
             )));
         }
+        let numel = shape_numel(expect_shape, name)?;
         let (s, en) = offsets_field(e, name)?;
-        let expect_bytes = tensor_byte_len(shape_numel(expect_shape, name)?, name)?;
+        let expect_bytes = numel.checked_mul(elem).ok_or_else(|| {
+            invalid(format!("{name}: tensor byte length overflows usize"))
+        })?;
         if s > en || en > blob.len() || en - s != expect_bytes {
             return Err(invalid(format!(
                 "{name}: byte range [{s},{en}) invalid (expected {expect_bytes} bytes, blob {})",
                 blob.len()
             )));
         }
-        Ok(blob[s..en]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect())
+        decode_to_f32(&blob[s..en], dtype, numel, name)
     };
     let put = |t: &crate::tensor::Tensor, data: &[f32]| -> std::io::Result<()> {
         if data.len() != t.numel() {
@@ -764,4 +926,57 @@ pub fn import_hf_safetensors(
         c.n_layers, path
     );
     Ok(model)
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::{bf16_to_f32, decode_to_f32, f16_to_f32};
+
+    #[test]
+    fn bf16_widens_exactly() {
+        // bf16 holds the high 16 bits of an f32, so any value whose low 16 mantissa bits are
+        // zero round-trips exactly. 1.0=0x3F80, -2.0=0xC000, 0.0=0x0000.
+        assert_eq!(bf16_to_f32(0x3F80), 1.0);
+        assert_eq!(bf16_to_f32(0xC000), -2.0);
+        assert_eq!(bf16_to_f32(0x0000), 0.0);
+        assert_eq!(bf16_to_f32(0x4049), f32::from_bits(0x4049u32 << 16)); // ~3.14
+        // Range: bf16 keeps f32's 8-bit exponent, so values far above the f16 max survive.
+        let big = bf16_to_f32(0x7149); // ~1e30
+        assert!(big > 1e29, "bf16 must preserve large exponent: {big}");
+    }
+
+    #[test]
+    fn f16_widens_exactly() {
+        // IEEE half: 1.0=0x3C00, -2.0=0xC000, 0.5=0x3800, 0.0=0x0000.
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x8000), -0.0);
+        // Largest normal half = 65504.
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
+        // Smallest positive subnormal half = 2^-24.
+        assert!((f16_to_f32(0x0001) - 2f32.powi(-24)).abs() < 1e-12);
+        // Inf / NaN.
+        assert!(f16_to_f32(0x7C00).is_infinite() && f16_to_f32(0x7C00) > 0.0);
+        assert!(f16_to_f32(0xFC00).is_infinite() && f16_to_f32(0xFC00) < 0.0);
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn decode_dispatches_and_validates_length() {
+        // F32 passthrough.
+        let f32_bytes: Vec<u8> = [1.0f32, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(decode_to_f32(&f32_bytes, "F32", 2, "t").unwrap(), vec![1.0, -2.0]);
+        // BF16 widening.
+        let bf16_bytes: Vec<u8> = [0x3F80u16, 0xC000].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(decode_to_f32(&bf16_bytes, "BF16", 2, "t").unwrap(), vec![1.0, -2.0]);
+        // F16 widening.
+        let f16_bytes: Vec<u8> = [0x3C00u16, 0x3800].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(decode_to_f32(&f16_bytes, "F16", 2, "t").unwrap(), vec![1.0, 0.5]);
+        // Wrong byte length is rejected (2 elems of bf16 = 4 bytes, not 8).
+        assert!(decode_to_f32(&[0u8; 8], "BF16", 2, "t").is_err());
+        // Unsupported dtype is rejected.
+        assert!(decode_to_f32(&[0u8; 16], "F64", 2, "t").is_err());
+    }
 }
