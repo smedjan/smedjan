@@ -20,6 +20,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "rms_norm_residual",
     "rope",
     "rope_backward",
+    "rope_yarn",
+    "rope_yarn_backward",
     "add_kernel",
     "add_inplace",
     "mul_kernel",
@@ -486,6 +488,72 @@ extern "C" __global__ void rope_backward(
     if (row >= total_rows || pos >= seq_len || pair >= head_dim / 2) return;
 
     float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)head_dim);
+    float angle = (float)(pos + offset) * freq;
+    float cos_val, sin_val;
+    sincosf(angle, &sin_val, &cos_val);
+
+    int base = row * seq_len * head_dim + pos * head_dim;
+    int i0 = base + 2 * pair;
+    int i1 = i0 + 1;
+    float g0 = grad_out[i0], g1 = grad_out[i1];
+    grad_in[i0] = g0 * cos_val + g1 * sin_val;
+    grad_in[i1] = -g0 * sin_val + g1 * cos_val;
+}
+
+// YaRN NTK-by-parts RoPE frequency: extrapolate high-frequency dims, interpolate low-frequency
+// dims (mirrors the Metal fused_transpose_rope_yarn shader). yarn_scale==1.0 => plain RoPE.
+__device__ __forceinline__ float yarn_rope_freq(
+    int pair, unsigned int head_dim, float theta, float yarn_scale, float yarn_orig_max
+) {
+    float inv_extrap = 1.0f / powf(theta, (float)(2 * pair) / (float)head_dim);
+    if (yarn_scale == 1.0f) return inv_extrap;
+    float inv_interp = inv_extrap / yarn_scale;
+    const float two_pi = 6.28318530718f;
+    float log_base = logf(theta);
+    float low = floorf((float)head_dim * logf(yarn_orig_max / (32.0f * two_pi)) / (2.0f * log_base));
+    float high = ceilf((float)head_dim * logf(yarn_orig_max / two_pi) / (2.0f * log_base));
+    low = fmaxf(low, 0.0f);
+    high = fminf(high, (float)(head_dim / 2 - 1));
+    float ramp = fminf(fmaxf(((float)pair - low) / fmaxf(high - low, 1e-3f), 0.0f), 1.0f);
+    float extrap_mask = 1.0f - ramp;
+    return inv_interp * (1.0f - extrap_mask) + inv_extrap * extrap_mask;
+}
+
+extern "C" __global__ void rope_yarn(
+    float* data, unsigned int total_rows, unsigned int seq_len,
+    unsigned int head_dim, unsigned int offset, float theta,
+    float yarn_scale, float yarn_orig_max
+) {
+    int row = blockIdx.x;
+    int pos = blockIdx.y;
+    int pair = threadIdx.x;
+    if (row >= total_rows || pos >= seq_len || pair >= head_dim / 2) return;
+
+    float freq = yarn_rope_freq(pair, head_dim, theta, yarn_scale, yarn_orig_max);
+    float angle = (float)(pos + offset) * freq;
+    float cos_val, sin_val;
+    sincosf(angle, &sin_val, &cos_val);
+
+    int base = row * seq_len * head_dim + pos * head_dim;
+    int i0 = base + pair * 2;
+    int i1 = base + pair * 2 + 1;
+    float x0 = data[i0], x1 = data[i1];
+    data[i0] = x0 * cos_val - x1 * sin_val;
+    data[i1] = x0 * sin_val + x1 * cos_val;
+}
+
+extern "C" __global__ void rope_yarn_backward(
+    const float* grad_out, float* grad_in,
+    unsigned int total_rows, unsigned int seq_len,
+    unsigned int head_dim, unsigned int offset, float theta,
+    float yarn_scale, float yarn_orig_max
+) {
+    int row = blockIdx.x;
+    int pos = blockIdx.y;
+    int pair = threadIdx.x;
+    if (row >= total_rows || pos >= seq_len || pair >= head_dim / 2) return;
+
+    float freq = yarn_rope_freq(pair, head_dim, theta, yarn_scale, yarn_orig_max);
     float angle = (float)(pos + offset) * freq;
     float cos_val, sin_val;
     sincosf(angle, &sin_val, &cos_val);

@@ -1740,17 +1740,22 @@ pub fn gpu_transpose_rope(
     output: &GpuBuffer,
     d: TrRopeDims,
 ) {
-    assert!((d.yarn_scale - 1.0).abs() < 1e-6, "YaRN is not yet supported on the CUDA backend (the rope kernel does plain RoPE); use the Metal backend or port the YaRN blend.");
     gpu_transpose_perm_forward(ctx, input, output, d.batch, d.seq, d.n_heads, d.head_dim);
-    gpu_rope(
-        ctx,
-        output,
-        d.batch * d.n_heads,
-        d.seq,
-        d.head_dim,
-        d.offset,
-        d.theta,
-    );
+    let total_rows = d.batch * d.n_heads;
+    if (d.yarn_scale - 1.0).abs() < 1e-6 {
+        gpu_rope(ctx, output, total_rows, d.seq, d.head_dim, d.offset, d.theta);
+    } else {
+        // YaRN NTK-by-parts RoPE (rope_yarn kernel).
+        let cfg = launch_cfg_3d(total_rows, d.seq, 1, d.head_dim / 2);
+        let f = ctx.device.get_func("smedjan", "rope_yarn").unwrap();
+        unsafe {
+            f.launch(
+                cfg,
+                (output, total_rows, d.seq, d.head_dim, d.offset, d.theta, d.yarn_scale, d.yarn_orig_max),
+            )
+        }
+        .unwrap();
+    }
 }
 
 pub fn gpu_transpose_rope_backward(
@@ -1759,16 +1764,21 @@ pub fn gpu_transpose_rope_backward(
     grad_in: &GpuBuffer,
     d: TrRopeDims,
 ) {
-    assert!((d.yarn_scale - 1.0).abs() < 1e-6, "YaRN is not yet supported on the CUDA backend; use the Metal backend or port the YaRN blend.");
-    gpu_rope_backward(
-        ctx,
-        grad_out,
-        d.batch * d.n_heads,
-        d.seq,
-        d.head_dim,
-        d.offset,
-        d.theta,
-    );
+    let total_rows = d.batch * d.n_heads;
+    if (d.yarn_scale - 1.0).abs() < 1e-6 {
+        gpu_rope_backward(ctx, grad_out, total_rows, d.seq, d.head_dim, d.offset, d.theta);
+    } else {
+        // YaRN backward (rope_yarn_backward kernel), in-place on grad_out.
+        let cfg = launch_cfg_3d(total_rows, d.seq, 1, d.head_dim / 2);
+        let f = ctx.device.get_func("smedjan", "rope_yarn_backward").unwrap();
+        unsafe {
+            f.launch(
+                cfg,
+                (grad_out, grad_out, total_rows, d.seq, d.head_dim, d.offset, d.theta, d.yarn_scale, d.yarn_orig_max),
+            )
+        }
+        .unwrap();
+    }
     // grad_out (rope'd [bh,seq,hd]) is the source; grad_in ([b,seq,d]) is the dest.
     gpu_transpose_perm_backward(
         ctx, grad_out, grad_in, d.batch, d.seq, d.n_heads, d.head_dim,
