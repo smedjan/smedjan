@@ -29,7 +29,7 @@ objc2-metal = { version = "0.3", optional = true }
 
 # CUDA backend (NVIDIA GPUs). cudarc 0.12 needs an explicit CUDA-version feature; 12060 is its
 # newest, ABI-forward-compatible with the 12.8 toolkit (PTX JITs to newer archs like sm_120 at runtime).
-cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }
+cudarc = { version = "0.12", optional = true, features = ["cuda-12060", "cublas", "f16"] }
 
 rand = "0.8"
 memmap2 = "0.9"

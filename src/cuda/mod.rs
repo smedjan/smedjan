@@ -74,6 +74,11 @@ pub fn buf_as_u32(b: &Buf) -> BufU32 {
 /// Named MetalContext for source compatibility with the rest of the codebase.
 pub struct MetalContext {
     pub device: Arc<CudaDevice>,
+    /// cuBLAS handle with TF32 tensor-core math — the fast path (training/inference forward).
+    pub cublas_fast: cudarc::cublas::CudaBlas,
+    /// cuBLAS handle with strict fp32 math — the precise path (gradchecks, where TF32's ~1e-3
+    /// mantissa would make finite-difference checks fail just like the old fp16 kernels did).
+    pub cublas_precise: cudarc::cublas::CudaBlas,
 }
 
 unsafe impl Send for MetalContext {}
@@ -99,7 +104,24 @@ impl MetalContext {
             .load_ptx(ptx, "smedjan", &kernels::KERNEL_NAMES)
             .expect("Failed to load CUDA kernels");
 
-        Arc::new(Self { device })
+        // cuBLAS GEMM uses the GPU's tensor cores — orders of magnitude faster than the hand-rolled
+        // tiled kernels. Two handles: TF32 tensor-core math for speed, strict fp32 for precision.
+        let cublas_fast =
+            cudarc::cublas::CudaBlas::new(device.clone()).expect("Failed to init cuBLAS (fast)");
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *cublas_fast.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+            );
+        }
+        let cublas_precise =
+            cudarc::cublas::CudaBlas::new(device.clone()).expect("Failed to init cuBLAS (precise)");
+
+        Arc::new(Self {
+            device,
+            cublas_fast,
+            cublas_precise,
+        })
     }
 
     /// Allocate a GPU buffer (device memory).

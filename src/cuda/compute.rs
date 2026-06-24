@@ -33,6 +33,51 @@ fn launch_cfg_3d(bx: u32, by: u32, bz: u32, tx: u32) -> LaunchConfig {
 
 // ===== Matmul =====
 
+/// cuBLAS SGEMM for a row-major `C[m,n] = opA(A) · opB(B)`. `blas` picks TF32 tensor cores (fast)
+/// vs strict fp32 (precise) via its math mode. We use the col-major→row-major identity: cuBLAS
+/// computes `C^T = opB(B)^T · opA(A)^T`, so we feed B then A with swapped m/n. Buffers are
+/// `Arc<CudaSlice>` (shared) so we go through the sys-level call with raw device pointers rather
+/// than the safe `gemm` wrapper (which needs `&mut`).
+fn cublas_sgemm(
+    blas: &cudarc::cublas::CudaBlas,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_a: bool,
+    trans_b: bool,
+) {
+    use cudarc::cublas::sys::{cublasOperation_t as Op, cublasSgemm_v2};
+    use cudarc::driver::DevicePtr;
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let a_ptr = *a.device_ptr() as *const f32;
+    let b_ptr = *b.device_ptr() as *const f32;
+    let c_ptr = *c.device_ptr() as *mut f32;
+    let (op_b, ldb) = if trans_b { (Op::CUBLAS_OP_T, k as i32) } else { (Op::CUBLAS_OP_N, n as i32) };
+    let (op_a, lda) = if trans_a { (Op::CUBLAS_OP_T, m as i32) } else { (Op::CUBLAS_OP_N, k as i32) };
+    unsafe {
+        cublasSgemm_v2(
+            *blas.handle(),
+            op_b,
+            op_a,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32,
+            b_ptr,
+            ldb,
+            a_ptr,
+            lda,
+            &beta as *const f32,
+            c_ptr,
+            n as i32,
+        );
+    }
+}
+
 pub fn gpu_matmul(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -42,11 +87,8 @@ pub fn gpu_matmul(
     n: u32,
     k: u32,
 ) {
-    let tile = 32u32;
-    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    // gpu_matmul is the precise (fp32) matmul — the fp16 fast path is gpu_matmul_f16.
-    let f = ctx.device.get_func("smedjan", "matmul_tiled_fp32").unwrap();
-    unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
+    // Precise (strict fp32) cuBLAS GEMM — the fp16 fast path is gpu_matmul_f16.
+    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, false);
 }
 
 pub fn gpu_matmul_trans_b(
