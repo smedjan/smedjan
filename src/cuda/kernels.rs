@@ -87,10 +87,6 @@ pub const KERNEL_NAMES: &[&str] = &[
     "flash_attention_backward",
     "lion_update",
     "sophia_update",
-    "argmax",
-    "temperature_scale",
-    "zero_rows",
-    "gradient_mask",
     "logsumexp",
     "compute_inv_rms",
     "causal_mask_window",
@@ -1291,52 +1287,11 @@ extern "C" __global__ void kl_divergence(
 // ============================================================
 // UTILITY KERNELS
 // ============================================================
-extern "C" __global__ void argmax(
-    const float* input, unsigned int* output, unsigned int size
-) {
-    __shared__ float shared_vals[256];
-    __shared__ unsigned int shared_idxs[256];
-    int tid = threadIdx.x, nt = blockDim.x;
-    float best_val = -1e30f;
-    unsigned int best_idx = 0;
-    for (int i = tid; i < size; i += nt) {
-        if (input[i] > best_val) { best_val = input[i]; best_idx = i; }
-    }
-    shared_vals[tid] = best_val;
-    shared_idxs[tid] = best_idx;
-    __syncthreads();
-    for (int s=nt/2;s>0;s>>=1) {
-        if (tid<s && shared_vals[tid+s]>shared_vals[tid]) {
-            shared_vals[tid]=shared_vals[tid+s]; shared_idxs[tid]=shared_idxs[tid+s];
-        }
-        __syncthreads();
-    }
-    if (tid==0) output[0] = shared_idxs[0];
-}
-
-extern "C" __global__ void temperature_scale(
-    float* logits, unsigned int offset, unsigned int vocab, float temperature
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < vocab) logits[offset + i] /= temperature;
-}
-
-extern "C" __global__ void gradient_mask(
-    float* grad, const unsigned int* mask, unsigned int size
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size && mask[i] == 0) grad[i] = 0.0f;
-}
-
-extern "C" __global__ void zero_rows(
-    float* data, const unsigned int* row_indices,
-    unsigned int n_rows, unsigned int cols
-) {
-    int idx = blockIdx.x;
-    int col = threadIdx.x;
-    if (idx >= n_rows || col >= cols) return;
-    data[row_indices[idx] * cols + col] = 0.0f;
-}
+// argmax / temperature_scale / gradient_mask / zero_rows are defined once further down
+// (the "Sampling / generation" + "Training utilities" sections) with the signatures the Rust
+// launch code in compute.rs actually calls (e.g. temperature_scale takes inv_temperature, and
+// gradient_mask takes (grad, mask, total, vocab_size)). Duplicate defs here made NVRTC fail with
+// "function already defined", which broke EVERY GPU kernel — so they were removed.
 
 extern "C" __global__ void transpose_2d(
     const float* input, float* output,
