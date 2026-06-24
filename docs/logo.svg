@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 140" width="140" height="140" role="img" aria-label="Smedjan">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#161b22"/><stop offset="1" stop-color="#0d1014"/></linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="56%"><stop offset="0" stop-color="#ff7a2f" stop-opacity=".30"/><stop offset="100%" stop-color="#ff7a2f" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect x="4" y="4" width="132" height="132" rx="30" fill="url(#tile)" stroke="#2a313c" stroke-width="2"/>
+  <rect x="4" y="4" width="132" height="132" rx="30" fill="url(#glow)"/>
+  <g transform="translate(70 70) scale(3.0) translate(-14 -16.5)">
+    <path d="M3 5 L6 2 L22 2 L25 5 L25 13 L17.5 13 L17.5 29.2 Q17.5 31 15.7 31 L12.3 31 Q10.5 31 10.5 29.2 L10.5 13 L3 13 Z" fill="#ff7a2f"/>
+    <path d="M3 5 L6 2 L22 2 L25 5 L25 7.4 L3 7.4 Z" fill="#ffb066"/>
+  </g>
+</svg>

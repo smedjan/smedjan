@@ -1,6 +1,17 @@
-# Smedjan
+<p align="center">
+  <img src="docs/logo.svg" alt="Smedjan" width="128" height="128">
+</p>
 
-**Pure-Rust LLM training and inference engine. Zero Python. Zero PyTorch. Zero cloud dependency.**
+<h1 align="center">SMEDJAN</h1>
+
+<p align="center"><strong>Pure-Rust LLM training and inference engine — zero Python, zero PyTorch, zero cloud.</strong></p>
+
+<p align="center">
+  <a href="https://smedjan.dev"><strong>Website</strong></a> &nbsp;·&nbsp;
+  <a href="https://crates.io/crates/smedjan">crates.io</a> &nbsp;·&nbsp;
+  <a href="https://smedjan.dev/docs">Docs</a> &nbsp;·&nbsp;
+  <a href="LICENSE">MIT</a>
+</p>
 
 *Smedjan* is Swedish for "the smithy" — the forge where you make your own tools. The whole stack is here: every line of code, every GPU kernel, every byte of the model. ~45K lines of Rust that train, fine-tune, align, quantize, and serve decoder-only transformer language models from scratch on your own hardware.
 
@@ -137,14 +148,14 @@ smedjan dpo \
 
 ## Performance
 
-Throughput (removed: broken benchmark):
+Measured with `smedjan bench` on an Apple M1 Mac mini (16 GB) — batch 4, sequence length 128. Real throughput, not theoretical peaks:
 
-| Machine | Baseline | Optimized | Speedup |
-|---------|----------|-----------|---------|
-| Mac mini M1 | benchmark removed (broken bench era) |
-| MacBook Air M3 | benchmark removed (broken bench era) |
+| Preset | Inference (forward) | Decode (1 tok, KV cache) | Train (fwd+bwd) |
+|--------|--------------------:|-------------------------:|----------------:|
+| `small` (7.2M · d256/6L) | 20,300 tok/s | 154 tok/s | 3,329 tok/s |
+| `medium` (45M · d512/12L) | 4,386 tok/s | 57 tok/s | 901 tok/s |
 
-Key optimizations: batched matmul shaders (96 GPU dispatches → 6 per attention layer), FP16 mixed precision, a merged forward+backward GPU command batch, clamped FP16 casts, and single-instruction RoPE sincos.
+The hardware simdgroup-MMA matmul path (on by default) runs ~1.2–1.3× the scalar fallback on `medium`: training 760 → 901 tok/s, inference 3,323 → 4,386 tok/s. Other Metal-pass wins: batched matmul shaders, FP16 mixed precision with float accumulators, a merged forward+backward command batch, and single-instruction RoPE sincos. Reproduce on your own hardware with `smedjan bench --size <preset>`.
 
 ## Module map
 
