@@ -6458,7 +6458,7 @@ mod suite {
     /// Only handles the KV value types Smedjan writes (u32=4, f32=6, string=8).
     fn read_gguf_alignment_and_offsets(path: &str) -> (Option<u32>, Vec<u64>) {
         let buf = std::fs::read(path).expect("read gguf");
-        let mut p = 0usize;
+        let mut p;
         let u32a = |b: &[u8], p: &mut usize| {
             let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
             *p += 4;

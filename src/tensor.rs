@@ -475,10 +475,10 @@ impl Tensor {
                     k as u32,
                 );
             } else {
-                let a_f16 = self.cast_to_f16();
-                let b_f16 = other.cast_to_f16();
-                compute::gpu_matmul_f16(
-                    &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+                // precise fp32 path (gradchecks / simdgroup-off): no fp16 cast, so finite-difference
+                // perturbations register and gradients are not corrupted by fp16 rounding.
+                compute::gpu_matmul(
+                    &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
                 );
             }
         } else if batch_a == batch_b {
@@ -724,11 +724,20 @@ impl Tensor {
         assert_eq!(k, other.shape[1], "Inner dim mismatch");
 
         let out_buf = self.ctx.alloc_buffer(m * n * 4);
-        let a_f16 = self.cast_to_f16();
-        let b_f16 = other.cast_to_f16();
-        compute::gpu_matmul_trans_b_f16(
-            &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
-        );
+        if compute::simdgroup_matmul_enabled() {
+            // fp16 fast path (training/inference default).
+            let a_f16 = self.cast_to_f16();
+            let b_f16 = other.cast_to_f16();
+            compute::gpu_matmul_trans_b_f16(
+                &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+            );
+        } else {
+            // precise fp32 path (gradchecks / simdgroup-off): no fp16 cast, so finite-difference
+            // perturbations register and gradients are not corrupted by fp16 rounding.
+            compute::gpu_matmul_trans_b(
+                &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
+            );
+        }
 
         let out_id = autograd::next_id();
         let out = Tensor {

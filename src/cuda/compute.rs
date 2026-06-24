@@ -44,7 +44,8 @@ pub fn gpu_matmul(
 ) {
     let tile = 32u32;
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
-    let f = ctx.device.get_func("smedjan", "matmul_tiled").unwrap();
+    // gpu_matmul is the precise (fp32) matmul — the fp16 fast path is gpu_matmul_f16.
+    let f = ctx.device.get_func("smedjan", "matmul_tiled_fp32").unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
 
@@ -59,9 +60,10 @@ pub fn gpu_matmul_trans_b(
 ) {
     let tile = 32u32;
     let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
+    // precise (fp32) trans_b — the fp16 fast path is gpu_matmul_trans_b_f16.
     let f = ctx
         .device
-        .get_func("smedjan", "matmul_tiled_trans_b")
+        .get_func("smedjan", "matmul_tiled_trans_b_fp32")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k)) }.unwrap();
 }
