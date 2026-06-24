@@ -90,7 +90,7 @@ pub fn gpu_matmul(
     k: u32,
 ) {
     // Precise (strict fp32) cuBLAS GEMM — the fp16 fast path is gpu_matmul_f16.
-    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, false);
+    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, false);
 }
 
 /// cuBLAS strided-batched SGEMM: `C[b] = opA(A[b]) · opB(B[b])` over `batch` independent matrices.
@@ -146,6 +146,18 @@ fn cublas_sgemm_batched(
     }
 }
 
+/// Pick the cuBLAS handle by the simdgroup-MMA flag: TF32 tensor cores for the fast path
+/// (training/inference forward+backward — TF32's fp32 range + ~10-bit mantissa is plenty and far
+/// beats the old fp16 kernels), strict fp32 for the precise path (gradchecks set simdgroup off and
+/// need full precision so the finite-difference checks register).
+fn cublas_for(ctx: &Arc<MetalContext>) -> &cudarc::cublas::CudaBlas {
+    if simdgroup_matmul_enabled() {
+        &ctx.cublas_fast
+    } else {
+        &ctx.cublas_precise
+    }
+}
+
 pub fn gpu_matmul_trans_b(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -156,7 +168,7 @@ pub fn gpu_matmul_trans_b(
     k: u32,
 ) {
     // Precise cuBLAS C = A · B^T.
-    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, true);
+    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, true);
 }
 
 pub fn gpu_matmul_trans_a(
@@ -604,7 +616,7 @@ pub fn gpu_matmul_fp32(
     n: u32,
     k: u32,
 ) {
-    cublas_sgemm(&ctx.cublas_precise, a, b, c, m, n, k, false, false);
+    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, false);
 }
 
 pub fn gpu_matmul_bf16(
@@ -786,7 +798,7 @@ pub fn gpu_batched_matmul(
     d: BatchedDims,
 ) {
     let BatchedDims { batch, m, n, k } = d;
-    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, m, n, k, batch, false, false);
+    cublas_sgemm_batched(cublas_for(ctx), a, b, c, m, n, k, batch, false, false);
 }
 
 pub fn gpu_batched_matmul_simdgroup(
@@ -827,7 +839,7 @@ pub fn gpu_batched_matmul_trans_b(
     d: BatchedDims,
 ) {
     let BatchedDims { batch, m, n, k } = d;
-    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, m, n, k, batch, false, true);
+    cublas_sgemm_batched(cublas_for(ctx), a, b, c, m, n, k, batch, false, true);
 }
 
 pub fn gpu_batched_matmul_gqa_trans_b(
@@ -899,7 +911,7 @@ pub fn gpu_batched_matmul_trans_a(
 ) {
     let BatchedDims { batch, m, n, k } = d;
     // C[k,n] = A[m,k]^T · B[m,n]: contraction over m, output rows k (matches the kernel it replaces).
-    cublas_sgemm_batched(&ctx.cublas_precise, a, b, c, k, n, m, batch, true, false);
+    cublas_sgemm_batched(cublas_for(ctx), a, b, c, k, n, m, batch, true, false);
 }
 
 pub fn gpu_rms_norm_residual(

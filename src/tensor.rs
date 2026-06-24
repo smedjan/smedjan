@@ -457,12 +457,20 @@ impl Tensor {
         // The F16_CAST_CACHE avoids redundant casts for weights within a step.
         if batch == 1 {
             if compute::simdgroup_matmul_enabled() {
-                // Hardware MMA fast path — same fp16-input/fp32-output precision as gpu_matmul_f16.
-                let a_f16 = self.cast_to_f16();
-                let b_f16 = other.cast_to_f16();
-                compute::gpu_matmul_simdgroup_f16(
-                    &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+                // Fast path. CUDA: cuBLAS TF32 tensor-core SGEMM on the f32 buffers directly (no
+                // fp16 cast). Metal: hardware simdgroup MMA on fp16 inputs.
+                #[cfg(feature = "cuda")]
+                compute::gpu_matmul_simdgroup(
+                    &self.ctx, &self.buffer, &other.buffer, &out_buf, m as u32, n as u32, k as u32,
                 );
+                #[cfg(feature = "metal")]
+                {
+                    let a_f16 = self.cast_to_f16();
+                    let b_f16 = other.cast_to_f16();
+                    compute::gpu_matmul_simdgroup_f16(
+                        &self.ctx, &a_f16, &b_f16, &out_buf, m as u32, n as u32, k as u32,
+                    );
+                }
             } else if compute::bf16_matmul_enabled() {
                 // bf16 path: fp32 operands, fp32 range (no ±65504 clamp), bf16 mantissa.
                 compute::gpu_matmul_bf16(
