@@ -366,6 +366,31 @@ impl TrainConfig {
     }
 }
 
+/// Render a compact Unicode sparkline of recent losses (taller bar = higher loss),
+/// so a descending run visibly steps down in the live progress line. No TUI — just
+/// one extra field of plain terminal output.
+fn loss_sparkline(window: &std::collections::VecDeque<f32>) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if window.len() < 2 {
+        return String::new();
+    }
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in window {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return String::new();
+    }
+    let range = (hi - lo).max(1e-6);
+    window
+        .iter()
+        .map(|&v| BARS[((v - lo) / range * 7.0).round().clamp(0.0, 7.0) as usize])
+        .collect()
+}
+
 /// Run the training loop.
 pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<()> {
     config.validate()?;
@@ -789,6 +814,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut peak_tok_s = 0.0f32;
     let mut best_train_loss = f32::INFINITY;
     let mut prev_loss = 0.0f32; // for gradient noise estimation
+    // Rolling window of recent logged losses, rendered as a Unicode sparkline in the progress line.
+    let mut loss_window: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(21);
     let loss_scale = 1.0 / grad_accum_steps as f32;
 
     // Persistent, UNPOOLED loss-readout buffer (allocated once, never recycled, never aliases a live
@@ -1365,14 +1392,20 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             };
             prev_loss = loss_val;
 
+            loss_window.push_back(loss_val);
+            if loss_window.len() > 20 {
+                loss_window.pop_front();
+            }
+            let loss_trend = loss_sparkline(&loss_window);
+
             eprintln!(
-                "step {:>6} | loss {:>8.4} ({:+.3}) | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | pool {}/{} | ETA {} | w{:.1}",
+                "step {:>6} | loss {:>8.4} ({:+.3}) | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | pool {}/{} | ETA {} | w{:.1} | {}",
                 step, loss_val, loss_delta,
                 lr, tokens_per_sec, step_time,
                 total_tokens / 1_000_000,
                 data_loader.epoch(),
                 pool_hits, pool_hits + pool_misses,
-                eta_str, weight_norm,
+                eta_str, weight_norm, loss_trend,
             );
 
             // Write to CSV log file
