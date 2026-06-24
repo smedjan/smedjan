@@ -171,6 +171,10 @@ struct TrainArgs {
     warmup: u32,
     #[arg(long, default_value = "checkpoints")]
     checkpoint_dir: String,
+    /// Steps between checkpoint saves (and validation eval). Lower = more frequent + durable for
+    /// long campaigns; the saved state also enables --resume after a crash. Default: 5000
+    #[arg(long, default_value = "5000")]
+    checkpoint_interval: u32,
     /// Enable gradient checkpointing (trades 2x compute for ~60% less activation memory)
     #[arg(long, default_value = "false")]
     gradient_checkpointing: bool,
@@ -807,6 +811,7 @@ fn main() {
                 lr,
                 warmup,
                 checkpoint_dir,
+                checkpoint_interval,
                 gradient_checkpointing,
                 teacher_checkpoint,
                 distill_temperature,
@@ -960,6 +965,7 @@ fn main() {
             let mut config = train::TrainConfig::default_small(&dataset, &tok_path);
             config.model_config = model_config;
             config.checkpoint_dir = checkpoint_dir;
+            config.checkpoint_interval = checkpoint_interval;
             config.batch_size = batch_size;
             config.seq_len = seq_len;
             config.total_steps = steps;
