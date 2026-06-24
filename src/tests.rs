@@ -1424,7 +1424,12 @@ mod suite {
                 (r - big).abs() < big * 1e-3,
                 "fp32 must preserve 1e5: got {r}"
             );
+            // Hermetic: force the fp16 path for this comparison (simdgroup-off is now precise fp32,
+            // and grad_check can leave it off — without this rf16 could inherit the precise path).
+            let prev_sg = compute::simdgroup_matmul_enabled();
+            compute::set_simdgroup_matmul(true);
             let rf16 = at2.matmul(&bt2).to_vec()[0];
+            compute::set_simdgroup_matmul(prev_sg);
             assert!(
                 (rf16 - big).abs() > big * 0.1,
                 "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}"
@@ -3953,12 +3958,22 @@ mod suite {
             bv[0] = 1.0;
             let b = Tensor::from_slice(&ctx, &bv, vec![32, 1]);
 
-            let prev = compute::set_bf16_matmul(false);
+            // Hermetic: pin each matmul path explicitly. grad_check leaves the global simdgroup flag
+            // OFF un-restored, and simdgroup-off is now the precise fp32 path — so without forcing
+            // simdgroup ON the "fp16 corrupts" measurement could inherit fp32 and not clamp.
+            let prev_sg = compute::simdgroup_matmul_enabled();
+            let prev_bf = compute::bf16_matmul_enabled();
+            // fp16 path: simdgroup ON (gpu_matmul_simdgroup_f16), bf16 OFF.
+            compute::set_simdgroup_matmul(true);
+            compute::set_bf16_matmul(false);
             let r_f16 = a.matmul(&b).to_vec()[0];
+            // bf16 path: simdgroup OFF, bf16 ON.
+            compute::set_simdgroup_matmul(false);
             compute::set_bf16_matmul(true);
             assert!(compute::bf16_matmul_enabled());
             let r_bf16 = a.matmul(&b).to_vec()[0];
-            compute::set_bf16_matmul(prev); // restore
+            compute::set_simdgroup_matmul(prev_sg);
+            compute::set_bf16_matmul(prev_bf); // restore
 
             eprintln!("matmul 1e5: fp16={r_f16}, bf16={r_bf16}");
             assert!(
