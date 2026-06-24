@@ -391,13 +391,27 @@ fn loss_sparkline(window: &std::collections::VecDeque<f32>) -> String {
         .collect()
 }
 
+/// A human model name for a config, e.g. `Smedjan-5M`, `Smedjan-98M`, `Smedjan-1.3B`.
+/// Every model forged by the engine carries the family name plus its parameter scale.
+fn model_name(n_params: usize) -> String {
+    let tag = if n_params >= 1_000_000_000 {
+        format!("{:.1}B", n_params as f64 / 1e9)
+    } else if n_params >= 1_000_000 {
+        format!("{}M", (n_params as f64 / 1e6).round() as u64)
+    } else {
+        format!("{}K", (n_params as f64 / 1e3).round() as u64)
+    };
+    format!("Smedjan-{tag}")
+}
+
 /// Run the training loop.
 pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<()> {
     config.validate()?;
 
-    eprintln!("=== Smedjan Training ===");
+    let mname = model_name(config.model_config.param_count());
+    eprintln!("=== Smedjan · forging {mname} ===");
     eprintln!(
-        "Model: {}M params, {} layers, d_model={}, {} heads",
+        "Model: {mname} · {}M params, {} layers, d_model={}, {} heads",
         config.model_config.param_count() as f32 / 1e6,
         config.model_config.n_layers,
         config.model_config.d_model,
@@ -1579,7 +1593,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         config.total_steps
     );
     eprintln!(
-        "  Model: {}M params, d={}, {}L, {} heads",
+        "  Model: {mname} · {}M params, d={}, {}L, {} heads",
         config.model_config.param_count() as f32 / 1e6,
         config.model_config.d_model,
         config.model_config.n_layers,
