@@ -9,6 +9,9 @@ pub const KERNEL_NAMES: &[&str] = &[
     "batched_matmul_tiled",
     "batched_matmul_tiled_trans_b",
     "batched_matmul_tiled_trans_a",
+    "batched_matmul_tiled_fp32",
+    "batched_matmul_tiled_trans_b_fp32",
+    "batched_matmul_tiled_trans_a_fp32",
     "matmul_tiled_f16",
     "matmul_tiled_trans_b_f16",
     "matmul_trans_a_tiled_f16",
@@ -1001,6 +1004,125 @@ extern "C" __global__ void batched_matmul_tiled_trans_a(
             for(int j=0;j<4;j++) bv[j]=Bs[m][local_col*4+j];
             for(int i=0;i<4;i++) for(int j=0;j<4;j++)
                 acc[i][j]+=__half2float(__hmul(av[i],bv[j]));
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++){
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<K&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+// FP32 twins of the batched matmuls — the precise path (the __half versions above are the
+// fp16 fast path). float tiles + float multiply, no __float2half clamp.
+extern "C" __global__ void batched_matmul_tiled_fp32(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * K * N;
+    float* C_b = C + batch_idx * M * N;
+    __shared__ float As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = tile_row+r, gc = kb+c;
+            As[r][c] = (gr<M&&gc<K) ? A_b[gr*K+gc] : 0.0f;
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = kb+r, gc = tile_col+c;
+            Bs[r][c] = (gr<K&&gc<N) ? B_b[gr*N+gc] : 0.0f;
+        }
+        __syncthreads();
+        for (int k=0;k<32;k++) {
+            float av[4], bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]+=av[i]*bv[j];
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+extern "C" __global__ void batched_matmul_tiled_trans_b_fp32(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * N * K;
+    float* C_b = C + batch_idx * M * N;
+    __shared__ float As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int kb = 0; kb < K; kb += 32) {
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gr = tile_row+r, gc = kb+c;
+            As[r][c] = (gr<M&&gc<K) ? A_b[gr*K+gc] : 0.0f;
+        }
+        for (int i = 0; i < 16; i++) {
+            int f = threadIdx.x*16+i, r = f/32, c = f%32;
+            int gk = kb+r, gn = tile_col+c;
+            Bs[r][c] = (gk<K&&gn<N) ? B_b[gn*K+gk] : 0.0f;
+        }
+        __syncthreads();
+        for (int k=0;k<32;k++) {
+            float av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][k];
+            for(int j=0;j<4;j++) bv[j]=Bs[k][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]+=av[i]*bv[j];
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+        int gr=tile_row+local_row*4+i, gc=tile_col+local_col*4+j;
+        if(gr<M&&gc<N) C_b[gr*N+gc]=acc[i][j];
+    }
+}
+
+extern "C" __global__ void batched_matmul_tiled_trans_a_fp32(
+    const float* A, const float* B, float* C,
+    unsigned int M, unsigned int K, unsigned int N, unsigned int batch
+) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) return;
+    int local_row = threadIdx.x / 8, local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * 32, tile_col = blockIdx.x * 32;
+    const float* A_b = A + batch_idx * M * K;
+    const float* B_b = B + batch_idx * M * N;
+    float* C_b = C + batch_idx * K * N;
+    __shared__ float As[32][32], Bs[32][32];
+    float acc[4][4] = {{0.0f}};
+    for (int mb = 0; mb < M; mb += 32) {
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gk=tile_row+r, gm=mb+c;
+            As[r][c]=(gk<K&&gm<M)?A_b[gm*K+gk]:0.0f;
+        }
+        for (int i=0;i<16;i++) {
+            int f=threadIdx.x*16+i, r=f/32, c=f%32;
+            int gm=mb+r, gn=tile_col+c;
+            Bs[r][c]=(gm<M&&gn<N)?B_b[gm*N+gn]:0.0f;
+        }
+        __syncthreads();
+        for(int m=0;m<32;m++){
+            float av[4],bv[4];
+            for(int i=0;i<4;i++) av[i]=As[local_row*4+i][m];
+            for(int j=0;j<4;j++) bv[j]=Bs[m][local_col*4+j];
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++) acc[i][j]+=av[i]*bv[j];
         }
         __syncthreads();
     }

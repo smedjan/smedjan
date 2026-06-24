@@ -701,7 +701,7 @@ pub fn gpu_batched_matmul(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("smedjan", "batched_matmul_tiled")
+        .get_func("smedjan", "batched_matmul_tiled_fp32")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -747,7 +747,7 @@ pub fn gpu_batched_matmul_trans_b(
     let cfg = launch_cfg_3d(n.div_ceil(32), m.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("smedjan", "batched_matmul_tiled_trans_b")
+        .get_func("smedjan", "batched_matmul_tiled_trans_b_fp32")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, n, k, batch)) }.unwrap();
 }
@@ -823,7 +823,7 @@ pub fn gpu_batched_matmul_trans_a(
     let cfg = launch_cfg_3d(n.div_ceil(32), k.div_ceil(32), batch, 64);
     let f = ctx
         .device
-        .get_func("smedjan", "batched_matmul_tiled_trans_a")
+        .get_func("smedjan", "batched_matmul_tiled_trans_a_fp32")
         .unwrap();
     unsafe { f.launch(cfg, (a, b, c, m, k, n, batch)) }.unwrap();
 }
