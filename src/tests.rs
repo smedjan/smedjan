@@ -1430,10 +1430,14 @@ mod suite {
             compute::set_simdgroup_matmul(true);
             let rf16 = at2.matmul(&bt2).to_vec()[0];
             compute::set_simdgroup_matmul(prev_sg);
-            assert!(
-                (rf16 - big).abs() > big * 0.1,
-                "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}"
-            );
+            // Metal-only: the fp16 fast path clamps. On CUDA the fast path is cuBLAS TF32 (fp32 range)
+            // and preserves 1e5 — better, so the "corrupts" claim only holds on Metal.
+            if cfg!(feature = "metal") {
+                assert!(
+                    (rf16 - big).abs() > big * 0.1,
+                    "fp16 path corrupts 1e5 (overflow/clamp): got {rf16}"
+                );
+            }
         });
     }
 
@@ -3986,10 +3990,14 @@ mod suite {
                 (r_bf16 - big).abs() < big * 5e-3,
                 "bf16 must preserve 1e5: got {r_bf16}"
             );
-            assert!(
-                (r_f16 - big).abs() > big * 0.1,
-                "fp16 path should corrupt 1e5 (overflow/clamp): got {r_f16}"
-            );
+            // The fp16-range clamp is a Metal-only property: on CUDA the fast path is now cuBLAS
+            // TF32 (fp32 range), which preserves 1e5 — strictly better, so only assert the clamp on Metal.
+            if cfg!(feature = "metal") {
+                assert!(
+                    (r_f16 - big).abs() > big * 0.1,
+                    "fp16 path should corrupt 1e5 (overflow/clamp): got {r_f16}"
+                );
+            }
 
             // Normal range: bf16-on vs fp16 default agree to bf16 precision.
             let x = Tensor::randn(&ctx, vec![48, 40], 0.4);
