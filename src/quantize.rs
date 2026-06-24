@@ -730,7 +730,7 @@ fn read_quantized_tensor(
 
 /// Export model to GGUF format for llama.cpp inference.
 /// Maps Smedjan tensor layout to GGUF's expected naming convention.
-/// Supports F32 and Q8_0 quantization types.
+/// Supports F32, Q8_0, and Q4_0 (real GGML blocks; 1-D norm tensors stay F32).
 pub fn export_gguf(
     model: &Transformer,
     output_path: &str,
