@@ -15,15 +15,21 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Global size-keyed free list of recycled device buffers (key = element count == n_floats).
+/// Global free list of recycled device buffers, keyed by `(device instance, element count)`.
 ///
-/// Why this is aliasing-safe without Metal's generation/quarantine machinery: CUDA executes all of
-/// our kernels in issue order on a single (default) stream. A buffer is only returned here once its
-/// last Rust-side reference drops (`Arc::strong_count == 1`), so no later code holds it; and because
-/// every reissue's zeroing memset and every subsequent kernel are queued on the same stream *after*
+/// Why this is aliasing-safe without Metal's generation/quarantine machinery: each `CudaDevice`
+/// issues our kernels in order on its own single stream. A buffer is returned here only once its
+/// last Rust-side reference drops (`Arc::strong_count == 1`), so nothing else holds it; and because
+/// every reissue's zeroing memset and every subsequent kernel are queued on that same stream *after*
 /// whatever last read the buffer, the GPU can't reorder a stale read past the reuse. That ordering
 /// is exactly what Metal's deferred command-buffer model lacks, which is why this needs no quarantine.
-static BUFFER_POOL: OnceLock<Mutex<HashMap<usize, Vec<CudaSlice<f32>>>>> = OnceLock::new();
+///
+/// The device half of the key is essential: a process can hold several `CudaDevice` instances (every
+/// `test_ctx()` makes a fresh one, each with its *own* stream), and reusing a buffer recycled under
+/// one stream on a *different* stream would race the zeroing memset against the first stream's still
+/// pending work. Keying by device confines reuse to a single stream — full reuse for the one context
+/// a real run holds, zero cross-context reuse in the test suite.
+static BUFFER_POOL: OnceLock<Mutex<HashMap<(usize, usize), Vec<CudaSlice<f32>>>>> = OnceLock::new();
 /// (hits, misses) since process start — surfaced by `pool_stats()` for the training/bench readout.
 static POOL_HITS: AtomicUsize = AtomicUsize::new(0);
 static POOL_MISSES: AtomicUsize = AtomicUsize::new(0);
@@ -34,8 +40,15 @@ static POOL_BYPASS: AtomicUsize = AtomicUsize::new(0);
 /// Cap per size bucket, mirroring Metal, so idle VRAM can't grow unbounded across varied seq lengths.
 const POOL_BUCKET_CAP: usize = 64;
 
-fn buffer_pool() -> &'static Mutex<HashMap<usize, Vec<CudaSlice<f32>>>> {
+fn buffer_pool() -> &'static Mutex<HashMap<(usize, usize), Vec<CudaSlice<f32>>>> {
     BUFFER_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stable per-instance id for a `CudaDevice` (its heap address). Distinguishes contexts that share
+/// GPU ordinal 0 but own different streams, so the pool never reuses a buffer across streams.
+#[inline]
+fn device_id(dev: &Arc<CudaDevice>) -> usize {
+    Arc::as_ptr(dev) as usize
 }
 
 /// GPU buffer type for CUDA — wraps a device memory allocation.
@@ -155,10 +168,11 @@ impl MetalContext {
     /// page setup) with a same-stream memset of an already-mapped allocation in the steady state.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
-                                               // Pop a recycled same-size buffer under the lock, then release it before touching the GPU.
+                                               // Pop a recycled same-device, same-size buffer under the lock; release it before the GPU op.
         let reused = if POOL_BYPASS.load(Ordering::Relaxed) == 0 {
+            let key = (device_id(&self.device), n_floats);
             let mut pool = buffer_pool().lock().unwrap();
-            pool.get_mut(&n_floats).and_then(|list| list.pop())
+            pool.get_mut(&key).and_then(|list| list.pop())
         } else {
             None
         };
@@ -272,9 +286,11 @@ impl MetalContext {
             return; // bypassed region: drop instead of pooling
         }
         if let Ok(slice) = Arc::try_unwrap(buf) {
-            let n_floats = slice.len();
+            // Key by the buffer's *own* device so it can only ever be reissued on the stream that
+            // last touched it (see BUFFER_POOL docs) — `slice.device()` is that owning device.
+            let key = (device_id(&slice.device()), slice.len());
             let mut pool = buffer_pool().lock().unwrap();
-            let list = pool.entry(n_floats).or_default();
+            let list = pool.entry(key).or_default();
             if list.len() < POOL_BUCKET_CAP {
                 list.push(slice);
             }
