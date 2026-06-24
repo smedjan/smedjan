@@ -18,3 +18,21 @@ src/metal/compute_head.tmp
 
 # OS
 .DS_Store
+
+# Secrets / credentials — never commit (vast.ai keys, SSH keys, env, certs)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+.netrc
+*.credentials
+*_api_key
+*api_key*.txt
+.vast*
+vast_api_key
