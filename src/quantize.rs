@@ -380,6 +380,9 @@ fn validate_gguf_quantize_type(quantize_type: &str) -> std::io::Result<()> {
 
 /// GGML quantization block length (both Q8_0 and Q4_0 quantize 32 values at a time).
 const GGML_QK: usize = 32;
+/// GGUF tensor-data alignment (the `general.alignment` default). Every tensor's data offset must
+/// be a multiple of this; readers (llama.cpp, the gguf python lib) rely on it.
+const GGUF_ALIGN: usize = 32;
 // GGML tensor type IDs (ggml.h).
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_Q4_0: u32 = 2;
@@ -756,7 +759,7 @@ pub fn export_gguf(
         ("general.architecture", "llama"),
         ("general.name", "smedjan"),
     ];
-    let n_kv = metadata.len() as u64 + 10; // base metadata + config values
+    let n_kv = metadata.len() as u64 + 11; // base metadata + config values + general.alignment
     file.write_all(&n_kv.to_le_bytes())?;
 
     // Write string metadata
@@ -795,6 +798,8 @@ pub fn export_gguf(
         _ => 0u32,
     };
     write_gguf_u32(&mut file, "general.file_type", file_type)?;
+    // GGUF requires each tensor's data offset to be a multiple of general.alignment.
+    write_gguf_u32(&mut file, "general.alignment", GGUF_ALIGN as u32)?;
 
     // Encode every tensor once into real GGML block bytes (mixed precision: norms/1-D stay F32).
     let encoded: Vec<(u32, Vec<u8>)> = params
@@ -802,7 +807,8 @@ pub fn export_gguf(
         .map(|p| encode_gguf_tensor(&p.to_vec(), &p.shape, quantize_type))
         .collect();
 
-    // Tensor info headers (name, shape, per-tensor type, offset).
+    // Tensor info headers (name, shape, per-tensor type, offset). Each offset is rounded up to
+    // GGUF_ALIGN; the data section below inserts matching padding between tensors.
     let mut data_offset: u64 = 0;
     for ((param, name), (gguf_type, bytes)) in
         params.iter().zip(tensor_names.iter()).zip(encoded.iter())
@@ -817,18 +823,27 @@ pub fn export_gguf(
         file.write_all(&gguf_type.to_le_bytes())?;
         file.write_all(&data_offset.to_le_bytes())?;
         data_offset += bytes.len() as u64;
+        data_offset = data_offset.next_multiple_of(GGUF_ALIGN as u64); // align next tensor
     }
 
-    // Alignment padding to 32 bytes.
+    // Alignment padding so the data section itself starts on a GGUF_ALIGN boundary.
     let pos = file.metadata()?.len();
-    let aligned = (pos + 31) & !31;
+    let aligned = pos.next_multiple_of(GGUF_ALIGN as u64);
     for _ in pos..aligned {
         file.write_all(&[0u8])?;
     }
 
-    // Tensor data (GGML block bytes, in the same order as the info headers).
+    // Tensor data (GGML block bytes, same order as the info headers), each padded up to GGUF_ALIGN
+    // so the next tensor lands exactly on the aligned offset written above.
+    let mut written: u64 = 0;
     for (_, bytes) in &encoded {
         file.write_all(bytes)?;
+        written += bytes.len() as u64;
+        let pad = written.next_multiple_of(GGUF_ALIGN as u64) - written;
+        for _ in 0..pad {
+            file.write_all(&[0u8])?;
+        }
+        written += pad;
     }
 
     let size_mb = std::fs::metadata(output_path)?.len() as f32 / (1024.0 * 1024.0);

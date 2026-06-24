@@ -6454,6 +6454,81 @@ mod suite {
         std::fs::remove_file(path).ok();
     }
 
+    /// Minimal GGUF reader for the alignment test: returns (general.alignment, tensor offsets).
+    /// Only handles the KV value types Smedjan writes (u32=4, f32=6, string=8).
+    fn read_gguf_alignment_and_offsets(path: &str) -> (Option<u32>, Vec<u64>) {
+        let buf = std::fs::read(path).expect("read gguf");
+        let mut p = 0usize;
+        let u32a = |b: &[u8], p: &mut usize| {
+            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let u64a = |b: &[u8], p: &mut usize| {
+            let v = u64::from_le_bytes(b[*p..*p + 8].try_into().unwrap());
+            *p += 8;
+            v
+        };
+        let stra = |b: &[u8], p: &mut usize| {
+            let n = u64::from_le_bytes(b[*p..*p + 8].try_into().unwrap()) as usize;
+            *p += 8;
+            let s = String::from_utf8(b[*p..*p + n].to_vec()).unwrap();
+            *p += n;
+            s
+        };
+        assert_eq!(&buf[0..4], b"GGUF", "magic");
+        p = 4;
+        let _ver = u32a(&buf, &mut p);
+        let n_tensors = u64a(&buf, &mut p);
+        let n_kv = u64a(&buf, &mut p);
+        let mut alignment = None;
+        for _ in 0..n_kv {
+            let key = stra(&buf, &mut p);
+            let vtype = u32a(&buf, &mut p);
+            let val = match vtype {
+                4 | 6 => Some(u32a(&buf, &mut p)), // u32 / f32 (4 bytes either way)
+                8 => {
+                    let _ = stra(&buf, &mut p);
+                    None
+                }
+                other => panic!("unexpected GGUF KV value type {other} for key {key}"),
+            };
+            if key == "general.alignment" {
+                alignment = val;
+            }
+        }
+        let mut offsets = Vec::new();
+        for _ in 0..n_tensors {
+            let _name = stra(&buf, &mut p);
+            let ndims = u32a(&buf, &mut p) as usize;
+            for _ in 0..ndims {
+                let _ = u64a(&buf, &mut p);
+            }
+            let _ttype = u32a(&buf, &mut p);
+            offsets.push(u64a(&buf, &mut p));
+        }
+        (alignment, offsets)
+    }
+
+    /// GGUF requires every tensor data offset to be a multiple of general.alignment (32). d_model=48
+    /// gives Q8_0 attention weights (48×48 = 72 blocks = 2448 bytes) that do NOT land on a 32-byte
+    /// boundary, so this fails if the exporter forgets to pad between tensors.
+    #[test]
+    fn gguf_export_aligns_every_tensor_offset() {
+        let ctx = test_ctx();
+        let model = Transformer::new(&ctx, ModelConfig::custom(96, 48, 4, 2, 2.67, 32));
+        for quant in ["q8_0", "q4_0", "f32"] {
+            let path = format!("/tmp/smedjan_align_{quant}.gguf");
+            crate::quantize::export_gguf(&model, &path, quant).expect("export gguf");
+            let (alignment, offsets) = read_gguf_alignment_and_offsets(&path);
+            assert_eq!(alignment, Some(32), "{quant}: general.alignment KV must be 32");
+            for (i, off) in offsets.iter().enumerate() {
+                assert_eq!(off % 32, 0, "{quant}: tensor {i} offset {off} not 32-aligned");
+            }
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
     #[test]
     fn hf_safetensors_import_rejects_wrong_shapes_and_ragged_bytes() {
         let ctx = test_ctx();
