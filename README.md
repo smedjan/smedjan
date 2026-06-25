@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://smedjan.dev"><img src="https://raw.githubusercontent.com/smedjan/smedjan/main/docs/banner.png" alt="SMEDJAN — pure-Rust LLM engine. Own the stack." width="840"></a>
+  <a href="https://smedjan.dev"><img src="https://raw.githubusercontent.com/smedjan/smedjan/main/docs/banner.png?v=2" alt="SMEDJAN — pure-Rust LLM engine. Own the stack." width="840"></a>
 </p>
 
 <p align="center">
