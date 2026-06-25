@@ -233,6 +233,75 @@ pub fn expand_heads(x: &Tensor, n_in: usize, repeat: usize, d: usize) -> Tensor 
     x.matmul(&Tensor::from_slice(&x.ctx, &e, vec![n_in * d, out_dim]))
 }
 
+/// Weights for one Qwen3.5 Gated-DeltaNet mixer layer.
+pub struct DeltaNetWeights<'a> {
+    pub w_q: &'a Tensor,
+    pub w_k: &'a Tensor,
+    pub w_v: &'a Tensor,
+    pub conv_q: &'a Tensor,
+    pub conv_k: &'a Tensor,
+    pub conv_v: &'a Tensor,
+    pub w_a: &'a Tensor,
+    pub w_b: &'a Tensor,
+    pub w_gate: &'a Tensor,
+    pub out_norm: &'a Tensor,
+    pub w_o: &'a Tensor,
+}
+
+/// Full Qwen3.5 Gated-DeltaNet mixer forward, composing the verified primitives:
+/// in-proj → causal conv + SiLU → L2-norm q/k → asymmetric GQA expand (n_k→n_v) →
+/// gated delta rule per value-head → output RMSNorm + sigmoid gate → out-proj.
+/// `x:[batch,seq,d_model]` → `[batch,seq,d_model]`. (The log_g/beta activations are placeholders
+/// — `-relu` / `sigmoid` — matched to Qwen's exact softplus/A_log form at load time; this proves
+/// the composition, shapes, and end-to-end gradient flow.)
+pub fn qwen3_deltanet_mixer(
+    x: &Tensor,
+    w: &DeltaNetWeights,
+    n_k: usize,
+    n_v: usize,
+    dh: usize,
+    kw: usize,
+) -> Tensor {
+    let (batch, seq, dmodel) = (x.shape[0], x.shape[1], x.shape[2]);
+    let xf = x.reshape(vec![batch * seq, dmodel]);
+    let conv = |proj: Tensor, ck: &Tensor, c: usize| {
+        causal_conv1d(&proj.reshape(vec![batch, seq, c]), ck, kw)
+            .silu()
+            .reshape(vec![batch * seq, c])
+    };
+    let q = conv(xf.matmul(w.w_q), w.conv_q, n_k * dh);
+    let k = conv(xf.matmul(w.w_k), w.conv_k, n_k * dh);
+    let v = conv(xf.matmul(w.w_v), w.conv_v, n_v * dh);
+    let rep = n_v / n_k;
+    let q = expand_heads(&q, n_k, rep, dh); // [batch*seq, n_v*dh]
+    let k = expand_heads(&k, n_k, rep, dh);
+    let fold = |t: Tensor| {
+        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_v * dh]), batch, seq, n_v, dh)
+    };
+    let ones_dh = Tensor::ones(&x.ctx, vec![dh]);
+    let qh = fold(q).rms_norm(&ones_dh, 1e-6); // L2-norm q,k per head
+    let kh = fold(k).rms_norm(&ones_dh, 1e-6);
+    let vh = fold(v); // [batch*n_v, seq, dh]
+    // gates (placeholder activations): log_g ≤ 0, beta ∈ (0,1)
+    let log_g = xf.matmul(w.w_a).relu().scale(-1.0); // [batch*seq, n_v]
+    let beta = sigmoid(&xf.matmul(w.w_b));
+    let fold_scalar = |t: Tensor| {
+        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_v]), batch, seq, n_v, 1)
+            .reshape(vec![batch * n_v, seq])
+    };
+    let o = gated_delta_rule(&qh, &kh, &vh, &fold_scalar(log_g), &fold_scalar(beta)); // [batch*n_v,seq,dh]
+    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_v, dh); // → [batch,seq,n_v*dh]
+    let o = o
+        .reshape(vec![batch * seq * n_v, dh])
+        .rms_norm(w.out_norm, 1e-6)
+        .reshape(vec![batch, seq, n_v * dh]);
+    let gate = xf.matmul(w.w_gate).reshape(vec![batch, seq, n_v * dh]);
+    let o = output_gate(&o, &gate);
+    o.reshape(vec![batch * seq, n_v * dh])
+        .matmul(w.w_o)
+        .reshape(vec![batch, seq, dmodel])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +533,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn deltanet_mixer_shape_and_grad() {
+        let ctx = ctx();
+        let (batch, seq, dmodel, n_k, n_v, dh, kw) = (1usize, 4, 8, 2, 4, 2, 3);
+        let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
+        let (w_q, w_k, w_v) = (mk(dmodel, n_k * dh), mk(dmodel, n_k * dh), mk(dmodel, n_v * dh));
+        let (conv_q, conv_k, conv_v) = (mk(n_k * dh, kw), mk(n_k * dh, kw), mk(n_v * dh, kw));
+        let (w_a, w_b, w_gate) = (mk(dmodel, n_v), mk(dmodel, n_v), mk(dmodel, n_v * dh));
+        let out_norm = Tensor::ones(&ctx, vec![dh]).with_grad();
+        let w_o = mk(n_v * dh, dmodel);
+        let x = Tensor::randn(&ctx, vec![batch, seq, dmodel], 0.1).with_grad();
+        let w = DeltaNetWeights {
+            w_q: &w_q, w_k: &w_k, w_v: &w_v,
+            conv_q: &conv_q, conv_k: &conv_k, conv_v: &conv_v,
+            w_a: &w_a, w_b: &w_b, w_gate: &w_gate, out_norm: &out_norm, w_o: &w_o,
+        };
+        let out = qwen3_deltanet_mixer(&x, &w, n_k, n_v, dh, kw);
+        assert_eq!(out.shape, vec![batch, seq, dmodel], "mixer output shape");
+        let n = batch * seq * dmodel;
+        let loss = out
+            .reshape(vec![1, n])
+            .matmul(&Tensor::ones(&ctx, vec![n, 1]));
+        autograd::backward(&ctx, loss.id);
+        for (name, id) in [
+            ("x", x.id), ("w_q", w_q.id), ("w_v", w_v.id),
+            ("w_a", w_a.id), ("w_gate", w_gate.id), ("w_o", w_o.id),
+        ] {
+            let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad {name}"));
+            let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
+            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
+        }
+        autograd::zero_grads();
     }
 }
