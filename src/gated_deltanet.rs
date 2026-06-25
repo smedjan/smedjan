@@ -641,14 +641,20 @@ pub fn qwen3_full_attention_mixer_strict(
     hd: usize,
     rot_dim: usize,
     rope_theta: f32,
+    kv_cache: Option<&mut crate::kv_cache::KvCache>,
 ) -> Tensor {
     let (batch, seq, dmodel) = (x.shape[0], x.shape[1], x.shape[2]);
     let xf = x.reshape(vec![batch * seq, dmodel]);
     // q_proj is doubled: [n_h*hd*2, d]. When quantized, do one qmatmul + split output.
-    // When f32, split the weight columns then matmul.
+    // Use decode kernel when M=1 (qmul auto-routes).
     let (q_out, gate_out) = match &w.q_q_proj_out {
         Some(qp) => {
-            let qg = qp.qmatmul(&xf); // [M, n_h*hd*2]
+            // The doubled q_proj: one qmatmul → split output into q and gate.
+            let qg = if xf.shape[0] == 1 {
+                qp.qmatmul_decode(&xf)
+            } else {
+                qp.qmatmul(&xf)
+            };
             (
                 qg.slice_cols(0, n_h * hd),
                 qg.slice_cols(n_h * hd, n_h * hd),
@@ -664,8 +670,8 @@ pub fn qwen3_full_attention_mixer_strict(
         },
     };
     let rep = n_h / n_kv;
-    let k = expand_heads(&qmul(&xf, &w.q_w_k, &w.w_k), n_kv, rep, hd);
-    let v = expand_heads(&qmul(&xf, &w.q_w_v, &w.w_v), n_kv, rep, hd);
+    let k_new = expand_heads(&qmul(&xf, &w.q_w_k, &w.w_k), n_kv, rep, hd);
+    let v_new = expand_heads(&qmul(&xf, &w.q_w_v, &w.w_v), n_kv, rep, hd);
     let fold = |t: Tensor| {
         crate::attention::transpose_bsh_to_bhs(
             &t.reshape(vec![batch, seq, n_h * hd]),
@@ -681,20 +687,78 @@ pub fn qwen3_full_attention_mixer_strict(
         0,
         rope_theta,
     );
-    let kh = partial_rope(&fold(k).rms_norm(&w.k_norm, 1e-6), rot_dim, 0, rope_theta);
-    let vh = fold(v);
+    let kh_new = partial_rope(
+        &fold(k_new).rms_norm(&w.k_norm, 1e-6),
+        rot_dim,
+        0,
+        rope_theta,
+    );
+    let vh_new = fold(v_new);
+
+    // KV-cache: if provided, append the new K/V and compute attention over the full context.
+    // At decode (seq=1), this makes attention O(1) per token — the cache grows by one row per step.
+    let (kh, vh, total_seq, used_cache) = if let Some(cache) = kv_cache {
+        // Extract the new K/V for the current token(s) and append to cache.
+        let kh_new_flat = kh_new.reshape(vec![batch * n_kv, seq * hd]).to_vec();
+        let vh_new_flat = vh_new.reshape(vec![batch * n_kv, seq * hd]).to_vec();
+        // For batch=1, seq=1: kh_new_flat has n_kv * hd values.
+        // Append each head's K/V to the cache.
+        for h in 0..n_kv {
+            let k_row = &kh_new_flat[h * hd..(h + 1) * hd];
+            let v_row = &vh_new_flat[h * hd..(h + 1) * hd];
+            cache.append(k_row, v_row);
+        }
+        // Build the full K/V tensors from the cache.
+        let kh_tensor = cache.k_tensor(&x.ctx);
+        let vh_tensor = cache.v_tensor(&x.ctx);
+        let total = cache.seq_len;
+        // Reshape to [batch, n_kv, total, hd] — for batch=1, this is [1, n_kv, total, hd].
+        // The cache stores [seq, n_kv * hd] row-major, so reshape to [total, n_kv, hd] then transpose.
+        let kh_full = kh_tensor.reshape(vec![total, n_kv * hd]);
+        // Expand to n_h heads (GQA: repeat each KV head rep times).
+        let kh_expanded = expand_heads(&kh_full.reshape(vec![total, n_kv * hd]), n_kv, rep, hd);
+        let kh_4d = crate::attention::transpose_bsh_to_bhs(
+            &kh_expanded.reshape(vec![1, total, n_h * hd]),
+            1,
+            total,
+            n_h,
+            hd,
+        );
+        let vh_4d = crate::attention::transpose_bsh_to_bhs(
+            &vh_tensor.reshape(vec![1, total, n_h * hd]),
+            1,
+            total,
+            n_h,
+            hd,
+        );
+        (kh_4d, vh_4d, total, true)
+    } else {
+        (kh_new, vh_new, seq, false)
+    };
+
     let scale = 1.0 / (hd as f32).sqrt();
     let probs = qh
         .batched_matmul_trans_b(&kh)
         .scaled_causal_softmax(scale, 0);
     let o = probs.batched_matmul(&vh);
-    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_h, hd).reshape(vec![
+    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, total_seq, n_h, hd).reshape(vec![
         batch,
-        seq,
+        total_seq,
         n_h * hd,
     ]);
+    // When using KV-cache, the output covers all cached tokens, but we only need the last token's
+    // output for decode. Slice the last `seq` positions.
+    let o_decode = if used_cache && total_seq > seq {
+        o.slice_flat(
+            (total_seq - seq) * n_h * hd,
+            seq * n_h * hd,
+            vec![batch, seq, n_h * hd],
+        )
+    } else {
+        o
+    };
     let gate = gate_out.reshape(vec![batch, seq, n_h * hd]);
-    let og = output_gate(&o, &gate).reshape(vec![batch * seq, n_h * hd]);
+    let og = output_gate(&o_decode, &gate).reshape(vec![batch * seq, n_h * hd]);
     qmul(&og, &w.q_w_o, &w.w_o).reshape(vec![batch, seq, dmodel])
 }
 
@@ -768,6 +832,7 @@ impl Qwen35Model {
                         c.head_dim,
                         rot,
                         c.rope_theta,
+                        None, // no KV-cache for full-seq forward
                     ),
                 }
             } else {

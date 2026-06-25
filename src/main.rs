@@ -377,6 +377,8 @@ struct Qwen35LoraTrainArgs {
     report_every: usize,
     #[arg(long, default_value = "false")]
     self_distill: bool,
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
 }
 
 /// Arguments for `qwen35-generate` — fast generation with speculative decoding.
@@ -2278,6 +2280,7 @@ fn main() {
                 save_every: args.save_every,
                 report_every: args.report_every,
                 self_distill: args.self_distill,
+                optimizer: args.optimizer,
             };
             result_or_exit(
                 lora::qwen35_lora_train(&ctx, &config),

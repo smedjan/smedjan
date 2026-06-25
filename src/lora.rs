@@ -205,6 +205,7 @@ impl Qwen35LoraModel {
                             c.head_dim,
                             rot,
                             c.rope_theta,
+                            None, // no KV-cache for LoRA training forward
                         ),
                     }
                 } else {
@@ -384,6 +385,10 @@ pub struct LoraTrainConfig {
     /// training uses `textual_feedback_loss` instead of plain cross-entropy. The data JSONL
     /// must include "hint" and "turn_idx" fields for the teacher forward.
     pub self_distill: bool,
+    /// Optimizer: "adamw" (default) or "muon" (MomentUm Orthogonalized by Newton-Schulz).
+    /// Muon is ~2x faster convergence for 2-D weight matrices (LoRA A/B are 2-D), per the
+    /// Muon paper and Cursor's Composer 2.5 training stack.
+    pub optimizer: String,
 }
 
 /// Run LoRA fine-tuning on the Qwen3.5 model.
@@ -394,6 +399,7 @@ pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> s
     use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
 
     eprintln!("=== Smedjan Qwen3.5 LoRA Fine-Tuning ===");
+    eprintln!("Optimizer: {}", config.optimizer);
     eprintln!(
         "LoRA: rank={}, alpha={}, lr={:.1e}, batch={}, seq={}, iters={}",
         config.rank, config.alpha, config.lr, config.batch_size, config.seq_len, config.iters
@@ -417,54 +423,83 @@ pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> s
         lora_params.iter().map(|t| t.numel() as f64).sum::<f64>() / 1e6
     );
 
-    // Optimizer on LoRA params only.
-    let param_refs: Vec<&Tensor> = lora_params.iter().collect();
-    let mut optimizer = AdamW::new(ctx, &param_refs, 0.0); // no weight decay for LoRA
-
-    // Load training data (JSONL with "text" field → tokenized via BPE if available).
+    // Load training data before the optimizer setup.
     let dataset = load_lora_dataset(&config.data_path, config.tokenizer_path.as_deref())?;
     eprintln!("Dataset: {} examples", dataset.len());
 
+    // Optimizer on LoRA params only. Muon for 2-D matrices (LoRA A/B), AdamW fallback for 1-D.
+    let param_refs: Vec<&Tensor> = lora_params.iter().collect();
+    // Muon gives ~2x faster convergence for 2-D weight matrices (Newton-Schulz orthogonalization).
+    // LoRA A/B matrices are all 2-D, so Muon is the better choice when configured.
+    match config.optimizer.as_str() {
+        "muon" => {
+            eprintln!("Using Muon optimizer (Newton-Schulz orthogonalization)");
+            let mut optimizer = crate::optim::Muon::new(ctx, &param_refs, 0.0);
+            lora_train_loop(ctx, config, &model, &dataset, &cfg, &mut optimizer)?;
+        }
+        _ => {
+            eprintln!("Using AdamW optimizer");
+            let mut optimizer = AdamW::new(ctx, &param_refs, 0.0);
+            lora_train_loop(ctx, config, &model, &dataset, &cfg, &mut optimizer)?;
+        }
+    }
+    Ok(())
+}
+
+/// Generic training loop that works with any optimizer implementing `step(lr)`.
+trait OptimizerStep {
+    fn step(&mut self, lr: f32);
+}
+impl OptimizerStep for crate::optim::AdamW {
+    fn step(&mut self, lr: f32) {
+        crate::optim::AdamW::step(self, lr);
+    }
+}
+impl OptimizerStep for crate::optim::Muon {
+    fn step(&mut self, lr: f32) {
+        crate::optim::Muon::step(self, lr);
+    }
+}
+
+fn lora_train_loop(
+    ctx: &Arc<MetalContext>,
+    config: &LoraTrainConfig,
+    model: &Qwen35LoraModel,
+    dataset: &[Vec<u32>],
+    cfg: &crate::gated_deltanet::Qwen35Config,
+    optimizer: &mut impl OptimizerStep,
+) -> std::io::Result<()> {
+    use crate::autograd;
+    use crate::loss::cross_entropy_loss;
+
     std::fs::create_dir_all(&config.output_dir)?;
 
-    // Training loop.
     for step in 0..config.iters {
-        // Get a batch: random sequences from the dataset.
-        let batch = get_lora_batch(&dataset, config.batch_size, config.seq_len, &cfg, &model);
-        let x = batch.input; // [batch, seq, d]
-        let targets = batch.targets; // [batch * seq]
+        let batch = get_lora_batch(dataset, config.batch_size, config.seq_len, cfg, model);
+        let x = batch.input;
+        let targets = batch.targets;
 
-        // Forward with LoRA (gradients flow through A/B only).
         autograd::clear_tape();
-        let logits = model.forward_lora(&x); // [batch, seq, vocab]
+        let logits = model.forward_lora(&x);
         let (b, s, v) = (logits.shape[0], logits.shape[1], logits.shape[2]);
         let logits_flat = logits.reshape(vec![b * s, v]);
-
-        // Cross-entropy loss.
-        let (loss, grad_logits) = cross_entropy_loss(ctx, &logits_flat, &targets);
-
-        // Backward through LoRA params only.
+        let (loss, _grad) = cross_entropy_loss(ctx, &logits_flat, &targets);
         autograd::backward(ctx, loss.id);
-
-        // Optimizer step.
         optimizer.step(config.lr);
 
         if step % config.report_every == 0 {
             let loss_val = loss.to_vec()[0];
             eprintln!("step {step}/{}: loss={loss_val:.4}", config.iters);
         }
-
         if step > 0 && step % config.save_every == 0 {
             let path = format!("{}/lora_step_{step}.safetensors", config.output_dir);
             model.save_lora(&path)?;
         }
     }
 
-    // Final save.
     let path = format!("{}/lora_final.safetensors", config.output_dir);
     model.save_lora(&path)?;
     eprintln!("LoRA training complete. Final adapter: {path}");
-
     Ok(())
 }
 
