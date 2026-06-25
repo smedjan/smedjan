@@ -195,6 +195,23 @@ pub fn partial_rope(x: &Tensor, rot_dim: usize, offset: u32, theta: f32) -> Tens
         .reshape(vec![bh, seq, hd])
 }
 
+/// Sigmoid with no new kernel: `sigmoid(x) = softmax([x, 0])[..,0]`. Row-wise softmax over a 2-wide
+/// matrix gives `[σ(x), 1−σ(x)]`; take column 0. Composed-ops → autograd backward for free.
+pub fn sigmoid(x: &Tensor) -> Tensor {
+    let n = x.numel();
+    let e = Tensor::from_slice(&x.ctx, &[1.0, 0.0], vec![1, 2]); // x·[1,0] → [x, 0] per row
+    x.reshape(vec![n, 1])
+        .matmul(&e)
+        .softmax()
+        .slice_cols(0, 1)
+        .reshape(x.shape.clone())
+}
+
+/// Qwen3.5 attention **output gate**: `out ⊙ sigmoid(gate)`.
+pub fn output_gate(out: &Tensor, gate: &Tensor) -> Tensor {
+    out.mul(&sigmoid(gate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +403,17 @@ mod tests {
         });
         for (a, b) in eq.iter().zip(full.iter()) {
             assert!((a - b).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn sigmoid_matches_cpu() {
+        let ctx = ctx();
+        let x: Vec<f32> = (0..12).map(|i| (i as f32 - 6.0) * 0.5).collect();
+        let got = autograd::no_grad(|| sigmoid(&Tensor::from_slice(&ctx, &x, vec![3, 4])).to_vec());
+        for (g, xi) in got.iter().zip(x.iter()) {
+            let w = 1.0 / (1.0 + (-xi).exp());
+            assert!((g - w).abs() < 1e-3, "sigmoid {g} vs {w}");
         }
     }
 }
