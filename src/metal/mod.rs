@@ -386,6 +386,7 @@ impl MetalContext {
             ("muon_frob_normalize", shaders::MUON_FROB_NORMALIZE),
             ("inv_sqrt_bc", shaders::INV_SQRT_BC),
             ("rope_copy", shaders::ROPE_COPY),
+            ("rope_copy_cached", shaders::ROPE_COPY_CACHED),
             ("rope_backward_copy", shaders::ROPE_BACKWARD_COPY),
             ("matmul_narrow", shaders::MATMUL_NARROW),
             ("axpy", shaders::AXPY),

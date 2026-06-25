@@ -1174,6 +1174,46 @@ pub fn gpu_rope_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, 
     dispatch_threads_sync!(ctx, "rope_copy", total, tg, 0 => src, 1 => dst, 2 => &params_buf);
 }
 
+/// **Cached RoPE**: uses a precomputed cos/sin table to eliminate per-thread `pow` + `sincos`.
+/// `cos_sin_buf` is `[max_pos, rot_dim/2, 2]` f32 (cos and sin interleaved), computed once on CPU.
+pub fn gpu_rope_copy_cached(
+    ctx: &Arc<MetalContext>,
+    src: &GpuBuffer,
+    dst: &GpuBuffer,
+    cos_sin_buf: &GpuBuffer,
+    total_rows: u32,
+    seq_len: u32,
+    head_dim: u32,
+    offset: u32,
+    rot_dim: u32,
+) {
+    #[repr(C)]
+    struct Params {
+        seq_len: u32,
+        head_dim: u32,
+        total_rows: u32,
+        offset: u32,
+        rot_dim: u32,
+    }
+    let params = Params {
+        seq_len,
+        head_dim,
+        total_rows,
+        offset,
+        rot_dim,
+    };
+    let params_buf = params_buffer(ctx, &params);
+    let half_rot = (rot_dim / 2) as u64;
+    let total = MetalContext::size(seq_len as u64, total_rows as u64, half_rot);
+    let tg = MetalContext::size(
+        8.min(seq_len as u64).max(1),
+        8.min(total_rows as u64).max(1),
+        8.min(half_rot).max(1),
+    );
+    dispatch_threads_sync!(ctx, "rope_copy_cached", total, tg,
+        0 => src, 1 => dst, 2 => cos_sin_buf, 3 => &params_buf);
+}
+
 /// RoPE backward: apply inverse rotation (rotate by -θ) to propagate gradients.
 pub fn gpu_rope_backward(
     ctx: &Arc<MetalContext>,

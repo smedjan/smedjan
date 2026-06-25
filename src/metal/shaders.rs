@@ -1545,6 +1545,55 @@ kernel void rope_copy(
 }
 "#;
 
+/// **RoPE with precomputed frequency cache** — eliminates the per-thread `pow` + `sincos`
+/// by looking up cos/sin from a precomputed table. The table is `[seq_len, rot_dim/2, 2]`
+/// (cos and sin interleaved), computed once on CPU and uploaded as a GPU buffer.
+///
+/// At decode, `seq_len=1` and the table is tiny (32 pairs × 2 = 64 floats). The `pow` + `sincos`
+/// computation is replaced by a single memory read — a measurable saving when RoPE is called
+/// 8 times per layer (q and k for each of the 8 full-attention layers) × 32 layers = 256 calls
+/// per forward, each with 32 pairs × 16 heads = 512 threads computing the same `sincos`.
+pub const ROPE_COPY_CACHED: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RopeCachedParams {
+    uint seq_len;
+    uint head_dim;
+    uint total_rows;
+    uint offset;
+    uint rot_dim;     // rotary dimension (head_dim for full RoPE, partial for partial RoPE)
+};
+
+kernel void rope_copy_cached(
+    device const float* src        [[buffer(0)]],
+    device float* dst               [[buffer(1)]],
+    device const float* cos_sin     [[buffer(2)]],  // [seq_len + offset, rot_dim/2, 2]
+    constant RopeCachedParams& params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint pos = gid.x;
+    uint pair = gid.z;
+    if (row >= params.total_rows || pos >= params.seq_len || pair >= params.rot_dim / 2) return;
+
+    // Look up cos/sin from the precomputed table instead of computing pow + sincos.
+    uint table_pos = pos + params.offset;
+    uint cs_idx = table_pos * (params.rot_dim / 2) * 2 + pair * 2;
+    float cos_val = cos_sin[cs_idx];
+    float sin_val = cos_sin[cs_idx + 1];
+
+    uint base = row * params.seq_len * params.head_dim + pos * params.head_dim;
+    uint i0 = base + pair * 2;
+    uint i1 = base + pair * 2 + 1;
+
+    float x0 = src[i0];
+    float x1 = src[i1];
+    dst[i0] = x0 * cos_val - x1 * sin_val;
+    dst[i1] = x0 * sin_val + x1 * cos_val;
+}
+"#;
+
 /// RoPE backward pass: inverse rotation (negate sin to undo forward rotation).
 /// Given grad_output with RoPE applied, produces grad_input by rotating by -θ.
 pub const ROPE_BACKWARD: &str = r#"

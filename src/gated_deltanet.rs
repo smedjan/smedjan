@@ -34,6 +34,60 @@ use crate::gpu::MetalContext;
 use crate::tensor::{QuantizedTensor, Tensor};
 use std::sync::Arc;
 
+/// **RoPE frequency cache** — precomputes cos/sin for all positions up to `max_pos` and all
+/// `rot_dim/2` frequency pairs. Stored as a GPU buffer `[max_pos, rot_dim/2, 2]` (cos, sin).
+///
+/// The frequencies `freq_i = 1 / theta^(2i/head_dim)` depend only on `theta`, `head_dim`, and
+/// `rot_dim` — they're identical across all layers and all calls with the same parameters. The
+/// cos/sin values `cos((pos+offset) * freq_i)` depend on the position offset, which changes only
+/// during prefill (batch of tokens at different positions). During decode (seq=1, offset grows
+/// by 1 per token), the table is precomputed up to `max_pos` so the cache covers all positions.
+///
+/// Eliminates the per-thread `pow` + `sincos` in the Metal kernel — replaced by a single memory
+/// lookup. For a 32-layer model with 8 FA layers, this saves 8 × 2 × 32 = 512 calls to `sincos`
+/// per token, each with 32 frequency pairs × 16 heads = 512 threads computing the same values.
+pub struct RopeCache {
+    pub cos_sin_buf: crate::gpu::Buf, // [max_pos, rot_dim/2, 2] f32
+    pub max_pos: usize,
+    pub rot_dim: usize,
+    pub theta: f32,
+    pub head_dim: usize,
+}
+
+impl RopeCache {
+    /// Precompute the cos/sin table on CPU and upload to GPU. Called once per model (not per layer).
+    pub fn new(
+        ctx: &Arc<MetalContext>,
+        max_pos: usize,
+        rot_dim: usize,
+        theta: f32,
+        head_dim: usize,
+    ) -> Self {
+        let half_rot = rot_dim / 2;
+        let mut table = vec![0.0f32; max_pos * half_rot * 2];
+        for pos in 0..max_pos {
+            for (pair, slot) in (0..half_rot).enumerate() {
+                let freq = 1.0f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                let angle = pos as f32 * freq;
+                let (sin, cos) = angle.sin_cos();
+                let idx = (pos * half_rot + slot) * 2;
+                table[idx] = cos;
+                table[idx + 1] = sin;
+            }
+        }
+        let bytes: Vec<u8> = table.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let cos_sin_buf = ctx.alloc_buffer(bytes.len());
+        crate::gpu::buf_write_bytes(&cos_sin_buf, &bytes);
+        RopeCache {
+            cos_sin_buf,
+            max_pos,
+            rot_dim,
+            theta,
+            head_dim,
+        }
+    }
+}
+
 /// Parsed Qwen3.5 / Qwen3-Next text-model architecture config (see `safetensors::config_from_hf_qwen35`).
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
