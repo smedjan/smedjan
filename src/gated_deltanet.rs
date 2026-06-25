@@ -36,6 +36,29 @@ use crate::gpu::MetalContext;
 #[cfg(test)]
 use std::sync::Arc;
 
+/// Parsed Qwen3.5 / Qwen3-Next text-model architecture config (see `safetensors::config_from_hf_qwen35`).
+#[derive(Debug, Clone)]
+pub struct Qwen35Config {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub head_dim: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: u32,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_conv_kernel_dim: usize,
+    pub full_attention_interval: usize,
+    /// Per-layer mixer: `true` = full attention, `false` = Gated DeltaNet (the 3:1 hybrid topology).
+    pub is_full_attention: Vec<bool>,
+}
+
 /// Lower-triangular ones `[seq,seq]` (incl. diagonal if `incl_diag`, else strict) tiled to `[bh,seq,seq]`.
 fn tri_mask(ctx: &std::sync::Arc<MetalContext>, bh: usize, seq: usize, incl_diag: bool) -> Tensor {
     let mut m = vec![0.0f32; seq * seq];
@@ -567,5 +590,23 @@ mod tests {
             assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
         }
         autograd::zero_grads();
+    }
+
+    #[test]
+    fn qwen35_config_parses_topology() {
+        let json = r#"{"model_type":"qwen3_5","text_config":{"hidden_size":4096,"num_hidden_layers":4,"head_dim":256,"num_attention_heads":16,"num_key_value_heads":4,"intermediate_size":12288,"vocab_size":248320,"rms_norm_eps":1e-06,"partial_rotary_factor":0.25,"linear_num_key_heads":16,"linear_num_value_heads":32,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"full_attention_interval":4,"rope_parameters":{"rope_theta":10000000},"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"]}}"#;
+        let p = std::env::temp_dir().join("qwen35_test_config.json");
+        std::fs::write(&p, json).unwrap();
+        let cfg = crate::safetensors::config_from_hf_qwen35(p.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.num_hidden_layers, 4);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.linear_num_key_heads, 16);
+        assert_eq!(cfg.linear_num_value_heads, 32);
+        assert_eq!(cfg.linear_conv_kernel_dim, 4);
+        assert_eq!(cfg.intermediate_size, 12288);
+        assert_eq!(cfg.is_full_attention, vec![false, false, false, true]);
+        assert!((cfg.partial_rotary_factor - 0.25).abs() < 1e-6);
+        assert!((cfg.rope_theta - 10_000_000.0).abs() < 1.0);
     }
 }

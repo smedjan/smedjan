@@ -789,6 +789,55 @@ pub fn config_from_hf_json(path: &str) -> std::io::Result<ModelConfig> {
     Ok(config)
 }
 
+/// Parse a Qwen3.5 / Qwen3-Next `config.json` (`model_type` "qwen3_5") into a `Qwen35Config`,
+/// reading the nested `text_config` incl. the `layer_types` hybrid topology. Vision tower ignored.
+pub fn config_from_hf_qwen35(path: &str) -> std::io::Result<crate::gated_deltanet::Qwen35Config> {
+    let bytes = std::fs::read(path)?;
+    let json = parse_header(&bytes)?;
+    let tc = json
+        .get("text_config")
+        .ok_or_else(|| invalid("config.json: missing text_config"))?;
+    let req_u = |k: &str| -> std::io::Result<usize> {
+        tc.get(k)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| invalid(format!("text_config: missing/invalid integer '{k}'")))
+    };
+    let opt_f = |k: &str, d: f32| -> f32 { tc.get(k).and_then(|v| v.as_f64()).map_or(d, |n| n as f32) };
+    let rope_theta = tc
+        .get("rope_parameters")
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .map_or(10_000.0, |n| n as f32);
+    let layer_types = tc
+        .get("layer_types")
+        .and_then(|v| v.as_arr())
+        .ok_or_else(|| invalid("text_config: missing layer_types array"))?;
+    let is_full_attention: Vec<bool> = layer_types
+        .iter()
+        .map(|lt| lt.as_str() == Some("full_attention"))
+        .collect();
+    Ok(crate::gated_deltanet::Qwen35Config {
+        hidden_size: req_u("hidden_size")?,
+        num_hidden_layers: req_u("num_hidden_layers")?,
+        head_dim: req_u("head_dim")?,
+        num_attention_heads: req_u("num_attention_heads")?,
+        num_key_value_heads: req_u("num_key_value_heads")?,
+        intermediate_size: req_u("intermediate_size")?,
+        vocab_size: req_u("vocab_size")? as u32,
+        rms_norm_eps: opt_f("rms_norm_eps", 1e-6),
+        rope_theta,
+        partial_rotary_factor: opt_f("partial_rotary_factor", 1.0),
+        linear_num_key_heads: req_u("linear_num_key_heads")?,
+        linear_num_value_heads: req_u("linear_num_value_heads")?,
+        linear_key_head_dim: req_u("linear_key_head_dim")?,
+        linear_value_head_dim: req_u("linear_value_head_dim")?,
+        linear_conv_kernel_dim: req_u("linear_conv_kernel_dim")?,
+        full_attention_interval: req_u("full_attention_interval")?,
+        is_full_attention,
+    })
+}
+
 pub fn import_hf_safetensors(
     ctx: &Arc<MetalContext>,
     path: &str,
