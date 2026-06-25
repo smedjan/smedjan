@@ -432,6 +432,9 @@ pub struct OwnedDelta {
     pub q_w_b: Option<QuantizedTensor>,
     pub q_z_gate: Option<QuantizedTensor>,
     pub q_w_o: Option<QuantizedTensor>,
+    /// Combined in_proj_qkv QuantizedTensor [qkv_out, d]. When present, the strict forward does
+    /// one qmatmul and splits the output into q/k/v (avoids 3 separate GPU buffers for one tensor).
+    pub q_qkv: Option<QuantizedTensor>,
 }
 /// Owned weights for a full-attention layer.
 ///
@@ -489,6 +492,44 @@ fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
     g.silu_gate(&u).matmul(down).reshape(vec![b, s, d])
 }
 
+/// Quantized-aware SwiGLU: when quantized FFN weights are present, uses qmatmul instead of matmul.
+fn swiglu_q(
+    x: &Tensor,
+    q_gate: &Option<QuantizedTensor>,
+    q_up: &Option<QuantizedTensor>,
+    q_down: &Option<QuantizedTensor>,
+    f_gate: &Tensor,
+    f_up: &Tensor,
+    f_down: &Tensor,
+) -> Tensor {
+    let (b, s, d) = (x.shape[0], x.shape[1], x.shape[2]);
+    let xf = x.reshape(vec![b * s, d]);
+    let g = match q_gate {
+        Some(q) => q.qmatmul(&xf),
+        None => xf.matmul(f_gate),
+    };
+    let u = match q_up {
+        Some(q) => q.qmatmul(&xf),
+        None => xf.matmul(f_up),
+    };
+    let out = g.silu_gate(&u);
+    match q_down {
+        Some(q) => q.qmatmul(&out).reshape(vec![b, s, d]),
+        None => out.matmul(f_down).reshape(vec![b, s, d]),
+    }
+}
+
+/// Matmul that uses the quantized weight when available, falls back to f32 otherwise.
+/// `xf` is `[M, K]`, the weight is logically `[K, N]` (smedjan matmul convention) but stored
+/// as `[N, K]` in the quantized version (HF convention = transposed B for the qmatmul kernel).
+#[inline]
+fn qmul(xf: &Tensor, qw: &Option<QuantizedTensor>, fw: &Tensor) -> Tensor {
+    match qw {
+        Some(q) => q.qmatmul(xf),
+        None => xf.matmul(fw),
+    }
+}
+
 /// Strict Qwen3.5 Gated-DeltaNet forward — the real activation path (vs the placeholder
 /// `-relu`/`sigmoid` in `qwen3_deltanet_mixer`). Differences:
 ///   - `beta = sigmoid(xf @ w_b)`  (same as placeholder)
@@ -513,12 +554,28 @@ pub fn qwen3_deltanet_mixer_strict(
             .silu()
             .reshape(vec![batch * seq, c])
     };
-    let q = conv(xf.matmul(&w.w_q), &w.conv_q, n_k * dh);
-    let k = conv(xf.matmul(&w.w_k), &w.conv_k, n_k * dh);
-    let v = conv(xf.matmul(&w.w_v), &w.conv_v, n_v * dh);
+    let q_len = n_k * dh;
+    let k_len = n_k * dh;
+    let v_len = n_v * dh;
+    // Q/K/V: combined in_proj_qkv → one qmatmul → split output via slice_cols.
+    let (q_raw, k_raw, v_raw) = match &w.q_qkv {
+        Some(q) => {
+            let qkv = q.qmatmul(&xf); // [M, qkv_out]
+            let q = conv(qkv.slice_cols(0, q_len), &w.conv_q, q_len);
+            let k = conv(qkv.slice_cols(q_len, k_len), &w.conv_k, k_len);
+            let v = conv(qkv.slice_cols(q_len + k_len, v_len), &w.conv_v, v_len);
+            (q, k, v)
+        }
+        None => {
+            let q = conv(xf.matmul(&w.w_q), &w.conv_q, q_len);
+            let k = conv(xf.matmul(&w.w_k), &w.conv_k, k_len);
+            let v = conv(xf.matmul(&w.w_v), &w.conv_v, v_len);
+            (q, k, v)
+        }
+    };
     let rep = n_v / n_k;
-    let q = expand_heads(&q, n_k, rep, dh);
-    let k = expand_heads(&k, n_k, rep, dh);
+    let q = expand_heads(&q_raw, n_k, rep, dh);
+    let k = expand_heads(&k_raw, n_k, rep, dh);
     let fold = |t: Tensor| {
         crate::attention::transpose_bsh_to_bhs(
             &t.reshape(vec![batch, seq, n_v * dh]),
@@ -531,18 +588,14 @@ pub fn qwen3_deltanet_mixer_strict(
     let ones_dh = Tensor::ones(&x.ctx, vec![dh]);
     let qh = fold(q).rms_norm(&ones_dh, 1e-6);
     let kh = fold(k).rms_norm(&ones_dh, 1e-6);
-    let vh = fold(v);
-    // Real gates: g = -exp(A_log) * softplus(a + dt_bias), beta = sigmoid(b).
-    let a_proj = xf.matmul(&w.w_a); // [batch*seq, n_v]
-    let b_proj = xf.matmul(&w.w_b); // [batch*seq, n_v]
-                                    // Broadcast A_log [n_v] and dt_bias [n_v] across (batch*seq): add via scale_rows trick.
-                                    // a + dt_bias: add per-head bias to each (batch*seq) row.
+    let vh = fold(v_raw);
+    let a_proj = qmul(&xf, &w.q_w_a, &w.w_a);
+    let b_proj = qmul(&xf, &w.q_w_b, &w.w_b);
     let dt_bias_rows = w.dt_bias.broadcast_rows(batch * seq);
     let a_plus_dt = a_proj.add(&dt_bias_rows);
-    let softplus_a = a_plus_dt.softplus(); // [batch*seq, n_v]
-                                           // exp(A_log) broadcast across (batch*seq): exp(A_log) is [n_v], broadcast to [batch*seq, n_v].
-    let exp_a_log = w.a_log.exp().broadcast_rows(batch * seq); // [batch*seq, n_v]
-    let g_neg = exp_a_log.mul(&softplus_a).scale(-1.0); // g = -exp(A_log) * softplus(a + dt_bias)
+    let softplus_a = a_plus_dt.softplus();
+    let exp_a_log = w.a_log.exp().broadcast_rows(batch * seq);
+    let g_neg = exp_a_log.mul(&softplus_a).scale(-1.0);
     let beta = sigmoid(&b_proj);
     let fold_scalar = |t: Tensor| {
         crate::attention::transpose_bsh_to_bhs(
@@ -555,16 +608,13 @@ pub fn qwen3_deltanet_mixer_strict(
         .reshape(vec![batch * n_v, seq])
     };
     let o = gated_delta_rule(&qh, &kh, &vh, &fold_scalar(g_neg), &fold_scalar(beta));
-    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_v, dh); // [batch,seq,n_v*dh]
-                                                                             // RMSNormGated: norm(o) * silu(z), z = xf @ z_gate.
-    let z = xf.matmul(&w.z_gate).reshape(vec![batch, seq, n_v * dh]);
+    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_v, dh);
+    let z = qmul(&xf, &w.q_z_gate, &w.z_gate).reshape(vec![batch, seq, n_v * dh]);
     let o_2d = o.reshape(vec![batch * seq * n_v, dh]);
     let z_2d = z.reshape(vec![batch * seq * n_v, dh]);
     let o_gated = o_2d.rms_norm_gated(&z_2d, &w.out_norm, eps);
-    o_gated
-        .reshape(vec![batch * seq, n_v * dh])
-        .matmul(&w.w_o)
-        .reshape(vec![batch, seq, dmodel])
+    let o_flat = o_gated.reshape(vec![batch * seq, n_v * dh]);
+    qmul(&o_flat, &w.q_w_o, &w.w_o).reshape(vec![batch, seq, dmodel])
 }
 
 /// Strict Qwen3.5 full-attention forward — the real q_proj split + separate q/k norms.
@@ -582,19 +632,28 @@ pub fn qwen3_full_attention_mixer_strict(
 ) -> Tensor {
     let (batch, seq, dmodel) = (x.shape[0], x.shape[1], x.shape[2]);
     let xf = x.reshape(vec![batch * seq, dmodel]);
-    // Use the doubled q_proj if the loader populated it; otherwise fall back to w_q + w_gate.
-    let (q_proj, gate_proj) = if let Some(qp) = &w.q_proj_out {
-        // qp is [d, n_h*hd*2]. Split columns into q [d, n_h*hd] and gate [d, n_h*hd].
-        let q_w = qp.slice_cols(0, n_h * hd);
-        let g_w = qp.slice_cols(n_h * hd, n_h * hd);
-        (q_w, g_w)
-    } else {
-        (w.w_q.clone(), w.w_gate.clone())
+    // q_proj is doubled: [n_h*hd*2, d]. When quantized, do one qmatmul + split output.
+    // When f32, split the weight columns then matmul.
+    let (q_out, gate_out) = match &w.q_q_proj_out {
+        Some(qp) => {
+            let qg = qp.qmatmul(&xf); // [M, n_h*hd*2]
+            (
+                qg.slice_cols(0, n_h * hd),
+                qg.slice_cols(n_h * hd, n_h * hd),
+            )
+        }
+        None => match &w.q_proj_out {
+            Some(qp) => {
+                let q_w = qp.slice_cols(0, n_h * hd);
+                let g_w = qp.slice_cols(n_h * hd, n_h * hd);
+                (xf.matmul(&q_w), xf.matmul(&g_w))
+            }
+            None => (xf.matmul(&w.w_q), xf.matmul(&w.w_gate)),
+        },
     };
-    let q = xf.matmul(&q_proj);
     let rep = n_h / n_kv;
-    let k = expand_heads(&xf.matmul(&w.w_k), n_kv, rep, hd);
-    let v = expand_heads(&xf.matmul(&w.w_v), n_kv, rep, hd);
+    let k = expand_heads(&qmul(&xf, &w.q_w_k, &w.w_k), n_kv, rep, hd);
+    let v = expand_heads(&qmul(&xf, &w.q_w_v, &w.w_v), n_kv, rep, hd);
     let fold = |t: Tensor| {
         crate::attention::transpose_bsh_to_bhs(
             &t.reshape(vec![batch, seq, n_h * hd]),
@@ -604,8 +663,12 @@ pub fn qwen3_full_attention_mixer_strict(
             hd,
         )
     };
-    // Separate q_norm and k_norm (placeholder shared qk_norm for both).
-    let qh = partial_rope(&fold(q).rms_norm(&w.qk_norm, 1e-6), rot_dim, 0, rope_theta);
+    let qh = partial_rope(
+        &fold(q_out).rms_norm(&w.qk_norm, 1e-6),
+        rot_dim,
+        0,
+        rope_theta,
+    );
     let kh = partial_rope(&fold(k).rms_norm(&w.k_norm, 1e-6), rot_dim, 0, rope_theta);
     let vh = fold(v);
     let scale = 1.0 / (hd as f32).sqrt();
@@ -618,11 +681,9 @@ pub fn qwen3_full_attention_mixer_strict(
         seq,
         n_h * hd,
     ]);
-    let gate = xf.matmul(&gate_proj).reshape(vec![batch, seq, n_h * hd]);
-    output_gate(&o, &gate)
-        .reshape(vec![batch * seq, n_h * hd])
-        .matmul(&w.w_o)
-        .reshape(vec![batch, seq, dmodel])
+    let gate = gate_out.reshape(vec![batch, seq, n_h * hd]);
+    let og = output_gate(&o, &gate).reshape(vec![batch * seq, n_h * hd]);
+    qmul(&og, &w.q_w_o, &w.w_o).reshape(vec![batch, seq, dmodel])
 }
 
 impl Qwen35Model {
@@ -721,8 +782,11 @@ impl Qwen35Model {
             };
             h = h.add(&mixed);
             let normed2 = h.rms_norm(&layer.ln2, eps);
-            h = h.add(&swiglu(
+            h = h.add(&swiglu_q(
                 &normed2,
+                &layer.q_ffn_gate,
+                &layer.q_ffn_up,
+                &layer.q_ffn_down,
                 &layer.ffn_gate,
                 &layer.ffn_up,
                 &layer.ffn_down,
@@ -730,9 +794,9 @@ impl Qwen35Model {
         }
         let h = h.rms_norm(&self.final_norm, eps);
         let (b, s, d) = (h.shape[0], h.shape[1], h.shape[2]);
-        h.reshape(vec![b * s, d])
-            .matmul(&self.lm_head)
-            .reshape(vec![b, s, c.vocab_size as usize])
+        let hf = h.reshape(vec![b * s, d]);
+        let logits = qmul(&hf, &self.q_lm_head, &self.lm_head);
+        logits.reshape(vec![b, s, c.vocab_size as usize])
     }
 }
 
@@ -1163,7 +1227,14 @@ mod tests {
             a_log: Tensor::zeros(&ctx, vec![lnv]),
             dt_bias: Tensor::ones(&ctx, vec![lnv]),
             z_gate: mk(d, lnv * ldh),
-            q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None,
+            q_w_q: None,
+            q_w_k: None,
+            q_w_v: None,
+            q_w_a: None,
+            q_w_b: None,
+            q_z_gate: None,
+            q_w_o: None,
+            q_qkv: None,
         };
         let full = OwnedFull {
             w_q: mk(d, n_h * hd),
@@ -1173,7 +1244,11 @@ mod tests {
             w_gate: mk(d, n_h * hd),
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
-            q_proj_out: None, q_w_q: None, q_w_k: None, q_w_v: None, q_w_o: None, q_q_proj_out: None,
+            q_proj_out: None,
+            q_w_q: None,
+            q_w_k: None,
+            q_w_v: None,
+            q_w_o: None, q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
@@ -1185,7 +1260,10 @@ mod tests {
                 mixer: Mixer::Delta(delta),
                 ffn_gate: g0,
                 ffn_up: u0,
-                ffn_down: dn0, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
+                ffn_down: dn0,
+                q_ffn_gate: None,
+                q_ffn_up: None,
+                q_ffn_down: None,
             },
             Qwen35Layer {
                 ln1: mkn(d),
@@ -1193,7 +1271,10 @@ mod tests {
                 mixer: Mixer::Full(full),
                 ffn_gate: g1,
                 ffn_up: u1,
-                ffn_down: dn1, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
+                ffn_down: dn1,
+                q_ffn_gate: None,
+                q_ffn_up: None,
+                q_ffn_down: None,
             },
         ];
         let model = Qwen35Model {
@@ -1201,7 +1282,9 @@ mod tests {
             final_norm: mkn(d),
             lm_head: mk(d, vocab),
             cfg,
-            embed: None, q_embed: None, q_lm_head: None,
+            embed: None,
+            q_embed: None,
+            q_lm_head: None,
         };
         let (batch, seq) = (1usize, 4);
         let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1).with_grad();
@@ -1267,7 +1350,14 @@ mod tests {
             a_log: Tensor::full(&ctx, vec![lnv], 0.5), // exp(0.5)≈1.65, finite
             dt_bias: Tensor::full(&ctx, vec![lnv], 0.1),
             z_gate: mk(d, lnv * ldh),
-            q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None,
+            q_w_q: None,
+            q_w_k: None,
+            q_w_v: None,
+            q_w_a: None,
+            q_w_b: None,
+            q_z_gate: None,
+            q_w_o: None,
+            q_qkv: None,
         };
         // Full-attn with the doubled q_proj_out populated (exercises the split path).
         let q_proj_out = mk(d, n_h * hd * 2);
@@ -1279,7 +1369,11 @@ mod tests {
             w_gate: mk(d, n_h * hd),
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
-            q_proj_out: Some(q_proj_out), q_w_q: None, q_w_k: None, q_w_v: None, q_w_o: None, q_q_proj_out: None,
+            q_proj_out: Some(q_proj_out),
+            q_w_q: None,
+            q_w_k: None,
+            q_w_v: None,
+            q_w_o: None, q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
@@ -1291,7 +1385,10 @@ mod tests {
                 mixer: Mixer::Delta(delta),
                 ffn_gate: g0,
                 ffn_up: u0,
-                ffn_down: dn0, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
+                ffn_down: dn0,
+                q_ffn_gate: None,
+                q_ffn_up: None,
+                q_ffn_down: None,
             },
             Qwen35Layer {
                 ln1: mkn(d),
@@ -1299,7 +1396,10 @@ mod tests {
                 mixer: Mixer::Full(full),
                 ffn_gate: g1,
                 ffn_up: u1,
-                ffn_down: dn1, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
+                ffn_down: dn1,
+                q_ffn_gate: None,
+                q_ffn_up: None,
+                q_ffn_down: None,
             },
         ];
         let model = Qwen35Model {
@@ -1307,7 +1407,9 @@ mod tests {
             final_norm: mkn(d),
             lm_head: mk(d, vocab),
             cfg,
-            embed: None, q_embed: None, q_lm_head: None,
+            embed: None,
+            q_embed: None,
+            q_lm_head: None,
         };
         let (batch, seq) = (1usize, 4);
         let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1);

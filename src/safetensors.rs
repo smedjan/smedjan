@@ -1086,7 +1086,7 @@ fn put_transposed(
 /// into a freshly-allocated `Qwen35Model` (smedjan).
 ///
 /// Maps the 927 quantized tensors (names prefixed `language_model.`) onto the hybrid topology:
-///   - 24 Gated-DeltaNet layers (combined `in_proj_qkv` split into q/k/v, `in_proj_z` → z_gate, q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None,
+///   - 24 Gated-DeltaNet layers (combined `in_proj_qkv` split into q/k/v, `in_proj_z` → z_gate, q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None, q_qkv: None,
 ///     `in_proj_a/b` → gate/beta pre-acts, `A_log`+`dt_bias`, conv1d, out-norm, out-proj).
 ///   - 8 full-attention layers (`q_proj` doubled → q + output-gate, `q_norm`+`k_norm` separate).
 ///   - Shared `embed_tokens`, `model.norm`, `lm_head`, per-layer `input_layernorm` /
@@ -1409,6 +1409,7 @@ pub fn import_qwen35_safetensors(
                 q_w_b: Some(q_w_b),
                 q_z_gate: Some(q_z_gate),
                 q_w_o: Some(q_w_o),
+                q_qkv: Some(q_qkv),
             })
         };
 
