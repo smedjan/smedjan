@@ -523,7 +523,7 @@ fn swiglu_q(
 /// `xf` is `[M, K]`, the weight is logically `[K, N]` (smedjan matmul convention) but stored
 /// as `[N, K]` in the quantized version (HF convention = transposed B for the qmatmul kernel).
 #[inline]
-fn qmul(xf: &Tensor, qw: &Option<QuantizedTensor>, fw: &Tensor) -> Tensor {
+pub fn qmul(xf: &Tensor, qw: &Option<QuantizedTensor>, fw: &Tensor) -> Tensor {
     match qw {
         Some(q) => q.qmatmul(xf),
         None => xf.matmul(fw),
@@ -1248,7 +1248,8 @@ mod tests {
             q_w_q: None,
             q_w_k: None,
             q_w_v: None,
-            q_w_o: None, q_q_proj_out: None,
+            q_w_o: None,
+            q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
@@ -1373,7 +1374,8 @@ mod tests {
             q_w_q: None,
             q_w_k: None,
             q_w_v: None,
-            q_w_o: None, q_q_proj_out: None,
+            q_w_o: None,
+            q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
