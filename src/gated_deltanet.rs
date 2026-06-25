@@ -212,6 +212,27 @@ pub fn output_gate(out: &Tensor, gate: &Tensor) -> Tensor {
     out.mul(&sigmoid(gate))
 }
 
+/// GQA head expansion for the asymmetric DeltaNet (Qwen3.5: 16 key heads → 32 value heads).
+/// Repeat each of `n_in` head-blocks `repeat` times along the feature axis via a constant
+/// block-selection matmul. `x:[rows, n_in*d]` → `[rows, n_in*repeat*d]`; out head `h*repeat+r` == in `h`.
+pub fn expand_heads(x: &Tensor, n_in: usize, repeat: usize, d: usize) -> Tensor {
+    if repeat == 1 {
+        return x.clone();
+    }
+    let rows = x.shape[0];
+    assert_eq!(x.shape, vec![rows, n_in * d]);
+    let out_dim = n_in * repeat * d;
+    let mut e = vec![0.0f32; (n_in * d) * out_dim];
+    for h in 0..n_in {
+        for r in 0..repeat {
+            for j in 0..d {
+                e[(h * d + j) * out_dim + (h * repeat + r) * d + j] = 1.0;
+            }
+        }
+    }
+    x.matmul(&Tensor::from_slice(&x.ctx, &e, vec![n_in * d, out_dim]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +435,34 @@ mod tests {
         for (g, xi) in got.iter().zip(x.iter()) {
             let w = 1.0 / (1.0 + (-xi).exp());
             assert!((g - w).abs() < 1e-3, "sigmoid {g} vs {w}");
+        }
+    }
+
+    #[test]
+    fn expand_heads_matches_cpu() {
+        let ctx = ctx();
+        let (rows, n_in, repeat, d) = (3usize, 2usize, 2usize, 3usize);
+        let x: Vec<f32> = (0..rows * n_in * d).map(|i| i as f32 * 0.5).collect();
+        let got = autograd::no_grad(|| {
+            expand_heads(
+                &Tensor::from_slice(&ctx, &x, vec![rows, n_in * d]),
+                n_in,
+                repeat,
+                d,
+            )
+            .to_vec()
+        });
+        let outdim = n_in * repeat * d;
+        for row in 0..rows {
+            for h in 0..n_in {
+                for r in 0..repeat {
+                    for j in 0..d {
+                        let want = x[row * (n_in * d) + h * d + j];
+                        let g = got[row * outdim + (h * repeat + r) * d + j];
+                        assert!((g - want).abs() < 1e-4, "expand mismatch");
+                    }
+                }
+            }
         }
     }
 }
