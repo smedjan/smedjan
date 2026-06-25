@@ -3178,6 +3178,61 @@ pub fn gpu_exp(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, s
     dispatch_sync!(ctx, "exp_fwd", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
 }
 
+/// Elementwise natural log: output = log(max(input, smallest_normal)). See `shaders::LOG`.
+pub fn gpu_log(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params {
+        size: u32,
+    }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "log_fwd", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
+}
+
+/// Elementwise softplus: output = log(1 + exp(x)), numerically stable. See `shaders::SOFTPLUS`.
+pub fn gpu_softplus(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    #[repr(C)]
+    struct Params {
+        size: u32,
+    }
+    let params = Params { size };
+    let params_buf = params_buffer(ctx, &params);
+    let tpg = 256u64;
+    let grid = MetalContext::size((size as u64).div_ceil(tpg), 1, 1);
+    let tg = MetalContext::size(tpg, 1, 1);
+    dispatch_sync!(ctx, "softplus_fwd", grid, tg, 0 => input, 1 => output, 2 => &params_buf);
+}
+
+/// RMSNorm-Gated: out = rms_norm(x, weight, eps) * silu(z) per row. See `shaders::RMS_NORM_GATED`.
+/// x and gate are both `[rows, cols]`; weight is `[cols]`.
+pub fn gpu_rms_norm_gated(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    output: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+    eps: f32,
+) {
+    #[repr(C)]
+    struct Params {
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    }
+    let params = Params { rows, cols, eps };
+    let params_buf = params_buffer(ctx, &params);
+    let threads_per_group = next_power_of_2_clamped(cols as u64);
+    let grid = MetalContext::size(rows as u64, 1, 1);
+    let tg = MetalContext::size(threads_per_group, 1, 1);
+    dispatch_sync!(ctx, "rms_norm_gated", grid, tg,
+        0 => input, 1 => gate, 2 => weight, 3 => output, 4 => &params_buf);
+}
+
 /// ReLU backward: grad_input = grad_output * (input > 0)
 pub fn gpu_relu_backward(
     ctx: &Arc<MetalContext>,

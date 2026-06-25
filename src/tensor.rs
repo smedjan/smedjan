@@ -1540,6 +1540,62 @@ impl Tensor {
         out
     }
 
+    /// Elementwise natural log: `log(max(x, smallest_normal))`. Forward-only (gate weights are
+    /// loaded constants for the strict Qwen3.5 path; add a backward entry if training needs it).
+    pub fn log(&self) -> Tensor {
+        let size = self.numel();
+        let out_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_log(&self.ctx, &self.buffer, &out_buf, size as u32);
+        Tensor {
+            id: autograd::next_id(),
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+
+    /// Elementwise softplus: `log(1 + exp(x))`, numerically stable. Forward-only (see `log`).
+    /// Used by Qwen3.5's gate: `g = -exp(A_log) * softplus(a + dt_bias)`.
+    pub fn softplus(&self) -> Tensor {
+        let size = self.numel();
+        let out_buf = self.ctx.alloc_buffer(size * 4);
+        compute::gpu_softplus(&self.ctx, &self.buffer, &out_buf, size as u32);
+        Tensor {
+            id: autograd::next_id(),
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+
+    /// RMSNorm-Gated: `rms_norm(x, weight, eps) * silu(z)` per row — the Qwen3.5
+    /// `linear_attn.norm` op. `self` is x `[rows, cols]`, `gate` is z `[rows, cols]`,
+    /// `weight` is the per-feature scale `[cols]`. Forward-only (gate z is a loaded constant).
+    pub fn rms_norm_gated(&self, gate: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        let out_buf = self.ctx.alloc_buffer(rows * cols * 4);
+        compute::gpu_rms_norm_gated(
+            &self.ctx,
+            &self.buffer,
+            &gate.buffer,
+            &weight.buffer,
+            &out_buf,
+            rows as u32,
+            cols as u32,
+            eps,
+        );
+        Tensor {
+            id: autograd::next_id(),
+            buffer: out_buf,
+            shape: self.shape.clone(),
+            requires_grad: self.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+
     /// Broadcast a 1-D `[cols]` vector to `[rows, cols]` (each row a copy). A direct-copy kernel,
     /// cheaper than the `ones[rows,1] @ vec[1,cols]` outer-product matmul it replaces. Backward
     /// sums the gradient over rows (column-sum). `self` must be 1-D.

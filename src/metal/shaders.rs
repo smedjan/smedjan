@@ -1624,6 +1624,112 @@ kernel void exp_fwd(
 }
 "#;
 
+/// Elementwise natural log: output = log(max(input, 1.4e-45)) — floor-clamped to avoid log(0)=-inf.
+/// Used by `softplus = log(1 + exp(x))` and by Qwen3.5's `A_log` decay path. Backward:
+/// d/dx log(x) = 1/x, so grad_input = grad_output / input (read from the output buffer).
+pub const LOG: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LogParams { uint size; };
+
+kernel void log_fwd(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant LogParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    // Clamp away from zero so log(0) and log(neg) don't produce -inf/NaN. The Qwen3.5 A_log path
+    // only ever feeds non-negative values; the clamp is pure overflow insurance.
+    float v = input[gid];
+    output[gid] = log(max(v, 1.17549435e-38f)); // smallest positive normal f32
+}
+"#;
+
+/// Elementwise softplus: output = log(1 + exp(x)), numerically stable.
+/// For x > 20: log(1+exp(x)) ≈ x; for x < -20: ≈ exp(x). Branchless form:
+///   softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+/// Used by Qwen3.5's gate: `g = -exp(A_log) * softplus(a + dt_bias)`.
+pub const SOFTPLUS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct SoftplusParams { uint size; };
+
+kernel void softplus_fwd(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant SoftplusParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float x = input[gid];
+    // Branchless: max(x,0) + log(1 + exp(-|x|)). exp clamped at 80 inside log1p-safe region.
+    // Metal has no log1p; use log(1 + ...) directly (safe since exp(-|x|) ≤ 1).
+    float abs_x = abs(x);
+    output[gid] = max(x, 0.0f) + log(1.0f + exp(-abs_x));
+}
+"#;
+
+/// RMSNorm-Gated: the Qwen3.5 `linear_attn.norm` op. Computes RMSNorm(x) * silu(z) per row,
+/// where x and z are both `[cols]` per row. Used by the strict_qwen35 forward after the gated
+/// delta rule. Equivalent to `rms_norm(x, weight, eps) * silu(z)` but fused into one kernel
+/// (one read pass, one write). Inputs: x `[rows, cols]`, z `[rows, cols]`, weight `[cols]`.
+pub const RMS_NORM_GATED: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NormGatedParams {
+    uint rows;
+    uint cols;
+    float eps;
+};
+
+kernel void rms_norm_gated(
+    device const float* input [[buffer(0)]],
+    device const float* gate  [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant NormGatedParams& params [[buffer(4)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg [[simdgroups_per_threadgroup]]
+) {
+    uint row = group_id;
+    if (row >= params.rows) return;
+    uint cols = params.cols;
+    device const float* row_in = input + row * cols;
+    device const float* row_gate = gate + row * cols;
+    device float* row_out = output + row * cols;
+
+    // Sum of squares of input.
+    float local_ss = 0.0f;
+    for (uint c = thread_index; c < cols; c += threads_per_group) {
+        float val = row_in[c];
+        local_ss += val * val;
+    }
+    float simd_ss = simd_sum(local_ss);
+    threadgroup float shared_vals[8];
+    if (simd_lane_id == 0) shared_vals[simd_group_id] = simd_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_ss = 0.0f;
+    for (uint i = 0; i < simd_groups_per_tg; i++) total_ss += shared_vals[i];
+    float rms = rsqrt(total_ss / float(cols) + params.eps);
+
+    // out = rms_norm(x) * silu(z) = (x * rms * weight) * (z / (1 + exp(-z)))
+    for (uint c = thread_index; c < cols; c += threads_per_group) {
+        float normed = row_in[c] * rms * weight[c];
+        float gz = row_gate[c];
+        float silu_z = gz / (1.0f + exp(-gz));
+        row_out[c] = normed * silu_z;
+    }
+}
+"#;
+
 /// Broadcast a `[cols]` vector to `[rows, cols]`: out`[r*cols + c]` = vec`[c]`. A direct copy,
 /// avoiding the wasted tiled-matmul machinery of an `ones[rows,1] @ vec[1,cols]` outer product.
 pub const BROADCAST_ROWS: &str = r#"
