@@ -124,6 +124,77 @@ pub fn gated_delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, log_g: &Tensor, beta
     m_read.batched_matmul(&dv)
 }
 
+/// Shift `x:[bh,seq,c]` by `lag` timesteps into the past: `out[t]=x[t-lag]` (zero for `t<lag`).
+fn shift_by(x: &Tensor, lag: usize, bh: usize, seq: usize, _c: usize) -> Tensor {
+    if lag == 0 {
+        return x.clone();
+    }
+    let mut s = vec![0.0f32; seq * seq];
+    for t in lag..seq {
+        s[t * seq + (t - lag)] = 1.0;
+    }
+    Tensor::from_slice(&x.ctx, &s, vec![seq * seq])
+        .broadcast_rows(bh)
+        .reshape(vec![bh, seq, seq])
+        .batched_matmul(x)
+}
+
+/// Depthwise **causal conv1d** (Qwen3.5 `linear_conv_kernel_dim`). `x:[bh,seq,c]`, `kernel:[c,kw]`
+/// (`kernel[c,kw-1]` = current-tap weight). `out[b,t,c] = Σ_j kernel[c,j]·x[b, t-(kw-1)+j, c]`.
+pub fn causal_conv1d(x: &Tensor, kernel: &Tensor, kw: usize) -> Tensor {
+    let (bh, seq, c) = (x.shape[0], x.shape[1], x.shape[2]);
+    assert_eq!(kernel.shape, vec![c, kw]);
+    let mut acc: Option<Tensor> = None;
+    for j in 0..kw {
+        let lag = kw - 1 - j;
+        let shifted = shift_by(x, lag, bh, seq, c);
+        let kj = kernel.slice_cols(j, 1).reshape(vec![c]); // kernel[:,j]
+        let kj_b = kj.broadcast_rows(bh * seq).reshape(vec![bh, seq, c]);
+        let term = shifted.mul(&kj_b);
+        acc = Some(match acc {
+            None => term,
+            Some(a) => a.add(&term),
+        });
+    }
+    acc.unwrap()
+}
+
+/// Constant selection matrix `[in_dim, out_dim]` with `M[i, base+i] = 1` (scatter a slice into cols).
+fn select_into(
+    ctx: &std::sync::Arc<MetalContext>,
+    in_dim: usize,
+    out_dim: usize,
+    base: usize,
+) -> Tensor {
+    let mut m = vec![0.0f32; in_dim * out_dim];
+    for i in 0..in_dim {
+        m[i * out_dim + (base + i)] = 1.0;
+    }
+    Tensor::from_slice(ctx, &m, vec![in_dim, out_dim])
+}
+
+/// **Partial RoPE** (Qwen3.5 `partial_rotary_factor`): rotate only the first `rot_dim` of `head_dim`,
+/// pass the rest through unchanged. Reassembled with constant selection matmuls (concat_flat is a
+/// flat append, not a per-row column concat).
+pub fn partial_rope(x: &Tensor, rot_dim: usize, offset: u32, theta: f32) -> Tensor {
+    let (bh, seq, hd) = (x.shape[0], x.shape[1], x.shape[2]);
+    if rot_dim >= hd {
+        return x.apply_rope(offset, theta);
+    }
+    let x2 = x.reshape(vec![bh * seq, hd]);
+    let xr = x2
+        .slice_cols(0, rot_dim)
+        .reshape(vec![bh, seq, rot_dim])
+        .apply_rope(offset, theta)
+        .reshape(vec![bh * seq, rot_dim]);
+    let xp = x2.slice_cols(rot_dim, hd - rot_dim);
+    let p_rot = select_into(&x.ctx, rot_dim, hd, 0);
+    let p_pass = select_into(&x.ctx, hd - rot_dim, hd, rot_dim);
+    xr.matmul(&p_rot)
+        .add(&xp.matmul(&p_pass))
+        .reshape(vec![bh, seq, hd])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +320,72 @@ mod tests {
             assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
         }
         autograd::zero_grads();
+    }
+
+    #[test]
+    fn conv1d_matches_cpu() {
+        let ctx = ctx();
+        let (bh, seq, c, kw) = (2usize, 5usize, 3usize, 4usize);
+        let n = bh * seq * c;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let ker: Vec<f32> = (0..c * kw).map(|i| ((i * 3 % 5) as f32 - 2.0) * 0.3).collect();
+        let got = autograd::no_grad(|| {
+            causal_conv1d(
+                &Tensor::from_slice(&ctx, &x, vec![bh, seq, c]),
+                &Tensor::from_slice(&ctx, &ker, vec![c, kw]),
+                kw,
+            )
+            .to_vec()
+        });
+        let mut want = vec![0.0f32; n];
+        for b in 0..bh {
+            for t in 0..seq {
+                for ch in 0..c {
+                    let mut acc = 0.0;
+                    for j in 0..kw {
+                        let lag = kw - 1 - j;
+                        if t >= lag {
+                            acc += ker[ch * kw + j] * x[(b * seq + (t - lag)) * c + ch];
+                        }
+                    }
+                    want[(b * seq + t) * c + ch] = acc;
+                }
+            }
+        }
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() <= 1e-3 * (1.0 + w.abs()), "conv1d gpu={g} cpu={w}");
+        }
+    }
+
+    #[test]
+    fn partial_rope_passthrough_and_full() {
+        let ctx = ctx();
+        let (bh, seq, hd) = (2usize, 4usize, 6usize);
+        let x: Vec<f32> = (0..bh * seq * hd)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let (full, part) = autograd::no_grad(|| {
+            let xt = Tensor::from_slice(&ctx, &x, vec![bh, seq, hd]);
+            (
+                xt.apply_rope(0, 10000.0).to_vec(),
+                partial_rope(&xt, 4, 0, 10000.0).to_vec(),
+            )
+        });
+        // pass columns [4,6) must be unchanged by partial rope (rot_dim=4)
+        for b in 0..bh {
+            for t in 0..seq {
+                for d in 4..hd {
+                    let idx = (b * seq + t) * hd + d;
+                    assert!((part[idx] - x[idx]).abs() < 1e-4, "pass col {d} changed");
+                }
+            }
+        }
+        // rot_dim == hd reproduces full apply_rope
+        let eq = autograd::no_grad(|| {
+            partial_rope(&Tensor::from_slice(&ctx, &x, vec![bh, seq, hd]), hd, 0, 10000.0).to_vec()
+        });
+        for (a, b) in eq.iter().zip(full.iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
     }
 }
