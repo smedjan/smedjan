@@ -558,6 +558,140 @@ kernel void matmul_simdgroup_trans_b(
 }
 "#;
 
+/// **Fused int4-dequant + GEMM** (the quantized matmul that lets a 9B model fit in 16 GB).
+///
+/// Computes `C[M,N] = A[M,K] @ B_q[N,K]^T` where B_q is stored as MLX affine-int4:
+///   - `q_weight`: U32 packed `[N, K/8]` — each U32 holds 8 signed int4 nibbles (little-endian
+///     nibble order: nibble i = bits `i*4..i*4+3`).
+///   - `q_scales`: BF16 `[N, K/group_size]` — one scale per group of `group_size` input features.
+///   - `q_biases`: BF16 `[N, K/group_size]` — one bias per group.
+///   - Dequant: `B[n,k] = nibble(q_weight[n, k/8], k%8) * q_scales[n, k/group_size] + q_biases[n, k/group_size]`
+///
+/// The dequant happens inside the B-slab load, per-element, so the weight never expands to f32
+/// in global memory — it stays 5 GB of int4+scales+biases on the GPU. The A slab and the MMA
+/// accumulate are identical to `matmul_simdgroup_trans_b`. 64×64 tile, 4 simdgroups, fp16 MMA
+/// fragments, fp32 accumulate.
+pub const MATMUL_QINT4_TRANS_B: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct QMatmulParams {
+    uint M;
+    uint N;
+    uint K;
+    uint group_size;
+};
+
+#define TILE 64
+
+// Dequantize one element B[n,k] from the packed int4 weight + group scales/biases.
+// q_weight is [N, K/8] U32, q_scales/q_biases are [N, K/group_size] stored as BF16 (NOT fp16).
+// Metal has no BF16 type, so we read the raw 16-bit value and widen: bf16 bits = f32 bits >> 16.
+inline float dequant_q4(
+    device const uint* q_weight,
+    device const ushort* q_scales,
+    device const ushort* q_biases,
+    uint n, uint k, uint K, uint group_size
+) {
+    uint in_packed = K / 8;
+    uint n_groups = K / group_size;
+    uint pack_idx = k / 8;
+    uint nibble_idx = k % 8;
+    uint group_idx = k / group_size;
+
+    uint packed = q_weight[n * in_packed + pack_idx];
+    uint raw = (packed >> (nibble_idx * 4)) & 0xF;
+    // Sign-extend 4-bit to int: values 8..15 are negative (-8..-1).
+    int nibble = (raw & 0x8) ? (int)raw - 16 : (int)raw;
+
+    // BF16 → f32: the bf16 bit pattern is the high 16 bits of the f32, so widening is a left shift.
+    // Reading as ushort (16-bit unsigned) gives the raw bf16 bits; shift left 16 to get f32 bits.
+    uint scale_bits = (uint)q_scales[n * n_groups + group_idx] << 16;
+    uint bias_bits = (uint)q_biases[n * n_groups + group_idx] << 16;
+    float scale = as_type<float>(scale_bits);
+    float bias = as_type<float>(bias_bits);
+    return (float)nibble * scale + bias;
+}
+
+kernel void matmul_qint4_trans_b(
+    device const float* A [[buffer(0)]],
+    device const uint* q_weight [[buffer(1)]],
+    device const ushort* q_scales [[buffer(2)]],
+    device const ushort* q_biases [[buffer(3)]],
+    device float* C [[buffer(4)]],
+    constant QMatmulParams& params [[buffer(5)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint M = params.M, N = params.N, K = params.K, GS = params.group_size;
+    uint tile_row = group_id.y * TILE;
+    uint tile_col = group_id.x * TILE;
+    uint q_row = (sgid >> 1) * 32;
+    uint q_col = (sgid & 1) * 32;
+
+    threadgroup half As[TILE * 8];   // 64×8 (M×K-step)
+    threadgroup half Bs[8 * TILE];   // 8×64 (K-step×N)
+    threadgroup float Cs[TILE * TILE];
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += 8) {
+        // Stage A slab [64×8]: activation in f32, cast to half for MMA.
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;
+            uint r = idx >> 3;             // 0..63 (M)
+            uint c = idx & 7;              // 0..7  (K)
+            uint gr = tile_row + r;
+            uint gc = k0 + c;
+            As[r * 8 + c] = (half)clamp((gr < M && gc < K) ? A[gr * K + gc] : 0.0f, -65504.0f, 65504.0f);
+        }
+        // Stage B slab [8×64]: dequantize int4 → f32 → half on the fly.
+        // B is logically [N,K]; B^T[k,n] = B[n,k]. We load B[tile_col+c, k0+r].
+        for (uint t = 0; t < 4; t++) {
+            uint idx = lane * 4 + t;
+            uint r = idx >> 6;             // 0..7  (K)
+            uint c = idx & 63;             // 0..63 (N)
+            uint gr = k0 + r;              // K index
+            uint gc = tile_col + c;        // N index
+            float val = 0.0f;
+            if (gr < K && gc < N) {
+                val = dequant_q4(q_weight, q_scales, q_biases, gc, gr, K, GS);
+            }
+            Bs[r * TILE + c] = (half)clamp(val, -65504.0f, 65504.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_half8x8 a[4], b[4];
+        for (uint i = 0; i < 4; i++) simdgroup_load(a[i], &As[(q_row + i * 8) * 8], 8);
+        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], &Bs[q_col + j * 8], TILE);
+        for (uint i = 0; i < 4; i++)
+            for (uint j = 0; j < 4; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], &Cs[(q_row + i * 8) * TILE + q_col + j * 8], TILE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < 32; t++) {
+        uint idx = lane * 32 + t;
+        uint r = idx >> 6;
+        uint c = idx & 63;
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < M && gc < N) C[gr * N + gc] = Cs[r * TILE + c];
+    }
+}
+"#;
+
 /// simdgroup_matrix C(fp32) = A(fp32)ᵀ @ B(fp32) on the hardware MMA units — the fast backward
 /// drop-in for `matmul_trans_a_tiled` (dB = Aᵀ @ dC). fp32 in / fp32 out, fp16 MMA fragments. 64×64
 /// tile / 4 simdgroups. A:`[M,K]` row-major (read transposed: Aᵀ`[k,m]`=A`[m,k]`), B:`[M,N]` row-major,

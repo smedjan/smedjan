@@ -31,6 +31,94 @@ pub struct Tensor {
     pub ctx: Arc<MetalContext>,
 }
 
+/// A weight tensor stored in MLX affine-int4 quantized form — the 9B Qwythos stays 5 GB on the
+/// GPU, never expanded to f32. Holds three GPU buffers:
+///   - `weight`: U32 packed `[out, in/8]` (8 int4 nibbles per U32, little-endian nibble order)
+///   - `scales`: BF16 `[out, in/group_size]`
+///   - `biases`: BF16 `[out, in/group_size]`
+/// Dequantization happens on-the-fly inside `gpu_matmul_qint4_trans_b` during the matmul, so the
+/// weight never materializes as f32 in global memory. Use `QuantizedTensor::qmatmul` for linear
+/// layers loaded from the Q4 artifact.
+pub struct QuantizedTensor {
+    pub weight: crate::gpu::Buf, // U32 [out, in/8]
+    pub scales: crate::gpu::Buf, // BF16 [out, in/group_size]
+    pub biases: crate::gpu::Buf, // BF16 [out, in/group_size]
+    pub out_dim: usize,
+    pub in_dim: usize,
+    pub group_size: usize,
+    pub ctx: Arc<MetalContext>,
+}
+
+unsafe impl Send for QuantizedTensor {}
+unsafe impl Sync for QuantizedTensor {}
+
+impl QuantizedTensor {
+    /// Upload raw U32 weight bytes, BF16 scale bytes, BF16 bias bytes to GPU buffers.
+    /// The bytes are copied as-is — no dequantization, no f32 expansion.
+    pub fn from_bytes(
+        ctx: &Arc<MetalContext>,
+        weight_bytes: &[u8], // [out * (in/8) * 4]
+        scales_bytes: &[u8], // [out * (in/group_size) * 2]
+        biases_bytes: &[u8], // [out * (in/group_size) * 2]
+        out_dim: usize,
+        in_dim: usize,
+        group_size: usize,
+    ) -> Self {
+        let weight = ctx.alloc_buffer(weight_bytes.len());
+        crate::gpu::buf_write_bytes(&weight, weight_bytes);
+        let scales = ctx.alloc_buffer(scales_bytes.len());
+        crate::gpu::buf_write_bytes(&scales, scales_bytes);
+        let biases = ctx.alloc_buffer(biases_bytes.len());
+        crate::gpu::buf_write_bytes(&biases, biases_bytes);
+        QuantizedTensor {
+            weight,
+            scales,
+            biases,
+            out_dim,
+            in_dim,
+            group_size,
+            ctx: Arc::clone(ctx),
+        }
+    }
+
+    /// Quantized matmul: `out[M, out_dim] = activation[M, in_dim] @ self[in_dim, out_dim]`.
+    /// The weight is stored as `[out_dim, in_dim]` (HF convention = transposed B); the kernel
+    /// computes `A @ B^T` with on-the-fly int4 dequant. Returns a regular f32 `Tensor`.
+    pub fn qmatmul(&self, activation: &Tensor) -> Tensor {
+        let m = activation.shape[0];
+        let k = self.in_dim;
+        let n = self.out_dim;
+        assert_eq!(
+            activation.shape.get(1),
+            Some(&k),
+            "qmatmul: activation [{},{}] vs weight in_dim {}",
+            m,
+            k,
+            k
+        );
+        let out_buf = self.ctx.alloc_buffer(m * n * 4);
+        crate::gpu::compute::gpu_matmul_qint4_trans_b(
+            &self.ctx,
+            &activation.buffer,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            &out_buf,
+            m as u32,
+            n as u32,
+            k as u32,
+            self.group_size as u32,
+        );
+        Tensor {
+            id: crate::autograd::next_id(),
+            buffer: out_buf,
+            shape: vec![m, n],
+            requires_grad: activation.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+}
+
 // SAFETY: Tensor's non-Send fields are Metal GPU buffers. All GPU dispatch
 // in this codebase is synchronous (waitUntilCompleted), and Metal buffers
 // on Apple Silicon are safe to reference from any thread.

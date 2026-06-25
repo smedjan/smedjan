@@ -236,6 +236,43 @@ pub fn gpu_matmul_trans_b_simdgroup(
     dispatch_sync!(ctx, "matmul_simdgroup_trans_b", grid, tg, 0 => a, 1 => b, 2 => c, 3 => &params_buf);
 }
 
+/// **Fused int4-dequant + GEMM**: `C[M,N] = A[M,K] @ B_q[N,K]^T` where B_q is affine-int4 packed.
+/// `q_weight` is U32 `[N, K/8]`, `q_scales`/`q_biases` are BF16 `[N, K/group_size]`. The kernel
+/// dequantizes each weight element on-the-fly inside the tile load — weights stay 5 GB on the GPU,
+/// never expanded to f32. This is what lets the 9B Qwythos run on a 16 GB M1.
+pub fn gpu_matmul_qint4_trans_b(
+    ctx: &Arc<MetalContext>,
+    a: &GpuBuffer,
+    q_weight: &GpuBuffer,
+    q_scales: &GpuBuffer,
+    q_biases: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    group_size: u32,
+) {
+    #[repr(C)]
+    struct Params {
+        m: u32,
+        n: u32,
+        k: u32,
+        group_size: u32,
+    }
+    let params = Params {
+        m,
+        n,
+        k,
+        group_size,
+    };
+    let params_buf = params_buffer(ctx, &params);
+    let tile = 64u64;
+    let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
+    let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
+    dispatch_sync!(ctx, "matmul_qint4_trans_b", grid, tg,
+        0 => a, 1 => q_weight, 2 => q_scales, 3 => q_biases, 4 => c, 5 => &params_buf);
+}
+
 /// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:`[M,K]`, B:`[M,N]`, C:`[K,N]`. Fast backward drop-in for
 /// gpu_matmul_trans_a (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate.
 pub fn gpu_matmul_trans_a_simdgroup(

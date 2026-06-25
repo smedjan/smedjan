@@ -31,7 +31,7 @@
 //! trainability are proven here against a CPU reference (see tests), exactly as RWKV/linear-attn were.
 
 use crate::gpu::MetalContext;
-use crate::tensor::Tensor;
+use crate::tensor::{QuantizedTensor, Tensor};
 use std::sync::Arc;
 
 /// Parsed Qwen3.5 / Qwen3-Next text-model architecture config (see `safetensors::config_from_hf_qwen35`).
@@ -420,14 +420,18 @@ pub struct OwnedDelta {
     pub w_gate: Tensor,
     pub out_norm: Tensor,
     pub w_o: Tensor,
-    /// Real Qwen3.5 per-head decay log-amplitude `[n_v]` (loaded from `linear_attn.A_log`).
-    /// Placeholder forward ignores it; strict path uses `g = -exp(A_log) * softplus(a + dt_bias)`.
     pub a_log: Tensor,
-    /// Real Qwen3.5 per-head time-step bias `[n_v]` (loaded from `linear_attn.dt_bias`).
     pub dt_bias: Tensor,
-    /// Output-gate projection `z` (`linear_attn.in_proj_z`); the real forward feeds this into
-    /// `RMSNormGated`. `w_gate` is retained for the placeholder path; `z_gate` is the canonical name.
     pub z_gate: Tensor,
+    /// Quantized weights (populated by the Q4 loader; `None` for synthetic tests).
+    /// When present, the strict forward uses `qmatmul` instead of `matmul` on the f32 fields.
+    pub q_w_q: Option<QuantizedTensor>,
+    pub q_w_k: Option<QuantizedTensor>,
+    pub q_w_v: Option<QuantizedTensor>,
+    pub q_w_a: Option<QuantizedTensor>,
+    pub q_w_b: Option<QuantizedTensor>,
+    pub q_z_gate: Option<QuantizedTensor>,
+    pub q_w_o: Option<QuantizedTensor>,
 }
 /// Owned weights for a full-attention layer.
 ///
@@ -441,13 +445,14 @@ pub struct OwnedFull {
     pub qk_norm: Tensor,
     pub w_gate: Tensor,
     pub w_o: Tensor,
-    /// Separate K-head RMSNorm weight `[head_dim]` (loaded from `self_attn.k_norm`).
     pub k_norm: Tensor,
-    /// Qwen3.5 full-attention packs the query and its output-gate into a single `q_proj`
-    /// (`out = n_h * head_dim * 2`): first half is q, second half is the gate. `q_proj_out` holds
-    /// the doubled weight; the strict path splits it at forward time, the placeholder path uses
-    /// `w_q` directly. Set by the loader; stays `None` for the verified synthetic-config tests.
     pub q_proj_out: Option<Tensor>,
+    /// Quantized weights (populated by the Q4 loader; `None` for synthetic tests).
+    pub q_w_q: Option<QuantizedTensor>,
+    pub q_w_k: Option<QuantizedTensor>,
+    pub q_w_v: Option<QuantizedTensor>,
+    pub q_w_o: Option<QuantizedTensor>,
+    pub q_q_proj_out: Option<QuantizedTensor>,
 }
 pub enum Mixer {
     Delta(OwnedDelta),
@@ -460,15 +465,20 @@ pub struct Qwen35Layer {
     pub ffn_gate: Tensor, // [d, inter]
     pub ffn_up: Tensor,   // [d, inter]
     pub ffn_down: Tensor, // [inter, d]
+    /// Quantized FFN weights (populated by the Q4 loader; `None` for synthetic tests).
+    pub q_ffn_gate: Option<QuantizedTensor>,
+    pub q_ffn_up: Option<QuantizedTensor>,
+    pub q_ffn_down: Option<QuantizedTensor>,
 }
 pub struct Qwen35Model {
     pub layers: Vec<Qwen35Layer>,
     pub final_norm: Tensor,
     pub lm_head: Tensor, // [d, vocab]
     pub cfg: Qwen35Config,
-    /// Token embedding table `[vocab, d_model]` (loaded from `model.embed_tokens.weight`).
-    /// `None` for the verified synthetic tests (which feed embedded inputs directly).
     pub embed: Option<Tensor>,
+    /// Quantized embedding + lm_head (populated by the Q4 loader; `None` for synthetic tests).
+    pub q_embed: Option<QuantizedTensor>,
+    pub q_lm_head: Option<QuantizedTensor>,
 }
 
 fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
@@ -1153,6 +1163,7 @@ mod tests {
             a_log: Tensor::zeros(&ctx, vec![lnv]),
             dt_bias: Tensor::ones(&ctx, vec![lnv]),
             z_gate: mk(d, lnv * ldh),
+            q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None,
         };
         let full = OwnedFull {
             w_q: mk(d, n_h * hd),
@@ -1162,7 +1173,7 @@ mod tests {
             w_gate: mk(d, n_h * hd),
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
-            q_proj_out: None,
+            q_proj_out: None, q_w_q: None, q_w_k: None, q_w_v: None, q_w_o: None, q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
@@ -1174,7 +1185,7 @@ mod tests {
                 mixer: Mixer::Delta(delta),
                 ffn_gate: g0,
                 ffn_up: u0,
-                ffn_down: dn0,
+                ffn_down: dn0, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
             },
             Qwen35Layer {
                 ln1: mkn(d),
@@ -1182,7 +1193,7 @@ mod tests {
                 mixer: Mixer::Full(full),
                 ffn_gate: g1,
                 ffn_up: u1,
-                ffn_down: dn1,
+                ffn_down: dn1, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
             },
         ];
         let model = Qwen35Model {
@@ -1190,7 +1201,7 @@ mod tests {
             final_norm: mkn(d),
             lm_head: mk(d, vocab),
             cfg,
-            embed: None,
+            embed: None, q_embed: None, q_lm_head: None,
         };
         let (batch, seq) = (1usize, 4);
         let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1).with_grad();
@@ -1256,6 +1267,7 @@ mod tests {
             a_log: Tensor::full(&ctx, vec![lnv], 0.5), // exp(0.5)≈1.65, finite
             dt_bias: Tensor::full(&ctx, vec![lnv], 0.1),
             z_gate: mk(d, lnv * ldh),
+            q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None,
         };
         // Full-attn with the doubled q_proj_out populated (exercises the split path).
         let q_proj_out = mk(d, n_h * hd * 2);
@@ -1267,7 +1279,7 @@ mod tests {
             w_gate: mk(d, n_h * hd),
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
-            q_proj_out: Some(q_proj_out),
+            q_proj_out: Some(q_proj_out), q_w_q: None, q_w_k: None, q_w_v: None, q_w_o: None, q_q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
@@ -1279,7 +1291,7 @@ mod tests {
                 mixer: Mixer::Delta(delta),
                 ffn_gate: g0,
                 ffn_up: u0,
-                ffn_down: dn0,
+                ffn_down: dn0, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
             },
             Qwen35Layer {
                 ln1: mkn(d),
@@ -1287,7 +1299,7 @@ mod tests {
                 mixer: Mixer::Full(full),
                 ffn_gate: g1,
                 ffn_up: u1,
-                ffn_down: dn1,
+                ffn_down: dn1, q_ffn_gate: None, q_ffn_up: None, q_ffn_down: None,
             },
         ];
         let model = Qwen35Model {
@@ -1295,7 +1307,7 @@ mod tests {
             final_norm: mkn(d),
             lm_head: mk(d, vocab),
             cfg,
-            embed: None,
+            embed: None, q_embed: None, q_lm_head: None,
         };
         let (batch, seq) = (1usize, 4);
         let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1);
