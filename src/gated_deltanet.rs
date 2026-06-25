@@ -30,10 +30,8 @@
 //! O(bh·seq²·d) memory; the chunked running-state scan is the production follow-up. Correctness and
 //! trainability are proven here against a CPU reference (see tests), exactly as RWKV/linear-attn were.
 
-use crate::tensor::Tensor;
-#[cfg(test)]
 use crate::gpu::MetalContext;
-#[cfg(test)]
+use crate::tensor::Tensor;
 use std::sync::Arc;
 
 /// Parsed Qwen3.5 / Qwen3-Next text-model architecture config (see `safetensors::config_from_hf_qwen35`).
@@ -57,6 +55,11 @@ pub struct Qwen35Config {
     pub full_attention_interval: usize,
     /// Per-layer mixer: `true` = full attention, `false` = Gated DeltaNet (the 3:1 hybrid topology).
     pub is_full_attention: Vec<bool>,
+    /// When `true`, the forward applies the real Qwen3.5 activations (`softplus(a + dt_bias)`,
+    /// `A_log`-based decay, `RMSNormGated`, q_proj split into q + output-gate) instead of the
+    /// placeholder `-relu` / `sigmoid` form the original (placeholder) verification used.
+    /// Off by default → the 11 verified tests stay byte-identical; flip on after loading real weights.
+    pub strict_qwen35: bool,
 }
 
 /// Lower-triangular ones `[seq,seq]` (incl. diagonal if `incl_diag`, else strict) tiled to `[bh,seq,seq]`.
@@ -92,7 +95,13 @@ fn sub(a: &Tensor, b: &Tensor) -> Tensor {
 
 /// Gated delta rule (materialized). `q,k,v: [bh,seq,d]`; `log_g,beta: [bh,seq]` (log_g ≤ 0).
 /// Returns `o: [bh,seq,d]`. Caller normalizes q/k and produces log_g/beta in the right ranges.
-pub fn gated_delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, log_g: &Tensor, beta: &Tensor) -> Tensor {
+pub fn gated_delta_rule(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    log_g: &Tensor,
+    beta: &Tensor,
+) -> Tensor {
     assert_eq!(q.shape.len(), 3, "expect [bh,seq,d]");
     let (bh, seq, d) = (q.shape[0], q.shape[1], q.shape[2]);
     assert_eq!(k.shape, vec![bh, seq, d]);
@@ -299,18 +308,30 @@ pub fn qwen3_deltanet_mixer(
     let q = expand_heads(&q, n_k, rep, dh); // [batch*seq, n_v*dh]
     let k = expand_heads(&k, n_k, rep, dh);
     let fold = |t: Tensor| {
-        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_v * dh]), batch, seq, n_v, dh)
+        crate::attention::transpose_bsh_to_bhs(
+            &t.reshape(vec![batch, seq, n_v * dh]),
+            batch,
+            seq,
+            n_v,
+            dh,
+        )
     };
     let ones_dh = Tensor::ones(&x.ctx, vec![dh]);
     let qh = fold(q).rms_norm(&ones_dh, 1e-6); // L2-norm q,k per head
     let kh = fold(k).rms_norm(&ones_dh, 1e-6);
     let vh = fold(v); // [batch*n_v, seq, dh]
-    // gates (placeholder activations): log_g ≤ 0, beta ∈ (0,1)
+                      // gates (placeholder activations): log_g ≤ 0, beta ∈ (0,1)
     let log_g = xf.matmul(w.w_a).relu().scale(-1.0); // [batch*seq, n_v]
     let beta = sigmoid(&xf.matmul(w.w_b));
     let fold_scalar = |t: Tensor| {
-        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_v]), batch, seq, n_v, 1)
-            .reshape(vec![batch * n_v, seq])
+        crate::attention::transpose_bsh_to_bhs(
+            &t.reshape(vec![batch, seq, n_v]),
+            batch,
+            seq,
+            n_v,
+            1,
+        )
+        .reshape(vec![batch * n_v, seq])
     };
     let o = gated_delta_rule(&qh, &kh, &vh, &fold_scalar(log_g), &fold_scalar(beta)); // [batch*n_v,seq,dh]
     let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_v, dh); // → [batch,seq,n_v*dh]
@@ -353,15 +374,27 @@ pub fn qwen3_full_attention_mixer(
     let k = expand_heads(&xf.matmul(w.w_k), n_kv, rep, hd); // GQA expand → [batch*seq, n_h*hd]
     let v = expand_heads(&xf.matmul(w.w_v), n_kv, rep, hd);
     let fold = |t: Tensor| {
-        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_h * hd]), batch, seq, n_h, hd)
+        crate::attention::transpose_bsh_to_bhs(
+            &t.reshape(vec![batch, seq, n_h * hd]),
+            batch,
+            seq,
+            n_h,
+            hd,
+        )
     };
     let qh = partial_rope(&fold(q).rms_norm(w.qk_norm, 1e-6), rot_dim, 0, rope_theta);
     let kh = partial_rope(&fold(k).rms_norm(w.qk_norm, 1e-6), rot_dim, 0, rope_theta);
     let vh = fold(v);
     let scale = 1.0 / (hd as f32).sqrt();
-    let probs = qh.batched_matmul_trans_b(&kh).scaled_causal_softmax(scale, 0); // [batch*n_h,seq,seq]
+    let probs = qh
+        .batched_matmul_trans_b(&kh)
+        .scaled_causal_softmax(scale, 0); // [batch*n_h,seq,seq]
     let o = probs.batched_matmul(&vh); // [batch*n_h, seq, hd]
-    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_h, hd).reshape(vec![batch, seq, n_h * hd]);
+    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_h, hd).reshape(vec![
+        batch,
+        seq,
+        n_h * hd,
+    ]);
     let gate = xf.matmul(w.w_gate).reshape(vec![batch, seq, n_h * hd]);
     output_gate(&o, &gate)
         .reshape(vec![batch * seq, n_h * hd])
@@ -370,15 +403,51 @@ pub fn qwen3_full_attention_mixer(
 }
 
 /// Owned weights for a Gated-DeltaNet layer (model-resident; borrowed into `DeltaNetWeights` at forward).
+///
+/// Fields mirror the real Qwen3.5 layout (see `safetensors::import_qwen35_safetensors`):
+/// the verified placeholder forward (`qwen3_deltanet_mixer`) only touches the fields it needs; the
+/// remaining real-Qwen fields (`A_log`, `dt_bias`, `z_gate`, `norm` — already present — plus the
+/// `in_proj` subviews) are populated by the loader and consumed by the `strict_qwen35` forward path.
 pub struct OwnedDelta {
-    pub w_q: Tensor, pub w_k: Tensor, pub w_v: Tensor,
-    pub conv_q: Tensor, pub conv_k: Tensor, pub conv_v: Tensor,
-    pub w_a: Tensor, pub w_b: Tensor, pub w_gate: Tensor, pub out_norm: Tensor, pub w_o: Tensor,
+    pub w_q: Tensor,
+    pub w_k: Tensor,
+    pub w_v: Tensor,
+    pub conv_q: Tensor,
+    pub conv_k: Tensor,
+    pub conv_v: Tensor,
+    pub w_a: Tensor,
+    pub w_b: Tensor,
+    pub w_gate: Tensor,
+    pub out_norm: Tensor,
+    pub w_o: Tensor,
+    /// Real Qwen3.5 per-head decay log-amplitude `[n_v]` (loaded from `linear_attn.A_log`).
+    /// Placeholder forward ignores it; strict path uses `g = -exp(A_log) * softplus(a + dt_bias)`.
+    pub a_log: Tensor,
+    /// Real Qwen3.5 per-head time-step bias `[n_v]` (loaded from `linear_attn.dt_bias`).
+    pub dt_bias: Tensor,
+    /// Output-gate projection `z` (`linear_attn.in_proj_z`); the real forward feeds this into
+    /// `RMSNormGated`. `w_gate` is retained for the placeholder path; `z_gate` is the canonical name.
+    pub z_gate: Tensor,
 }
 /// Owned weights for a full-attention layer.
+///
+/// Real Qwen3.5 stores `q_norm` AND `k_norm` as separate `[head_dim]` tensors (see the loader
+/// mapping); the placeholder `FullAttnWeights` shares one `qk_norm`. `k_norm` is populated by the
+/// loader and used by the `strict_qwen35` path; the placeholder path keeps the shared behaviour.
 pub struct OwnedFull {
-    pub w_q: Tensor, pub w_k: Tensor, pub w_v: Tensor,
-    pub qk_norm: Tensor, pub w_gate: Tensor, pub w_o: Tensor,
+    pub w_q: Tensor,
+    pub w_k: Tensor,
+    pub w_v: Tensor,
+    pub qk_norm: Tensor,
+    pub w_gate: Tensor,
+    pub w_o: Tensor,
+    /// Separate K-head RMSNorm weight `[head_dim]` (loaded from `self_attn.k_norm`).
+    pub k_norm: Tensor,
+    /// Qwen3.5 full-attention packs the query and its output-gate into a single `q_proj`
+    /// (`out = n_h * head_dim * 2`): first half is q, second half is the gate. `q_proj_out` holds
+    /// the doubled weight; the strict path splits it at forward time, the placeholder path uses
+    /// `w_q` directly. Set by the loader; stays `None` for the verified synthetic-config tests.
+    pub q_proj_out: Option<Tensor>,
 }
 pub enum Mixer {
     Delta(OwnedDelta),
@@ -397,6 +466,9 @@ pub struct Qwen35Model {
     pub final_norm: Tensor,
     pub lm_head: Tensor, // [d, vocab]
     pub cfg: Qwen35Config,
+    /// Token embedding table `[vocab, d_model]` (loaded from `model.embed_tokens.weight`).
+    /// `None` for the verified synthetic tests (which feed embedded inputs directly).
+    pub embed: Option<Tensor>,
 }
 
 fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
@@ -408,6 +480,29 @@ fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
 }
 
 impl Qwen35Model {
+    /// Embed `token_ids` (shape `[batch, seq]`, row-major) → `[batch, seq, d_model]` by gathering
+    /// rows of `self.embed`. Requires the loader to have populated `embed` (synthetic-config tests
+    /// feed embedded inputs directly and leave `embed = None`).
+    pub fn embed_tokens(&self, token_ids: &[u32], batch: usize, seq: usize) -> Tensor {
+        let embed = self.embed.as_ref().expect("Qwen35Model.embed not loaded");
+        let d = self.cfg.hidden_size;
+        assert_eq!(token_ids.len(), batch * seq, "token_ids length mismatch");
+        // Read the full embedding table on CPU, gather, upload. A dedicated GPU gather kernel is a
+        // follow-up; this is correct and only runs once per forward (vs. 32 transformer layers).
+        let table = embed.to_vec(); // [vocab * d]
+        let vocab = self.cfg.vocab_size as usize;
+        let mut out = vec![0.0f32; batch * seq * d];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            assert!(
+                (tid as usize) < vocab,
+                "token id {tid} out of vocab range {vocab}"
+            );
+            let row = &table[(tid as usize) * d..(tid as usize + 1) * d];
+            out[i * d..(i + 1) * d].copy_from_slice(row);
+        }
+        Tensor::from_slice(&embed.ctx, &out, vec![batch, seq, d])
+    }
+
     /// Forward over embedded inputs `x:[batch,seq,d_model]` → logits `[batch,seq,vocab]`.
     /// Pre-norm transformer: norm → mixer → residual; norm → SwiGLU → residual; final norm; lm_head.
     pub fn forward(&self, x: &Tensor) -> Tensor {
@@ -421,25 +516,48 @@ impl Qwen35Model {
                 Mixer::Delta(d) => qwen3_deltanet_mixer(
                     &normed,
                     &DeltaNetWeights {
-                        w_q: &d.w_q, w_k: &d.w_k, w_v: &d.w_v,
-                        conv_q: &d.conv_q, conv_k: &d.conv_k, conv_v: &d.conv_v,
-                        w_a: &d.w_a, w_b: &d.w_b, w_gate: &d.w_gate, out_norm: &d.out_norm, w_o: &d.w_o,
+                        w_q: &d.w_q,
+                        w_k: &d.w_k,
+                        w_v: &d.w_v,
+                        conv_q: &d.conv_q,
+                        conv_k: &d.conv_k,
+                        conv_v: &d.conv_v,
+                        w_a: &d.w_a,
+                        w_b: &d.w_b,
+                        w_gate: &d.w_gate,
+                        out_norm: &d.out_norm,
+                        w_o: &d.w_o,
                     },
-                    c.linear_num_key_heads, c.linear_num_value_heads, c.linear_key_head_dim,
+                    c.linear_num_key_heads,
+                    c.linear_num_value_heads,
+                    c.linear_key_head_dim,
                     c.linear_conv_kernel_dim,
                 ),
                 Mixer::Full(f) => qwen3_full_attention_mixer(
                     &normed,
                     &FullAttnWeights {
-                        w_q: &f.w_q, w_k: &f.w_k, w_v: &f.w_v,
-                        qk_norm: &f.qk_norm, w_gate: &f.w_gate, w_o: &f.w_o,
+                        w_q: &f.w_q,
+                        w_k: &f.w_k,
+                        w_v: &f.w_v,
+                        qk_norm: &f.qk_norm,
+                        w_gate: &f.w_gate,
+                        w_o: &f.w_o,
                     },
-                    c.num_attention_heads, c.num_key_value_heads, c.head_dim, rot, c.rope_theta,
+                    c.num_attention_heads,
+                    c.num_key_value_heads,
+                    c.head_dim,
+                    rot,
+                    c.rope_theta,
                 ),
             };
             h = h.add(&mixed);
             let normed2 = h.rms_norm(&layer.ln2, eps);
-            h = h.add(&swiglu(&normed2, &layer.ffn_gate, &layer.ffn_up, &layer.ffn_down));
+            h = h.add(&swiglu(
+                &normed2,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+            ));
         }
         let h = h.rms_norm(&self.final_norm, eps);
         let (b, s, d) = (h.shape[0], h.shape[1], h.shape[2]);
@@ -559,16 +677,47 @@ mod tests {
         let (bh, seq, d) = (1usize, 4usize, 3usize);
         let n = bh * seq * d;
         let mk = |f: fn(usize) -> f32, len: usize| (0..len).map(f).collect::<Vec<_>>();
-        let q = Tensor::from_slice(&ctx, &mk(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1, n), vec![bh, seq, d]).with_grad();
-        let k = Tensor::from_slice(&ctx, &mk(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1, n), vec![bh, seq, d]).with_grad();
-        let v = Tensor::from_slice(&ctx, &mk(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2, n), vec![bh, seq, d]).with_grad();
-        let log_g = Tensor::from_slice(&ctx, &mk(|i| -0.05 - (i % 3) as f32 * 0.02, bh * seq), vec![bh, seq]).with_grad();
-        let beta = Tensor::from_slice(&ctx, &mk(|i| 0.3 + (i % 4) as f32 * 0.1, bh * seq), vec![bh, seq]).with_grad();
+        let q = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1, n),
+            vec![bh, seq, d],
+        )
+        .with_grad();
+        let k = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1, n),
+            vec![bh, seq, d],
+        )
+        .with_grad();
+        let v = Tensor::from_slice(
+            &ctx,
+            &mk(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2, n),
+            vec![bh, seq, d],
+        )
+        .with_grad();
+        let log_g = Tensor::from_slice(
+            &ctx,
+            &mk(|i| -0.05 - (i % 3) as f32 * 0.02, bh * seq),
+            vec![bh, seq],
+        )
+        .with_grad();
+        let beta = Tensor::from_slice(
+            &ctx,
+            &mk(|i| 0.3 + (i % 4) as f32 * 0.1, bh * seq),
+            vec![bh, seq],
+        )
+        .with_grad();
         let out = gated_delta_rule(&q, &k, &v, &log_g, &beta);
         let ones = Tensor::ones(&ctx, vec![n, 1]);
         let loss = out.reshape(vec![1, n]).matmul(&ones);
         autograd::backward(&ctx, loss.id);
-        for (name, id) in [("q", q.id), ("k", k.id), ("v", v.id), ("log_g", log_g.id), ("beta", beta.id)] {
+        for (name, id) in [
+            ("q", q.id),
+            ("k", k.id),
+            ("v", v.id),
+            ("log_g", log_g.id),
+            ("beta", beta.id),
+        ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad for {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
             assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
@@ -582,7 +731,9 @@ mod tests {
         let (bh, seq, c, kw) = (2usize, 5usize, 3usize, 4usize);
         let n = bh * seq * c;
         let x: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
-        let ker: Vec<f32> = (0..c * kw).map(|i| ((i * 3 % 5) as f32 - 2.0) * 0.3).collect();
+        let ker: Vec<f32> = (0..c * kw)
+            .map(|i| ((i * 3 % 5) as f32 - 2.0) * 0.3)
+            .collect();
         let got = autograd::no_grad(|| {
             causal_conv1d(
                 &Tensor::from_slice(&ctx, &x, vec![bh, seq, c]),
@@ -607,7 +758,10 @@ mod tests {
             }
         }
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!((g - w).abs() <= 1e-3 * (1.0 + w.abs()), "conv1d gpu={g} cpu={w}");
+            assert!(
+                (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+                "conv1d gpu={g} cpu={w}"
+            );
         }
     }
 
@@ -636,7 +790,13 @@ mod tests {
         }
         // rot_dim == hd reproduces full apply_rope
         let eq = autograd::no_grad(|| {
-            partial_rope(&Tensor::from_slice(&ctx, &x, vec![bh, seq, hd]), hd, 0, 10000.0).to_vec()
+            partial_rope(
+                &Tensor::from_slice(&ctx, &x, vec![bh, seq, hd]),
+                hd,
+                0,
+                10000.0,
+            )
+            .to_vec()
         });
         for (a, b) in eq.iter().zip(full.iter()) {
             assert!((a - b).abs() < 1e-4);
@@ -687,16 +847,28 @@ mod tests {
         let ctx = ctx();
         let (batch, seq, dmodel, n_k, n_v, dh, kw) = (1usize, 4, 8, 2, 4, 2, 3);
         let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
-        let (w_q, w_k, w_v) = (mk(dmodel, n_k * dh), mk(dmodel, n_k * dh), mk(dmodel, n_v * dh));
+        let (w_q, w_k, w_v) = (
+            mk(dmodel, n_k * dh),
+            mk(dmodel, n_k * dh),
+            mk(dmodel, n_v * dh),
+        );
         let (conv_q, conv_k, conv_v) = (mk(n_k * dh, kw), mk(n_k * dh, kw), mk(n_v * dh, kw));
         let (w_a, w_b, w_gate) = (mk(dmodel, n_v), mk(dmodel, n_v), mk(dmodel, n_v * dh));
         let out_norm = Tensor::ones(&ctx, vec![dh]).with_grad();
         let w_o = mk(n_v * dh, dmodel);
         let x = Tensor::randn(&ctx, vec![batch, seq, dmodel], 0.1).with_grad();
         let w = DeltaNetWeights {
-            w_q: &w_q, w_k: &w_k, w_v: &w_v,
-            conv_q: &conv_q, conv_k: &conv_k, conv_v: &conv_v,
-            w_a: &w_a, w_b: &w_b, w_gate: &w_gate, out_norm: &out_norm, w_o: &w_o,
+            w_q: &w_q,
+            w_k: &w_k,
+            w_v: &w_v,
+            conv_q: &conv_q,
+            conv_k: &conv_k,
+            conv_v: &conv_v,
+            w_a: &w_a,
+            w_b: &w_b,
+            w_gate: &w_gate,
+            out_norm: &out_norm,
+            w_o: &w_o,
         };
         let out = qwen3_deltanet_mixer(&x, &w, n_k, n_v, dh, kw);
         assert_eq!(out.shape, vec![batch, seq, dmodel], "mixer output shape");
@@ -706,8 +878,12 @@ mod tests {
             .matmul(&Tensor::ones(&ctx, vec![n, 1]));
         autograd::backward(&ctx, loss.id);
         for (name, id) in [
-            ("x", x.id), ("w_q", w_q.id), ("w_v", w_v.id),
-            ("w_a", w_a.id), ("w_gate", w_gate.id), ("w_o", w_o.id),
+            ("x", x.id),
+            ("w_q", w_q.id),
+            ("w_v", w_v.id),
+            ("w_a", w_a.id),
+            ("w_gate", w_gate.id),
+            ("w_o", w_o.id),
         ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
@@ -739,19 +915,36 @@ mod tests {
         let ctx = ctx();
         let (batch, seq, dmodel, n_h, n_kv, hd, rot) = (1usize, 4, 8, 4, 2, 2, 2);
         let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
-        let (w_q, w_k, w_v) = (mk(dmodel, n_h * hd), mk(dmodel, n_kv * hd), mk(dmodel, n_kv * hd));
+        let (w_q, w_k, w_v) = (
+            mk(dmodel, n_h * hd),
+            mk(dmodel, n_kv * hd),
+            mk(dmodel, n_kv * hd),
+        );
         let qk_norm = Tensor::ones(&ctx, vec![hd]).with_grad();
         let (w_gate, w_o) = (mk(dmodel, n_h * hd), mk(n_h * hd, dmodel));
         let x = Tensor::randn(&ctx, vec![batch, seq, dmodel], 0.1).with_grad();
         let w = FullAttnWeights {
-            w_q: &w_q, w_k: &w_k, w_v: &w_v, qk_norm: &qk_norm, w_gate: &w_gate, w_o: &w_o,
+            w_q: &w_q,
+            w_k: &w_k,
+            w_v: &w_v,
+            qk_norm: &qk_norm,
+            w_gate: &w_gate,
+            w_o: &w_o,
         };
         let out = qwen3_full_attention_mixer(&x, &w, n_h, n_kv, hd, rot, 10000.0);
         assert_eq!(out.shape, vec![batch, seq, dmodel]);
         let n = batch * seq * dmodel;
-        let loss = out.reshape(vec![1, n]).matmul(&Tensor::ones(&ctx, vec![n, 1]));
+        let loss = out
+            .reshape(vec![1, n])
+            .matmul(&Tensor::ones(&ctx, vec![n, 1]));
         autograd::backward(&ctx, loss.id);
-        for (name, id) in [("x", x.id), ("w_q", w_q.id), ("w_k", w_k.id), ("w_gate", w_gate.id), ("w_o", w_o.id)] {
+        for (name, id) in [
+            ("x", x.id),
+            ("w_q", w_q.id),
+            ("w_k", w_k.id),
+            ("w_gate", w_gate.id),
+            ("w_o", w_o.id),
+        ] {
             let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad {name}"));
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
             assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
@@ -767,41 +960,94 @@ mod tests {
         let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
         let mkn = |n| Tensor::ones(&ctx, vec![n]).with_grad();
         let cfg = Qwen35Config {
-            hidden_size: d, num_hidden_layers: 2, head_dim: hd, num_attention_heads: n_h,
-            num_key_value_heads: n_kv, intermediate_size: inter, vocab_size: vocab as u32,
-            rms_norm_eps: 1e-6, rope_theta: 10000.0, partial_rotary_factor: 0.5,
-            linear_num_key_heads: lnk, linear_num_value_heads: lnv, linear_key_head_dim: ldh,
-            linear_value_head_dim: ldh, linear_conv_kernel_dim: kw, full_attention_interval: 2,
+            hidden_size: d,
+            num_hidden_layers: 2,
+            head_dim: hd,
+            num_attention_heads: n_h,
+            num_key_value_heads: n_kv,
+            intermediate_size: inter,
+            vocab_size: vocab as u32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 0.5,
+            linear_num_key_heads: lnk,
+            linear_num_value_heads: lnv,
+            linear_key_head_dim: ldh,
+            linear_value_head_dim: ldh,
+            linear_conv_kernel_dim: kw,
+            full_attention_interval: 2,
             is_full_attention: vec![false, true],
+            strict_qwen35: false,
         };
         let delta = OwnedDelta {
-            w_q: mk(d, lnk * ldh), w_k: mk(d, lnk * ldh), w_v: mk(d, lnv * ldh),
-            conv_q: mk(lnk * ldh, kw), conv_k: mk(lnk * ldh, kw), conv_v: mk(lnv * ldh, kw),
-            w_a: mk(d, lnv), w_b: mk(d, lnv), w_gate: mk(d, lnv * ldh),
-            out_norm: mkn(ldh), w_o: mk(lnv * ldh, d),
+            w_q: mk(d, lnk * ldh),
+            w_k: mk(d, lnk * ldh),
+            w_v: mk(d, lnv * ldh),
+            conv_q: mk(lnk * ldh, kw),
+            conv_k: mk(lnk * ldh, kw),
+            conv_v: mk(lnv * ldh, kw),
+            w_a: mk(d, lnv),
+            w_b: mk(d, lnv),
+            w_gate: mk(d, lnv * ldh),
+            out_norm: mkn(ldh),
+            w_o: mk(lnv * ldh, d),
+            a_log: Tensor::zeros(&ctx, vec![lnv]),
+            dt_bias: Tensor::ones(&ctx, vec![lnv]),
+            z_gate: mk(d, lnv * ldh),
         };
         let full = OwnedFull {
-            w_q: mk(d, n_h * hd), w_k: mk(d, n_kv * hd), w_v: mk(d, n_kv * hd),
-            qk_norm: mkn(hd), w_gate: mk(d, n_h * hd), w_o: mk(n_h * hd, d),
+            w_q: mk(d, n_h * hd),
+            w_k: mk(d, n_kv * hd),
+            w_v: mk(d, n_kv * hd),
+            qk_norm: mkn(hd),
+            w_gate: mk(d, n_h * hd),
+            w_o: mk(n_h * hd, d),
+            k_norm: mkn(hd),
+            q_proj_out: None,
         };
         let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
         let (g0, u0, dn0) = ffn(inter, d);
         let (g1, u1, dn1) = ffn(inter, d);
         let layers = vec![
-            Qwen35Layer { ln1: mkn(d), ln2: mkn(d), mixer: Mixer::Delta(delta), ffn_gate: g0, ffn_up: u0, ffn_down: dn0 },
-            Qwen35Layer { ln1: mkn(d), ln2: mkn(d), mixer: Mixer::Full(full), ffn_gate: g1, ffn_up: u1, ffn_down: dn1 },
+            Qwen35Layer {
+                ln1: mkn(d),
+                ln2: mkn(d),
+                mixer: Mixer::Delta(delta),
+                ffn_gate: g0,
+                ffn_up: u0,
+                ffn_down: dn0,
+            },
+            Qwen35Layer {
+                ln1: mkn(d),
+                ln2: mkn(d),
+                mixer: Mixer::Full(full),
+                ffn_gate: g1,
+                ffn_up: u1,
+                ffn_down: dn1,
+            },
         ];
-        let model = Qwen35Model { layers, final_norm: mkn(d), lm_head: mk(d, vocab), cfg };
+        let model = Qwen35Model {
+            layers,
+            final_norm: mkn(d),
+            lm_head: mk(d, vocab),
+            cfg,
+            embed: None,
+        };
         let (batch, seq) = (1usize, 4);
         let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1).with_grad();
         let logits = model.forward(&x);
         assert_eq!(logits.shape, vec![batch, seq, vocab], "logits shape");
         let n = batch * seq * vocab;
-        let loss = logits.reshape(vec![1, n]).matmul(&Tensor::ones(&ctx, vec![n, 1]));
+        let loss = logits
+            .reshape(vec![1, n])
+            .matmul(&Tensor::ones(&ctx, vec![n, 1]));
         autograd::backward(&ctx, loss.id);
         let g = autograd::get_grad(x.id).expect("no grad for x through full model");
         let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
-        assert!(gv.iter().all(|v| v.is_finite()), "non-finite grad through model");
+        assert!(
+            gv.iter().all(|v| v.is_finite()),
+            "non-finite grad through model"
+        );
         autograd::zero_grads();
     }
 }

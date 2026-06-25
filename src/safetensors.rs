@@ -803,7 +803,8 @@ pub fn config_from_hf_qwen35(path: &str) -> std::io::Result<crate::gated_deltane
             .map(|n| n as usize)
             .ok_or_else(|| invalid(format!("text_config: missing/invalid integer '{k}'")))
     };
-    let opt_f = |k: &str, d: f32| -> f32 { tc.get(k).and_then(|v| v.as_f64()).map_or(d, |n| n as f32) };
+    let opt_f =
+        |k: &str, d: f32| -> f32 { tc.get(k).and_then(|v| v.as_f64()).map_or(d, |n| n as f32) };
     let rope_theta = tc
         .get("rope_parameters")
         .and_then(|r| r.get("rope_theta"))
@@ -835,6 +836,536 @@ pub fn config_from_hf_qwen35(path: &str) -> std::io::Result<crate::gated_deltane
         linear_conv_kernel_dim: req_u("linear_conv_kernel_dim")?,
         full_attention_interval: req_u("full_attention_interval")?,
         is_full_attention,
+        strict_qwen35: false,
+    })
+}
+
+/// MLX-style affine int4 (group-size 64) packed-weight dequantization.
+///
+/// Storage layout (per the Qwythos-9B-Claude-Mythos-5-1M Q4 artifact):
+///   - `weight`: `U32` tensor of shape `[out, in_packed]` where `in_packed = in / 8` — each `U32`
+///     packs 8 signed int4 nibbles, **little-endian nibble order** (nibble 0 = bits 0..3, etc.).
+///   - `scales`: `BF16` shape `[out, in/64]` — one scale per group of 64 input features.
+///   - `biases`: `BF16` same shape as `scales`.
+///
+/// Dequantization: `w[o, i] = nibble(o, i) · scales[o, i/64] + biases[o, i/64]`, where `nibble` is
+/// sign-extended 4-bit (range `[-8, 7]`). `out` and `in` are the logical (dequantized) dims.
+///
+/// Returns row-major `[out * in]` f32. `name` is for diagnostics.
+pub fn dequant_int4_affine(
+    weight_u32: &[u8],
+    scales_bf16: &[u8],
+    biases_bf16: &[u8],
+    out: usize,
+    inp: usize,
+    group_size: usize,
+    name: &str,
+) -> std::io::Result<Vec<f32>> {
+    let in_packed = inp / 8;
+    if in_packed * 8 != inp {
+        return Err(invalid(format!(
+            "{name}: in_dim {inp} not divisible by 8 (int4 packing)"
+        )));
+    }
+    let n_groups = inp / group_size;
+    if n_groups * group_size != inp {
+        return Err(invalid(format!(
+            "{name}: in_dim {inp} not divisible by group_size {group_size}"
+        )));
+    }
+    if weight_u32.len() != out * in_packed * 4 {
+        return Err(invalid(format!(
+            "{name}: weight bytes {} != {} (out {out} × in_packed {in_packed} × 4)",
+            weight_u32.len(),
+            out * in_packed * 4
+        )));
+    }
+    if scales_bf16.len() != out * n_groups * 2 {
+        return Err(invalid(format!(
+            "{name}: scales bytes {} != {} (out {out} × n_groups {n_groups} × 2)",
+            scales_bf16.len(),
+            out * n_groups * 2
+        )));
+    }
+    if biases_bf16.len() != out * n_groups * 2 {
+        return Err(invalid(format!(
+            "{name}: biases bytes {} != {} (out {out} × n_groups {n_groups} × 2)",
+            biases_bf16.len(),
+            out * n_groups * 2
+        )));
+    }
+    let mut dst = vec![0.0f32; out * inp];
+    for o in 0..out {
+        let w_row_off = o * in_packed * 4;
+        let s_row_off = o * n_groups * 2;
+        for ig in 0..n_groups {
+            let scale = bf16_to_f32(u16::from_le_bytes([
+                scales_bf16[s_row_off + ig * 2],
+                scales_bf16[s_row_off + ig * 2 + 1],
+            ]));
+            let bias = bf16_to_f32(u16::from_le_bytes([
+                biases_bf16[s_row_off + ig * 2],
+                biases_bf16[s_row_off + ig * 2 + 1],
+            ]));
+            for j in 0..group_size {
+                let i = ig * group_size + j;
+                let pack_idx = i / 8;
+                let nibble_idx = i % 8;
+                let u = u32::from_le_bytes([
+                    weight_u32[w_row_off + pack_idx * 4],
+                    weight_u32[w_row_off + pack_idx * 4 + 1],
+                    weight_u32[w_row_off + pack_idx * 4 + 2],
+                    weight_u32[w_row_off + pack_idx * 4 + 3],
+                ]);
+                let raw = ((u >> (nibble_idx * 4)) & 0xF) as i8;
+                let nibble = if raw & 0x8 != 0 { raw - 16 } else { raw };
+                dst[o * inp + i] = nibble as f32 * scale + bias;
+            }
+        }
+    }
+    Ok(dst)
+}
+
+/// Fetch one triplet `{stem}.weight / {stem}.scales / {stem}.biases` and dequantize to `Vec<f32>`
+/// (row-major `[out, in]` → smedjan convention `[in, out]` happens in the caller, not here).
+/// `expect_out`/`expect_in` are the logical (dequantized) dims; group_size is 64 for this artifact.
+fn fetch_q4(
+    json: &Json,
+    blob: &[u8],
+    stem: &str,
+    expect_out: usize,
+    expect_in: usize,
+    group_size: usize,
+) -> std::io::Result<Vec<f32>> {
+    let entry = |suffix: &str| -> std::io::Result<(&Json, &[u8])> {
+        let name = format!("{stem}.{suffix}");
+        let e = json
+            .get(&name)
+            .ok_or_else(|| invalid(format!("Q4 fetch: missing {name}")))?;
+        let shape = shape_field(e, &name)?;
+        let (s, en) = offsets_field(e, &name)?;
+        if s > en || en > blob.len() {
+            return Err(invalid(format!(
+                "{name}: bad offsets [{s},{en}) in blob {}",
+                blob.len()
+            )));
+        }
+        Ok((e, &blob[s..en]))
+    };
+    let (we, wbytes) = entry("weight")?;
+    let (se, sbytes) = entry("scales")?;
+    let (be, bbytes) = entry("biases")?;
+    // Validate the stored shapes match expectations for this artifact.
+    let w_shape = shape_field(we, stem)?;
+    if w_shape[0] != expect_out || w_shape[1] * 8 != expect_in {
+        return Err(invalid(format!(
+            "{stem}.weight shape {w_shape:?} != expected [{expect_out}, {}]",
+            expect_in / 8
+        )));
+    }
+    let _ = shape_field(se, stem)?;
+    let _ = shape_field(be, stem)?;
+    dequant_int4_affine(
+        wbytes, sbytes, bbytes, expect_out, expect_in, group_size, stem,
+    )
+}
+
+/// Decode a plain (non-quantized) BF16/F32 tensor by name → `Vec<f32>`.
+fn fetch_plain(json: &Json, blob: &[u8], name: &str, numel: usize) -> std::io::Result<Vec<f32>> {
+    let e = json
+        .get(name)
+        .ok_or_else(|| invalid(format!("missing {name}")))?;
+    let dtype = e
+        .get("dtype")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| invalid(format!("{name}: no dtype")))?;
+    let shape = shape_field(e, name)?;
+    let stored_numel = shape_numel(&shape, name)?;
+    if stored_numel != numel {
+        return Err(invalid(format!(
+            "{name}: numel {stored_numel} != expected {numel}"
+        )));
+    }
+    let (s, en) = offsets_field(e, name)?;
+    if s > en || en > blob.len() {
+        return Err(invalid(format!("{name}: bad offsets")));
+    }
+    decode_to_f32(&blob[s..en], dtype, numel, name)
+}
+
+/// Put `data` (row-major f32) into a model-resident `Tensor`, transposing `[out, in] → [in, out]`
+/// (HF stores weights as `[out, in]`; smedjan `matmul` expects `[in, out]`).
+fn put_transposed(
+    t: &crate::tensor::Tensor,
+    data: &[f32],
+    out: usize,
+    inp: usize,
+) -> std::io::Result<()> {
+    if data.len() != out * inp {
+        return Err(invalid(format!(
+            "put_transposed: {} elements, expected {out}×{inp} = {}",
+            data.len(),
+            out * inp
+        )));
+    }
+    let mut t_data = vec![0.0f32; out * inp];
+    for o in 0..out {
+        for i in 0..inp {
+            t_data[i * out + o] = data[o * inp + i];
+        }
+    }
+    if t_data.len() != t.numel() {
+        return Err(invalid(format!(
+            "put_transposed: target tensor numel {} != transposed {}",
+            t.numel(),
+            t_data.len()
+        )));
+    }
+    let bytes: Vec<u8> = t_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    crate::gpu::buf_write_bytes(&t.buffer, &bytes);
+    Ok(())
+}
+
+/// Load an MLX-affine-int4 Qwen3.5 / Qwen3-Next safetensors file (single-shard `.safetensors`)
+/// into a freshly-allocated `Qwen35Model` (smedjan).
+///
+/// Maps the 927 quantized tensors (names prefixed `language_model.`) onto the hybrid topology:
+///   - 24 Gated-DeltaNet layers (combined `in_proj_qkv` split into q/k/v, `in_proj_z` → z_gate,
+///     `in_proj_a/b` → gate/beta pre-acts, `A_log`+`dt_bias`, conv1d, out-norm, out-proj).
+///   - 8 full-attention layers (`q_proj` doubled → q + output-gate, `q_norm`+`k_norm` separate).
+///   - Shared `embed_tokens`, `model.norm`, `lm_head`, per-layer `input_layernorm` /
+///     `post_attention_layernorm` / MLP `gate_proj`/`up_proj`/`down_proj`.
+///
+/// The forward stays on the placeholder activations (the model's existing behaviour); flipping
+/// `cfg.strict_qwen35 = true` (caller's choice) is what wires `A_log`/`dt_bias`/`RMSNormGated`.
+pub fn import_qwen35_safetensors(
+    ctx: &Arc<MetalContext>,
+    path: &str,
+    cfg: crate::gated_deltanet::Qwen35Config,
+    group_size: usize,
+) -> std::io::Result<crate::gated_deltanet::Qwen35Model> {
+    use crate::gated_deltanet::{Mixer, OwnedDelta, OwnedFull, Qwen35Layer, Qwen35Model};
+    let (json, blob) = read_parts(path)?;
+    let d = cfg.hidden_size;
+    let _eps = cfg.rms_norm_eps;
+
+    let mk_w = |rows: usize, cols: usize| -> crate::tensor::Tensor {
+        crate::tensor::Tensor::zeros(ctx, vec![rows, cols])
+    };
+    let mk_v = |n: usize| -> crate::tensor::Tensor { crate::tensor::Tensor::zeros(ctx, vec![n]) };
+
+    // Embeddings [vocab, d]. Stored quantized; dequant once into a model-resident tensor.
+    let embed_data = fetch_q4(
+        &json,
+        &blob,
+        "language_model.model.embed_tokens",
+        cfg.vocab_size as usize,
+        d,
+        group_size,
+    )?;
+    let embed = crate::tensor::Tensor::zeros(ctx, vec![cfg.vocab_size as usize, d]);
+    let bytes: Vec<u8> = embed_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    crate::gpu::buf_write_bytes(&embed.buffer, &bytes);
+
+    // Final norm [d] (BF16, plain).
+    let final_norm = crate::tensor::Tensor::zeros(ctx, vec![d]);
+    let fn_data = fetch_plain(&json, &blob, "language_model.model.norm.weight", d)?;
+    let bytes: Vec<u8> = fn_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    crate::gpu::buf_write_bytes(&final_norm.buffer, &bytes);
+
+    // lm_head [d, vocab] — stored quantized; we keep it row-major [d, vocab].
+    let lm_raw = fetch_q4(
+        &json,
+        &blob,
+        "language_model.lm_head",
+        cfg.vocab_size as usize,
+        d,
+        group_size,
+    )?;
+    // HF stores [out=vocab, in=d]; smedjan matmul wants [in=d, out=vocab] → transpose.
+    let lm_head = mk_w(d, cfg.vocab_size as usize);
+    put_transposed(&lm_head, &lm_raw, cfg.vocab_size as usize, d)?;
+
+    let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+    for b in 0..cfg.num_hidden_layers {
+        let pfx = format!("language_model.model.layers.{b}");
+        let ln1 = mk_v(d);
+        let ln1_data = fetch_plain(&json, &blob, &format!("{pfx}.input_layernorm.weight"), d)?;
+        let bytes: Vec<u8> = ln1_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        crate::gpu::buf_write_bytes(&ln1.buffer, &bytes);
+        let ln2 = mk_v(d);
+        let ln2_data = fetch_plain(
+            &json,
+            &blob,
+            &format!("{pfx}.post_attention_layernorm.weight"),
+            d,
+        )?;
+        let bytes: Vec<u8> = ln2_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        crate::gpu::buf_write_bytes(&ln2.buffer, &bytes);
+
+        // MLP — gate/up/down are all quantized. Smedjan stores FFN as [d, inter]/[d, inter]/[inter, d]
+        // (matmul convention); HF stores [inter, d]/[inter, d]/[d, inter].
+        let inter = cfg.intermediate_size;
+        let gate_raw = fetch_q4(
+            &json,
+            &blob,
+            &format!("{pfx}.mlp.gate_proj"),
+            inter,
+            d,
+            group_size,
+        )?;
+        let up_raw = fetch_q4(
+            &json,
+            &blob,
+            &format!("{pfx}.mlp.up_proj"),
+            inter,
+            d,
+            group_size,
+        )?;
+        let down_raw = fetch_q4(
+            &json,
+            &blob,
+            &format!("{pfx}.mlp.down_proj"),
+            d,
+            inter,
+            group_size,
+        )?;
+        let ffn_gate = mk_w(d, inter);
+        put_transposed(&ffn_gate, &gate_raw, inter, d)?;
+        let ffn_up = mk_w(d, inter);
+        put_transposed(&ffn_up, &up_raw, inter, d)?;
+        let ffn_down = mk_w(inter, d);
+        put_transposed(&ffn_down, &down_raw, d, inter)?;
+
+        let is_full = cfg.is_full_attention.get(b).copied().unwrap_or(false);
+        let mixer = if is_full {
+            let n_h = cfg.num_attention_heads;
+            let n_kv = cfg.num_key_value_heads;
+            let hd = cfg.head_dim;
+            // q_proj is doubled: [n_h*hd*2, d] → split into w_q [n_h*hd, d] and gate [n_h*hd, d].
+            let q_full = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.self_attn.q_proj"),
+                n_h * hd * 2,
+                d,
+                group_size,
+            )?;
+            let (q_half, gate_half) = q_full.split_at(n_h * hd * d);
+            let w_q = mk_w(d, n_h * hd);
+            put_transposed(&w_q, q_half, n_h * hd, d)?;
+            let w_gate = mk_w(d, n_h * hd);
+            put_transposed(&w_gate, gate_half, n_h * hd, d)?;
+            let k_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.self_attn.k_proj"),
+                n_kv * hd,
+                d,
+                group_size,
+            )?;
+            let w_k = mk_w(d, n_kv * hd);
+            put_transposed(&w_k, &k_raw, n_kv * hd, d)?;
+            let v_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.self_attn.v_proj"),
+                n_kv * hd,
+                d,
+                group_size,
+            )?;
+            let w_v = mk_w(d, n_kv * hd);
+            put_transposed(&w_v, &v_raw, n_kv * hd, d)?;
+            let o_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.self_attn.o_proj"),
+                d,
+                n_h * hd,
+                group_size,
+            )?;
+            let w_o = mk_w(n_h * hd, d);
+            put_transposed(&w_o, &o_raw, d, n_h * hd)?;
+            let qk_norm = mk_v(hd);
+            let qn = fetch_plain(&json, &blob, &format!("{pfx}.self_attn.q_norm.weight"), hd)?;
+            let bytes: Vec<u8> = qn.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&qk_norm.buffer, &bytes);
+            let k_norm = mk_v(hd);
+            let kn = fetch_plain(&json, &blob, &format!("{pfx}.self_attn.k_norm.weight"), hd)?;
+            let bytes: Vec<u8> = kn.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&k_norm.buffer, &bytes);
+            // Store the doubled q_proj for the strict path; placeholder path uses w_q.
+            let q_proj_out = {
+                let t = mk_w(d, n_h * hd * 2);
+                put_transposed(&t, &q_full, n_h * hd * 2, d)?;
+                Some(t)
+            };
+            Mixer::Full(OwnedFull {
+                w_q,
+                w_k,
+                w_v,
+                qk_norm,
+                w_gate,
+                w_o,
+                k_norm,
+                q_proj_out,
+            })
+        } else {
+            let n_k = cfg.linear_num_key_heads;
+            let n_v = cfg.linear_num_value_heads;
+            let ldh = cfg.linear_key_head_dim;
+            let lvh = cfg.linear_value_head_dim;
+            let kw = cfg.linear_conv_kernel_dim;
+            let qkv_out = 2 * n_k * ldh + n_v * lvh; // q+k+v combined
+            let qkv_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.in_proj_qkv"),
+                qkv_out,
+                d,
+                group_size,
+            )?;
+            let q_len = n_k * ldh;
+            let k_len = n_k * ldh;
+            let v_len = n_v * lvh;
+            let q_raw = &qkv_raw[..q_len * d];
+            let k_raw = &qkv_raw[q_len * d..(q_len + k_len) * d];
+            let v_raw = &qkv_raw[(q_len + k_len) * d..(q_len + k_len + v_len) * d];
+            let w_q = mk_w(d, q_len);
+            put_transposed(&w_q, q_raw, q_len, d)?;
+            let w_k = mk_w(d, k_len);
+            put_transposed(&w_k, k_raw, k_len, d)?;
+            let w_v = mk_w(d, v_len);
+            put_transposed(&w_v, v_raw, v_len, d)?;
+            // conv1d: stored as BF16 [conv_dim, kw, 1] (MLX layout) = row-major [conv_dim, kw].
+            // smedjan's placeholder forward takes separate conv_q/conv_k/conv_v each [n_* * ldh, kw];
+            // split the combined conv raw data on CPU (slice_cols works on dim 1, but the split axis
+            // here is dim 0 = conv_dim, so we slice the f32 buffer directly before upload).
+            let conv_dim = 2 * n_k * ldh + n_v * lvh;
+            let conv_raw = fetch_plain(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.conv1d.weight"),
+                conv_dim * kw,
+            )?;
+            let q_chans = n_k * ldh;
+            let k_chans = n_k * ldh;
+            let v_chans = n_v * lvh;
+            let conv_q = mk_w(q_chans, kw);
+            let conv_q_data: Vec<f32> = conv_raw[..q_chans * kw].to_vec();
+            let bytes: Vec<u8> = conv_q_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&conv_q.buffer, &bytes);
+            let conv_k = mk_w(k_chans, kw);
+            let conv_k_data: Vec<f32> = conv_raw[q_chans * kw..(q_chans + k_chans) * kw].to_vec();
+            let bytes: Vec<u8> = conv_k_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&conv_k.buffer, &bytes);
+            let conv_v = mk_w(v_chans, kw);
+            let conv_v_data: Vec<f32> = conv_raw[(q_chans + k_chans) * kw..].to_vec();
+            let bytes: Vec<u8> = conv_v_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&conv_v.buffer, &bytes);
+            // in_proj_a/b → gate/beta pre-activations ([n_v] each, quantized).
+            let a_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.in_proj_a"),
+                n_v,
+                d,
+                group_size,
+            )?;
+            let w_a = mk_w(d, n_v);
+            put_transposed(&w_a, &a_raw, n_v, d)?;
+            let b_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.in_proj_b"),
+                n_v,
+                d,
+                group_size,
+            )?;
+            let w_b = mk_w(d, n_v);
+            put_transposed(&w_b, &b_raw, n_v, d)?;
+            // in_proj_z → z_gate (the output-gate projection).
+            let z_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.in_proj_z"),
+                n_v * lvh,
+                d,
+                group_size,
+            )?;
+            let z_gate = mk_w(d, n_v * lvh);
+            put_transposed(&z_gate, &z_raw, n_v * lvh, d)?;
+            // w_gate (placeholder path) ← z_gate copy; they hold the same data semantically.
+            let w_gate = {
+                let t = mk_w(d, n_v * lvh);
+                let bytes: Vec<u8> = z_raw.iter().flat_map(|f| f.to_le_bytes()).collect();
+                // Transpose z_raw [out=n_v*lvh, in=d] → [d, n_v*lvh] into w_gate.
+                put_transposed(&t, &z_raw, n_v * lvh, d)?;
+                t
+            };
+            // out_norm [lvh] (BF16, plain).
+            let out_norm = mk_v(lvh);
+            let on = fetch_plain(&json, &blob, &format!("{pfx}.linear_attn.norm.weight"), lvh)?;
+            let bytes: Vec<u8> = on.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&out_norm.buffer, &bytes);
+            let out_proj_out = n_v * lvh;
+            let o_raw = fetch_q4(
+                &json,
+                &blob,
+                &format!("{pfx}.linear_attn.out_proj"),
+                out_proj_out,
+                d,
+                group_size,
+            )?;
+            let w_o = mk_w(out_proj_out, d);
+            put_transposed(&w_o, &o_raw, out_proj_out, d)?;
+            // A_log, dt_bias [n_v] (BF16).
+            let a_log = mk_v(n_v);
+            let al = fetch_plain(&json, &blob, &format!("{pfx}.linear_attn.A_log"), n_v)?;
+            let bytes: Vec<u8> = al.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&a_log.buffer, &bytes);
+            let dt_bias = mk_v(n_v);
+            let dt = fetch_plain(&json, &blob, &format!("{pfx}.linear_attn.dt_bias"), n_v)?;
+            let bytes: Vec<u8> = dt.iter().flat_map(|f| f.to_le_bytes()).collect();
+            crate::gpu::buf_write_bytes(&dt_bias.buffer, &bytes);
+            Mixer::Delta(OwnedDelta {
+                w_q,
+                w_k,
+                w_v,
+                conv_q,
+                conv_k,
+                conv_v,
+                w_a,
+                w_b,
+                w_gate,
+                out_norm,
+                w_o,
+                a_log,
+                dt_bias,
+                z_gate,
+            })
+        };
+
+        layers.push(Qwen35Layer {
+            ln1,
+            ln2,
+            mixer,
+            ffn_gate,
+            ffn_up,
+            ffn_down,
+        });
+    }
+
+    eprintln!(
+        "Qwen3.5 safetensors imported: {} layers ({}/{}/{} tensors) from {}",
+        cfg.num_hidden_layers, 0, 0, 0, path
+    );
+    Ok(Qwen35Model {
+        layers,
+        final_norm,
+        lm_head,
+        cfg,
+        embed: Some(embed),
     })
 }
 
@@ -1054,5 +1585,452 @@ mod dtype_tests {
         assert!(decode_to_f32(&[0u8; 8], "BF16", 2, "t").is_err());
         // Unsupported dtype is rejected.
         assert!(decode_to_f32(&[0u8; 16], "F64", 2, "t").is_err());
+    }
+
+    #[test]
+    fn int4_affine_dequant_roundtrips_known_values() {
+        use super::dequant_int4_affine;
+        // 1 output row, 8 inputs (1 group of 8, group_size=8 here for a tight test).
+        // Pack 8 nibbles into one U32: nibble i = (-1)^i * i, i.e. [0,1,-2,3,-4,5,-6,7].
+        let nibbles: [i8; 8] = [0, 1, -2, 3, -4, 5, -6, 7];
+        let mut packed: u32 = 0;
+        for (i, n) in nibbles.iter().enumerate() {
+            let raw: u32 = if *n < 0 {
+                ((*n as u8) & 0xF) as u32
+            } else {
+                *n as u32
+            };
+            packed |= (raw & 0xF) << (i * 4);
+        }
+        let weight: Vec<u8> = packed.to_le_bytes().to_vec(); // 4 bytes
+                                                             // scale=2.0, bias=0.5 (bf16). 1 group, 1 row.
+        let scale_bf16 = (0x4000u16).to_le_bytes().to_vec(); // bf16 2.0
+        let bias_bf16 = (0x3F00u16).to_le_bytes().to_vec(); // bf16 0.5
+                                                            // group_size=8 → n_groups=1.
+        let out = dequant_int4_affine(&weight, &scale_bf16, &bias_bf16, 1, 8, 8, "test").unwrap();
+        let want: Vec<f32> = nibbles.iter().map(|n| *n as f32 * 2.0 + 0.5).collect();
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-4, "nibble {i}: got {g} want {w}");
+        }
+    }
+
+    #[test]
+    fn int4_affine_rejects_bad_shapes() {
+        use super::dequant_int4_affine;
+        // in_dim not divisible by 8.
+        assert!(dequant_int4_affine(&[], &[], &[], 1, 7, 8, "t").is_err());
+        // in_dim not divisible by group_size.
+        assert!(dequant_int4_affine(&[0u8; 4], &[0u8; 2], &[0u8; 2], 1, 8, 3, "t").is_err());
+        // weight bytes mismatch (expected 1*1*4=4, got 8).
+        assert!(dequant_int4_affine(&[0u8; 8], &[0u8; 2], &[0u8; 2], 1, 8, 8, "t").is_err());
+    }
+
+    /// End-to-end loader test: synthesize a tiny Q4 safetensors with the real Qwen3.5 tensor-name
+    /// layout (1 DeltaNet + 1 full-attention layer, tiny dims), import it via
+    /// `import_qwen35_safetensors`, and verify the model loads + forward produces finite logits of
+    /// the right shape. Exercises every name-mapping branch + the dequant path + transpose, without
+    /// needing the 5 GB real artifact.
+    #[test]
+    fn qwen35_loader_maps_synthetic_q4_artifact() {
+        use super::*;
+        use crate::gated_deltanet::Qwen35Config;
+        use std::sync::Arc;
+
+        let ctx = Arc::new(MetalContext::new());
+        // Tiny config that still exercises both layer types.
+        let (d, n_h, n_kv, hd, inter, vocab) = (8usize, 4, 2, 4, 16, 12);
+        let (lnk, lnv, ldh, lvh, kw) = (2usize, 4, 4, 4, 2);
+        let cfg = Qwen35Config {
+            hidden_size: d,
+            num_hidden_layers: 2,
+            head_dim: hd,
+            num_attention_heads: n_h,
+            num_key_value_heads: n_kv,
+            intermediate_size: inter,
+            vocab_size: vocab as u32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 0.5,
+            linear_num_key_heads: lnk,
+            linear_num_value_heads: lnv,
+            linear_key_head_dim: ldh,
+            linear_value_head_dim: lvh,
+            linear_conv_kernel_dim: kw,
+            full_attention_interval: 2,
+            is_full_attention: vec![false, true],
+            strict_qwen35: false,
+        };
+        let group_size = 8; // tiny group so the synthetic file stays compact
+
+        // Build entries: {name: {dtype, shape, data_offsets}}.
+        let mut blob: Vec<u8> = Vec::new();
+        let mut entries: Vec<String> = Vec::new();
+        fn add_u32(
+            blob: &mut Vec<u8>,
+            entries: &mut Vec<String>,
+            name: &str,
+            shape: Vec<usize>,
+            data: &[u8],
+        ) {
+            let start = blob.len();
+            blob.extend_from_slice(data);
+            let end = blob.len();
+            let shape_s = shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"U32\",\"shape\":[{shape_s}],\"data_offsets\":[{start},{end}]}}"
+            ));
+        }
+        fn add_bf16(
+            blob: &mut Vec<u8>,
+            entries: &mut Vec<String>,
+            name: &str,
+            shape: Vec<usize>,
+            data: &[u8],
+        ) {
+            let start = blob.len();
+            blob.extend_from_slice(data);
+            let end = blob.len();
+            let shape_s = shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"BF16\",\"shape\":[{shape_s}],\"data_offsets\":[{start},{end}]}}"
+            ));
+        }
+        // Helper: encode one row of int4-packed weights given logical [out, in] f32 values.
+        fn encode_q(vals: &[f32], out: usize, inp: usize, group_size: usize) -> Vec<u8> {
+            assert_eq!(vals.len(), out * inp);
+            let in_packed = inp / 8;
+            let mut bytes = vec![0u8; out * in_packed * 4];
+            for o in 0..out {
+                for ig in 0..inp / group_size {
+                    for j in 0..group_size {
+                        let i = ig * group_size + j;
+                        let raw = (vals[o * inp + i] as i32) as i8;
+                        let nibble: u8 = if raw < 0 {
+                            (raw as u8) & 0xF
+                        } else {
+                            (raw as u8) & 0xF
+                        };
+                        let pack_idx = i / 8;
+                        let off = (o * in_packed + pack_idx) * 4;
+                        let mut u = u32::from_le_bytes([
+                            bytes[off],
+                            bytes[off + 1],
+                            bytes[off + 2],
+                            bytes[off + 3],
+                        ]);
+                        u |= (nibble as u32 & 0xF) << ((i % 8) * 4);
+                        bytes[off..off + 4].copy_from_slice(&u.to_le_bytes());
+                    }
+                }
+            }
+            bytes
+        }
+        fn bf16(f: f32) -> Vec<u8> {
+            let bits = (f.to_bits() >> 16) as u16;
+            bits.to_le_bytes().to_vec()
+        }
+        fn q4_triplet(
+            blob: &mut Vec<u8>,
+            entries: &mut Vec<String>,
+            stem: &str,
+            out: usize,
+            inp: usize,
+            vals: &[f32],
+            group_size: usize,
+        ) {
+            let weight = encode_q(vals, out, inp, group_size);
+            let in_packed = inp / 8;
+            let n_groups = inp / group_size;
+            let mut scales = Vec::new();
+            let mut biases = Vec::new();
+            for _ in 0..(out * n_groups) {
+                scales.extend(bf16(1.0));
+                biases.extend(bf16(0.0));
+            }
+            add_u32(
+                blob,
+                entries,
+                &format!("{stem}.weight"),
+                vec![out, in_packed],
+                &weight,
+            );
+            add_bf16(
+                blob,
+                entries,
+                &format!("{stem}.scales"),
+                vec![out, n_groups],
+                &scales,
+            );
+            add_bf16(
+                blob,
+                entries,
+                &format!("{stem}.biases"),
+                vec![out, n_groups],
+                &biases,
+            );
+        }
+        fn bf16_vec(blob: &mut Vec<u8>, entries: &mut Vec<String>, name: &str, n: usize, val: f32) {
+            let mut data = Vec::new();
+            for _ in 0..n {
+                data.extend(bf16(val));
+            }
+            add_bf16(blob, entries, name, vec![n], &data);
+        }
+
+        // Top-level.
+        let embed_vals: Vec<f32> = (0..(vocab * d)).map(|i| (i % 7) as f32 - 3.0).collect();
+        q4_triplet(
+            &mut blob,
+            &mut entries,
+            "language_model.model.embed_tokens",
+            vocab,
+            d,
+            &embed_vals,
+            group_size,
+        );
+        bf16_vec(
+            &mut blob,
+            &mut entries,
+            "language_model.model.norm.weight",
+            d,
+            1.0,
+        );
+        let lm_vals: Vec<f32> = (0..(vocab * d)).map(|i| (i % 5) as f32 - 2.0).collect();
+        q4_triplet(
+            &mut blob,
+            &mut entries,
+            "language_model.lm_head",
+            vocab,
+            d,
+            &lm_vals,
+            group_size,
+        );
+
+        // Per-layer.
+        for b in 0..2 {
+            let pfx = format!("language_model.model.layers.{b}");
+            bf16_vec(
+                &mut blob,
+                &mut entries,
+                &format!("{pfx}.input_layernorm.weight"),
+                d,
+                1.0,
+            );
+            bf16_vec(
+                &mut blob,
+                &mut entries,
+                &format!("{pfx}.post_attention_layernorm.weight"),
+                d,
+                1.0,
+            );
+            let gate_vals: Vec<f32> = (0..(inter * d)).map(|i| (i % 3) as f32 - 1.0).collect();
+            q4_triplet(
+                &mut blob,
+                &mut entries,
+                &format!("{pfx}.mlp.gate_proj"),
+                inter,
+                d,
+                &gate_vals,
+                group_size,
+            );
+            let up_vals: Vec<f32> = (0..(inter * d)).map(|i| (i % 4) as f32 - 1.0).collect();
+            q4_triplet(
+                &mut blob,
+                &mut entries,
+                &format!("{pfx}.mlp.up_proj"),
+                inter,
+                d,
+                &up_vals,
+                group_size,
+            );
+            let down_vals: Vec<f32> = (0..(d * inter)).map(|i| (i % 5) as f32 - 2.0).collect();
+            q4_triplet(
+                &mut blob,
+                &mut entries,
+                &format!("{pfx}.mlp.down_proj"),
+                d,
+                inter,
+                &down_vals,
+                group_size,
+            );
+
+            let is_full = b == 1;
+            if is_full {
+                let q_full_out = n_h * hd * 2;
+                let q_vals: Vec<f32> = (0..(q_full_out * d))
+                    .map(|i| (i % 5) as f32 - 2.0)
+                    .collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.q_proj"),
+                    q_full_out,
+                    d,
+                    &q_vals,
+                    group_size,
+                );
+                let k_out = n_kv * hd;
+                let k_vals: Vec<f32> = (0..(k_out * d)).map(|i| (i % 3) as f32 - 1.0).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.k_proj"),
+                    k_out,
+                    d,
+                    &k_vals,
+                    group_size,
+                );
+                let v_vals: Vec<f32> = (0..(k_out * d)).map(|i| (i % 4) as f32 - 1.0).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.v_proj"),
+                    k_out,
+                    d,
+                    &v_vals,
+                    group_size,
+                );
+                let o_vals: Vec<f32> = (0..(d * n_h * hd)).map(|i| (i % 6) as f32 - 3.0).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.o_proj"),
+                    d,
+                    n_h * hd,
+                    &o_vals,
+                    group_size,
+                );
+                bf16_vec(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.q_norm.weight"),
+                    hd,
+                    1.0,
+                );
+                bf16_vec(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.self_attn.k_norm.weight"),
+                    hd,
+                    1.0,
+                );
+            } else {
+                let qkv_out = 2 * lnk * ldh + lnv * lvh;
+                let qkv_vals: Vec<f32> = (0..(qkv_out * d)).map(|i| (i % 5) as f32 - 2.0).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.in_proj_qkv"),
+                    qkv_out,
+                    d,
+                    &qkv_vals,
+                    group_size,
+                );
+                let a_vals: Vec<f32> = (0..(lnv * d)).map(|i| (i % 3) as f32).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.in_proj_a"),
+                    lnv,
+                    d,
+                    &a_vals,
+                    group_size,
+                );
+                let b_vals: Vec<f32> = (0..(lnv * d)).map(|i| (i % 3) as f32).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.in_proj_b"),
+                    lnv,
+                    d,
+                    &b_vals,
+                    group_size,
+                );
+                let z_vals: Vec<f32> = (0..(lnv * lvh * d)).map(|i| (i % 4) as f32).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.in_proj_z"),
+                    lnv * lvh,
+                    d,
+                    &z_vals,
+                    group_size,
+                );
+                let o_vals: Vec<f32> = (0..(lnv * lvh * d)).map(|i| (i % 5) as f32 - 2.0).collect();
+                q4_triplet(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.out_proj"),
+                    lnv * lvh,
+                    d,
+                    &o_vals,
+                    group_size,
+                );
+                let conv_dim = 2 * lnk * ldh + lnv * lvh;
+                let conv_data: Vec<u8> = (0..(conv_dim * kw)).flat_map(|_| bf16(0.5)).collect();
+                add_bf16(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.conv1d.weight"),
+                    vec![conv_dim, kw, 1],
+                    &conv_data,
+                );
+                bf16_vec(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.norm.weight"),
+                    lvh,
+                    1.0,
+                );
+                bf16_vec(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.A_log"),
+                    lnv,
+                    0.0,
+                );
+                bf16_vec(
+                    &mut blob,
+                    &mut entries,
+                    &format!("{pfx}.linear_attn.dt_bias"),
+                    lnv,
+                    1.0,
+                );
+            }
+        }
+
+        // Serialize header.
+        let header = format!("{{{}}}", entries.join(","));
+        let path = std::env::temp_dir().join("qwen35_loader_test.safetensors");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.write_all(&blob).unwrap();
+        drop(file);
+
+        // Load and forward.
+        let model =
+            import_qwen35_safetensors(&ctx, path.to_str().unwrap(), cfg.clone(), group_size)
+                .unwrap();
+        assert_eq!(model.layers.len(), 2, "two layers loaded");
+        assert!(model.embed.is_some(), "embed populated");
+        let (batch, seq) = (1usize, 3);
+        let token_ids: Vec<u32> = vec![0, 5, 11]; // within vocab=12
+        let x = model.embed_tokens(&token_ids, batch, seq);
+        assert_eq!(x.shape, vec![batch, seq, d], "embedded input shape");
+        let logits = crate::autograd::no_grad(|| model.forward(&x));
+        assert_eq!(logits.shape, vec![batch, seq, vocab], "logits shape");
+        let lv = logits.to_vec();
+        assert!(lv.iter().all(|v| v.is_finite()), "logits finite");
+        std::fs::remove_file(&path).ok();
     }
 }
