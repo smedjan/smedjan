@@ -369,6 +369,86 @@ pub fn qwen3_full_attention_mixer(
         .reshape(vec![batch, seq, dmodel])
 }
 
+/// Owned weights for a Gated-DeltaNet layer (model-resident; borrowed into `DeltaNetWeights` at forward).
+pub struct OwnedDelta {
+    pub w_q: Tensor, pub w_k: Tensor, pub w_v: Tensor,
+    pub conv_q: Tensor, pub conv_k: Tensor, pub conv_v: Tensor,
+    pub w_a: Tensor, pub w_b: Tensor, pub w_gate: Tensor, pub out_norm: Tensor, pub w_o: Tensor,
+}
+/// Owned weights for a full-attention layer.
+pub struct OwnedFull {
+    pub w_q: Tensor, pub w_k: Tensor, pub w_v: Tensor,
+    pub qk_norm: Tensor, pub w_gate: Tensor, pub w_o: Tensor,
+}
+pub enum Mixer {
+    Delta(OwnedDelta),
+    Full(OwnedFull),
+}
+pub struct Qwen35Layer {
+    pub ln1: Tensor,
+    pub ln2: Tensor,
+    pub mixer: Mixer,
+    pub ffn_gate: Tensor, // [d, inter]
+    pub ffn_up: Tensor,   // [d, inter]
+    pub ffn_down: Tensor, // [inter, d]
+}
+pub struct Qwen35Model {
+    pub layers: Vec<Qwen35Layer>,
+    pub final_norm: Tensor,
+    pub lm_head: Tensor, // [d, vocab]
+    pub cfg: Qwen35Config,
+}
+
+fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
+    let (b, s, d) = (x.shape[0], x.shape[1], x.shape[2]);
+    let xf = x.reshape(vec![b * s, d]);
+    let g = xf.matmul(gate);
+    let u = xf.matmul(up);
+    g.silu_gate(&u).matmul(down).reshape(vec![b, s, d])
+}
+
+impl Qwen35Model {
+    /// Forward over embedded inputs `x:[batch,seq,d_model]` → logits `[batch,seq,vocab]`.
+    /// Pre-norm transformer: norm → mixer → residual; norm → SwiGLU → residual; final norm; lm_head.
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        let c = &self.cfg;
+        let eps = c.rms_norm_eps;
+        let rot = (c.head_dim as f32 * c.partial_rotary_factor) as usize;
+        let mut h = x.clone();
+        for layer in &self.layers {
+            let normed = h.rms_norm(&layer.ln1, eps);
+            let mixed = match &layer.mixer {
+                Mixer::Delta(d) => qwen3_deltanet_mixer(
+                    &normed,
+                    &DeltaNetWeights {
+                        w_q: &d.w_q, w_k: &d.w_k, w_v: &d.w_v,
+                        conv_q: &d.conv_q, conv_k: &d.conv_k, conv_v: &d.conv_v,
+                        w_a: &d.w_a, w_b: &d.w_b, w_gate: &d.w_gate, out_norm: &d.out_norm, w_o: &d.w_o,
+                    },
+                    c.linear_num_key_heads, c.linear_num_value_heads, c.linear_key_head_dim,
+                    c.linear_conv_kernel_dim,
+                ),
+                Mixer::Full(f) => qwen3_full_attention_mixer(
+                    &normed,
+                    &FullAttnWeights {
+                        w_q: &f.w_q, w_k: &f.w_k, w_v: &f.w_v,
+                        qk_norm: &f.qk_norm, w_gate: &f.w_gate, w_o: &f.w_o,
+                    },
+                    c.num_attention_heads, c.num_key_value_heads, c.head_dim, rot, c.rope_theta,
+                ),
+            };
+            h = h.add(&mixed);
+            let normed2 = h.rms_norm(&layer.ln2, eps);
+            h = h.add(&swiglu(&normed2, &layer.ffn_gate, &layer.ffn_up, &layer.ffn_down));
+        }
+        let h = h.rms_norm(&self.final_norm, eps);
+        let (b, s, d) = (h.shape[0], h.shape[1], h.shape[2]);
+        h.reshape(vec![b * s, d])
+            .matmul(&self.lm_head)
+            .reshape(vec![b, s, c.vocab_size as usize])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +756,52 @@ mod tests {
             let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
             assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
         }
+        autograd::zero_grads();
+    }
+
+    #[test]
+    fn qwen35_model_forward_shape_and_grad() {
+        let ctx = ctx();
+        let (d, n_h, n_kv, hd, inter, vocab) = (8usize, 4, 2, 2, 16, 10);
+        let (lnk, lnv, ldh, kw) = (2usize, 4, 2, 3);
+        let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
+        let mkn = |n| Tensor::ones(&ctx, vec![n]).with_grad();
+        let cfg = Qwen35Config {
+            hidden_size: d, num_hidden_layers: 2, head_dim: hd, num_attention_heads: n_h,
+            num_key_value_heads: n_kv, intermediate_size: inter, vocab_size: vocab as u32,
+            rms_norm_eps: 1e-6, rope_theta: 10000.0, partial_rotary_factor: 0.5,
+            linear_num_key_heads: lnk, linear_num_value_heads: lnv, linear_key_head_dim: ldh,
+            linear_value_head_dim: ldh, linear_conv_kernel_dim: kw, full_attention_interval: 2,
+            is_full_attention: vec![false, true],
+        };
+        let delta = OwnedDelta {
+            w_q: mk(d, lnk * ldh), w_k: mk(d, lnk * ldh), w_v: mk(d, lnv * ldh),
+            conv_q: mk(lnk * ldh, kw), conv_k: mk(lnk * ldh, kw), conv_v: mk(lnv * ldh, kw),
+            w_a: mk(d, lnv), w_b: mk(d, lnv), w_gate: mk(d, lnv * ldh),
+            out_norm: mkn(ldh), w_o: mk(lnv * ldh, d),
+        };
+        let full = OwnedFull {
+            w_q: mk(d, n_h * hd), w_k: mk(d, n_kv * hd), w_v: mk(d, n_kv * hd),
+            qk_norm: mkn(hd), w_gate: mk(d, n_h * hd), w_o: mk(n_h * hd, d),
+        };
+        let ffn = |inter: usize, d: usize| (mk(d, inter), mk(d, inter), mk(inter, d));
+        let (g0, u0, dn0) = ffn(inter, d);
+        let (g1, u1, dn1) = ffn(inter, d);
+        let layers = vec![
+            Qwen35Layer { ln1: mkn(d), ln2: mkn(d), mixer: Mixer::Delta(delta), ffn_gate: g0, ffn_up: u0, ffn_down: dn0 },
+            Qwen35Layer { ln1: mkn(d), ln2: mkn(d), mixer: Mixer::Full(full), ffn_gate: g1, ffn_up: u1, ffn_down: dn1 },
+        ];
+        let model = Qwen35Model { layers, final_norm: mkn(d), lm_head: mk(d, vocab), cfg };
+        let (batch, seq) = (1usize, 4);
+        let x = Tensor::randn(&ctx, vec![batch, seq, d], 0.1).with_grad();
+        let logits = model.forward(&x);
+        assert_eq!(logits.shape, vec![batch, seq, vocab], "logits shape");
+        let n = batch * seq * vocab;
+        let loss = logits.reshape(vec![1, n]).matmul(&Tensor::ones(&ctx, vec![n, 1]));
+        autograd::backward(&ctx, loss.id);
+        let g = autograd::get_grad(x.id).expect("no grad for x through full model");
+        let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
+        assert!(gv.iter().all(|v| v.is_finite()), "non-finite grad through model");
         autograd::zero_grads();
     }
 }
