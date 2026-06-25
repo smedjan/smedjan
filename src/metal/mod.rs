@@ -198,6 +198,21 @@ pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
     }
 }
 
+/// Read a slice of bytes from a GPU buffer at the given offset. On Metal shared-memory
+/// buffers, this is a direct memcpy from the buffer's contents — no GPU dispatch needed.
+pub fn buf_read_bytes(buf: &Buf, offset: usize, length: usize) -> Vec<u8> {
+    use objc2_metal::MTLBuffer;
+    let mut out = vec![0u8; length];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (buf.contents().as_ptr() as *const u8).add(offset),
+            out.as_mut_ptr(),
+            length,
+        );
+    }
+    out
+}
+
 /// On Metal, buffers are untyped so the u32/f32 handles are the same — identity conversions.
 #[inline]
 pub fn u32_to_buf(b: BufU32) -> Buf {

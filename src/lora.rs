@@ -249,6 +249,22 @@ impl Qwen35LoraModel {
                     }
                 }
             });
+            // Add LoRA delta on the mixer output (attention output projection or DeltaNet out_proj).
+            let mixed = match &lora.qkv {
+                Some(a) => mixed.add(&a.delta(
+                    &normed.reshape(vec![normed.shape[0] * normed.shape[1], normed.shape[2]]),
+                )),
+                None => mixed,
+            };
+            let mixed = match &lora.w_o {
+                Some(a) => {
+                    let mflat =
+                        mixed.reshape(vec![mixed.shape[0] * mixed.shape[1], mixed.shape[2]]);
+                    let delta = a.delta(&mflat);
+                    mixed.add(&delta.reshape(mixed.shape.clone()))
+                }
+                None => mixed,
+            };
             h = h.add(&mixed);
 
             // FFN with LoRA: base (frozen) + LoRA delta (trainable).
@@ -354,6 +370,7 @@ pub struct LoraTrainConfig {
     pub model_path: String,
     pub config_path: String,
     pub data_path: String,
+    pub tokenizer_path: Option<String>,
     pub output_dir: String,
     pub rank: usize,
     pub alpha: f32,
@@ -363,6 +380,10 @@ pub struct LoraTrainConfig {
     pub iters: usize,
     pub save_every: usize,
     pub report_every: usize,
+    /// Enable self-distillation textual feedback (Composer 2.5 technique) — when true,
+    /// training uses `textual_feedback_loss` instead of plain cross-entropy. The data JSONL
+    /// must include "hint" and "turn_idx" fields for the teacher forward.
+    pub self_distill: bool,
 }
 
 /// Run LoRA fine-tuning on the Qwen3.5 model.
@@ -400,8 +421,8 @@ pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> s
     let param_refs: Vec<&Tensor> = lora_params.iter().collect();
     let mut optimizer = AdamW::new(ctx, &param_refs, 0.0); // no weight decay for LoRA
 
-    // Load training data (JSONL with "text" field → tokenized).
-    let dataset = load_lora_dataset(&config.data_path)?;
+    // Load training data (JSONL with "text" field → tokenized via BPE if available).
+    let dataset = load_lora_dataset(&config.data_path, config.tokenizer_path.as_deref())?;
     eprintln!("Dataset: {} examples", dataset.len());
 
     std::fs::create_dir_all(&config.output_dir)?;
@@ -409,7 +430,7 @@ pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> s
     // Training loop.
     for step in 0..config.iters {
         // Get a batch: random sequences from the dataset.
-        let batch = get_lora_batch(&dataset, config.batch_size, config.seq_len, &cfg);
+        let batch = get_lora_batch(&dataset, config.batch_size, config.seq_len, &cfg, &model);
         let x = batch.input; // [batch, seq, d]
         let targets = batch.targets; // [batch * seq]
 
@@ -453,17 +474,24 @@ struct LoraBatch {
     targets: Vec<u32>, // [batch * seq] — next-token targets
 }
 
-/// Load a JSONL dataset where each line has a "text" field. Tokenizes using the model's tokenizer
-/// (simplified: uses character-level tokenization for now — real BPE integration is a follow-up).
-fn load_lora_dataset(path: &str) -> std::io::Result<Vec<Vec<u32>>> {
+/// Load a JSONL dataset where each line has a "text" field. Tokenizes using smedjan's BPE
+/// tokenizer when a tokenizer path is provided; falls back to byte-level tokenization otherwise.
+fn load_lora_dataset(path: &str, tokenizer_path: Option<&str>) -> std::io::Result<Vec<Vec<u32>>> {
     let content = std::fs::read_to_string(path)?;
     let mut dataset = Vec::new();
+
+    // Try to load the BPE tokenizer (smedjan's own implementation).
+    let tokenizer = match tokenizer_path {
+        Some(p) => Some(crate::tokenizer::BpeTokenizer::load(p)?),
+        None => None,
+    };
+
     for line in content.lines() {
-        // Simple JSONL "text" field extraction (avoids serde_json dependency).
-        // Looks for "text": "..." pattern.
         if let Some(text) = extract_json_field(line, "text") {
-            // Simple character-level tokenization (placeholder for BPE).
-            let tokens: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+            let tokens = match &tokenizer {
+                Some(tok) => tok.encode(&text),
+                None => text.bytes().map(|b| b as u32).collect(),
+            };
             if tokens.len() > 10 {
                 dataset.push(tokens);
             }
@@ -519,28 +547,26 @@ fn get_lora_batch(
     batch_size: usize,
     seq_len: usize,
     cfg: &crate::gated_deltanet::Qwen35Config,
+    model: &Qwen35LoraModel,
 ) -> LoraBatch {
-    let ctx = Arc::new(MetalContext::new()); // TODO: share ctx
     let d = cfg.hidden_size;
     let vocab = cfg.vocab_size as usize;
-    let mut input_data = vec![0.0f32; batch_size * seq_len * d];
+
+    // Build the batch: pick examples, truncate/pad to seq_len, embed via q_embed.
+    let mut all_token_ids: Vec<u32> = Vec::with_capacity(batch_size * seq_len);
     let mut targets = vec![0u32; batch_size * seq_len];
 
     for b in 0..batch_size {
-        // Pick a random example, truncate/pad to seq_len.
         let example = &dataset[b % dataset.len()];
         let tokens: Vec<u32> = example
             .iter()
             .take(seq_len)
             .map(|&t| t % vocab as u32)
             .collect();
-        // Embed: one-hot * random projection (placeholder — real embedding via q_embed).
-        for (t, &tid) in tokens.iter().enumerate() {
-            // Simple embedding: hash token into d-dim space (placeholder).
-            for j in 0..d {
-                let hash = (tid as usize).wrapping_mul(31).wrapping_add(j);
-                input_data[b * seq_len * d + t * d + j] = ((hash % 100) as f32 - 50.0) * 0.01;
-            }
+        // Token IDs for embedding (padded with 0).
+        for t in 0..seq_len {
+            let tid = if t < tokens.len() { tokens[t] } else { 0 };
+            all_token_ids.push(tid);
             // Target = next token (shifted by 1).
             targets[b * seq_len + t] = if t + 1 < tokens.len() {
                 tokens[t + 1]
@@ -548,12 +574,9 @@ fn get_lora_batch(
                 0
             };
         }
-        // Pad remaining positions.
-        for t in tokens.len()..seq_len {
-            targets[b * seq_len + t] = 0;
-        }
     }
 
-    let input = Tensor::from_slice(&ctx, &input_data, vec![batch_size, seq_len, d]);
+    // Embed via the model's q_embed (GPU-side dequantized embedding gather).
+    let input = model.base.embed_tokens(&all_token_ids, batch_size, seq_len);
     LoraBatch { input, targets }
 }

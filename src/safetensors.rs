@@ -2156,11 +2156,10 @@ mod dtype_tests {
         // Enable strict forward (the real Qwen3.5 activation path).
         model.cfg.strict_qwen35 = true;
 
-        // Forward on a random embedded input [1, 4, d_model] → 32 layers → logits [1, 4, 248320].
-        // (The quantized loader keeps embed as int4 on the GPU; a GPU-side gather kernel is the
-        // follow-up. For now, feed a random embedded input to verify the 32-layer forward.)
+        // Forward on 4 real tokens: embed via q_embed → 32 layers → logits [1, 4, 248320].
+        let token_ids: Vec<u32> = vec![1, 9608, 1280, 4];
         let (batch, seq) = (1usize, 4);
-        let x = crate::tensor::Tensor::randn(&ctx, vec![batch, seq, cfg.hidden_size], 0.1);
+        let x = model.embed_tokens(&token_ids, batch, seq);
         eprintln!("Input: x.shape = {:?}", x.shape);
 
         let fwd_start = std::time::Instant::now();

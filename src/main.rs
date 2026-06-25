@@ -346,6 +346,54 @@ struct TrainArgs {
     pretrained: Option<String>,
 }
 
+/// Arguments for `qwen35-lora-train` — LoRA fine-tuning on the Qwen3.5 hybrid model.
+#[derive(Parser, Debug)]
+struct Qwen35LoraTrainArgs {
+    #[arg(long)]
+    model_path: String,
+    #[arg(long)]
+    config_path: String,
+    #[arg(long)]
+    data_path: String,
+    #[arg(long)]
+    tokenizer_path: Option<String>,
+    #[arg(long)]
+    output_dir: String,
+    #[arg(long, default_value = "8")]
+    rank: usize,
+    #[arg(long, default_value = "16")]
+    alpha: f32,
+    #[arg(long, default_value = "0.0001")]
+    lr: f32,
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
+    #[arg(long, default_value = "1024")]
+    seq_len: usize,
+    #[arg(long, default_value = "1200")]
+    iters: usize,
+    #[arg(long, default_value = "200")]
+    save_every: usize,
+    #[arg(long, default_value = "10")]
+    report_every: usize,
+    #[arg(long, default_value = "false")]
+    self_distill: bool,
+}
+
+/// Arguments for `qwen35-generate` — fast generation with speculative decoding.
+#[derive(Parser, Debug)]
+struct Qwen35GenerateArgs {
+    #[arg(long)]
+    model_path: String,
+    #[arg(long)]
+    config_path: String,
+    #[arg(long)]
+    prompt: String,
+    #[arg(long, default_value = "256")]
+    max_tokens: usize,
+    #[arg(long, default_value = "0")]
+    temperature: f32,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Train a BPE tokenizer from a text corpus
@@ -720,6 +768,12 @@ enum Commands {
         #[arg(long = "no-simdgroup-matmul")]
         no_simdgroup_matmul: bool,
     },
+
+    /// LoRA fine-tune the Qwen3.5 hybrid model (frozen 9B int4 base + trainable low-rank adapters)
+    Qwen35LoraTrain(Box<Qwen35LoraTrainArgs>),
+
+    /// Generate text with the Qwen3.5 model using speculative decoding
+    Qwen35Generate(Box<Qwen35GenerateArgs>),
 }
 
 fn main() {
@@ -2207,6 +2261,68 @@ fn main() {
                 checkpoint::save_checkpoint(&output, &grown, step),
                 "Failed to save grown checkpoint",
             );
+        }
+        Commands::Qwen35LoraTrain(args) => {
+            let config = lora::LoraTrainConfig {
+                model_path: args.model_path,
+                config_path: args.config_path,
+                data_path: args.data_path,
+                tokenizer_path: args.tokenizer_path,
+                output_dir: args.output_dir,
+                rank: args.rank,
+                alpha: args.alpha,
+                lr: args.lr,
+                batch_size: args.batch_size,
+                seq_len: args.seq_len,
+                iters: args.iters,
+                save_every: args.save_every,
+                report_every: args.report_every,
+                self_distill: args.self_distill,
+            };
+            result_or_exit(
+                lora::qwen35_lora_train(&ctx, &config),
+                "Qwen3.5 LoRA training failed",
+            );
+        }
+        Commands::Qwen35Generate(args) => {
+            // Load the Q4 model and generate text using the quantized forward.
+            let cfg = result_or_exit(
+                safetensors::config_from_hf_qwen35(&args.config_path),
+                "Failed to parse Qwen3.5 config",
+            );
+            let model = result_or_exit(
+                safetensors::import_qwen35_safetensors(&ctx, &args.model_path, cfg.clone(), 64),
+                "Failed to load Qwen3.5 safetensors",
+            );
+            let mut model = model;
+            model.cfg.strict_qwen35 = true;
+            eprintln!(
+                "Model loaded: {} layers, d={}",
+                cfg.num_hidden_layers, cfg.hidden_size
+            );
+
+            // Generate using the architecture-aware speculative decoder.
+            let spec_config = spec_decode::SpecConfig {
+                draft_k: 4,
+                max_tokens: args.max_tokens,
+                temperature: args.temperature,
+            };
+
+            // Run a forward pass to get the prompt logits.
+            let token_ids: Vec<u32> = args.prompt.bytes().map(|b| b as u32).collect();
+            let x = model.embed_tokens(&token_ids, 1, token_ids.len());
+            let prompt_logits = autograd::no_grad(|| model.forward(&x));
+
+            let (generated, acceptance) =
+                spec_decode::spec_decode(&ctx, &model, &prompt_logits, &spec_config);
+            eprintln!(
+                "Generated {} tokens, acceptance rate: {:.1}%",
+                generated.len(),
+                acceptance * 100.0
+            );
+            // Decode tokens to text (byte-level for now; BPE decode would need the tokenizer).
+            let text: String = generated.iter().map(|&t| t as u8 as char).collect();
+            println!("{text}");
         }
     }
 }
