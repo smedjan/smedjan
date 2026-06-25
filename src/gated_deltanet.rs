@@ -325,6 +325,50 @@ pub fn qwen3_deltanet_mixer(
         .reshape(vec![batch, seq, dmodel])
 }
 
+/// Weights for one Qwen3.5 full-attention layer.
+pub struct FullAttnWeights<'a> {
+    pub w_q: &'a Tensor,
+    pub w_k: &'a Tensor,
+    pub w_v: &'a Tensor,
+    pub qk_norm: &'a Tensor,
+    pub w_gate: &'a Tensor,
+    pub w_o: &'a Tensor,
+}
+
+/// Qwen3.5 full-attention layer (1 of every 4): GQA + QK-norm + partial-RoPE + causal softmax +
+/// sigmoid output-gate + out-proj. `x:[batch,seq,d_model]` → `[batch,seq,d_model]`.
+pub fn qwen3_full_attention_mixer(
+    x: &Tensor,
+    w: &FullAttnWeights,
+    n_h: usize,
+    n_kv: usize,
+    hd: usize,
+    rot_dim: usize,
+    rope_theta: f32,
+) -> Tensor {
+    let (batch, seq, dmodel) = (x.shape[0], x.shape[1], x.shape[2]);
+    let xf = x.reshape(vec![batch * seq, dmodel]);
+    let q = xf.matmul(w.w_q); // [batch*seq, n_h*hd]
+    let rep = n_h / n_kv;
+    let k = expand_heads(&xf.matmul(w.w_k), n_kv, rep, hd); // GQA expand → [batch*seq, n_h*hd]
+    let v = expand_heads(&xf.matmul(w.w_v), n_kv, rep, hd);
+    let fold = |t: Tensor| {
+        crate::attention::transpose_bsh_to_bhs(&t.reshape(vec![batch, seq, n_h * hd]), batch, seq, n_h, hd)
+    };
+    let qh = partial_rope(&fold(q).rms_norm(w.qk_norm, 1e-6), rot_dim, 0, rope_theta);
+    let kh = partial_rope(&fold(k).rms_norm(w.qk_norm, 1e-6), rot_dim, 0, rope_theta);
+    let vh = fold(v);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let probs = qh.batched_matmul_trans_b(&kh).scaled_causal_softmax(scale, 0); // [batch*n_h,seq,seq]
+    let o = probs.batched_matmul(&vh); // [batch*n_h, seq, hd]
+    let o = crate::attention::transpose_bhs_to_bsh(&o, batch, seq, n_h, hd).reshape(vec![batch, seq, n_h * hd]);
+    let gate = xf.matmul(w.w_gate).reshape(vec![batch, seq, n_h * hd]);
+    output_gate(&o, &gate)
+        .reshape(vec![batch * seq, n_h * hd])
+        .matmul(w.w_o)
+        .reshape(vec![batch, seq, dmodel])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +652,30 @@ mod tests {
         assert_eq!(cfg.is_full_attention, vec![false, false, false, true]);
         assert!((cfg.partial_rotary_factor - 0.25).abs() < 1e-6);
         assert!((cfg.rope_theta - 10_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn full_attention_mixer_shape_and_grad() {
+        let ctx = ctx();
+        let (batch, seq, dmodel, n_h, n_kv, hd, rot) = (1usize, 4, 8, 4, 2, 2, 2);
+        let mk = |r, c| Tensor::randn(&ctx, vec![r, c], 0.05).with_grad();
+        let (w_q, w_k, w_v) = (mk(dmodel, n_h * hd), mk(dmodel, n_kv * hd), mk(dmodel, n_kv * hd));
+        let qk_norm = Tensor::ones(&ctx, vec![hd]).with_grad();
+        let (w_gate, w_o) = (mk(dmodel, n_h * hd), mk(n_h * hd, dmodel));
+        let x = Tensor::randn(&ctx, vec![batch, seq, dmodel], 0.1).with_grad();
+        let w = FullAttnWeights {
+            w_q: &w_q, w_k: &w_k, w_v: &w_v, qk_norm: &qk_norm, w_gate: &w_gate, w_o: &w_o,
+        };
+        let out = qwen3_full_attention_mixer(&x, &w, n_h, n_kv, hd, rot, 10000.0);
+        assert_eq!(out.shape, vec![batch, seq, dmodel]);
+        let n = batch * seq * dmodel;
+        let loss = out.reshape(vec![1, n]).matmul(&Tensor::ones(&ctx, vec![n, 1]));
+        autograd::backward(&ctx, loss.id);
+        for (name, id) in [("x", x.id), ("w_q", w_q.id), ("w_k", w_k.id), ("w_gate", w_gate.id), ("w_o", w_o.id)] {
+            let g = autograd::get_grad(id).unwrap_or_else(|| panic!("no grad {name}"));
+            let gv = Tensor::from_buffer(Arc::clone(&ctx), g, vec![1]).to_vec();
+            assert!(gv.iter().all(|x| x.is_finite()), "non-finite grad {name}");
+        }
+        autograd::zero_grads();
     }
 }
