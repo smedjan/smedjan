@@ -22,6 +22,7 @@ mod mla;
 mod model;
 mod optim;
 pub mod quantize;
+mod gated_deltanet;
 mod rwkv;
 mod safetensors;
 mod sft;
