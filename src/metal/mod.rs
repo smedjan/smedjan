@@ -268,6 +268,7 @@ impl MetalContext {
                 shaders::MATMUL_SIMDGROUP_TRANS_B,
             ),
             ("matmul_qint4_trans_b", shaders::MATMUL_QINT4_TRANS_B),
+            ("matmul_qint4_decode", shaders::MATMUL_QINT4_DECODE),
             (
                 "matmul_simdgroup_trans_a",
                 shaders::MATMUL_SIMDGROUP_TRANS_A,

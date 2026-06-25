@@ -493,7 +493,7 @@ fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
 }
 
 /// Quantized-aware SwiGLU: when quantized FFN weights are present, uses qmatmul instead of matmul.
-fn swiglu_q(
+pub fn swiglu_q(
     x: &Tensor,
     q_gate: &Option<QuantizedTensor>,
     q_up: &Option<QuantizedTensor>,

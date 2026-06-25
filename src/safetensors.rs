@@ -2301,4 +2301,145 @@ mod dtype_tests {
             );
         }
     }
+
+    /// **Output-centric decode kernel correctness test**: verify that `qmatmul_decode`
+    /// (one SIMD-group per output neuron) produces the same result as the tiled `qmatmul`
+    /// and the CPU reference, for the same int4 weights. This confirms the decode kernel
+    /// is numerically correct — the output-centric approach changes the parallelism, not
+    /// the math.
+    #[test]
+    fn qmatmul_decode_matches_tiled_and_cpu() {
+        use crate::gpu::MetalContext;
+        use crate::tensor::{QuantizedTensor, Tensor};
+        use std::sync::Arc;
+
+        let ctx = Arc::new(MetalContext::new());
+        let (k, n, gs) = (16usize, 8usize, 8usize);
+        let in_packed = k / 8;
+        let n_groups = k / gs;
+
+        // Known int4 weight: nibbles = ((o + k) % 9) - 4 (same as the qmatmul test).
+        let mut weight_u32: Vec<u8> = vec![0u8; n * in_packed * 4];
+        for o in 0..n {
+            for pack_idx in 0..in_packed {
+                let mut packed: u32 = 0;
+                for ni in 0..8 {
+                    let ki = pack_idx * 8 + ni;
+                    let val: i32 = (((o + ki) % 9) as i32) - 4;
+                    let nibble: u32 = if val < 0 {
+                        ((val + 16) as u8) as u32 & 0xF
+                    } else {
+                        val as u32 & 0xF
+                    };
+                    packed |= nibble << (ni * 4);
+                }
+                let off = (o * in_packed + pack_idx) * 4;
+                weight_u32[off..off + 4].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+        let bf16 = |f: f32| -> Vec<u8> { ((f.to_bits() >> 16) as u16).to_le_bytes().to_vec() };
+        let mut scales_bytes = Vec::new();
+        let mut biases_bytes = Vec::new();
+        for _ in 0..(n * n_groups) {
+            scales_bytes.extend(bf16(1.0));
+            biases_bytes.extend(bf16(0.5));
+        }
+
+        // CPU reference: dequant + dot product for M=1.
+        let a_vals: Vec<f32> = (0..k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let mut cpu_c = vec![0.0f32; n];
+        for o in 0..n {
+            let mut acc = 0.0;
+            for ki in 0..k {
+                let nibble = (((o + ki) % 9) as i32) - 4;
+                let w = nibble as f32 * 1.0 + 0.5;
+                acc += a_vals[ki] * w;
+            }
+            cpu_c[o] = acc;
+        }
+
+        // GPU: tiled qmatmul (M=1) — the existing kernel.
+        let qweight =
+            QuantizedTensor::from_bytes(&ctx, &weight_u32, &scales_bytes, &biases_bytes, n, k, gs);
+        let a_2d = Tensor::from_slice(&ctx, &a_vals, vec![1, k]);
+        let tiled_c = crate::autograd::no_grad(|| qweight.qmatmul(&a_2d).to_vec());
+
+        // GPU: output-centric decode kernel (M=1) — the new kernel.
+        let a_1d = Tensor::from_slice(&ctx, &a_vals, vec![k]);
+        let decode_c = crate::autograd::no_grad(|| qweight.qmatmul_decode(&a_1d).to_vec());
+
+        // Compare all three.
+        eprintln!("CPU:     {:?}", &cpu_c[..n]);
+        eprintln!("Tiled:   {:?}", &tiled_c[..n]);
+        eprintln!("Decode:  {:?}", &decode_c[..n]);
+
+        for i in 0..n {
+            let cpu = cpu_c[i];
+            let tiled = tiled_c[i];
+            let decode = decode_c[i];
+            // Decode vs CPU: exact (no fp16 MMA, pure f32 accumulation).
+            assert!(
+                (decode - cpu).abs() < 1e-4,
+                "decode vs CPU mismatch at [{i}]: decode={decode} cpu={cpu}"
+            );
+            // Decode vs tiled: small fp16 rounding in the tiled kernel's MMA fragments.
+            assert!(
+                (decode - tiled).abs() < 0.1 * (1.0 + tiled.abs()),
+                "decode vs tiled mismatch at [{i}]: decode={decode} tiled={tiled}"
+            );
+        }
+    }
+
+    /// **Decode speedup benchmark**: compare output-centric `qmatmul_decode` vs tiled `qmatmul`
+    /// at M=1 (decode regime). Measures wall-clock time for both and prints the speedup ratio.
+    #[test]
+    #[ignore]
+    fn qmatmul_decode_speedup_benchmark() {
+        use crate::gpu::MetalContext;
+        use crate::tensor::{QuantizedTensor, Tensor};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let ctx = Arc::new(MetalContext::new());
+        // Realistic dims: d_model=4096, out_dim=4096 (a typical linear layer in the 9B).
+        let (k, n, gs) = (4096usize, 4096usize, 64usize);
+        let in_packed = k / 8;
+        let n_groups = k / gs;
+
+        // Build a weight of the right size (values don't matter for timing).
+        let weight_u32 = vec![0u8; n * in_packed * 4];
+        let bf16 = |f: f32| -> Vec<u8> { ((f.to_bits() >> 16) as u16).to_le_bytes().to_vec() };
+        let scales_bytes: Vec<u8> = (0..(n * n_groups)).flat_map(|_| bf16(1.0)).collect();
+        let biases_bytes: Vec<u8> = (0..(n * n_groups)).flat_map(|_| bf16(0.0)).collect();
+
+        let qweight =
+            QuantizedTensor::from_bytes(&ctx, &weight_u32, &scales_bytes, &biases_bytes, n, k, gs);
+        let a_vals = vec![0.1f32; k];
+
+        // Warm up both kernels (first Metal dispatch includes compilation).
+        let a_2d = Tensor::from_slice(&ctx, &a_vals, vec![1, k]);
+        let _ = crate::autograd::no_grad(|| qweight.qmatmul(&a_2d));
+        let a_1d = Tensor::from_slice(&ctx, &a_vals, vec![k]);
+        let _ = crate::autograd::no_grad(|| qweight.qmatmul_decode(&a_1d));
+
+        // Benchmark tiled kernel (100 iterations).
+        let iters = 100;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let _ = crate::autograd::no_grad(|| qweight.qmatmul(&a_2d));
+        }
+        let tiled_ms = start.elapsed().as_secs_f32() * 1000.0 / iters as f32;
+
+        // Benchmark decode kernel (100 iterations).
+        let start = Instant::now();
+        for _ in 0..iters {
+            let _ = crate::autograd::no_grad(|| qweight.qmatmul_decode(&a_1d));
+        }
+        let decode_ms = start.elapsed().as_secs_f32() * 1000.0 / iters as f32;
+
+        eprintln!("Decode benchmark (K={}, N={}, M=1, {} iters):", k, n, iters);
+        eprintln!("  Tiled:   {tiled_ms:.2} ms/call");
+        eprintln!("  Decode:  {decode_ms:.2} ms/call");
+        eprintln!("  Speedup: {:.2}x", tiled_ms / decode_ms);
+    }
 }

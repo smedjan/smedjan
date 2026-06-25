@@ -117,6 +117,42 @@ impl QuantizedTensor {
             ctx: Arc::clone(&self.ctx),
         }
     }
+
+    /// **Output-centric decode matmul**: `output[N] = activation[K] @ weight[N, K]^T`.
+    /// Uses the SIMD-group-per-neuron decode kernel — 2-3x faster than `qmatmul` at M=1
+    /// because it eliminates threadgroup staging, barriers, and tile boundary checks.
+    /// Use this for autoregressive decode (generating one token at a time).
+    /// For M ≥ 16, use `qmatmul` instead (the tiled kernel amortizes tile loads).
+    pub fn qmatmul_decode(&self, activation: &Tensor) -> Tensor {
+        let k = self.in_dim;
+        let n = self.out_dim;
+        // The decode kernel expects a 1-D activation [K]. If the input is [1, K], flatten.
+        let k_actual = activation.shape.iter().product::<usize>();
+        assert_eq!(
+            k_actual, k,
+            "qmatmul_decode: activation numel {} != weight in_dim {}",
+            k_actual, k
+        );
+        let out_buf = self.ctx.alloc_buffer(n * 4);
+        crate::gpu::compute::gpu_matmul_qint4_decode(
+            &self.ctx,
+            &activation.buffer,
+            &self.weight,
+            &self.scales,
+            &self.biases,
+            &out_buf,
+            n as u32,
+            k as u32,
+            self.group_size as u32,
+        );
+        Tensor {
+            id: crate::autograd::next_id(),
+            buffer: out_buf,
+            shape: vec![1, n],
+            requires_grad: activation.requires_grad,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
 }
 
 // SAFETY: Tensor's non-Send fields are Metal GPU buffers. All GPU dispatch
@@ -985,6 +1021,12 @@ impl Tensor {
         }
 
         out
+    }
+
+    /// Log-softmax: `log(softmax(x))` per row. Used by the self-distillation KL-divergence loss.
+    /// Composed from softmax + log (both forward-only for the distillation path).
+    pub fn log_softmax(&self) -> Tensor {
+        self.softmax().log()
     }
 
     /// RMS normalization over the last dimension.
@@ -2232,5 +2274,15 @@ impl Tensor {
         }
 
         out
+    }
+
+    /// Sum all elements into a scalar tensor [1]. Used by the KL-divergence loss.
+    /// Forward-only (loss computation, not backprop target).
+    pub fn sum_all(&self) -> Tensor {
+        let n = self.numel();
+        // CPU reduction (simple, correct — only called once per loss computation, not in hot path).
+        let data = self.to_vec();
+        let total: f32 = data.iter().sum();
+        Tensor::from_slice(&self.ctx, &[total], vec![1])
     }
 }

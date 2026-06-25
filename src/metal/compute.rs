@@ -273,6 +273,43 @@ pub fn gpu_matmul_qint4_trans_b(
         0 => a, 1 => q_weight, 2 => q_scales, 3 => q_biases, 4 => c, 5 => &params_buf);
 }
 
+/// **Output-centric quantized decode**: `output[N] = activation[K] @ weight_q[N, K]^T` where
+/// weight_q is affine-int4 packed. One SIMD-group (32 threads) per output neuron — each group
+/// streams the int4 weight row, dequantizes in registers, dot-products with the activation,
+/// and writes one f32. No threadgroup staging, no barriers, no tile loads.
+///
+/// This is the Apple-Silicon analog of Cursor's "warp decode" — designed for decode (M=1)
+/// where the tiled GEMM's bookkeeping overhead dominates. For M ≥ 16, use the tiled kernel.
+pub fn gpu_matmul_qint4_decode(
+    ctx: &Arc<MetalContext>,
+    activation: &GpuBuffer, // [K] f32
+    q_weight: &GpuBuffer,   // [N, K/8] U32
+    q_scales: &GpuBuffer,   // [N, K/gs] BF16 (as ushort)
+    q_biases: &GpuBuffer,   // [N, K/gs] BF16
+    output: &GpuBuffer,     // [N] f32
+    n: u32,
+    k: u32,
+    group_size: u32,
+) {
+    #[repr(C)]
+    struct Params {
+        n: u32,
+        k: u32,
+        gs: u32,
+    }
+    let params = Params {
+        n,
+        k,
+        gs: group_size,
+    };
+    let params_buf = params_buffer(ctx, &params);
+    // One thread-group per output neuron. 32 threads per group (one SIMD-group).
+    let grid = MetalContext::size(n as u64, 1, 1);
+    let tg = MetalContext::size(32, 1, 1);
+    dispatch_sync!(ctx, "matmul_qint4_decode", grid, tg,
+        0 => activation, 1 => q_weight, 2 => q_scales, 3 => q_biases, 4 => output, 5 => &params_buf);
+}
+
 /// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:`[M,K]`, B:`[M,N]`, C:`[K,N]`. Fast backward drop-in for
 /// gpu_matmul_trans_a (selected by the simdgroup flag). fp16 MMA fragments, fp32 accumulate.
 pub fn gpu_matmul_trans_a_simdgroup(
