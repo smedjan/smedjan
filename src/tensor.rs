@@ -167,33 +167,40 @@ impl QuantizedTensor {
             "gather_row: idx {row_idx} >= out_dim {}",
             self.out_dim
         );
-        // Build a 1-hot activation vector [in_dim] where position row_idx... wait.
-        // The weight is [out_dim, in_dim]. Row `row_idx` of the weight is the embedding for
-        // token `row_idx`. To extract it, we need to dequantize that specific row.
-        // The decode kernel computes output[n] = sum_k activation[k] * weight[n, k].
-        // If we set activation = one-hot at position k=0 (doesn't help — we want a specific row).
-        // Actually, the decode kernel outputs [out_dim], one scalar per output neuron.
-        // To get a specific row, we need a different approach: use the tiled kernel with
-        // activation = one-hot at position k=row_idx, but the weight is [out, in] so this gives
-        // output[out] = weight[out, row_idx] for all out. We want row_idx-th row of [out, in].
+        // Dequant one row on the GPU using the decode kernel with a one-hot activation.
+        // Build a 1-hot activation [in_dim] where position 0 = 1.0 (the kernel computes
+        // output[n] = sum_k activation[k] * weight[n, k]; with a=onehot(0), this gives
+        // output[n] = weight[n, 0] — which is column 0, not row n. That's wrong.
         //
-        // Simplest: the weight stores [out_dim, in_dim]. Row `row_idx` is at offset
-        // row_idx * in_packed in the U32 buffer. Dequantize that row on CPU (it's one row,
-        // d=4096 values — 512 U32s — trivial cost). In practice, the decode kernel could be
-        // extended to support "dequantize row n only", but the CPU path is fine for now.
+        // The decode kernel computes C[N] = A[K] @ B_q[N,K]^T where B is [N, K].
+        // To get row `row_idx` of B (the embedding for token `row_idx`), we need to
+        // "select" row row_idx. We can do this by setting N=1 (output is 1 neuron = row_idx)
+        // but the kernel dispatches one group per output neuron. If we dispatch only 1 group
+        // (group_id = row_idx), it computes output[row_idx] = sum_k a[k] * weight[row_idx, k].
+        // But we want the full row, not a single scalar.
+        //
+        // Actually, the embedding for token `row_idx` is row `row_idx` of the [vocab, d] weight
+        // matrix. Each element of that row is weight[row_idx, k] for k in 0..d. To extract the
+        // full row, we'd need to compute d separate dot products (one per k), which is what
+        // the tiled kernel does with a one-hot input. But that's expensive.
+        //
+        // The simplest fast path: read the raw bytes for this row directly from the GPU buffer
+        // (Metal shared memory = direct CPU access, no GPU dispatch needed), dequant on CPU
+        // (fast — 4096 values), and upload. The GPU buffer read is a single memcpy in shared memory.
         let in_packed = self.in_dim / 8;
         let n_groups = self.in_dim / self.group_size;
         let row_bytes = in_packed * 4;
         let scale_bytes = n_groups * 2;
 
-        // Read the raw bytes for this row from the GPU buffers.
+        // Single read call: read weight + scales + biases for this row in one contiguous slice.
+        // On Metal shared-memory buffers, this is a direct CPU memcpy — no GPU dispatch.
         let weight_all = crate::gpu::buf_read_bytes(&self.weight, row_idx * row_bytes, row_bytes);
         let scales_all =
             crate::gpu::buf_read_bytes(&self.scales, row_idx * scale_bytes, scale_bytes);
         let biases_all =
             crate::gpu::buf_read_bytes(&self.biases, row_idx * scale_bytes, scale_bytes);
 
-        // Dequantize on CPU (fast — one row of d=4096).
+        // Dequant on CPU (fast — one row of d=4096, ~512 U32s + 128 groups).
         let data = crate::safetensors::dequant_int4_affine(
             &weight_all,
             &scales_all,

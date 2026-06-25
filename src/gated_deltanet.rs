@@ -861,11 +861,22 @@ impl Qwen35Model {
     /// Forward over embedded inputs `x:[batch,seq,d_model]` → logits `[batch,seq,vocab]`.
     /// Pre-norm transformer: norm → mixer → residual; norm → SwiGLU → residual; final norm; lm_head.
     pub fn forward(&self, x: &Tensor) -> Tensor {
+        self.forward_with_cache(x, None)
+    }
+
+    /// **Decode forward** with optional KV-cache for the full-attention layers. When `kv_cache`
+    /// is provided, each FA layer appends its new K/V and computes attention over the full cached
+    /// context — O(1) per new token. The 24 DeltaNet layers are already O(1) via their recurrent state.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mut kv_cache: Option<&mut crate::kv_cache::ModelKvCache>,
+    ) -> Tensor {
         let c = &self.cfg;
         let eps = c.rms_norm_eps;
         let rot = (c.head_dim as f32 * c.partial_rotary_factor) as usize;
         let mut h = x.clone();
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             let normed = h.rms_norm(&layer.ln1, eps);
             let mixed = if c.strict_qwen35 {
                 match &layer.mixer {
@@ -878,16 +889,20 @@ impl Qwen35Model {
                         c.linear_conv_kernel_dim,
                         eps,
                     ),
-                    Mixer::Full(f) => qwen3_full_attention_mixer_strict(
-                        &normed,
-                        f,
-                        c.num_attention_heads,
-                        c.num_key_value_heads,
-                        c.head_dim,
-                        rot,
-                        c.rope_theta,
-                        None, // no KV-cache for full-seq forward
-                    ),
+                    Mixer::Full(f) => {
+                        // Extract the cache for this layer if available.
+                        let layer_cache = kv_cache.as_mut().and_then(|c| c.caches[li].as_mut());
+                        qwen3_full_attention_mixer_strict(
+                            &normed,
+                            f,
+                            c.num_attention_heads,
+                            c.num_key_value_heads,
+                            c.head_dim,
+                            rot,
+                            c.rope_theta,
+                            layer_cache,
+                        )
+                    }
                 }
             } else {
                 match &layer.mixer {

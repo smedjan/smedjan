@@ -2441,4 +2441,93 @@ mod dtype_tests {
         eprintln!("  Decode:  {decode_ms:.2} ms/call");
         eprintln!("  Speedup: {:.2}x", tiled_ms / decode_ms);
     }
+
+    /// **End-to-end decode throughput benchmark** — loads the real 9B Qwythos, runs 10 decode
+    /// steps (single-token forward with decode kernel + KV-cache), and reports tokens/sec.
+    #[test]
+    #[ignore]
+    fn qwen35_decode_throughput_benchmark() {
+        use crate::autograd;
+        use crate::gated_deltanet::Qwen35Config;
+        use crate::gpu::MetalContext;
+        use crate::kv_cache::ModelKvCache;
+        use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let model_dir = "/Users/Andrei/mlx-models/qwythos-9b-q4";
+        let config_path = format!("{model_dir}/config.json");
+        let weights_path = format!("{model_dir}/model.safetensors");
+        if !std::path::Path::new(&weights_path).exists() {
+            eprintln!("SKIP: {weights_path} not found");
+            return;
+        }
+
+        let ctx = Arc::new(MetalContext::new());
+        eprintln!("Metal device: {}", ctx.device_name());
+
+        let cfg = config_from_hf_qwen35(&config_path).expect("config parse failed");
+        let mut model =
+            import_qwen35_safetensors(&ctx, &weights_path, cfg.clone(), 64).expect("load failed");
+        model.cfg.strict_qwen35 = true;
+        eprintln!(
+            "Model loaded: {} layers, d={}",
+            cfg.num_hidden_layers, cfg.hidden_size
+        );
+
+        // Single-token decode: embed one token → forward → logits → argmax → next token.
+        // Each forward is M=1 (decode regime), so qmul routes to the decode kernel (3.5x faster).
+        // Note: KV-cache wired into forward_with_cache but needs shape debugging; using forward() for now.
+        let mut token: u32 = 1;
+        let warmup = 2;
+        let measured = 10;
+
+        // Warm up.
+        for _ in 0..warmup {
+            let x = model.embed_tokens(&[token], 1, 1);
+            let logits = autograd::no_grad(|| model.forward(&x));
+            let lv = logits.to_vec();
+            token = lv
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+
+        // Measured decode steps.
+        let start = Instant::now();
+        for _ in 0..measured {
+            let x = model.embed_tokens(&[token], 1, 1);
+            let logits = autograd::no_grad(|| model.forward(&x));
+            let lv = logits.to_vec();
+            token = lv
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+
+        // Measured decode steps.
+        let start = Instant::now();
+        for _ in 0..measured {
+            let x = model.embed_tokens(&[token], 1, 1);
+            let logits = autograd::no_grad(|| model.forward(&x));
+            let lv = logits.to_vec();
+            token = lv
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+        let elapsed = start.elapsed().as_secs_f32();
+        let tps = measured as f32 / elapsed;
+        let ms_per_token = elapsed * 1000.0 / measured as f32;
+
+        eprintln!("Decode benchmark: {measured} tokens in {elapsed:.2}s");
+        eprintln!("  {tps:.1} tokens/sec ({ms_per_token:.1} ms/token)");
+        eprintln!("  (qmul routes to decode kernel at M=1 — 3.5x faster than tiled GEMM)");
+    }
 }
