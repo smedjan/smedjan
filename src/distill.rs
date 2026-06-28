@@ -1,10 +1,10 @@
 //! Phase 6: API Distillation — generate high-quality training data from large models.
 //!
-//! Uses Claude/OpenAI/local APIs to generate synthetic text that captures
+//! Uses OpenAI/local APIs to generate synthetic text that captures
 //! the reasoning capability of 100B+ parameter models. Train a small model
 //! on this data to "distill" that capability.
 //!
-//! A 98M model trained on Claude-generated data >>> 98M trained on raw web text.
+//! A 98M model trained on API-generated data >>> 98M trained on raw web text.
 
 use std::io::{Error, ErrorKind, Write};
 
@@ -12,7 +12,7 @@ use std::io::{Error, ErrorKind, Write};
 pub struct DistillConfig {
     pub api_url: String,
     pub api_key: String,
-    pub model: String, // e.g. "claude-sonnet-4-20250514", "gpt-4o"
+    pub model: String, // e.g. "gpt-4o", "qwen2.5:7b"
     pub output_path: String,
     pub n_samples: usize,
     pub max_tokens: usize,
@@ -31,7 +31,7 @@ impl DistillConfig {
             && self.api_key.is_empty()
         {
             return Err(invalid_input(
-                "api_key must not be empty for Claude/OpenAI distillation",
+                "api_key must not be empty for OpenAI distillation",
             ));
         }
         Ok(())
@@ -142,7 +142,7 @@ pub fn default_templates() -> Vec<PromptTemplate> {
 /// Each line: {"prompt": "...", "response": "...", "category": "..."}
 ///
 /// For local models (Ollama): use `api_url = "http://localhost:11434/api/generate"`
-/// For Claude: use `api_url = "https://api.anthropic.com/v1/messages"`
+/// For Anthropic: use `api_url = "https://api.anthropic.com/v1/messages"`
 /// For OpenAI: use `api_url = "https://api.openai.com/v1/chat/completions"`
 pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> {
     config.validate()?;
@@ -168,7 +168,7 @@ pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> 
 
             // Build API request based on URL pattern
             let response = if config.api_url.contains("anthropic.com") {
-                call_claude_api(
+                call_anthropic_api(
                     &config.api_url,
                     &config.api_key,
                     &config.model,
@@ -234,8 +234,8 @@ pub fn generate_training_data(config: &DistillConfig) -> std::io::Result<usize> 
     Ok(total_pairs)
 }
 
-/// Call Claude API (Anthropic Messages API).
-fn call_claude_api(
+/// Call Anthropic Messages API.
+fn call_anthropic_api(
     url: &str,
     api_key: &str,
     model: &str,
@@ -274,7 +274,7 @@ fn call_claude_api(
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // Extract text from Claude response (simple JSON parsing)
+    // Extract text from the response (simple JSON parsing)
     if let Some(start) = response.find("\"text\":\"") {
         let start = start + 8;
         if let Some(end) = find_json_string_end(&response[start..]) {
@@ -282,7 +282,7 @@ fn call_claude_api(
         }
     }
     Err(format!(
-        "Failed to parse Claude response: {}",
+        "Failed to parse Anthropic response: {}",
         crate::truncate_on_char_boundary(&response, 200)
     ))
 }

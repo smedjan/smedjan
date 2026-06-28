@@ -842,7 +842,7 @@ pub fn config_from_hf_qwen35(path: &str) -> std::io::Result<crate::gated_deltane
 
 /// MLX-style affine int4 (group-size 64) packed-weight dequantization.
 ///
-/// Storage layout (per the Qwythos-9B-Claude-Mythos-5-1M Q4 artifact):
+/// Storage layout (per the Qwythos-9B Q4 artifact):
 ///   - `weight`: `U32` tensor of shape `[out, in_packed]` where `in_packed = in / 8` — each `U32`
 ///     packs 8 signed int4 nibbles, **little-endian nibble order** (nibble 0 = bits 0..3, etc.).
 ///   - `scales`: `BF16` shape `[out, in/64]` — one scale per group of 64 input features.

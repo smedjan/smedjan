@@ -9,7 +9,7 @@ OUT=/tmp/sj_cal
 CKPT=$OUT/final.bin
 TOK=data/tokenizer_v2.bin
 HELD=$OUT/heldout.txt
-VENVPY=/private/tmp/claude-501/-Users-Andrei/a667c1bd-e4c7-4712-84c7-dc4d14ed9327/scratchpad/ggufvenv/bin/python
+VENVPY=$(command -v python3 || echo python3)
 R=$OUT/REPORT.md
 
 # 1. Wait for training to complete (it prints "Final EMA loss" at the end).

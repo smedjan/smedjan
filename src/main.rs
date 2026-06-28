@@ -689,15 +689,15 @@ enum Commands {
         tokenizer: String,
     },
 
-    /// Generate training data from Claude/OpenAI/Ollama API (distillation)
+    /// Generate training data from OpenAI/Ollama API (distillation)
     Distill {
         /// API endpoint URL
         #[arg(long, default_value = "http://localhost:11434/api/generate")]
         api_url: String,
-        /// API key (for Claude/OpenAI, not needed for Ollama)
+        /// API key (for OpenAI, not needed for Ollama)
         #[arg(long, default_value = "")]
         api_key: String,
-        /// Model name (e.g. "claude-sonnet-4-20250514", "qwen2.5:7b")
+        /// Model name (e.g. "gpt-4o", "qwen2.5:7b")
         #[arg(long, default_value = "qwen2.5:7b")]
         model: String,
         /// Output JSONL file
