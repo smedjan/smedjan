@@ -151,7 +151,7 @@ impl Drop for PoolBypassGuard {
 
 // Link CoreGraphics — required for MTLCreateSystemDefaultDevice
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {}
+unsafe extern "C" {}
 
 /// Type aliases for the objc2-metal protocol objects.
 pub type GpuDevice = ProtocolObject<dyn MTLDevice>;
@@ -560,9 +560,9 @@ impl MetalContext {
             if list.len() < 64 {
                 // Stamp the recycle generation so quarantine won't reissue this buffer until the
                 // batch it was recycled in has been flushed (committed + waited).
-                let gen = BATCH_GENERATION.with(|g| g.get());
+                let gen_val = BATCH_GENERATION.with(|g| g.get());
                 RECYCLE_GEN.with(|rg| {
-                    rg.borrow_mut().insert(addr, gen);
+                    rg.borrow_mut().insert(addr, gen_val);
                 });
                 #[cfg(feature = "bufsan")]
                 POISONED_POOL_ADDRS.with(|p| {

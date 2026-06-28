@@ -316,8 +316,8 @@ impl Tensor {
         let data: Vec<f32> = (0..size)
             .map(|_| {
                 // Box-Muller transform for normal distribution
-                let u1: f32 = rng.gen::<f32>().max(1e-7);
-                let u2: f32 = rng.gen();
+                let u1: f32 = rng.r#gen::<f32>().max(1e-7);
+                let u2: f32 = rng.r#gen();
                 ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()) * std_dev
             })
             .collect();

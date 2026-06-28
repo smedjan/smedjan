@@ -295,7 +295,7 @@ mod tests {
         let ctx = ctx();
         let (bh, seq, hd) = (2usize, 12usize, 4usize); // chunk ∈ {2,3,4,6} all give nc>1
         let n = bh * seq * hd;
-        let gen = |s: usize| {
+        let mk_data = |s: usize| {
             (0..n)
                 .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1)
                 .collect::<Vec<f32>>()
@@ -303,7 +303,7 @@ mod tests {
         let loga: Vec<f32> = (0..bh * seq)
             .map(|i| -0.1 - ((i % 4) as f32) * 0.2)
             .collect();
-        let (q, k, v) = (gen(1), gen(2), gen(3));
+        let (q, k, v) = (mk_data(1), mk_data(2), mk_data(3));
         autograd::no_grad(|| {
             let qt = Tensor::from_slice(&ctx, &q, vec![bh, seq, hd]);
             let kt = Tensor::from_slice(&ctx, &k, vec![bh, seq, hd]);
@@ -455,7 +455,7 @@ mod chunked_grad {
         let ctx = ctx();
         let (bh, seq, hd, chunk) = (2usize, 12usize, 4usize, 4usize); // nc=3
         let n = bh * seq * hd;
-        let gen = |s: usize| {
+        let mk_data = |s: usize| {
             (0..n)
                 .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1)
                 .collect::<Vec<f32>>()
@@ -463,7 +463,7 @@ mod chunked_grad {
         let la: Vec<f32> = (0..bh * seq)
             .map(|i| -0.2 - ((i % 4) as f32) * 0.2)
             .collect();
-        let (qd, kd, vd) = (gen(1), gen(2), gen(3));
+        let (qd, kd, vd) = (mk_data(1), mk_data(2), mk_data(3));
 
         // Return (dq, dk, dv, dloga) for either the materialised or the chunked numerator.
         let grads = |chunked: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {

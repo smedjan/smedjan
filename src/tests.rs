@@ -2317,14 +2317,14 @@ mod suite {
         let ctx = test_ctx();
         autograd::no_grad(|| {
             let (bh, seq, hd) = (2usize, 40usize, 16usize);
-            let gen = |s: usize| {
+            let mk_data = |s: usize| {
                 (0..bh * seq * hd)
                     .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05)
                     .collect::<Vec<f32>>()
             };
-            let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
-            let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
-            let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+            let q = Tensor::from_slice(&ctx, &mk_data(1), vec![bh, seq, hd]);
+            let k = Tensor::from_slice(&ctx, &mk_data(2), vec![bh, seq, hd]);
+            let v = Tensor::from_slice(&ctx, &mk_data(3), vec![bh, seq, hd]);
             let flash = flash_fwd_recorded(&ctx, &q, &k, &v).to_vec();
             // The kernel keeps Q in fp32 (`float q_row[]`) but stores K/V tiles as `half`, so it
             // implements fp16-K/V attention. Compare to a dense reference with K/V rounded through
@@ -2370,14 +2370,14 @@ mod suite {
         autograd::no_grad(|| {
             for &seq in &[31usize, 32, 33, 40, 47, 64, 65] {
                 let (bh, hd) = (1usize, 16usize);
-                let gen = |s: usize| {
+                let mk_data = |s: usize| {
                     (0..bh * seq * hd)
                         .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.05)
                         .collect::<Vec<f32>>()
                 };
-                let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
-                let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
-                let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+                let q = Tensor::from_slice(&ctx, &mk_data(1), vec![bh, seq, hd]);
+                let k = Tensor::from_slice(&ctx, &mk_data(2), vec![bh, seq, hd]);
+                let v = Tensor::from_slice(&ctx, &mk_data(3), vec![bh, seq, hd]);
                 let flash = flash_fwd_recorded(&ctx, &q, &k, &v).to_vec();
                 let scale = 1.0 / (hd as f32).sqrt();
                 let dense = q
@@ -2927,14 +2927,14 @@ mod suite {
         let (hd, seq, bsz) = (8usize, 8usize, 4usize); // nb=2
         let nb = seq.div_ceil(bsz);
         let scale = 1.0 / (hd as f32).sqrt();
-        let gen = |salt: usize| -> Vec<f32> {
+        let mk_data = |salt: usize| -> Vec<f32> {
             (0..seq * hd)
                 .map(|i| (((i * 5 + salt * 11) % 13) as f32 - 6.0) * 0.1)
                 .collect()
         };
-        let q = Tensor::from_slice(&ctx, &gen(1), vec![1, seq, hd]);
-        let k = Tensor::from_slice(&ctx, &gen(2), vec![1, seq, hd]);
-        let v = Tensor::from_slice(&ctx, &gen(3), vec![1, seq, hd]);
+        let q = Tensor::from_slice(&ctx, &mk_data(1), vec![1, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &mk_data(2), vec![1, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &mk_data(3), vec![1, seq, hd]);
         // Block-sparse with top_k = nb (≥ any query's past-block count) → selects all causal blocks.
         let bm = k.block_mean_keys(bsz);
         let bs = q.batched_matmul_trans_b(&bm);
@@ -3014,14 +3014,14 @@ mod suite {
     fn block_sparse_gather_matches_dense_when_full() {
         let ctx = test_ctx();
         let (bh, seq, hd, block) = (2usize, 16usize, 8usize, 4usize); // nb=4
-        let gen = |s: usize| {
+        let mk_data = |s: usize| {
             (0..bh * seq * hd)
                 .map(|i| (((i * 7 + s * 13) % 17) as f32 - 8.0) * 0.1)
                 .collect::<Vec<f32>>()
         };
-        let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
-        let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
-        let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+        let q = Tensor::from_slice(&ctx, &mk_data(1), vec![bh, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &mk_data(2), vec![bh, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &mk_data(3), vec![bh, seq, hd]);
         // top_k=3 → k_sel=4=nb → all causal blocks selected → dense causal attention.
         let gathered =
             crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 3).to_vec();
@@ -3053,14 +3053,14 @@ mod suite {
     fn block_sparse_gather_is_sparse() {
         let ctx = test_ctx();
         let (bh, seq, hd, block) = (1usize, 32usize, 8usize, 4usize); // nb=8
-        let gen = |s: usize| {
+        let mk_data = |s: usize| {
             (0..bh * seq * hd)
                 .map(|i| (((i * 3 + s * 5) % 19) as f32 - 9.0) * 0.1)
                 .collect::<Vec<f32>>()
         };
-        let q = Tensor::from_slice(&ctx, &gen(1), vec![bh, seq, hd]);
-        let k = Tensor::from_slice(&ctx, &gen(2), vec![bh, seq, hd]);
-        let v = Tensor::from_slice(&ctx, &gen(3), vec![bh, seq, hd]);
+        let q = Tensor::from_slice(&ctx, &mk_data(1), vec![bh, seq, hd]);
+        let k = Tensor::from_slice(&ctx, &mk_data(2), vec![bh, seq, hd]);
+        let v = Tensor::from_slice(&ctx, &mk_data(3), vec![bh, seq, hd]);
         let sparse = crate::attention::block_sparse_gather_attention(&q, &k, &v, block, 1).to_vec(); // own + 1 past of up to 7
         let scale = 1.0 / (hd as f32).sqrt();
         let dense = q
@@ -3127,8 +3127,8 @@ mod suite {
         Tensor::clear_f16_cache();
         let (bh, seq, hd, block) = (2usize, 8usize, 4usize, 2usize); // nb=4, top_k=3 → all blocks
         let n = bh * seq * hd;
-        let gen = |off: usize| (0..n).map(|i| gc_in(i + off)).collect::<Vec<f32>>();
-        let (qd, kd, vd) = (gen(0), gen(13), gen(29));
+        let mk_data = |off: usize| (0..n).map(|i| gc_in(i + off)).collect::<Vec<f32>>();
+        let (qd, kd, vd) = (mk_data(0), mk_data(13), mk_data(29));
         let scale = 1.0 / (hd as f32).sqrt();
 
         // Return (q_grad, k_grad, v_grad) for either the dense or the gather forward.
@@ -3211,7 +3211,6 @@ mod suite {
     /// Benchmark (ignored): the gather path's score compute is O(n·(top_k+1)·block) vs dense O(n²) —
     /// must be FASTER at long sequence. Grounds the subquadratic claim. Run with --ignored --nocapture.
     #[test]
-    #[ignore = "benchmark: run with --ignored --nocapture (release)"]
     fn bench_block_sparse_gather_subquadratic() {
         use std::time::Instant;
         let ctx = test_ctx();
@@ -4083,7 +4082,6 @@ mod suite {
     /// assuming it. Prints GFLOP/s for both and the speedup. Run:
     /// `cargo test --release bench_matmul_simdgroup -- --ignored --nocapture`.
     #[test]
-    #[ignore = "benchmark: run explicitly with --ignored --nocapture (release)"]
     fn bench_matmul_simdgroup_vs_handrolled() {
         use std::time::Instant;
         let ctx = test_ctx();
@@ -4634,12 +4632,12 @@ mod suite {
         let seq = l0 + l1; // 5, packed exactly (no pad)
         let scale = 1.0 / (hd as f32).sqrt();
         // Deterministic q,k,v for the packed [1, seq, hd].
-        let gen = |salt: usize| -> Vec<f32> {
+        let mk_data = |salt: usize| -> Vec<f32> {
             (0..seq * hd)
                 .map(|i| (((i * 7 + salt * 13) % 17) as f32 - 8.0) * 0.1)
                 .collect()
         };
-        let (qd, kd, vd) = (gen(1), gen(2), gen(3));
+        let (qd, kd, vd) = (mk_data(1), mk_data(2), mk_data(3));
         let seg = crate::gpu::u32_to_buf(ctx.buffer_from_u32_slice(&[0u32, 0, 0, 1, 1]));
 
         // Packed run: scores → block-diagonal mask → softmax → @v.

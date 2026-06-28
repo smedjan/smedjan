@@ -412,7 +412,7 @@ fn sample_token_prescaled(logits: &[f32], config: &SamplingConfig, generated: &[
     filter_min_p_typical(&mut probs, config.min_p, config.typical_p);
 
     // Sample from distribution
-    let r: f32 = rng.gen();
+    let r: f32 = rng.r#gen();
     let mut cumulative = 0.0;
     for &(idx, prob) in &probs {
         cumulative += prob;
@@ -501,7 +501,7 @@ fn sample_token(logits: &[f32], config: &SamplingConfig, generated: &[u32]) -> u
     filter_min_p_typical(&mut probs, config.min_p, config.typical_p);
 
     // Sample from the distribution
-    let r: f32 = rng.gen();
+    let r: f32 = rng.r#gen();
     let mut cumulative = 0.0;
     for &(idx, prob) in &probs {
         cumulative += prob;
@@ -935,7 +935,7 @@ fn generate_speculative_inner<F>(
 
 /// Emit a token through the streaming callback, if present.
 fn emit_token<F: FnMut(&str)>(tokenizer: &BpeTokenizer, token: u32, on_token: &mut Option<F>) {
-    if let Some(ref mut callback) = on_token {
+    if let Some(callback) = on_token {
         let text = tokenizer.decode(&[token]);
         callback(&text);
     }

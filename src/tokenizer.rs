@@ -143,7 +143,7 @@ impl BpeTokenizer {
             // Find most frequent pair
             let &best_pair = pair_counts
                 .iter()
-                .max_by_key(|(_, &count)| count)
+                .max_by_key(|&(_, &count)| count)
                 .map(|(pair, _)| pair)
                 .unwrap();
 

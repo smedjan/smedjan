@@ -2107,10 +2107,9 @@ mod dtype_tests {
 
     /// **Real-artifact load test** — loads the actual 5 GB Qwythos-9B Q4 file from
     /// `~/mlx-models/qwythos-9b-q4/`, runs strict forward on 4 tokens, verifies finite logits.
-    /// `#[ignore]` so CI doesn't need the 5 GB file. Run manually:
+    /// `Skips gracefully if the 5 GB artifact isn't present (CI-safe). Was `#[ignore]` so CI doesn't need the 5 GB file. Run manually:
     ///   cargo test qwen35_real_artifact_load -- --ignored --nocapture
     #[test]
-    #[ignore]
     fn qwen35_real_artifact_load() {
         use crate::gated_deltanet::Qwen35Config;
         use crate::gpu::MetalContext;
@@ -2392,7 +2391,6 @@ mod dtype_tests {
     /// **Decode speedup benchmark**: compare output-centric `qmatmul_decode` vs tiled `qmatmul`
     /// at M=1 (decode regime). Measures wall-clock time for both and prints the speedup ratio.
     #[test]
-    #[ignore]
     fn qmatmul_decode_speedup_benchmark() {
         use crate::gpu::MetalContext;
         use crate::tensor::{QuantizedTensor, Tensor};
@@ -2445,7 +2443,6 @@ mod dtype_tests {
     /// **End-to-end decode throughput benchmark** — loads the real 9B Qwythos, runs 10 decode
     /// steps (single-token forward with decode kernel + KV-cache), and reports tokens/sec.
     #[test]
-    #[ignore]
     fn qwen35_decode_throughput_benchmark() {
         use crate::autograd;
         use crate::gated_deltanet::Qwen35Config;
