@@ -32,61 +32,6 @@
 
 use crate::gpu::MetalContext;
 use crate::tensor::{QuantizedTensor, Tensor};
-use std::sync::Arc;
-
-/// **RoPE frequency cache** — precomputes cos/sin for all positions up to `max_pos` and all
-/// `rot_dim/2` frequency pairs. Stored as a GPU buffer `[max_pos, rot_dim/2, 2]` (cos, sin).
-///
-/// The frequencies `freq_i = 1 / theta^(2i/head_dim)` depend only on `theta`, `head_dim`, and
-/// `rot_dim` — they're identical across all layers and all calls with the same parameters. The
-/// cos/sin values `cos((pos+offset) * freq_i)` depend on the position offset, which changes only
-/// during prefill (batch of tokens at different positions). During decode (seq=1, offset grows
-/// by 1 per token), the table is precomputed up to `max_pos` so the cache covers all positions.
-///
-/// Eliminates the per-thread `pow` + `sincos` in the Metal kernel — replaced by a single memory
-/// lookup. For a 32-layer model with 8 FA layers, this saves 8 × 2 × 32 = 512 calls to `sincos`
-/// per token, each with 32 frequency pairs × 16 heads = 512 threads computing the same values.
-pub struct RopeCache {
-    pub cos_sin_buf: crate::gpu::Buf, // [max_pos, rot_dim/2, 2] f32
-    pub max_pos: usize,
-    pub rot_dim: usize,
-    pub theta: f32,
-    pub head_dim: usize,
-}
-
-impl RopeCache {
-    /// Precompute the cos/sin table on CPU and upload to GPU. Called once per model (not per layer).
-    pub fn new(
-        ctx: &Arc<MetalContext>,
-        max_pos: usize,
-        rot_dim: usize,
-        theta: f32,
-        head_dim: usize,
-    ) -> Self {
-        let half_rot = rot_dim / 2;
-        let mut table = vec![0.0f32; max_pos * half_rot * 2];
-        for pos in 0..max_pos {
-            for (pair, slot) in (0..half_rot).enumerate() {
-                let freq = 1.0f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
-                let angle = pos as f32 * freq;
-                let (sin, cos) = angle.sin_cos();
-                let idx = (pos * half_rot + slot) * 2;
-                table[idx] = cos;
-                table[idx + 1] = sin;
-            }
-        }
-        let bytes: Vec<u8> = table.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let cos_sin_buf = ctx.alloc_buffer(bytes.len());
-        crate::gpu::buf_write_bytes(&cos_sin_buf, &bytes);
-        RopeCache {
-            cos_sin_buf,
-            max_pos,
-            rot_dim,
-            theta,
-            head_dim,
-        }
-    }
-}
 
 /// Parsed Qwen3.5 / Qwen3-Next text-model architecture config (see `safetensors::config_from_hf_qwen35`).
 #[derive(Debug, Clone)]
@@ -106,7 +51,6 @@ pub struct Qwen35Config {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
-    pub full_attention_interval: usize,
     /// Per-layer mixer: `true` = full attention, `false` = Gated DeltaNet (the 3:1 hybrid topology).
     pub is_full_attention: Vec<bool>,
     /// When `true`, the forward applies the real Qwen3.5 activations (`softplus(a + dt_bias)`,
@@ -479,9 +423,6 @@ pub struct OwnedDelta {
     pub z_gate: Tensor,
     /// Quantized weights (populated by the Q4 loader; `None` for synthetic tests).
     /// When present, the strict forward uses `qmatmul` instead of `matmul` on the f32 fields.
-    pub q_w_q: Option<QuantizedTensor>,
-    pub q_w_k: Option<QuantizedTensor>,
-    pub q_w_v: Option<QuantizedTensor>,
     pub q_w_a: Option<QuantizedTensor>,
     pub q_w_b: Option<QuantizedTensor>,
     pub q_z_gate: Option<QuantizedTensor>,
@@ -505,15 +446,14 @@ pub struct OwnedFull {
     pub k_norm: Tensor,
     pub q_proj_out: Option<Tensor>,
     /// Quantized weights (populated by the Q4 loader; `None` for synthetic tests).
-    pub q_w_q: Option<QuantizedTensor>,
     pub q_w_k: Option<QuantizedTensor>,
     pub q_w_v: Option<QuantizedTensor>,
     pub q_w_o: Option<QuantizedTensor>,
     pub q_q_proj_out: Option<QuantizedTensor>,
 }
 pub enum Mixer {
-    Delta(OwnedDelta),
-    Full(OwnedFull),
+    Delta(Box<OwnedDelta>),
+    Full(Box<OwnedFull>),
 }
 pub struct Qwen35Layer {
     pub ln1: Tensor,
@@ -536,14 +476,6 @@ pub struct Qwen35Model {
     /// Quantized embedding + lm_head (populated by the Q4 loader; `None` for synthetic tests).
     pub q_embed: Option<QuantizedTensor>,
     pub q_lm_head: Option<QuantizedTensor>,
-}
-
-fn swiglu(x: &Tensor, gate: &Tensor, up: &Tensor, down: &Tensor) -> Tensor {
-    let (b, s, d) = (x.shape[0], x.shape[1], x.shape[2]);
-    let xf = x.reshape(vec![b * s, d]);
-    let g = xf.matmul(gate);
-    let u = xf.matmul(up);
-    g.silu_gate(&u).matmul(down).reshape(vec![b, s, d])
 }
 
 /// Quantized-aware SwiGLU: when quantized FFN weights are present, uses qmatmul instead of matmul.
@@ -603,7 +535,7 @@ pub fn qmul(xf: &Tensor, qw: &Option<QuantizedTensor>, fw: &Tensor) -> Tensor {
 ///     `A_log` and `dt_bias` are per-`[n_v]` vectors broadcast across `(batch, seq)`.
 ///   - `RMSNormGated(o, z, out_norm)` with `z = xf @ z_gate`  (placeholder used `rms_norm(o) +
 ///     sigmoid(xf @ w_gate)` separately; the real op fuses norm + silu(z) in one kernel).
-/// Owned weights (`OwnedDelta`) carry `a_log`, `dt_bias`, `z_gate` populated by the loader.
+///     Owned weights (`OwnedDelta`) carry `a_log`, `dt_bias`, `z_gate` populated by the loader.
 pub fn qwen3_deltanet_mixer_strict(
     x: &Tensor,
     w: &OwnedDelta,
@@ -683,6 +615,16 @@ pub fn qwen3_deltanet_mixer_strict(
     qmul(&o_flat, &w.q_w_o, &w.w_o).reshape(vec![batch, seq, dmodel])
 }
 
+/// Geometry parameters for a full-attention layer — groups the per-layer constants that
+/// `qwen3_full_attention_mixer_strict` needs alongside the weights and input.
+pub struct AttnGeom {
+    pub n_h: usize,
+    pub n_kv: usize,
+    pub hd: usize,
+    pub rot_dim: usize,
+    pub rope_theta: f32,
+}
+
 /// Strict Qwen3.5 full-attention forward — the real q_proj split + separate q/k norms.
 /// `q_proj` stores `[d, n_h*hd*2]` (doubled): first half is q, second half is the output-gate.
 /// `q_norm` and `k_norm` are separate `[hd]` tensors (placeholder shared one `qk_norm`).
@@ -690,13 +632,11 @@ pub fn qwen3_deltanet_mixer_strict(
 pub fn qwen3_full_attention_mixer_strict(
     x: &Tensor,
     w: &OwnedFull,
-    n_h: usize,
-    n_kv: usize,
-    hd: usize,
-    rot_dim: usize,
-    rope_theta: f32,
+    geom: &AttnGeom,
     kv_cache: Option<&mut crate::kv_cache::KvCache>,
 ) -> Tensor {
+    let (n_h, n_kv, hd, rot_dim, rope_theta) =
+        (geom.n_h, geom.n_kv, geom.hd, geom.rot_dim, geom.rope_theta);
     let (batch, seq, dmodel) = (x.shape[0], x.shape[1], x.shape[2]);
     let xf = x.reshape(vec![batch * seq, dmodel]);
     // q_proj is doubled: [n_h*hd*2, d]. When quantized, do one qmatmul + split output.
@@ -895,11 +835,13 @@ impl Qwen35Model {
                         qwen3_full_attention_mixer_strict(
                             &normed,
                             f,
-                            c.num_attention_heads,
-                            c.num_key_value_heads,
-                            c.head_dim,
-                            rot,
-                            c.rope_theta,
+                            &AttnGeom {
+                                n_h: c.num_attention_heads,
+                                n_kv: c.num_key_value_heads,
+                                hd: c.head_dim,
+                                rot_dim: rot,
+                                rope_theta: c.rope_theta,
+                            },
                             layer_cache,
                         )
                     }
@@ -968,6 +910,7 @@ impl Qwen35Model {
 mod tests {
     use super::*;
     use crate::autograd;
+    use std::sync::Arc;
 
     fn ctx() -> Arc<MetalContext> {
         MetalContext::new()
@@ -1372,7 +1315,6 @@ mod tests {
             linear_key_head_dim: ldh,
             linear_value_head_dim: ldh,
             linear_conv_kernel_dim: kw,
-            full_attention_interval: 2,
             is_full_attention: vec![false, true],
             strict_qwen35: false,
         };
@@ -1391,9 +1333,6 @@ mod tests {
             a_log: Tensor::zeros(&ctx, vec![lnv]),
             dt_bias: Tensor::ones(&ctx, vec![lnv]),
             z_gate: mk(d, lnv * ldh),
-            q_w_q: None,
-            q_w_k: None,
-            q_w_v: None,
             q_w_a: None,
             q_w_b: None,
             q_z_gate: None,
@@ -1409,7 +1348,6 @@ mod tests {
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
             q_proj_out: None,
-            q_w_q: None,
             q_w_k: None,
             q_w_v: None,
             q_w_o: None,
@@ -1422,7 +1360,7 @@ mod tests {
             Qwen35Layer {
                 ln1: mkn(d),
                 ln2: mkn(d),
-                mixer: Mixer::Delta(delta),
+                mixer: Mixer::Delta(Box::new(delta)),
                 ffn_gate: g0,
                 ffn_up: u0,
                 ffn_down: dn0,
@@ -1433,7 +1371,7 @@ mod tests {
             Qwen35Layer {
                 ln1: mkn(d),
                 ln2: mkn(d),
-                mixer: Mixer::Full(full),
+                mixer: Mixer::Full(Box::new(full)),
                 ffn_gate: g1,
                 ffn_up: u1,
                 ffn_down: dn1,
@@ -1496,7 +1434,6 @@ mod tests {
             linear_key_head_dim: ldh,
             linear_value_head_dim: ldh,
             linear_conv_kernel_dim: kw,
-            full_attention_interval: 2,
             is_full_attention: vec![false, true],
             strict_qwen35: true,
         };
@@ -1515,9 +1452,6 @@ mod tests {
             a_log: Tensor::full(&ctx, vec![lnv], 0.5), // exp(0.5)≈1.65, finite
             dt_bias: Tensor::full(&ctx, vec![lnv], 0.1),
             z_gate: mk(d, lnv * ldh),
-            q_w_q: None,
-            q_w_k: None,
-            q_w_v: None,
             q_w_a: None,
             q_w_b: None,
             q_z_gate: None,
@@ -1535,7 +1469,6 @@ mod tests {
             w_o: mk(n_h * hd, d),
             k_norm: mkn(hd),
             q_proj_out: Some(q_proj_out),
-            q_w_q: None,
             q_w_k: None,
             q_w_v: None,
             q_w_o: None,
@@ -1548,7 +1481,7 @@ mod tests {
             Qwen35Layer {
                 ln1: mkn(d),
                 ln2: mkn(d),
-                mixer: Mixer::Delta(delta),
+                mixer: Mixer::Delta(Box::new(delta)),
                 ffn_gate: g0,
                 ffn_up: u0,
                 ffn_down: dn0,
@@ -1559,7 +1492,7 @@ mod tests {
             Qwen35Layer {
                 ln1: mkn(d),
                 ln2: mkn(d),
-                mixer: Mixer::Full(full),
+                mixer: Mixer::Full(Box::new(full)),
                 ffn_gate: g1,
                 ffn_up: u1,
                 ffn_down: dn1,

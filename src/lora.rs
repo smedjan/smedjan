@@ -159,7 +159,10 @@ impl Qwen35LoraModel {
                 &layer.ffn_gate,
                 &layer.ffn_up,
                 &layer.ffn_down,
-            ].into_iter().flatten() {
+            ]
+            .into_iter()
+            .flatten()
+            {
                 params.extend(a.params());
             }
         }
@@ -198,11 +201,13 @@ impl Qwen35LoraModel {
                         Mixer::Full(f) => crate::gated_deltanet::qwen3_full_attention_mixer_strict(
                             &normed,
                             f,
-                            c.num_attention_heads,
-                            c.num_key_value_heads,
-                            c.head_dim,
-                            rot,
-                            c.rope_theta,
+                            &crate::gated_deltanet::AttnGeom {
+                                n_h: c.num_attention_heads,
+                                n_kv: c.num_key_value_heads,
+                                hd: c.head_dim,
+                                rot_dim: rot,
+                                rope_theta: c.rope_theta,
+                            },
                             None, // no KV-cache for LoRA training forward
                         ),
                     }
@@ -391,8 +396,6 @@ pub struct LoraTrainConfig {
 
 /// Run LoRA fine-tuning on the Qwen3.5 model.
 pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> std::io::Result<()> {
-    
-    
     use crate::optim::AdamW;
     use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
 

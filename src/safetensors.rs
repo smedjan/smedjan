@@ -6,11 +6,12 @@
 //! config (the same flow a foreign HF import uses, sourcing config from the model's config.json) and
 //! overwrites each parameter in order. Foreign HF->Smedjan name remap + `[out,in]`->`[in,out]` transpose
 //! + RoPE permutation layer on top of this format machinery.
-#![allow(dead_code)] // export/import are exercised by the round-trip test; CLI + foreign import wire them next.
 
 use crate::gpu::MetalContext;
 use crate::model::{ModelConfig, Transformer};
-use std::io::{Error, ErrorKind, Read, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{Error, ErrorKind, Read};
 use std::sync::Arc;
 
 fn invalid(msg: impl Into<String>) -> Error {
@@ -24,7 +25,7 @@ enum Json {
     Arr(Vec<Json>),
     Str(String),
     Num(String),
-    Bool(bool),
+    Bool,
     Null,
 }
 
@@ -91,11 +92,11 @@ impl<'a> JsonParser<'a> {
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') => {
                 self.lit("true")?;
-                Ok(Json::Bool(true))
+                Ok(Json::Bool)
             }
             Some(b'f') => {
                 self.lit("false")?;
-                Ok(Json::Bool(false))
+                Ok(Json::Bool)
             }
             Some(b'n') => {
                 self.lit("null")?;
@@ -229,6 +230,7 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+#[cfg(test)]
 const ST_DTYPE: &str = "F32";
 const MAX_HEADER_LEN: u64 = 100_000_000;
 
@@ -394,6 +396,7 @@ fn offsets_field(entry: &Json, name: &str) -> std::io::Result<(usize, usize)> {
 
 /// Export an Smedjan model to a `.safetensors` file (F32). Tensors are named `p{i}` in
 /// `parameters()`-then-`base_parameters()` order, the same order `import_safetensors` walks.
+#[cfg(test)]
 pub fn export_safetensors(path: &str, model: &Transformer) -> std::io::Result<()> {
     let params = model.parameters();
     let base = model.base_parameters();
@@ -447,6 +450,7 @@ pub fn export_safetensors(path: &str, model: &Transformer) -> std::io::Result<()
 
 /// Import a `.safetensors` file into a fresh model built from `config`. Each `p{i}` tensor is
 /// shape-checked against the model parameter at index `i` and written into its buffer.
+#[cfg(test)]
 pub fn import_safetensors(
     ctx: &Arc<MetalContext>,
     path: &str,
@@ -574,6 +578,7 @@ fn rope_permute_rows(
 }
 
 /// Write a name-keyed F32 safetensors file (shared by the HF-layout export).
+#[cfg(test)]
 fn write_named(path: &str, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> std::io::Result<()> {
     let mut blob: Vec<u8> = Vec::new();
     let mut entries: Vec<String> = Vec::with_capacity(tensors.len());
@@ -644,6 +649,7 @@ fn ensure_standard(config: &ModelConfig, n_params: usize) -> std::io::Result<()>
 }
 
 /// Export an Smedjan model to HF-Llama-named safetensors (inverse transforms of the importer).
+#[cfg(test)]
 pub fn export_hf_safetensors(path: &str, model: &Transformer) -> std::io::Result<()> {
     let c = &model.config;
     let p = model.parameters();
@@ -834,7 +840,6 @@ pub fn config_from_hf_qwen35(path: &str) -> std::io::Result<crate::gated_deltane
         linear_key_head_dim: req_u("linear_key_head_dim")?,
         linear_value_head_dim: req_u("linear_value_head_dim")?,
         linear_conv_kernel_dim: req_u("linear_conv_kernel_dim")?,
-        full_attention_interval: req_u("full_attention_interval")?,
         is_full_attention,
         strict_qwen35: false,
     })
@@ -926,50 +931,6 @@ pub fn dequant_int4_affine(
     Ok(dst)
 }
 
-/// Fetch one triplet `{stem}.weight / {stem}.scales / {stem}.biases` and dequantize to `Vec<f32>`
-/// (row-major `[out, in]` → smedjan convention `[in, out]` happens in the caller, not here).
-/// `expect_out`/`expect_in` are the logical (dequantized) dims; group_size is 64 for this artifact.
-fn fetch_q4(
-    json: &Json,
-    blob: &[u8],
-    stem: &str,
-    expect_out: usize,
-    expect_in: usize,
-    group_size: usize,
-) -> std::io::Result<Vec<f32>> {
-    let entry = |suffix: &str| -> std::io::Result<(&Json, &[u8])> {
-        let name = format!("{stem}.{suffix}");
-        let e = json
-            .get(&name)
-            .ok_or_else(|| invalid(format!("Q4 fetch: missing {name}")))?;
-        let shape = shape_field(e, &name)?;
-        let (s, en) = offsets_field(e, &name)?;
-        if s > en || en > blob.len() {
-            return Err(invalid(format!(
-                "{name}: bad offsets [{s},{en}) in blob {}",
-                blob.len()
-            )));
-        }
-        Ok((e, &blob[s..en]))
-    };
-    let (we, wbytes) = entry("weight")?;
-    let (se, sbytes) = entry("scales")?;
-    let (be, bbytes) = entry("biases")?;
-    // Validate the stored shapes match expectations for this artifact.
-    let w_shape = shape_field(we, stem)?;
-    if w_shape[0] != expect_out || w_shape[1] * 8 != expect_in {
-        return Err(invalid(format!(
-            "{stem}.weight shape {w_shape:?} != expected [{expect_out}, {}]",
-            expect_in / 8
-        )));
-    }
-    let _ = shape_field(se, stem)?;
-    let _ = shape_field(be, stem)?;
-    dequant_int4_affine(
-        wbytes, sbytes, bbytes, expect_out, expect_in, group_size, stem,
-    )
-}
-
 /// Read the raw `{stem}.weight` (U32) + `.scales` (BF16) + `.biases` (BF16) bytes from the blob
 /// and upload them directly to GPU as a `QuantizedTensor` — **no CPU dequant, no f32 expansion**.
 /// This is the 16 GB-friendly path: 9B params stay ~5 GB of int4+scales+biases on the GPU.
@@ -1049,44 +1010,11 @@ fn fetch_plain(json: &Json, blob: &[u8], name: &str, numel: usize) -> std::io::R
     decode_to_f32(&blob[s..en], dtype, numel, name)
 }
 
-/// Put `data` (row-major f32) into a model-resident `Tensor`, transposing `[out, in] → [in, out]`
-/// (HF stores weights as `[out, in]`; smedjan `matmul` expects `[in, out]`).
-fn put_transposed(
-    t: &crate::tensor::Tensor,
-    data: &[f32],
-    out: usize,
-    inp: usize,
-) -> std::io::Result<()> {
-    if data.len() != out * inp {
-        return Err(invalid(format!(
-            "put_transposed: {} elements, expected {out}×{inp} = {}",
-            data.len(),
-            out * inp
-        )));
-    }
-    let mut t_data = vec![0.0f32; out * inp];
-    for o in 0..out {
-        for i in 0..inp {
-            t_data[i * out + o] = data[o * inp + i];
-        }
-    }
-    if t_data.len() != t.numel() {
-        return Err(invalid(format!(
-            "put_transposed: target tensor numel {} != transposed {}",
-            t.numel(),
-            t_data.len()
-        )));
-    }
-    let bytes: Vec<u8> = t_data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    crate::gpu::buf_write_bytes(&t.buffer, &bytes);
-    Ok(())
-}
-
 /// Load an MLX-affine-int4 Qwen3.5 / Qwen3-Next safetensors file (single-shard `.safetensors`)
 /// into a freshly-allocated `Qwen35Model` (smedjan).
 ///
 /// Maps the 927 quantized tensors (names prefixed `language_model.`) onto the hybrid topology:
-///   - 24 Gated-DeltaNet layers (combined `in_proj_qkv` split into q/k/v, `in_proj_z` → z_gate, q_w_q: None, q_w_k: None, q_w_v: None, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None, q_qkv: None,
+///   - 24 Gated-DeltaNet layers (combined `in_proj_qkv` split into q/k/v, `in_proj_z` → z_gate, q_w_a: None, q_w_b: None, q_z_gate: None, q_w_o: None, q_qkv: None,
 ///     `in_proj_a/b` → gate/beta pre-acts, `A_log`+`dt_bias`, conv1d, out-norm, out-proj).
 ///   - 8 full-attention layers (`q_proj` doubled → q + output-gate, `q_norm`+`k_norm` separate).
 ///   - Shared `embed_tokens`, `model.norm`, `lm_head`, per-layer `input_layernorm` /
@@ -1219,16 +1147,6 @@ pub fn import_qwen35_safetensors(
                 d,
                 group_size,
             )?;
-            let q_w_q = fetch_q4_raw(
-                ctx,
-                &json,
-                &blob,
-                &format!("{pfx}.self_attn.q_proj"),
-                n_h * hd,
-                d,
-                group_size,
-            )
-            .ok();
             let q_w_k = fetch_q4_raw(
                 ctx,
                 &json,
@@ -1264,7 +1182,7 @@ pub fn import_qwen35_safetensors(
             let kn = fetch_plain(&json, &blob, &format!("{pfx}.self_attn.k_norm.weight"), hd)?;
             let bytes: Vec<u8> = kn.iter().flat_map(|f| f.to_le_bytes()).collect();
             crate::gpu::buf_write_bytes(&k_norm.buffer, &bytes);
-            Mixer::Full(OwnedFull {
+            Mixer::Full(Box::new(OwnedFull {
                 w_q: mk_w(d, n_h * hd),
                 w_k: mk_w(d, n_kv * hd),
                 w_v: mk_w(d, n_kv * hd),
@@ -1273,12 +1191,11 @@ pub fn import_qwen35_safetensors(
                 w_o: mk_w(n_h * hd, d),
                 k_norm,
                 q_proj_out: None,
-                q_w_q,
                 q_w_k: Some(q_w_k),
                 q_w_v: Some(q_w_v),
                 q_w_o: Some(q_w_o),
                 q_q_proj_out: Some(q_q_proj_out),
-            })
+            }))
         } else {
             let n_k = cfg.linear_num_key_heads;
             let n_v = cfg.linear_num_value_heads;
@@ -1384,10 +1301,9 @@ pub fn import_qwen35_safetensors(
             let dt = fetch_plain(&json, &blob, &format!("{pfx}.linear_attn.dt_bias"), n_v)?;
             let bytes: Vec<u8> = dt.iter().flat_map(|f| f.to_le_bytes()).collect();
             crate::gpu::buf_write_bytes(&dt_bias.buffer, &bytes);
-            // Store the combined qkv QuantizedTensor in q_w_q (the forward will split the output).
-            // For the separate q/k/v, we'll need to handle this in the strict forward.
+            // Store the combined qkv QuantizedTensor in q_qkv (the forward will split the output).
             let _ = q_qkv;
-            Mixer::Delta(OwnedDelta {
+            Mixer::Delta(Box::new(OwnedDelta {
                 w_q: mk_w(d, q_len),
                 w_k: mk_w(d, k_len),
                 w_v: mk_w(d, v_len),
@@ -1402,15 +1318,12 @@ pub fn import_qwen35_safetensors(
                 a_log,
                 dt_bias,
                 z_gate: mk_w(d, n_v * lvh),
-                q_w_q: None,
-                q_w_k: None,
-                q_w_v: None,
                 q_w_a: Some(q_w_a),
                 q_w_b: Some(q_w_b),
                 q_z_gate: Some(q_z_gate),
                 q_w_o: Some(q_w_o),
                 q_qkv: Some(q_qkv),
-            })
+            }))
         };
 
         layers.push(Qwen35Layer {
@@ -1728,7 +1641,6 @@ mod dtype_tests {
             linear_key_head_dim: ldh,
             linear_value_head_dim: lvh,
             linear_conv_kernel_dim: kw,
-            full_attention_interval: 2,
             is_full_attention: vec![false, true],
             strict_qwen35: false,
         };
