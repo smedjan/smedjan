@@ -318,7 +318,7 @@ pub fn qwen3_deltanet_mixer(
     let qh = fold(q).rms_norm(&ones_dh, 1e-6); // L2-norm q,k per head
     let kh = fold(k).rms_norm(&ones_dh, 1e-6);
     let vh = fold(v); // [batch*n_v, seq, dh]
-                      // gates (placeholder activations): log_g ≤ 0, beta ∈ (0,1)
+    // gates (placeholder activations): log_g ≤ 0, beta ∈ (0,1)
     let log_g = xf.matmul(w.w_a).relu().scale(-1.0); // [batch*seq, n_v]
     let beta = sigmoid(&xf.matmul(w.w_b));
     let fold_scalar = |t: Tensor| {
@@ -1534,7 +1534,7 @@ mod tests {
         });
         let (log_got, sp_got) = got;
         for (i, (&x, &lg)) in xs.iter().zip(log_got.iter()).enumerate() {
-            let want = (x.max(1.17549435e-38)).ln();
+            let want = (x.max(1.175_494_4e-38)).ln();
             assert!(
                 (lg - want).abs() < 1e-3,
                 "log({x}) got {lg} want {want} at {i}"

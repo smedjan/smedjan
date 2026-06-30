@@ -1257,9 +1257,10 @@ fn backward_checkpoint(
     // Extract gradient for the checkpoint's input tensor.
     // We saved first_input_id before consuming the sub-tape.
     if let Some(sub_input_id) = first_input_id
-        && let Some(input_grad) = GRADS.with(|grads| grads.borrow().get(&sub_input_id).cloned()) {
-            accumulate_grad(ctx, entry.inputs[0], input_grad, input_size);
-        }
+        && let Some(input_grad) = GRADS.with(|grads| grads.borrow().get(&sub_input_id).cloned())
+    {
+        accumulate_grad(ctx, entry.inputs[0], input_grad, input_size);
+    }
 
     // Clean up sub-tape intermediate gradients. These are ephemeral activations
     // from the recomputed forward — not model parameter gradients. Removing them

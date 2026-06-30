@@ -1,5 +1,3 @@
-#![cfg_attr(all(feature = "cuda", not(feature = "metal")), allow(dead_code))]
-
 #[cfg(feature = "metal")]
 pub mod api;
 mod attention;
@@ -27,7 +25,6 @@ mod optim;
 pub mod quantize;
 mod rwkv;
 mod safetensors;
-mod self_distill;
 mod sft;
 mod spec_decode;
 mod ssm;
@@ -375,8 +372,6 @@ struct Qwen35LoraTrainArgs {
     save_every: usize,
     #[arg(long, default_value = "10")]
     report_every: usize,
-    #[arg(long, default_value = "false")]
-    self_distill: bool,
     #[arg(long, default_value = "adamw")]
     optimizer: String,
 }
@@ -2281,7 +2276,6 @@ fn main() {
                 iters: args.iters,
                 save_every: args.save_every,
                 report_every: args.report_every,
-                self_distill: args.self_distill,
                 optimizer: args.optimizer,
             };
             result_or_exit(

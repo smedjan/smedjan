@@ -1056,86 +1056,82 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 // KL(teacher || student) as auxiliary loss with weight 0.1.
                 // Self-distillation every 10 steps to amortize the cost (~40% overhead per step)
                 if let Some(ref h) = hidden_for_distill
-                    && !ema_buffers.is_empty() && step % 10 == 0 {
-                        // Self-distillation: compute teacher logits from hidden + EMA LM head.
-                        // Uses EMA embedding (ema_buffers[0]) for the weight-tied LM head.
-                        // One extra matmul — no full teacher forward needed.
-                        let ema_embed = &ema_buffers[0];
-                        let teacher_logits = autograd::no_grad(|| {
-                            let vocab = config.model_config.vocab_size as usize;
-                            let n = h.shape[0];
-                            if model.embed_rank > 0 {
-                                // Factored: h @ ema_embed_proj^T @ ema_embedding^T
-                                let ema_proj = &ema_buffers[2]; // embed_proj is 3rd param
-                                let d = config.model_config.d_model;
-                                let r = model.embed_rank;
-                                let h_proj_buf = ctx.alloc_buffer(n * r * 4);
-                                compute::gpu_matmul_trans_b(
-                                    ctx,
-                                    &h.buffer,
-                                    ema_proj,
-                                    &h_proj_buf,
-                                    n as u32,
-                                    r as u32,
-                                    d as u32,
-                                );
-                                let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
-                                compute::gpu_matmul_trans_b(
-                                    ctx,
-                                    &h_proj_buf,
-                                    ema_embed,
-                                    &teacher_buf,
-                                    n as u32,
-                                    vocab as u32,
-                                    r as u32,
-                                );
-                                crate::tensor::Tensor::from_buffer(
-                                    Arc::clone(&h.ctx),
-                                    teacher_buf,
-                                    vec![n, vocab],
-                                )
-                            } else {
-                                let d = config.model_config.d_model;
-                                let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
-                                compute::gpu_matmul_trans_b(
-                                    ctx,
-                                    &h.buffer,
-                                    ema_embed,
-                                    &teacher_buf,
-                                    n as u32,
-                                    vocab as u32,
-                                    d as u32,
-                                );
-                                crate::tensor::Tensor::from_buffer(
-                                    Arc::clone(&h.ctx),
-                                    teacher_buf,
-                                    vec![n, vocab],
-                                )
-                            }
-                        });
-                        // KL distillation: alpha=0.1, temperature=2.0
-                        let (distill_loss, distill_grad) = loss::distillation_loss(
-                            ctx,
-                            &logits,
-                            &teacher_logits,
-                            2.0,
-                            0.1,
-                            targets,
-                        );
-                        // Add distillation loss to main loss for display
-                        compute::gpu_axpy(ctx, &loss_tensor.buffer, &distill_loss.buffer, 1, 0.1);
-                        // Add distillation gradient to CE gradient
-                        compute::gpu_axpy(
-                            ctx,
-                            &grad_logits,
-                            &distill_grad,
-                            (config.batch_size
-                                * effective_seq
-                                * config.model_config.vocab_size as usize)
-                                as u32,
-                            0.1,
-                        );
-                    }
+                    && !ema_buffers.is_empty()
+                    && step % 10 == 0
+                {
+                    // Self-distillation: compute teacher logits from hidden + EMA LM head.
+                    // Uses EMA embedding (ema_buffers[0]) for the weight-tied LM head.
+                    // One extra matmul — no full teacher forward needed.
+                    let ema_embed = &ema_buffers[0];
+                    let teacher_logits = autograd::no_grad(|| {
+                        let vocab = config.model_config.vocab_size as usize;
+                        let n = h.shape[0];
+                        if model.embed_rank > 0 {
+                            // Factored: h @ ema_embed_proj^T @ ema_embedding^T
+                            let ema_proj = &ema_buffers[2]; // embed_proj is 3rd param
+                            let d = config.model_config.d_model;
+                            let r = model.embed_rank;
+                            let h_proj_buf = ctx.alloc_buffer(n * r * 4);
+                            compute::gpu_matmul_trans_b(
+                                ctx,
+                                &h.buffer,
+                                ema_proj,
+                                &h_proj_buf,
+                                n as u32,
+                                r as u32,
+                                d as u32,
+                            );
+                            let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
+                            compute::gpu_matmul_trans_b(
+                                ctx,
+                                &h_proj_buf,
+                                ema_embed,
+                                &teacher_buf,
+                                n as u32,
+                                vocab as u32,
+                                r as u32,
+                            );
+                            crate::tensor::Tensor::from_buffer(
+                                Arc::clone(&h.ctx),
+                                teacher_buf,
+                                vec![n, vocab],
+                            )
+                        } else {
+                            let d = config.model_config.d_model;
+                            let teacher_buf = ctx.alloc_buffer(n * vocab * 4);
+                            compute::gpu_matmul_trans_b(
+                                ctx,
+                                &h.buffer,
+                                ema_embed,
+                                &teacher_buf,
+                                n as u32,
+                                vocab as u32,
+                                d as u32,
+                            );
+                            crate::tensor::Tensor::from_buffer(
+                                Arc::clone(&h.ctx),
+                                teacher_buf,
+                                vec![n, vocab],
+                            )
+                        }
+                    });
+                    // KL distillation: alpha=0.1, temperature=2.0
+                    let (distill_loss, distill_grad) =
+                        loss::distillation_loss(ctx, &logits, &teacher_logits, 2.0, 0.1, targets);
+                    // Add distillation loss to main loss for display
+                    compute::gpu_axpy(ctx, &loss_tensor.buffer, &distill_loss.buffer, 1, 0.1);
+                    // Add distillation gradient to CE gradient
+                    compute::gpu_axpy(
+                        ctx,
+                        &grad_logits,
+                        &distill_grad,
+                        (config.batch_size
+                            * effective_seq
+                            * config.model_config.vocab_size as usize)
+                            as u32,
+                        0.1,
+                    );
+                }
 
                 // Multi-token prediction: add loss from extra heads
                 if !extra_logits.is_empty() {
@@ -1520,34 +1516,31 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
         // Validation loss + early stopping (if validation dataset provided)
         if let Some(ref val_path) = config.val_dataset
-            && step > 0 && step % config.checkpoint_interval == 0 {
-                let val_loss = compute_validation_loss(
-                    ctx,
-                    &model,
-                    val_path,
-                    config.batch_size,
-                    config.seq_len,
-                )?;
-                let _ = writeln!(log_file, "# val_loss={:.6} at step {}", val_loss, step);
-                if val_loss < best_val_loss {
-                    best_val_loss = val_loss;
-                    val_no_improve = 0;
-                    eprintln!("  val_loss: {:.4} (new best)", val_loss);
-                } else {
-                    val_no_improve += 1;
+            && step > 0
+            && step % config.checkpoint_interval == 0
+        {
+            let val_loss =
+                compute_validation_loss(ctx, &model, val_path, config.batch_size, config.seq_len)?;
+            let _ = writeln!(log_file, "# val_loss={:.6} at step {}", val_loss, step);
+            if val_loss < best_val_loss {
+                best_val_loss = val_loss;
+                val_no_improve = 0;
+                eprintln!("  val_loss: {:.4} (new best)", val_loss);
+            } else {
+                val_no_improve += 1;
+                eprintln!(
+                    "  val_loss: {:.4} (no improve {}/{})",
+                    val_loss, val_no_improve, early_stop_patience
+                );
+                if early_stop_patience > 0 && val_no_improve >= early_stop_patience {
                     eprintln!(
-                        "  val_loss: {:.4} (no improve {}/{})",
-                        val_loss, val_no_improve, early_stop_patience
+                        "Early stopping: val_loss didn't improve for {} checks",
+                        early_stop_patience
                     );
-                    if early_stop_patience > 0 && val_no_improve >= early_stop_patience {
-                        eprintln!(
-                            "Early stopping: val_loss didn't improve for {} checks",
-                            early_stop_patience
-                        );
-                        break;
-                    }
+                    break;
                 }
             }
+        }
     }
 
     // Final checkpoint — wait for GPU before reading weights

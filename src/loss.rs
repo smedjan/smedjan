@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::gpu::{compute, MetalContext};
+use crate::gpu::{MetalContext, compute};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ pub fn cross_entropy_loss_with_workspace(
 /// equal-length sequences it is bit-identical to `cross_entropy_loss`. The CE kernel emits
 /// grad = (softmax - onehot)/n_tokens per row; per-sample reweights each row by n_tokens/(n_seq*len)
 /// so the gradient stays exact (finite-difference-checked in tests).
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn cross_entropy_loss_per_sample(
     ctx: &Arc<MetalContext>,
     logits: &Tensor,

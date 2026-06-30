@@ -75,8 +75,6 @@ pub struct LoraLayer {
 pub struct Qwen35LoraModel {
     pub base: Qwen35Model,
     pub lora_layers: Vec<LoraLayer>,
-    pub rank: usize,
-    pub alpha: f32,
 }
 
 impl Qwen35LoraModel {
@@ -134,12 +132,7 @@ impl Qwen35LoraModel {
             })
             .collect();
 
-        Qwen35LoraModel {
-            base,
-            lora_layers,
-            rank,
-            alpha,
-        }
+        Qwen35LoraModel { base, lora_layers }
     }
 
     /// Collect all trainable LoRA parameters (for the optimizer).
@@ -384,10 +377,6 @@ pub struct LoraTrainConfig {
     pub iters: usize,
     pub save_every: usize,
     pub report_every: usize,
-    /// Enable self-distillation textual feedback (Composer 2.5 technique) — when true,
-    /// training uses `textual_feedback_loss` instead of plain cross-entropy. The data JSONL
-    /// must include "hint" and "turn_idx" fields for the teacher forward.
-    pub self_distill: bool,
     /// Optimizer: "adamw" (default) or "muon" (MomentUm Orthogonalized by Newton-Schulz).
     /// Muon is ~2x faster convergence for 2-D weight matrices (LoRA A/B are 2-D), per the
     /// Muon paper and Cursor's Composer 2.5 training stack.

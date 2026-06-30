@@ -534,7 +534,7 @@ pub fn import_safetensors(
 // ============================================================================
 
 const HF_BLOCK_PARAMS: usize = 10; // params per standard block in parameters() order:
-                                   // [w_q, w_k, w_v, w_o, qk_norm, ffn_w1(gate), ffn_w2(down), ffn_w3(up), ln1, ln2]
+// [w_q, w_k, w_v, w_o, qk_norm, ffn_w1(gate), ffn_w2(down), ffn_w3(up), ln1, ln2]
 
 /// Transpose a row-major [rows, cols] f32 matrix to [cols, rows].
 fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -750,13 +750,14 @@ pub fn config_from_hf_json(path: &str) -> std::io::Result<ModelConfig> {
             .map_or(dflt, |n| n as f32)
     };
 
-    if let Some(mt) = json.get("model_type").and_then(|v| v.as_str()) {
-        if mt != "llama" && mt != "mistral" {
-            eprintln!(
-                "warning: config.json model_type='{mt}' (expected llama/mistral); mapping the standard \
-                 Llama-arch fields — non-Llama architectures may not import faithfully."
-            );
-        }
+    if let Some(mt) = json.get("model_type").and_then(|v| v.as_str())
+        && mt != "llama"
+        && mt != "mistral"
+    {
+        eprintln!(
+            "warning: config.json model_type='{mt}' (expected llama/mistral); mapping the standard \
+             Llama-arch fields — non-Llama architectures may not import faithfully."
+        );
     }
 
     let hidden = req_u("hidden_size")?;
@@ -1100,7 +1101,7 @@ pub fn import_qwen35_safetensors(
 
         // MLP — quantized, raw int4 on GPU (no f32 expansion).
         let inter = cfg.intermediate_size;
-        let q_ffn_gate = fetch_q4_raw(
+        let _q_ffn_gate = fetch_q4_raw(
             ctx,
             &json,
             &blob,
@@ -1109,7 +1110,7 @@ pub fn import_qwen35_safetensors(
             d,
             group_size,
         )?;
-        let q_ffn_up = fetch_q4_raw(
+        let _q_ffn_up = fetch_q4_raw(
             ctx,
             &json,
             &blob,
@@ -1118,7 +1119,7 @@ pub fn import_qwen35_safetensors(
             d,
             group_size,
         )?;
-        let q_ffn_down = fetch_q4_raw(
+        let _q_ffn_down = fetch_q4_raw(
             ctx,
             &json,
             &blob,
@@ -1514,7 +1515,7 @@ mod dtype_tests {
         assert_eq!(bf16_to_f32(0xC000), -2.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
         assert_eq!(bf16_to_f32(0x4049), f32::from_bits(0x4049u32 << 16)); // ~3.14
-                                                                          // Range: bf16 keeps f32's 8-bit exponent, so values far above the f16 max survive.
+        // Range: bf16 keeps f32's 8-bit exponent, so values far above the f16 max survive.
         let big = bf16_to_f32(0x7149); // ~1e30
         assert!(big > 1e29, "bf16 must preserve large exponent: {big}");
     }
@@ -1588,10 +1589,10 @@ mod dtype_tests {
             packed |= (raw & 0xF) << (i * 4);
         }
         let weight: Vec<u8> = packed.to_le_bytes().to_vec(); // 4 bytes
-                                                             // scale=2.0, bias=0.5 (bf16). 1 group, 1 row.
+        // scale=2.0, bias=0.5 (bf16). 1 group, 1 row.
         let scale_bf16 = (0x4000u16).to_le_bytes().to_vec(); // bf16 2.0
         let bias_bf16 = (0x3F00u16).to_le_bytes().to_vec(); // bf16 0.5
-                                                            // group_size=8 → n_groups=1.
+        // group_size=8 → n_groups=1.
         let out = dequant_int4_affine(&weight, &scale_bf16, &bias_bf16, 1, 8, 8, "test").unwrap();
         let want: Vec<f32> = nibbles.iter().map(|n| *n as f32 * 2.0 + 0.5).collect();
         for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
@@ -1697,11 +1698,7 @@ mod dtype_tests {
                     for j in 0..group_size {
                         let i = ig * group_size + j;
                         let raw = (vals[o * inp + i] as i32) as i8;
-                        let nibble: u8 = if raw < 0 {
-                            (raw as u8) & 0xF
-                        } else {
-                            (raw as u8) & 0xF
-                        };
+                        let nibble: u8 = (raw as u8) & 0xF;
                         let pack_idx = i / 8;
                         let off = (o * in_packed + pack_idx) * 4;
                         let mut u = u32::from_le_bytes([
@@ -2023,7 +2020,6 @@ mod dtype_tests {
     ///   cargo test qwen35_real_artifact_load -- --ignored --nocapture
     #[test]
     fn qwen35_real_artifact_load() {
-        use crate::gated_deltanet::Qwen35Config;
         use crate::gpu::MetalContext;
         use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
         use std::sync::Arc;
@@ -2258,14 +2254,14 @@ mod dtype_tests {
         // CPU reference: dequant + dot product for M=1.
         let a_vals: Vec<f32> = (0..k).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
         let mut cpu_c = vec![0.0f32; n];
-        for o in 0..n {
+        for (o, cpu_c_o) in cpu_c.iter_mut().enumerate().take(n) {
             let mut acc = 0.0;
-            for ki in 0..k {
+            for (ki, &a_val) in a_vals.iter().enumerate().take(k) {
                 let nibble = (((o + ki) % 9) as i32) - 4;
                 let w = nibble as f32 * 1.0 + 0.5;
-                acc += a_vals[ki] * w;
+                acc += a_val * w;
             }
-            cpu_c[o] = acc;
+            *cpu_c_o = acc;
         }
 
         // GPU: tiled qmatmul (M=1) — the existing kernel.
@@ -2357,9 +2353,7 @@ mod dtype_tests {
     #[test]
     fn qwen35_decode_throughput_benchmark() {
         use crate::autograd;
-        use crate::gated_deltanet::Qwen35Config;
         use crate::gpu::MetalContext;
-        use crate::kv_cache::ModelKvCache;
         use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
         use std::sync::Arc;
         use std::time::Instant;
@@ -2405,7 +2399,6 @@ mod dtype_tests {
         }
 
         // Measured decode steps.
-        let start = Instant::now();
         for _ in 0..measured {
             let x = model.embed_tokens(&[token], 1, 1);
             let logits = autograd::no_grad(|| model.forward(&x));

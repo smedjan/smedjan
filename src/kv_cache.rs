@@ -25,17 +25,6 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(max_seq: usize, n_kv: usize, head_dim: usize) -> Self {
-        let kv_size = n_kv * head_dim;
-        KvCache {
-            k_cache: vec![0.0f32; max_seq * kv_size],
-            v_cache: vec![0.0f32; max_seq * kv_size],
-            seq_len: 0,
-            n_kv,
-            head_dim,
-        }
-    }
-
     /// Append one token's K and V to the cache. `k_new` and `v_new` are `[n_kv * head_dim]` f32.
     pub fn append(&mut self, k_new: &[f32], v_new: &[f32]) {
         let kv_size = self.n_kv * self.head_dim;
@@ -60,36 +49,9 @@ impl KvCache {
         let data = &self.v_cache[..self.seq_len * kv_size];
         Tensor::from_slice(ctx, data, vec![self.seq_len, kv_size])
     }
-
-    /// Reset the cache (start a new generation).
-    pub fn reset(&mut self) {
-        self.seq_len = 0;
-    }
 }
 
 /// Per-layer KV-caches for the full model. Index by layer index.
 pub struct ModelKvCache {
     pub caches: Vec<Option<KvCache>>, // Some for full-attn layers, None for DeltaNet
-}
-
-impl ModelKvCache {
-    pub fn new(max_seq: usize, n_kv: usize, head_dim: usize, is_full_attention: &[bool]) -> Self {
-        let caches = is_full_attention
-            .iter()
-            .map(|&is_full| {
-                if is_full {
-                    Some(KvCache::new(max_seq, n_kv, head_dim))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        ModelKvCache { caches }
-    }
-
-    pub fn reset(&mut self) {
-        for c in self.caches.iter_mut().flatten() {
-            c.reset();
-        }
-    }
 }

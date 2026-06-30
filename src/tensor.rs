@@ -36,6 +36,7 @@ pub struct Tensor {
 ///   - `weight`: U32 packed `[out, in/8]` (8 int4 nibbles per U32, little-endian nibble order)
 ///   - `scales`: BF16 `[out, in/group_size]`
 ///   - `biases`: BF16 `[out, in/group_size]`
+///
 /// Dequantization happens on-the-fly inside `gpu_matmul_qint4_trans_b` during the matmul, so the
 /// weight never materializes as f32 in global memory. Use `QuantizedTensor::qmatmul` for linear
 /// layers loaded from the Q4 artifact.
@@ -100,14 +101,16 @@ impl QuantizedTensor {
         crate::gpu::compute::gpu_matmul_qint4_trans_b(
             &self.ctx,
             &activation.buffer,
-            &self.weight,
-            &self.scales,
-            &self.biases,
+            &crate::gpu::compute::Q4Params {
+                weight: &self.weight,
+                scales: &self.scales,
+                biases: &self.biases,
+                group_size: self.group_size as u32,
+            },
             &out_buf,
             m as u32,
             n as u32,
             k as u32,
-            self.group_size as u32,
         );
         Tensor {
             id: crate::autograd::next_id(),
@@ -137,13 +140,15 @@ impl QuantizedTensor {
         crate::gpu::compute::gpu_matmul_qint4_decode(
             &self.ctx,
             &activation.buffer,
-            &self.weight,
-            &self.scales,
-            &self.biases,
+            &crate::gpu::compute::Q4Params {
+                weight: &self.weight,
+                scales: &self.scales,
+                biases: &self.biases,
+                group_size: self.group_size as u32,
+            },
             &out_buf,
             n as u32,
             k as u32,
-            self.group_size as u32,
         );
         Tensor {
             id: crate::autograd::next_id(),
@@ -213,21 +218,6 @@ impl QuantizedTensor {
         .expect("gather_row dequant failed");
 
         Tensor::from_slice(&self.ctx, &data, vec![self.in_dim])
-    }
-
-    /// Batch embedding gather: dequantize multiple rows and return `[seq, in_dim]`.
-    /// More efficient than calling `gather_row` per token because it amortizes the CPU→GPU
-    /// upload into one batch.
-    pub fn gather_rows(&self, row_indices: &[u32]) -> Tensor {
-        let seq = row_indices.len();
-        let d = self.in_dim;
-        let mut all_data = vec![0.0f32; seq * d];
-        for (t, &tid) in row_indices.iter().enumerate() {
-            let row = self.gather_row(tid as usize);
-            let row_data = row.to_vec();
-            all_data[t * d..(t + 1) * d].copy_from_slice(&row_data);
-        }
-        Tensor::from_slice(&self.ctx, &all_data, vec![seq, d])
     }
 }
 
@@ -1787,11 +1777,13 @@ impl Tensor {
             &self.ctx,
             &self.buffer,
             &gate.buffer,
-            &weight.buffer,
+            &compute::NormConfig {
+                weight: &weight.buffer,
+                eps,
+            },
             &out_buf,
             rows as u32,
             cols as u32,
-            eps,
         );
         Tensor {
             id: autograd::next_id(),

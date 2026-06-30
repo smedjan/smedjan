@@ -7,6 +7,20 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+/// Quantized-int4 weight parameters for GPU matmul dispatchers.
+pub struct Q4Params<'a> {
+    pub weight: &'a GpuBuffer,
+    pub scales: &'a GpuBuffer,
+    pub biases: &'a GpuBuffer,
+    pub group_size: u32,
+}
+
+/// RMSNorm configuration for `gpu_rms_norm_gated`.
+pub struct NormConfig<'a> {
+    pub weight: &'a GpuBuffer,
+    pub eps: f32,
+}
+
 /// Round up to the next power of 2, clamped to [1, 256].
 /// Required for threadgroup reductions in all row-wise kernels.
 /// 256 threads × 2 shared arrays × 4 bytes = 2KB — fits in 32KB threadgroup memory.
@@ -243,14 +257,11 @@ pub fn gpu_matmul_trans_b_simdgroup(
 pub fn gpu_matmul_qint4_trans_b(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
-    q_weight: &GpuBuffer,
-    q_scales: &GpuBuffer,
-    q_biases: &GpuBuffer,
+    q: &Q4Params,
     c: &GpuBuffer,
     m: u32,
     n: u32,
     k: u32,
-    group_size: u32,
 ) {
     #[repr(C)]
     struct Params {
@@ -263,14 +274,14 @@ pub fn gpu_matmul_qint4_trans_b(
         m,
         n,
         k,
-        group_size,
+        group_size: q.group_size,
     };
     let params_buf = params_buffer(ctx, &params);
     let tile = 64u64;
     let grid = MetalContext::size((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1);
     let tg = MetalContext::size(128, 1, 1); // 4 simdgroups
     dispatch_sync!(ctx, "matmul_qint4_trans_b", grid, tg,
-        0 => a, 1 => q_weight, 2 => q_scales, 3 => q_biases, 4 => c, 5 => &params_buf);
+        0 => a, 1 => q.weight, 2 => q.scales, 3 => q.biases, 4 => c, 5 => &params_buf);
 }
 
 /// **Output-centric quantized decode**: `output[N] = activation[K] @ weight_q[N, K]^T` where
@@ -283,13 +294,10 @@ pub fn gpu_matmul_qint4_trans_b(
 pub fn gpu_matmul_qint4_decode(
     ctx: &Arc<MetalContext>,
     activation: &GpuBuffer, // [K] f32
-    q_weight: &GpuBuffer,   // [N, K/8] U32
-    q_scales: &GpuBuffer,   // [N, K/gs] BF16 (as ushort)
-    q_biases: &GpuBuffer,   // [N, K/gs] BF16
-    output: &GpuBuffer,     // [N] f32
+    q: &Q4Params,
+    output: &GpuBuffer, // [N] f32
     n: u32,
     k: u32,
-    group_size: u32,
 ) {
     #[repr(C)]
     struct Params {
@@ -300,14 +308,14 @@ pub fn gpu_matmul_qint4_decode(
     let params = Params {
         n,
         k,
-        gs: group_size,
+        gs: q.group_size,
     };
     let params_buf = params_buffer(ctx, &params);
     // One thread-group per output neuron. 32 threads per group (one SIMD-group).
     let grid = MetalContext::size(n as u64, 1, 1);
     let tg = MetalContext::size(32, 1, 1);
     dispatch_sync!(ctx, "matmul_qint4_decode", grid, tg,
-        0 => activation, 1 => q_weight, 2 => q_scales, 3 => q_biases, 4 => output, 5 => &params_buf);
+        0 => activation, 1 => q.weight, 2 => q.scales, 3 => q.biases, 4 => output, 5 => &params_buf);
 }
 
 /// simdgroup MMA: C(f32) = A(f32)ᵀ @ B(f32) — A:`[M,K]`, B:`[M,N]`, C:`[K,N]`. Fast backward drop-in for
@@ -1172,46 +1180,6 @@ pub fn gpu_rope_copy(ctx: &Arc<MetalContext>, src: &GpuBuffer, dst: &GpuBuffer, 
         8.min(half_dim as u64).max(1),
     );
     dispatch_threads_sync!(ctx, "rope_copy", total, tg, 0 => src, 1 => dst, 2 => &params_buf);
-}
-
-/// **Cached RoPE**: uses a precomputed cos/sin table to eliminate per-thread `pow` + `sincos`.
-/// `cos_sin_buf` is `[max_pos, rot_dim/2, 2]` f32 (cos and sin interleaved), computed once on CPU.
-pub fn gpu_rope_copy_cached(
-    ctx: &Arc<MetalContext>,
-    src: &GpuBuffer,
-    dst: &GpuBuffer,
-    cos_sin_buf: &GpuBuffer,
-    total_rows: u32,
-    seq_len: u32,
-    head_dim: u32,
-    offset: u32,
-    rot_dim: u32,
-) {
-    #[repr(C)]
-    struct Params {
-        seq_len: u32,
-        head_dim: u32,
-        total_rows: u32,
-        offset: u32,
-        rot_dim: u32,
-    }
-    let params = Params {
-        seq_len,
-        head_dim,
-        total_rows,
-        offset,
-        rot_dim,
-    };
-    let params_buf = params_buffer(ctx, &params);
-    let half_rot = (rot_dim / 2) as u64;
-    let total = MetalContext::size(seq_len as u64, total_rows as u64, half_rot);
-    let tg = MetalContext::size(
-        8.min(seq_len as u64).max(1),
-        8.min(total_rows as u64).max(1),
-        8.min(half_rot).max(1),
-    );
-    dispatch_threads_sync!(ctx, "rope_copy_cached", total, tg,
-        0 => src, 1 => dst, 2 => cos_sin_buf, 3 => &params_buf);
 }
 
 /// RoPE backward: apply inverse rotation (rotate by -θ) to propagate gradients.
@@ -3326,11 +3294,10 @@ pub fn gpu_rms_norm_gated(
     ctx: &Arc<MetalContext>,
     input: &GpuBuffer,
     gate: &GpuBuffer,
-    weight: &GpuBuffer,
+    norm: &NormConfig,
     output: &GpuBuffer,
     rows: u32,
     cols: u32,
-    eps: f32,
 ) {
     #[repr(C)]
     struct Params {
@@ -3338,13 +3305,17 @@ pub fn gpu_rms_norm_gated(
         cols: u32,
         eps: f32,
     }
-    let params = Params { rows, cols, eps };
+    let params = Params {
+        rows,
+        cols,
+        eps: norm.eps,
+    };
     let params_buf = params_buffer(ctx, &params);
     let threads_per_group = next_power_of_2_clamped(cols as u64);
     let grid = MetalContext::size(rows as u64, 1, 1);
     let tg = MetalContext::size(threads_per_group, 1, 1);
     dispatch_sync!(ctx, "rms_norm_gated", grid, tg,
-        0 => input, 1 => gate, 2 => weight, 3 => output, 4 => &params_buf);
+        0 => input, 1 => gate, 2 => norm.weight, 3 => output, 4 => &params_buf);
 }
 
 /// ReLU backward: grad_input = grad_output * (input > 0)
