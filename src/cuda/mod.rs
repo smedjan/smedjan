@@ -96,6 +96,36 @@ pub fn buf_write_bytes(buf: &Buf, bytes: &[u8]) {
     }
 }
 
+/// Read a slice of bytes from a device buffer at the given offset (dtoh). On Metal shared-memory
+/// buffers this is a direct CPU memcpy; on CUDA the buffer lives in device memory, so we copy the
+/// requested byte range back to the host synchronously. Used by `Q4Matmul::gather_row` to pull one
+/// int4 weight row + its group scales/biases back to the CPU for dequantization (a single row of
+/// d=4096 is ~512 U32s + 128 groups — small enough that the dtoh is cheaper than a GPU kernel).
+pub fn buf_read_bytes(buf: &Buf, offset: usize, length: usize) -> Vec<u8> {
+    // The buffer is a CudaSlice<f32> (4-byte elements). `offset` and `length` are in bytes, and
+    // may not be 4-byte aligned (e.g. BF16 scales use 2-byte stride). We copy the full enclosing
+    // f32 elements, then slice the byte range out of the host Vec.
+    let elem_offset = offset / 4;
+    let elem_end = (offset + length + 3) / 4; // ceil to include the partial tail element
+    let n_elems = elem_end - elem_offset;
+    // dtoh_sync_copy_into copies from the START of the given CudaSlice; to read a sub-range we
+    // need to offset the device pointer. Use the raw memcpy with a byte-offset device pointer.
+    let base_ptr = *buf.device_ptr();
+    let byte_offset = elem_offset * 4;
+    let mut host = vec![0.0f32; n_elems];
+    buf.device().bind_to_thread().expect("bind CUDA context");
+    unsafe {
+        // CUdeviceptr is an integer (u64) device address; add the byte offset to advance it.
+        // memcpy_dtoh_sync takes (dst: &mut [T], src: CUdeviceptr).
+        let offset_ptr = base_ptr + byte_offset as cudarc::driver::sys::CUdeviceptr;
+        cudarc::driver::result::memcpy_dtoh_sync(&mut host, offset_ptr)
+            .expect("dtoh buf_read_bytes");
+    }
+    let bytes: Vec<u8> = host.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let byte_offset_in_slice = offset - elem_offset * 4;
+    bytes[byte_offset_in_slice..byte_offset_in_slice + length].to_vec()
+}
+
 /// Reinterpret a u32 buffer handle as a Buf (f32) for storage in the untyped tape Vec<Buf>.
 /// CudaSlice<u32> and CudaSlice<f32> have identical layout (device ptr + len, both 4-byte elems);
 /// the tape only holds it to hand back to embedding_backward, which reinterprets it back as u32.
@@ -168,7 +198,7 @@ impl MetalContext {
     /// page setup) with a same-stream memset of an already-mapped allocation in the steady state.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
-        // Pop a recycled same-device, same-size buffer under the lock; release it before the GPU op.
+                                               // Pop a recycled same-device, same-size buffer under the lock; release it before the GPU op.
         let reused = if POOL_BYPASS.load(Ordering::Relaxed) == 0 {
             let key = (device_id(&self.device), n_floats);
             let mut pool = buffer_pool().lock().unwrap();

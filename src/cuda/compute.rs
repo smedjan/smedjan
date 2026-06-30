@@ -731,6 +731,22 @@ pub struct RmsNormBackwardParams {
     pub eps: f32,
 }
 
+/// Quantized-int4 weight parameters for GPU matmul dispatchers (mirrors metal::Q4Params).
+/// `weight` is `[N, K/8]` U32 (8 int4 nibbles packed per word); `scales`/`biases` are
+/// `[N, K/group_size]` BF16 (stored as CudaSlice<f32> but read as 16-bit in the kernel).
+pub struct Q4Params<'a> {
+    pub weight: &'a GpuBuffer,
+    pub scales: &'a GpuBuffer,
+    pub biases: &'a GpuBuffer,
+    pub group_size: u32,
+}
+
+/// RMSNorm configuration for `gpu_rms_norm_gated` (mirrors metal::NormConfig).
+pub struct NormConfig<'a> {
+    pub weight: &'a GpuBuffer,
+    pub eps: f32,
+}
+
 pub fn gpu_matmul_fp32(
     ctx: &Arc<MetalContext>,
     a: &GpuBuffer,
@@ -2242,6 +2258,124 @@ pub fn gpu_repeat_kv_backward(
         f.launch(
             cfg,
             (out_grad, kv_grad, n_kv_total, group_size, seq_len, head_dim),
+        )
+    }
+    .unwrap();
+}
+
+// ===== Elementwise log / softplus (Qwen3.5 A_log decay + gate paths) =====
+
+/// Elementwise natural log: `output = log(max(input, 1.17549435e-38))`. The floor clamp avoids
+/// log(0) = -inf / log(neg) = NaN; the Qwen3.5 A_log path only ever feeds non-negative values, so
+/// the clamp is pure overflow insurance (mirrors metal::gpu_log / shaders::LOG).
+pub fn gpu_log(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("smedjan", "log_fwd").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
+
+/// Elementwise softplus: `output = max(x, 0) + log(1 + exp(-|x|))` — numerically stable branchless
+/// form (mirrors metal::gpu_softplus / shaders::SOFTPLUS). Used by Qwen3.5's gate
+/// `g = -exp(A_log) * softplus(a + dt_bias)`.
+pub fn gpu_softplus(ctx: &Arc<MetalContext>, input: &GpuBuffer, output: &GpuBuffer, size: u32) {
+    let cfg = launch_cfg(256, size.div_ceil(256));
+    let f = ctx.device.get_func("smedjan", "softplus_fwd").unwrap();
+    unsafe { f.launch(cfg, (input, output, size)) }.unwrap();
+}
+
+// ===== RMSNorm-Gated: out = rms_norm(x, weight, eps) * silu(z) per row (Qwen3.5 linear_attn.norm) =====
+
+/// RMSNorm-Gated: `out = rms_norm(x, weight, eps) * silu(z)` per row. Both `input` and `gate` are
+/// `[rows, cols]`; `norm.weight` is `[cols]`. One block per row, blockDim = next_pow2(cols) clamp 256
+/// (mirrors metal::gpu_rms_norm_gated / shaders::RMS_NORM_GATED — reduction shared memory + syncthreads).
+pub fn gpu_rms_norm_gated(
+    ctx: &Arc<MetalContext>,
+    input: &GpuBuffer,
+    gate: &GpuBuffer,
+    norm: &NormConfig,
+    output: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) {
+    let tpg = next_power_of_2_clamped(cols as u64) as u32;
+    let cfg = launch_cfg_2d(rows, 1, tpg, 1);
+    let f = ctx.device.get_func("smedjan", "rms_norm_gated").unwrap();
+    unsafe {
+        f.launch(
+            cfg,
+            (input, gate, norm.weight, output, rows, cols, norm.eps),
+        )
+    }
+    .unwrap();
+}
+
+// ===== Quantized int4 matmul (on-the-fly dequant of int4 weights; Qwythos-9B serving) =====
+//
+// Mirrors metal::gpu_matmul_qint4_trans_b / _decode. The weight is `[N, K/8]` U32 (8 nibbles per
+// word); scales/biases are `[N, K/group_size]` BF16 stored as CudaSlice<f32> (read as 16-bit in the
+// kernel). CUDA has no simdgroup MMA, so the tiled kernel uses a 32×32 float-tile + 64-thread
+// 4×4 sub-tile (same shape as matmul_tiled_fp32) and dequantizes each B element on the fly. The
+// decode kernel is the M=1 optimization: one block per output neuron, 32 threads strided over K,
+// warp shuffle reduction (the CUDA analog of Metal's simd_sum).
+
+/// Fused int4-dequant + GEMM: `C[M,N] = A[M,K] @ B_q[N,K]^T`. 32×32 tile, 64 threads, fp32 accumulate
+/// (no fp16 downcast — the int4 dequant already costs precision; don't lose more in the MMA). The
+/// kernel dequantizes B inside the tile load so weights stay packed in VRAM.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_matmul_qint4_trans_b(
+    ctx: &Arc<MetalContext>,
+    a: &GpuBuffer,
+    q: &Q4Params,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    let tile = 32u32;
+    let cfg = launch_cfg_3d(n.div_ceil(tile), m.div_ceil(tile), 1, 64);
+    let f = ctx
+        .device
+        .get_func("smedjan", "matmul_qint4_trans_b")
+        .unwrap();
+    unsafe {
+        f.launch(
+            cfg,
+            (a, q.weight, q.scales, q.biases, c, m, n, k, q.group_size),
+        )
+    }
+    .unwrap();
+}
+
+/// Output-centric quantized decode: `output[N] = activation[K] @ weight_q[N,K]^T`. One block per
+/// output neuron, 32 threads strided over K, warp-shuffle reduction (the CUDA analog of Metal's
+/// simd_sum). Designed for M=1 autoregressive decode — no tile staging, no barriers.
+pub fn gpu_matmul_qint4_decode(
+    ctx: &Arc<MetalContext>,
+    activation: &GpuBuffer,
+    q: &Q4Params,
+    output: &GpuBuffer,
+    n: u32,
+    k: u32,
+) {
+    // 32 threads/block (one warp), one block per output neuron. n blocks in the grid.
+    let cfg = launch_cfg(32, n);
+    let f = ctx
+        .device
+        .get_func("smedjan", "matmul_qint4_decode")
+        .unwrap();
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                activation,
+                q.weight,
+                q.scales,
+                q.biases,
+                output,
+                n,
+                k,
+                q.group_size,
+            ),
         )
     }
     .unwrap();

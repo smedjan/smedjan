@@ -97,6 +97,11 @@ pub const KERNEL_NAMES: &[&str] = &[
     "logsumexp",
     "compute_inv_rms",
     "causal_mask_window",
+    "log_fwd",
+    "softplus_fwd",
+    "rms_norm_gated",
+    "matmul_qint4_trans_b",
+    "matmul_qint4_decode",
 ];
 
 /// All CUDA kernels in a single compilation unit.
@@ -2356,5 +2361,188 @@ extern "C" __global__ void causal_mask_window(float* scores, unsigned int batch_
     bool future = k > q_pos;
     bool too_far = (window > 0) && (k + window <= q_pos);
     if (future || too_far) scores[bh * seq_q * seq_k + q * seq_k + k] = __int_as_float(0xff800000);
+}
+
+// ===== Elementwise log / softplus (Qwen3.5 A_log decay + gate paths) =====
+// Mirrors metal shaders::LOG / SOFTPLUS. log floors at smallest-positive-normal to avoid -inf/NaN.
+extern "C" __global__ void log_fwd(const float* input, float* output, unsigned int size) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float v = input[gid];
+    output[gid] = logf(fmaxf(v, 1.17549435e-38f)); // smallest positive normal f32
+}
+
+// softplus(x) = max(x, 0) + log(1 + exp(-|x|)) — branchless, numerically stable.
+extern "C" __global__ void softplus_fwd(const float* input, float* output, unsigned int size) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= size) return;
+    float x = input[gid];
+    float abs_x = fabsf(x);
+    output[gid] = fmaxf(x, 0.0f) + logf(1.0f + expf(-abs_x));
+}
+
+// ===== RMSNorm-Gated: out = rms_norm(x, weight, eps) * silu(z) per row (Qwen3.5 linear_attn.norm) =====
+// Mirrors metal shaders::RMS_NORM_GATED. One block per row; blockDim = next_pow2(cols) clamped 256.
+// Grid-stride over cols + shared-memory reduction + __syncthreads.
+extern "C" __global__ void rms_norm_gated(
+    const float* input, const float* gate, const float* weight, float* output,
+    unsigned int rows, unsigned int cols, float eps
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x, nt = blockDim.x;
+    const float* row_in = input + row * cols;
+    const float* row_gate = gate + row * cols;
+    float* row_out = output + row * cols;
+
+    __shared__ float sh[256];
+    float local_ss = 0.0f;
+    for (unsigned int c = tid; c < cols; c += nt) {
+        float v = row_in[c];
+        local_ss += v * v;
+    }
+    sh[tid] = local_ss;
+    __syncthreads();
+    for (unsigned int s = nt / 2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; __syncthreads(); }
+    float rms = rsqrtf(sh[0] / (float)cols + eps);
+
+    for (unsigned int c = tid; c < cols; c += nt) {
+        float normed = row_in[c] * rms * weight[c];
+        float gz = row_gate[c];
+        float silu_z = gz / (1.0f + expf(-gz));
+        row_out[c] = normed * silu_z;
+    }
+}
+
+// ===== Quantized int4 matmul (on-the-fly dequant; Qwythos-9B serving) =====
+//
+// Mirrors metal shaders::MATMUL_QINT4_TRANS_B / _DECODE. q_weight is [N, K/8] U32 (8 int4 nibbles
+// per word, little-endian nibble order); q_scales/q_biases are [N, K/group_size] BF16 stored as
+// 16-bit. CUDA has no BF16-as-ushort load like Metal, so the scales/biases buffer is a CudaSlice<f32>
+// (4-byte elements) and we READ the low 16 bits of each f32 word as the bf16 bit pattern. The
+// caller uploads them as bf16-packed-into-f32 (see QuantizedWeights::upload — scales/biases are
+// created via buffer_from_slice of bf16-bits-reinterpreted-as-f32), so element i of the f32 buffer
+// holds the 16-bit bf16 value in its low half. Widen bf16→f32 by shifting the raw 16 bits left 16.
+
+// Dequantize B[n,k] from packed int4 + group scales/biases. __device__ so both kernels share it.
+__device__ __forceinline__ float dequant_q4(
+    const unsigned int* q_weight,
+    const float* q_scales_f32,   // [N, K/group_size]: bf16 bits packed in the low 16 bits of each f32 word
+    const float* q_biases_f32,
+    unsigned int n, unsigned int k, unsigned int K, unsigned int group_size
+) {
+    unsigned int in_packed = K / 8;
+    unsigned int n_groups = K / group_size;
+    unsigned int pack_idx = k / 8;
+    unsigned int nibble_idx = k % 8;
+    unsigned int group_idx = k / group_size;
+
+    unsigned int packed = q_weight[n * in_packed + pack_idx];
+    unsigned int raw = (packed >> (nibble_idx * 4)) & 0xFu;
+    // Sign-extend 4-bit to int: values 8..15 are negative (-8..-1).
+    int nibble = (raw & 0x8u) ? (int)raw - 16 : (int)raw;
+
+    // bf16 bits → f32: the bf16 bit pattern is the high 16 bits of f32, so widening = left shift 16.
+    // The scales buffer stores one bf16 per f32 word (low 16 bits = bf16, high 16 = zero); extract
+    // the low 16 bits and shift into the high half, then reinterpret as f32.
+    unsigned int scale_lo = __float_as_uint(q_scales_f32[n * n_groups + group_idx]) & 0xFFFFu;
+    unsigned int bias_lo = __float_as_uint(q_biases_f32[n * n_groups + group_idx]) & 0xFFFFu;
+    unsigned int scale_bits = scale_lo << 16;
+    unsigned int bias_bits = bias_lo << 16;
+    float scale = __uint_as_float(scale_bits);
+    float bias = __uint_as_float(bias_bits);
+    return (float)nibble * scale + bias;
+}
+
+// Tiled quantized matmul: C[M,N] = A[M,K] @ B_q[N,K]^T. 32×32 tile, 64 threads (8×8 thread-tile,
+// 4×4 sub-tile per thread), fp32 shared tiles + fp32 accumulate (no fp16 downcast — preserves the
+// little precision int4 leaves). Dequantizes B inside the tile load so weights stay packed in VRAM.
+extern "C" __global__ void matmul_qint4_trans_b(
+    const float* __restrict__ A,
+    const unsigned int* __restrict__ q_weight,
+    const float* __restrict__ q_scales,
+    const float* __restrict__ q_biases,
+    float* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int group_size
+) {
+    int local_row = threadIdx.x / 8;
+    int local_col = threadIdx.x % 8;
+    int tile_row = blockIdx.y * TILE;
+    int tile_col = blockIdx.x * TILE;
+
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+    float acc[THREAD_TILE][THREAD_TILE] = {{0.0f}};
+
+    for (int k_block = 0; k_block < (int)K; k_block += TILE) {
+        // Stage A tile [TILE, TILE] from A[M, K] — f32, boundary-checked.
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gr = tile_row + r, gc = k_block + c;
+            As[r][c] = (gr < (int)M && gc < (int)K) ? A[gr * K + gc] : 0.0f;
+        }
+        // Stage B tile [TILE, TILE] — B is logically [N, K]; B^T[k, n] = B[n, k]. We load
+        // B[tile_col + c, k_block + r] (n=tile_col+c, k=k_block+r), dequantizing on the fly.
+        for (int i = 0; i < 16; i++) {
+            int flat = threadIdx.x * 16 + i;
+            int r = flat / TILE, c = flat % TILE;
+            int gk = k_block + r, gn = tile_col + c;
+            float val = 0.0f;
+            if (gk < (int)K && gn < (int)N) {
+                val = dequant_q4(q_weight, q_scales, q_biases,
+                                 (unsigned int)gn, (unsigned int)gk, K, group_size);
+            }
+            Bs[r][c] = val;
+        }
+        __syncthreads();
+
+        for (int k = 0; k < TILE; k++) {
+            float a_vals[THREAD_TILE], b_vals[THREAD_TILE];
+            for (int i = 0; i < THREAD_TILE; i++)
+                a_vals[i] = As[local_row * THREAD_TILE + i][k];
+            for (int j = 0; j < THREAD_TILE; j++)
+                b_vals[j] = Bs[k][local_col * THREAD_TILE + j];
+            for (int i = 0; i < THREAD_TILE; i++)
+                for (int j = 0; j < THREAD_TILE; j++)
+                    acc[i][j] += a_vals[i] * b_vals[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < THREAD_TILE; i++)
+        for (int j = 0; j < THREAD_TILE; j++) {
+            int gr = tile_row + local_row * THREAD_TILE + i;
+            int gc = tile_col + local_col * THREAD_TILE + j;
+            if (gr < (int)M && gc < (int)N) C[gr * N + gc] = acc[i][j];
+        }
+}
+
+// Output-centric quantized decode: output[N] = activation[K] @ weight_q[N, K]^T. One block per
+// output neuron, 32 threads (one warp) strided over K. Each thread accumulates its slice, then a
+// warp shuffle (__shfl_down) reduces the 32 partial sums to one. The CUDA analog of Metal's
+// simd_sum. Designed for M=1 decode — no tile staging, no barriers, no shared memory.
+extern "C" __global__ void matmul_qint4_decode(
+    const float* __restrict__ activation,   // [K]
+    const unsigned int* __restrict__ q_weight, // [N, K/8]
+    const float* __restrict__ q_scales,       // [N, K/group_size] bf16-in-f32
+    const float* __restrict__ q_biases,        // [N, K/group_size]
+    float* __restrict__ output,                // [N]
+    unsigned int N, unsigned int K, unsigned int gs
+) {
+    unsigned int n = blockIdx.x;             // which output neuron
+    unsigned int lane = threadIdx.x;         // 0..31
+    float local_acc = 0.0f;
+
+    for (unsigned int k = lane; k < K; k += 32) {
+        float w = dequant_q4(q_weight, q_scales, q_biases, n, k, K, gs);
+        local_acc += activation[k] * w;
+    }
+
+    // Warp shuffle reduction: sum the 32 partial sums into lane 0.
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_acc += __shfl_down_sync(0xFFFFFFFFu, local_acc, offset);
+
+    if (lane == 0) output[n] = local_acc;
 }
 "#;
