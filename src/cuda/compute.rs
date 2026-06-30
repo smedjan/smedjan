@@ -33,25 +33,40 @@ fn launch_cfg_3d(bx: u32, by: u32, bz: u32, tx: u32) -> LaunchConfig {
 
 // ===== Matmul =====
 
-/// cuBLAS SGEMM for a row-major `C[m,n] = opA(A) · opB(B)`. `blas` picks TF32 tensor cores (fast)
-/// vs strict fp32 (precise) via its math mode. We use the col-major→row-major identity: cuBLAS
-/// computes `C^T = opB(B)^T · opA(A)^T`, so we feed B then A with swapped m/n. Buffers are
-/// `Arc<CudaSlice>` (shared) so we go through the sys-level call with raw device pointers rather
-/// than the safe `gemm` wrapper (which needs `&mut`).
-fn cublas_sgemm(
-    blas: &cudarc::cublas::CudaBlas,
-    a: &GpuBuffer,
-    b: &GpuBuffer,
-    c: &GpuBuffer,
+/// Dimensions + transpose flags for a cuBLAS SGEMM call, grouped to stay under clippy's
+/// argument limit (mirrors the Metal backend's `Q4Params` / `NormConfig` pattern).
+struct GemmParams<'a> {
+    blas: &'a cudarc::cublas::CudaBlas,
+    a: &'a GpuBuffer,
+    b: &'a GpuBuffer,
+    c: &'a GpuBuffer,
     m: u32,
     n: u32,
     k: u32,
     trans_a: bool,
     trans_b: bool,
-) {
+}
+
+/// cuBLAS SGEMM for a row-major `C[m,n] = opA(A) · opB(B)`. `blas` picks TF32 tensor cores (fast)
+/// vs strict fp32 (precise) via its math mode. We use the col-major→row-major identity: cuBLAS
+/// computes `C^T = opB(B)^T · opA(A)^T`, so we feed B then A with swapped m/n. Buffers are
+/// `Arc<CudaSlice>` (shared) so we go through the sys-level call with raw device pointers rather
+/// than the safe `gemm` wrapper (which needs `&mut`).
+fn cublas_sgemm(p: GemmParams) {
     use cudarc::cublas::result;
     use cudarc::cublas::sys::cublasOperation_t as Op;
     use cudarc::driver::DevicePtr;
+    let GemmParams {
+        blas,
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        trans_a,
+        trans_b,
+    } = p;
     let alpha = 1.0f32;
     let beta = 0.0f32;
     let a_ptr = *a.device_ptr() as *const f32;
@@ -188,7 +203,17 @@ fn cublas_gemm(
     if bf16_gemm_enabled() && simdgroup_matmul_enabled() {
         cublas_gemm_bf16(ctx, a, b, c, m, n, k, trans_a, trans_b);
     } else {
-        cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, trans_a, trans_b);
+        cublas_sgemm(GemmParams {
+            blas: cublas_for(ctx),
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            trans_a,
+            trans_b,
+        });
     }
 }
 
@@ -202,7 +227,17 @@ pub fn gpu_matmul(
     k: u32,
 ) {
     // Precise (strict fp32) cuBLAS GEMM — the fp16 fast path is gpu_matmul_f16.
-    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, false);
+    cublas_sgemm(GemmParams {
+        blas: cublas_for(ctx),
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        trans_a: false,
+        trans_b: false,
+    });
 }
 
 /// cuBLAS strided-batched SGEMM: `C[b] = opA(A[b]) · opB(B[b])` over `batch` independent matrices.
@@ -311,7 +346,7 @@ pub fn gpu_matmul_trans_a(
 // ===== Softmax / Norm =====
 
 fn next_power_of_2_clamped(n: u64) -> u64 {
-    let clamped = n.min(256).max(1) as u32;
+    let clamped = n.clamp(1, 256) as u32;
     clamped.next_power_of_two().min(256) as u64
 }
 
@@ -756,7 +791,17 @@ pub fn gpu_matmul_fp32(
     n: u32,
     k: u32,
 ) {
-    cublas_sgemm(cublas_for(ctx), a, b, c, m, n, k, false, false);
+    cublas_sgemm(GemmParams {
+        blas: cublas_for(ctx),
+        a,
+        b,
+        c,
+        m,
+        n,
+        k,
+        trans_a: false,
+        trans_b: false,
+    });
 }
 
 pub fn gpu_matmul_bf16(

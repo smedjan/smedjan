@@ -29,18 +29,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// one stream on a *different* stream would race the zeroing memset against the first stream's still
 /// pending work. Keying by device confines reuse to a single stream — full reuse for the one context
 /// a real run holds, zero cross-context reuse in the test suite.
-static BUFFER_POOL: OnceLock<Mutex<HashMap<(usize, usize), Vec<CudaSlice<f32>>>>> = OnceLock::new();
+/// Pool type alias to avoid clippy::type_complexity on the two sites that hold it.
+type BufferPool = Mutex<HashMap<(usize, usize), Vec<CudaSlice<f32>>>>;
+
+static BUFFER_POOL: OnceLock<BufferPool> = OnceLock::new();
 /// (hits, misses) since process start — surfaced by `pool_stats()` for the training/bench readout.
 static POOL_HITS: AtomicUsize = AtomicUsize::new(0);
 static POOL_MISSES: AtomicUsize = AtomicUsize::new(0);
 /// >0 while any `PoolBypassGuard` is live (checkpoint recompute / grad-accum): allocations come
-/// fresh and recycles are dropped, mirroring the Metal bypass. Process-global is sound because the
-/// GPU compute path is single-threaded.
+/// > fresh and recycles are dropped, mirroring the Metal bypass. Process-global is sound because
+/// > the GPU compute path is single-threaded.
 static POOL_BYPASS: AtomicUsize = AtomicUsize::new(0);
 /// Cap per size bucket, mirroring Metal, so idle VRAM can't grow unbounded across varied seq lengths.
 const POOL_BUCKET_CAP: usize = 64;
 
-fn buffer_pool() -> &'static Mutex<HashMap<(usize, usize), Vec<CudaSlice<f32>>>> {
+fn buffer_pool() -> &'static BufferPool {
     BUFFER_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -106,7 +109,7 @@ pub fn buf_read_bytes(buf: &Buf, offset: usize, length: usize) -> Vec<u8> {
     // may not be 4-byte aligned (e.g. BF16 scales use 2-byte stride). We copy the full enclosing
     // f32 elements, then slice the byte range out of the host Vec.
     let elem_offset = offset / 4;
-    let elem_end = (offset + length + 3) / 4; // ceil to include the partial tail element
+    let elem_end = (offset + length).div_ceil(4); // ceil to include the partial tail element
     let n_elems = elem_end - elem_offset;
     // dtoh_sync_copy_into copies from the START of the given CudaSlice; to read a sub-range we
     // need to offset the device pointer. Use the raw memcpy with a byte-offset device pointer.
@@ -169,7 +172,7 @@ impl MetalContext {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(kernels::ALL_KERNELS, opts)
             .expect("Failed to compile CUDA kernels");
         device
-            .load_ptx(ptx, "smedjan", &kernels::KERNEL_NAMES)
+            .load_ptx(ptx, "smedjan", kernels::KERNEL_NAMES)
             .expect("Failed to load CUDA kernels");
 
         // cuBLAS GEMM uses the GPU's tensor cores — orders of magnitude faster than the hand-rolled
