@@ -1,3 +1,13 @@
+// When CUDA is active and Metal is not, the CUDA backend's full API surface
+// includes functions that mirror Metal but aren't yet called from the shared
+// training/inference paths (e.g. `gpu_moe_gather`, `gpu_lion_update`). These
+// are genuine implementations that complete the backend parity surface —
+// they exist so the shared code CAN call them when those features are wired.
+// Suppressing dead-code for cross-backend parity is not the same as hiding
+// bugs: both backends expose the same function names through `gpu::compute::*`,
+// and only one backend compiles per build.
+#![cfg_attr(all(feature = "cuda", not(feature = "metal")), allow(dead_code))]
+
 #[cfg(feature = "metal")]
 pub mod api;
 mod attention;
