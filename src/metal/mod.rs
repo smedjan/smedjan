@@ -750,14 +750,13 @@ impl MetalContext {
     fn auto_flush_batch() {
         let flushed = ACTIVE_BATCH.with(|batch| {
             let mut b = batch.borrow_mut();
-            if let Some(cb) = b.take() {
-                if cb.dispatch_count > 0 {
+            if let Some(cb) = b.take()
+                && cb.dispatch_count > 0 {
                     cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
                     return true;
                 }
-            }
             false
         });
         if flushed {
@@ -795,14 +794,13 @@ impl MetalContext {
             let mut b = batch.borrow_mut();
             // If a batch is already active, flush it first
             let mut did = false;
-            if let Some(cb) = b.take() {
-                if cb.dispatch_count > 0 {
+            if let Some(cb) = b.take()
+                && cb.dispatch_count > 0 {
                     cb.encoder.endEncoding();
                     cb.cmd.commit();
                     cb.cmd.waitUntilCompleted();
                     did = true;
                 }
-            }
             let cmd = self
                 .queue
                 .commandBuffer()

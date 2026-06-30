@@ -22,19 +22,23 @@ cuda = ["cudarc"]
 bufsan = []
 
 [dependencies]
-# Metal backend (macOS/Apple Silicon)
+rand = "0.8"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1"
+
+# Metal backend (macOS/Apple Silicon only). Target-gated so `default = ["metal"]`
+# is safe on Linux — the feature is on but objc2 doesn't pull, and source-level
+# cfg gates prevent the Metal modules from compiling.
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 
 # CUDA backend (NVIDIA GPUs). cudarc 0.12 needs an explicit CUDA-version feature; 12060 is its
 # newest, ABI-forward-compatible with the 12.8 toolkit (PTX JITs to newer archs like sm_120 at runtime).
+[target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { version = "0.12", optional = true, features = ["cuda-12060", "cublas", "f16"] }
-
-rand = "0.8"
-memmap2 = "0.9"
-clap = { version = "4", features = ["derive"] }
-byteorder = "1"
 
 [profile.release]
 opt-level = 3

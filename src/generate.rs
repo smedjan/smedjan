@@ -1,10 +1,10 @@
 use crate::attention::KvCache;
 use crate::autograd;
-use crate::gpu::compute::{gpu_argmax, gpu_temperature_scale};
 use crate::gpu::MetalContext;
+use crate::gpu::compute::{gpu_argmax, gpu_temperature_scale};
 use crate::model::Transformer;
 use crate::tensor::Tensor;
-use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN};
+use crate::tokenizer::{BOS_TOKEN, BpeTokenizer, EOS_TOKEN};
 use rand::Rng;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -965,7 +965,7 @@ fn argmax(logits: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod ngram_tests {
-    use super::{no_repeat_ngram_banned, select_token, SamplingConfig};
+    use super::{SamplingConfig, no_repeat_ngram_banned, select_token};
 
     #[test]
     fn sampling_config_rejects_invalid_ranges() {

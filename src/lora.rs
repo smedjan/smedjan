@@ -10,7 +10,7 @@
 //! regular f32 matmul (small: rank × in_dim + rank × out_dim per layer).
 
 use crate::autograd;
-use crate::gated_deltanet::{Mixer, Qwen35Layer, Qwen35Model};
+use crate::gated_deltanet::{Mixer, Qwen35Model};
 use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;
@@ -146,7 +146,7 @@ impl Qwen35LoraModel {
     pub fn lora_params(&self) -> Vec<Tensor> {
         let mut params = Vec::new();
         for layer in &self.lora_layers {
-            for adapter in [
+            for a in [
                 &layer.qkv,
                 &layer.w_a,
                 &layer.w_b,
@@ -159,10 +159,8 @@ impl Qwen35LoraModel {
                 &layer.ffn_gate,
                 &layer.ffn_up,
                 &layer.ffn_down,
-            ] {
-                if let Some(a) = adapter {
-                    params.extend(a.params());
-                }
+            ].into_iter().flatten() {
+                params.extend(a.params());
             }
         }
         params
@@ -280,7 +278,7 @@ impl Qwen35LoraModel {
             let base_u = autograd::no_grad(|| {
                 crate::gated_deltanet::qmul(&xf, &layer.q_ffn_up, &layer.ffn_up)
             });
-            let base_silu = base_g.silu_gate(&base_u);
+            let _base_silu = base_g.silu_gate(&base_u);
 
             // LoRA delta for gate/up/down (trainable, with gradients).
             let lora_g = lora.ffn_gate.as_ref().map(|a| a.delta(&xf));
@@ -393,8 +391,8 @@ pub struct LoraTrainConfig {
 
 /// Run LoRA fine-tuning on the Qwen3.5 model.
 pub fn qwen35_lora_train(ctx: &Arc<MetalContext>, config: &LoraTrainConfig) -> std::io::Result<()> {
-    use crate::autograd;
-    use crate::loss::cross_entropy_loss;
+    
+    
     use crate::optim::AdamW;
     use crate::safetensors::{config_from_hf_qwen35, import_qwen35_safetensors};
 
@@ -584,7 +582,7 @@ fn get_lora_batch(
     cfg: &crate::gated_deltanet::Qwen35Config,
     model: &Qwen35LoraModel,
 ) -> LoraBatch {
-    let d = cfg.hidden_size;
+    let _d = cfg.hidden_size;
     let vocab = cfg.vocab_size as usize;
 
     // Build the batch: pick examples, truncate/pad to seq_len, embed via q_embed.

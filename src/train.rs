@@ -1,8 +1,8 @@
 use crate::autograd;
 use crate::checkpoint;
 use crate::data::DataLoader;
-use crate::gpu::compute;
 use crate::gpu::MetalContext;
+use crate::gpu::compute;
 use crate::loss;
 use crate::model::{ModelConfig, Transformer};
 use crate::optim::{AdamW, CosineWarmupScheduler};
@@ -420,8 +420,12 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let effective_batch = config.batch_size * config.grad_accum_steps as usize;
     eprintln!(
         "Training: batch_size={}, seq_len={}, total_steps={}, gradient_checkpointing={}, grad_accum_steps={}, effective_batch={}",
-        config.batch_size, config.seq_len, config.total_steps, config.gradient_checkpointing,
-        config.grad_accum_steps, effective_batch,
+        config.batch_size,
+        config.seq_len,
+        config.total_steps,
+        config.gradient_checkpointing,
+        config.grad_accum_steps,
+        effective_batch,
     );
     eprintln!("Tokenizer: {}", config.tokenizer_path);
 
@@ -429,7 +433,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     // so --no-simdgroup-matmul (and --bf16-matmul) override the binary-wide default-on set in main().
     compute::set_simdgroup_matmul(config.simdgroup_matmul);
     if config.simdgroup_matmul {
-        eprintln!("Matmul: hardware simdgroup MMA fast path enabled (default; --no-simdgroup-matmul to disable)");
+        eprintln!(
+            "Matmul: hardware simdgroup MMA fast path enabled (default; --no-simdgroup-matmul to disable)"
+        );
     } else if config.bf16_matmul {
         compute::set_bf16_matmul(true);
         eprintln!(
@@ -520,8 +526,11 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         if uses_main_adamw && opt_states.len() == optimizer.params.len() {
             optimizer.load_state(&opt_states, opt_step);
         } else if !opt_states.is_empty() {
-            eprintln!("[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
-                opt_states.len(), config.optimizer_type);
+            eprintln!(
+                "[WARN] checkpoint has {} optimizer states but {:?} is the live optimizer — starting its state fresh",
+                opt_states.len(),
+                config.optimizer_type
+            );
         }
         (model, optimizer, next_step, tokens)
     } else if let Some(ref pretrained_path) = config.pretrained {
@@ -626,8 +635,10 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
             eprintln!("  Cautious Muon: sign-agreement update masking ON (Muon group)");
         }
         let (n_muon, n_adamw) = h.split_counts();
-        eprintln!("Using Muon+AdamW hybrid: {} matrices on Muon (lr×{}), {} params on AdamW (embeddings/head/routers/norms, lr×{})",
-            n_muon, config.muon_lr_scale, n_adamw, config.adamw_lr_scale);
+        eprintln!(
+            "Using Muon+AdamW hybrid: {} matrices on Muon (lr×{}), {} params on AdamW (embeddings/head/routers/norms, lr×{})",
+            n_muon, config.muon_lr_scale, n_adamw, config.adamw_lr_scale
+        );
         Some(h)
     } else {
         None
@@ -828,7 +839,7 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     let mut peak_tok_s = 0.0f32;
     let mut best_train_loss = f32::INFINITY;
     let mut prev_loss = 0.0f32; // for gradient noise estimation
-                                // Rolling window of recent logged losses, rendered as a Unicode sparkline in the progress line.
+    // Rolling window of recent logged losses, rendered as a Unicode sparkline in the progress line.
     let mut loss_window: std::collections::VecDeque<f32> =
         std::collections::VecDeque::with_capacity(21);
     let loss_scale = 1.0 / grad_accum_steps as f32;
@@ -1044,8 +1055,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                 // One extra matmul — no full teacher forward needed.
                 // KL(teacher || student) as auxiliary loss with weight 0.1.
                 // Self-distillation every 10 steps to amortize the cost (~40% overhead per step)
-                if let Some(ref h) = hidden_for_distill {
-                    if !ema_buffers.is_empty() && step % 10 == 0 {
+                if let Some(ref h) = hidden_for_distill
+                    && !ema_buffers.is_empty() && step % 10 == 0 {
                         // Self-distillation: compute teacher logits from hidden + EMA LM head.
                         // Uses EMA embedding (ema_buffers[0]) for the weight-tied LM head.
                         // One extra matmul — no full teacher forward needed.
@@ -1125,7 +1136,6 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                             0.1,
                         );
                     }
-                }
 
                 // Multi-token prediction: add loss from extra heads
                 if !extra_logits.is_empty() {
@@ -1415,12 +1425,19 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
 
             eprintln!(
                 "step {:>6} | loss {:>8.4} ({:+.3}) | lr {:.2e} | {:.0} tok/s | {:.1}s/step | {}M tok | ep {} | pool {}/{} | ETA {} | w{:.1} | {}",
-                step, loss_val, loss_delta,
-                lr, tokens_per_sec, step_time,
+                step,
+                loss_val,
+                loss_delta,
+                lr,
+                tokens_per_sec,
+                step_time,
                 total_tokens / 1_000_000,
                 data_loader.epoch(),
-                pool_hits, pool_hits + pool_misses,
-                eta_str, weight_norm, loss_trend,
+                pool_hits,
+                pool_hits + pool_misses,
+                eta_str,
+                weight_norm,
+                loss_trend,
             );
 
             // Write to CSV log file
@@ -1502,8 +1519,8 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
         }
 
         // Validation loss + early stopping (if validation dataset provided)
-        if let Some(ref val_path) = config.val_dataset {
-            if step > 0 && step % config.checkpoint_interval == 0 {
+        if let Some(ref val_path) = config.val_dataset
+            && step > 0 && step % config.checkpoint_interval == 0 {
                 let val_loss = compute_validation_loss(
                     ctx,
                     &model,
@@ -1531,7 +1548,6 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
                     }
                 }
             }
-        }
     }
 
     // Final checkpoint — wait for GPU before reading weights
@@ -1556,7 +1572,9 @@ pub fn train(ctx: &Arc<MetalContext>, config: &TrainConfig) -> std::io::Result<(
     if !ema_buffers.is_empty() {
         let ema_path = format!("{}/ema_final.bin", config.checkpoint_dir);
         checkpoint::save_checkpoint_ema(&ema_path, &model, &ema_buffers, config.total_steps)?;
-        eprintln!("  EMA model saved to ema_final.bin (often better than final.bin — compare with `smedjan perplexity`)");
+        eprintln!(
+            "  EMA model saved to ema_final.bin (often better than final.bin — compare with `smedjan perplexity`)"
+        );
     }
     let elapsed_total = start_time.elapsed();
     let total_time = elapsed_total.as_secs();
@@ -1676,8 +1694,11 @@ fn clip_gradients_fused(ctx: &Arc<MetalContext>, model: &Transformer, max_norm: 
     let total_norm = total_norm_sq.sqrt();
 
     if !nan_indices.is_empty() {
-        eprintln!("[WARN] NaN/Inf detected in {} gradient(s) (param indices: {:?}) — zeroing affected gradients",
-            nan_indices.len(), &nan_indices[..nan_indices.len().min(10)]);
+        eprintln!(
+            "[WARN] NaN/Inf detected in {} gradient(s) (param indices: {:?}) — zeroing affected gradients",
+            nan_indices.len(),
+            &nan_indices[..nan_indices.len().min(10)]
+        );
     }
     let needs_scale = total_norm > max_norm && total_norm.is_finite();
     let scale = if needs_scale {
@@ -1749,7 +1770,10 @@ fn clip_gradients_per_tensor_fused(ctx: &Arc<MetalContext>, model: &Transformer,
         }
     }
     if nan_count > 0 {
-        eprintln!("[WARN] NaN/Inf detected in {} gradient(s) — zeroing affected gradients (per-tensor clip)", nan_count);
+        eprintln!(
+            "[WARN] NaN/Inf detected in {} gradient(s) — zeroing affected gradients (per-tensor clip)",
+            nan_count
+        );
     }
 
     let any = scales.iter().any(|s| s.is_some());

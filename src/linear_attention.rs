@@ -371,7 +371,7 @@ mod tests {
         let vt = Tensor::from_slice(&ctx, &mk(0.3, 0.0), vec![bh, seq, hd]).with_grad();
 
         let out = linear_attention(&qt, &kt, &vt); // [bh, seq, hd]
-                                                   // Reduce to a scalar loss that exercises the full linear-attention backward path.
+        // Reduce to a scalar loss that exercises the full linear-attention backward path.
         let flat = out.reshape(vec![1, n]);
         let ones = Tensor::ones(&ctx, vec![n, 1]);
         let loss = flat.matmul(&ones); // [1, 1]

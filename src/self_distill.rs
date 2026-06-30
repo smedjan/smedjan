@@ -14,7 +14,6 @@
 //! loss between their token distributions at the target turn, plus the standard cross-entropy
 //! loss on the target tokens.
 
-use crate::autograd;
 use crate::gpu::MetalContext;
 use crate::tensor::Tensor;
 use std::sync::Arc;

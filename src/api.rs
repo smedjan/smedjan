@@ -1,7 +1,7 @@
 use crate::checkpoint;
 use crate::generate::{self, SamplingConfig};
-use crate::gpu::compute;
 use crate::gpu::GpuContext as MetalContext;
+use crate::gpu::compute;
 use crate::model::Transformer;
 use crate::tokenizer::BpeTokenizer;
 use std::sync::Arc;
@@ -260,7 +260,7 @@ pub fn gpu_diagnostic(ctx: &Arc<MetalContext>) -> (usize, bool) {
     if (lse_vals[0] - lse_vals[1]).abs() > 0.01 {
         passed = false;
     } // same rows → same lse
-      // Z-loss (disabled in training but function exists)
+    // Z-loss (disabled in training but function exists)
     let z_logits = crate::tensor::Tensor::randn(ctx, vec![4, 8], 0.1);
     let z_loss_buf = ctx.alloc_buffer(4);
     compute::gpu_fill(ctx, &z_loss_buf, 1, 0.0);

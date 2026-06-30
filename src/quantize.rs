@@ -472,7 +472,7 @@ fn quantize_q4_0_block(x: &[f32], out: &mut Vec<u8>) {
 /// of 32-blocks. 1-D tensors (norms) and ragged shapes stay F32, exactly as llama.cpp's quantizer
 /// keeps them — so a "quantized" GGUF is legitimately mixed-precision.
 fn is_ggml_quantizable(shape: &[usize], numel: usize) -> bool {
-    shape.len() >= 2 && numel % GGML_QK == 0 && numel > 0
+    shape.len() >= 2 && numel.is_multiple_of(GGML_QK) && numel > 0
 }
 
 /// Encode a tensor's f32 data into `(ggml_type, bytes)` for the requested GGUF quant. Non-quantizable

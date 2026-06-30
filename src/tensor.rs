@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::gpu::{compute, MetalContext};
+use crate::gpu::{MetalContext, compute};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2355,7 +2355,7 @@ impl Tensor {
     /// Sum all elements into a scalar tensor [1]. Used by the KL-divergence loss.
     /// Forward-only (loss computation, not backprop target).
     pub fn sum_all(&self) -> Tensor {
-        let n = self.numel();
+        let _n = self.numel();
         // CPU reduction (simple, correct — only called once per loss computation, not in hot path).
         let data = self.to_vec();
         let total: f32 = data.iter().sum();

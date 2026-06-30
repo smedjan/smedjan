@@ -1,8 +1,8 @@
-use crate::gpu::{compute, MetalContext};
+use crate::gpu::{MetalContext, compute};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Global tensor ID counter.
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1256,11 +1256,10 @@ fn backward_checkpoint(
 
     // Extract gradient for the checkpoint's input tensor.
     // We saved first_input_id before consuming the sub-tape.
-    if let Some(sub_input_id) = first_input_id {
-        if let Some(input_grad) = GRADS.with(|grads| grads.borrow().get(&sub_input_id).cloned()) {
+    if let Some(sub_input_id) = first_input_id
+        && let Some(input_grad) = GRADS.with(|grads| grads.borrow().get(&sub_input_id).cloned()) {
             accumulate_grad(ctx, entry.inputs[0], input_grad, input_size);
         }
-    }
 
     // Clean up sub-tape intermediate gradients. These are ephemeral activations
     // from the recomputed forward — not model parameter gradients. Removing them

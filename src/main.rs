@@ -1320,7 +1320,9 @@ fn main() {
                 );
             }
             println!();
-            println!("Or use --size custom with --dim --layers --heads --kv-heads --ffn-mult --max-seq for any arbitrary config.");
+            println!(
+                "Or use --size custom with --dim --layers --heads --kv-heads --ffn-mult --max-seq for any arbitrary config."
+            );
         }
 
         Commands::Perplexity {
@@ -2205,7 +2207,7 @@ fn main() {
             eprintln!("--- Roofline Analysis ---");
             let mem_bw_gbs = 68.25; // M1 memory bandwidth
             let flops_tflops = 2.6; // M1 FP32 TFLOPS
-                                    // Per forward pass: roughly 2 * params * batch * seq FLOPs (matmul dominated)
+            // Per forward pass: roughly 2 * params * batch * seq FLOPs (matmul dominated)
             let fwd_flops = 2.0 * params as f64 * (batch_size * seq_len) as f64;
             let fwd_bytes = params as f64 * 4.0
                 + (batch_size * seq_len) as f64 * d as f64 * 4.0 * n_layers as f64 * 2.0;

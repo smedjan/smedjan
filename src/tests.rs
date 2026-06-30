@@ -2,10 +2,10 @@
 mod suite {
     use crate::autograd;
     use crate::datapipe;
-    use crate::gpu::{compute, MetalContext};
+    use crate::gpu::{MetalContext, compute};
     use crate::model::{ModelConfig, MoeSpec, Transformer, TransformerBlock};
     use crate::tensor::Tensor;
-    use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, SPECIAL_TOKENS};
+    use crate::tokenizer::{BOS_TOKEN, BpeTokenizer, EOS_TOKEN, PAD_TOKEN, SPECIAL_TOKENS};
     use std::sync::Arc;
 
     /// Helper: create a MetalContext for tests. Panics if no GPU available.
@@ -542,7 +542,7 @@ mod suite {
         let ctx = test_ctx();
         let u = ctx.buffer_from_slice(&[1.0f32, -2.0, 3.0, -4.0]); // candidate update
         let g = ctx.buffer_from_slice(&[1.0f32, 5.0, -1.0, -4.0]); // gradient
-                                                                   // agree: idx0 (1·1>0), idx3 (-4·-4>0); disagree: idx1 (-2·5<0), idx2 (3·-1<0)
+        // agree: idx0 (1·1>0), idx3 (-4·-4>0); disagree: idx1 (-2·5<0), idx2 (3·-1<0)
         let keep = ctx.alloc_buffer(4 * 4);
         compute::gpu_cautious_mask(&ctx, &u, &g, &keep, 4);
         assert_eq!(MetalContext::read_buffer(&u, 4), vec![1.0, 0.0, 0.0, -4.0]);
@@ -1262,7 +1262,7 @@ mod suite {
         let b =
             Tensor::from_slice(&ctx, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![1, 3, 2]).with_grad();
         let c = a.batched_matmul_trans_a(&b); // [1, 2, 2]
-                                              // loss = sum(C) → dC = ones[2,2]
+        // loss = sum(C) → dC = ones[2,2]
         let flat = c.reshape(vec![1, 4]);
         let ones = Tensor::ones(&ctx, vec![4, 1]);
         let loss = flat.matmul(&ones); // [1,1]
@@ -2356,7 +2356,10 @@ mod suite {
                 flash.iter().all(|x| x.is_finite()),
                 "flash output must be finite"
             );
-            assert!(md < 6e-3, "flash vs fp16-K/V dense causal max_abs_diff={md:.5} (kernel math, fp16 rep removed)");
+            assert!(
+                md < 6e-3,
+                "flash vs fp16-K/V dense causal max_abs_diff={md:.5} (kernel math, fp16 rep removed)"
+            );
         });
     }
 
@@ -2474,7 +2477,7 @@ mod suite {
             vec![1, 4],
         );
         let y = x.relu(); // [0, 2, 0, 4]
-                          // Use matmul with ones to create a sum → scalar-like loss
+        // Use matmul with ones to create a sum → scalar-like loss
         let ones = Tensor::from_buffer(
             Arc::clone(&ctx),
             ctx.buffer_from_slice(&[1.0f32, 1.0, 1.0, 1.0]),
@@ -2973,7 +2976,7 @@ mod suite {
         let ctx = test_ctx();
         let (seq, bsz, nb) = (12usize, 4usize, 3usize);
         let scores = Tensor::zeros(&ctx, vec![1, seq, seq]); // 0 = unmasked baseline
-                                                             // Block scores per query position; q=8 (block 2): block0 high, block1 low.
+        // Block scores per query position; q=8 (block 2): block0 high, block1 low.
         let mut bs = vec![0.0f32; seq * nb];
         for q in 0..seq {
             bs[q * nb] = 5.0;
@@ -3246,8 +3249,13 @@ mod suite {
         let ts = t1.elapsed().as_secs_f64() / iters as f64;
         let dense_flops = 2.0 * (bh * seq * seq * hd) as f64; // Q@K^T scores
         let sparse_flops = 2.0 * (bh * seq * (top_k + 1) * block * hd) as f64;
-        eprintln!("block-sparse gather seq={seq} block={block} top_k={top_k}: dense {td:.4}s, sparse {ts:.4}s, speedup {:.2}x; score-FLOPs {:.0}M vs {:.0}M ({:.2}× fewer)",
-            td / ts, dense_flops / 1e6, sparse_flops / 1e6, dense_flops / sparse_flops);
+        eprintln!(
+            "block-sparse gather seq={seq} block={block} top_k={top_k}: dense {td:.4}s, sparse {ts:.4}s, speedup {:.2}x; score-FLOPs {:.0}M vs {:.0}M ({:.2}× fewer)",
+            td / ts,
+            dense_flops / 1e6,
+            sparse_flops / 1e6,
+            dense_flops / sparse_flops
+        );
         // The subquadratic FLOP advantage (printed above) holds on every backend, but the wall-time
         // win depends on the gather impl's per-block launch overhead. On Metal the gather is fast
         // enough to beat dense at this seq; on CUDA the many small launches can erase the win at
@@ -3475,7 +3483,9 @@ mod suite {
         let clamped = max_abs(&gi);
         compute::set_rmsnorm_clamp(prev);
 
-        eprintln!("RMSNorm collapsed-row backward: unclamped max|grad|={unclamped:.1}, clamped max|grad|={clamped:.1}");
+        eprintln!(
+            "RMSNorm collapsed-row backward: unclamped max|grad|={unclamped:.1}, clamped max|grad|={clamped:.1}"
+        );
         assert!(
             unclamped > 1.0e3,
             "collapsed row should explode without the clamp, got {unclamped}"
@@ -3557,7 +3567,10 @@ mod suite {
             "AdamW must stay bounded (no explosion)"
         );
         // The mechanism: beta2=0.999 overshoots harder on the jump (lagging v → under-sized denom).
-        assert!(jump999 >= jump95, "beta2=0.999 should overshoot ≥ beta2=0.95 on the gradient jump (jump999={jump999}, jump95={jump95})");
+        assert!(
+            jump999 >= jump95,
+            "beta2=0.999 should overshoot ≥ beta2=0.95 on the gradient jump (jump999={jump999}, jump95={jump95})"
+        );
     }
 
     /// Regression for the latent Muon-fallback bug: the AdamW path for non-2-D params used to
@@ -4111,8 +4124,14 @@ mod suite {
             compute::gpu_matmul_simdgroup_f16(&ctx, &a16, &b16, &out, s as u32, s as u32, s as u32);
         }
         let sg = t1.elapsed().as_secs_f64() / iters as f64;
-        eprintln!("matmul {s}^3: hand-rolled f16 = {:.1} GFLOP/s ({:.3} ms), simdgroup f16 = {:.1} GFLOP/s ({:.3} ms), speedup = {:.2}x",
-            flops / hand / 1e9, hand * 1e3, flops / sg / 1e9, sg * 1e3, hand / sg);
+        eprintln!(
+            "matmul {s}^3: hand-rolled f16 = {:.1} GFLOP/s ({:.3} ms), simdgroup f16 = {:.1} GFLOP/s ({:.3} ms), speedup = {:.2}x",
+            flops / hand / 1e9,
+            hand * 1e3,
+            flops / sg / 1e9,
+            sg * 1e3,
+            hand / sg
+        );
         // The simdgroup-MMA speedup is a Metal hardware feature (simdgroup_matrix). On CUDA there is
         // no such hardware path — gpu_matmul_simdgroup_f16 is just another tiled f16 kernel — so the
         // two timings are equivalent-and-noisy; only assert the speedup on the backend it describes.
@@ -4303,11 +4322,7 @@ mod suite {
             row.iter()
                 .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv {
-                        (i, v)
-                    } else {
-                        (bi, bv)
-                    }
+                    if v > bv { (i, v) } else { (bi, bv) }
                 })
                 .0
         };
@@ -4317,7 +4332,9 @@ mod suite {
                 agree += 1;
             }
         }
-        eprintln!("MLA incremental-decode vs full-prefill: max logit_diff={max_diff:.4}, argmax agree {agree}/{seq}");
+        eprintln!(
+            "MLA incremental-decode vs full-prefill: max logit_diff={max_diff:.4}, argmax agree {agree}/{seq}"
+        );
         assert!(
             inc.iter().all(|x| x.is_finite()),
             "MLA incremental decode produced non-finite logits"
@@ -4578,7 +4595,7 @@ mod suite {
     /// and a sentinel pad segment. Deterministic layout check.
     #[test]
     fn pack_sequences_greedy_layout() {
-        use crate::datapipe::{pack_sequences, PACK_PAD_SEG};
+        use crate::datapipe::{PACK_PAD_SEG, pack_sequences};
         // lengths 3,2,4 into max_len 6: row0 = [s0(3)+s1(2)+pad(1)], row1 = [s2(4)+pad(2)].
         let rows = pack_sequences(&[vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]], 6, 0);
         assert_eq!(rows.len(), 2, "should pack into 2 rows");
@@ -4724,14 +4741,22 @@ mod suite {
             &docb_logits(&row1, Some(&seg_buf)),
             &docb_logits(&row2, Some(&seg_buf)),
         );
-        assert!(masked < 2e-3, "seq-packing leaked: docB logits changed with docA under the per-doc mask (max diff {masked})");
+        assert!(
+            masked < 2e-3,
+            "seq-packing leaked: docB logits changed with docA under the per-doc mask (max diff {masked})"
+        );
 
         // (2) Negative control: WITHOUT the mask, docB attends across the row, so changing docA DOES
         // move docB's logits — proving the mask is what isolates them (the test isn't vacuous).
         let unmasked = max_diff(&docb_logits(&row1, None), &docb_logits(&row2, None));
-        assert!(unmasked > 1e-2, "negative control failed: docB logits unchanged without the mask (max diff {unmasked}) — test can't detect leakage");
+        assert!(
+            unmasked > 1e-2,
+            "negative control failed: docB logits unchanged without the mask (max diff {unmasked}) — test can't detect leakage"
+        );
 
-        eprintln!("seq-packing isolation: masked diff={masked:.5} (want ~0), unmasked diff={unmasked:.5} (want >0)");
+        eprintln!(
+            "seq-packing isolation: masked diff={masked:.5} (want ~0), unmasked diff={unmasked:.5} (want >0)"
+        );
         autograd::clear_tape();
         autograd::zero_grads();
     }
@@ -5151,11 +5176,7 @@ mod suite {
             s.iter()
                 .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                    if x > bv {
-                        (i, x)
-                    } else {
-                        (bi, bv)
-                    }
+                    if x > bv { (i, x) } else { (bi, bv) }
                 })
                 .0
         };
@@ -6142,8 +6163,11 @@ mod suite {
         let ctx = test_ctx();
         let losses = bufsan_train_tiny(&ctx, false, None);
         for (s, l) in losses.iter().enumerate() {
-            assert!(l.is_finite(), "bufsan poison surfaced a non-finite loss at step {s}: {l} — \
-                a recycled buffer was read before being overwritten (use-after-recycle / under-dispatch)");
+            assert!(
+                l.is_finite(),
+                "bufsan poison surfaced a non-finite loss at step {s}: {l} — \
+                a recycled buffer was read before being overwritten (use-after-recycle / under-dispatch)"
+            );
         }
         assert!(
             *losses.last().unwrap() < 30.0,

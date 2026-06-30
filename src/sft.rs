@@ -1,11 +1,11 @@
 use crate::autograd;
 use crate::checkpoint;
-use crate::gpu::compute;
 use crate::gpu::MetalContext;
+use crate::gpu::compute;
 use crate::loss;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
-use crate::tokenizer::{BpeTokenizer, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN};
+use crate::tokenizer::{BOS_TOKEN, BpeTokenizer, EOS_TOKEN, PAD_TOKEN};
 use rand::seq::SliceRandom;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;

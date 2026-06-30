@@ -341,11 +341,10 @@ impl BpeTokenizer {
             }
 
             // Check new pair (left, next_of_left).
-            if next[left] < n {
-                if let Some(&p) = self.merge_priority.get(&(token[left], token[next[left]])) {
+            if next[left] < n
+                && let Some(&p) = self.merge_priority.get(&(token[left], token[next[left]])) {
                     heap.push(Reverse((p, left)));
                 }
-            }
         }
 
         // Collect surviving tokens by walking the linked list.

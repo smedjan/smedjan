@@ -1,6 +1,6 @@
 use crate::attention::{KvCache, MultiHeadAttention};
 use crate::autograd::{self, Op, TapeEntry};
-use crate::gpu::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{GpuBuffer, MetalContext, compute};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 

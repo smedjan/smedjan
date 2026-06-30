@@ -109,7 +109,7 @@ pub fn wkv(k: &Tensor, v: &Tensor, w: &Tensor, u: &Tensor) -> Tensor {
     // P with channel folded into batch: P2[(b,d),i,0] = P[b,i,d]; out2[(b,d),t,0] = Σ_{i<t} D·P2.
     let p2 = crate::attention::transpose_bsh_to_bhs(&p, bh, seq, hd, 1).reshape(vec![bhd, seq, 1]);
     let out2 = d2.batched_matmul(&p2); // [bhd, seq, 1]
-                                       // transpose_bhs_to_bsh returns the flattened [bh·seq, hd]; reshape back to [bh, seq, hd].
+    // transpose_bhs_to_bsh returns the flattened [bh·seq, hd]; reshape back to [bh, seq, hd].
     let past =
         crate::attention::transpose_bhs_to_bsh(&out2, bh, seq, hd, 1).reshape(vec![bh, seq, hd]);
 

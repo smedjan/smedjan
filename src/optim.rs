@@ -1,5 +1,5 @@
 use crate::autograd;
-use crate::gpu::{compute, GpuBuffer, MetalContext};
+use crate::gpu::{GpuBuffer, MetalContext, compute};
 use crate::tensor::Tensor;
 #[cfg(feature = "metal")]
 use objc2_metal::MTLBuffer;
@@ -912,7 +912,7 @@ impl Muon {
                 if self.normalized {
                     let vrow = ps.ns_vrow.as_ref().unwrap(); // [rows] running second moment
                     let rowss = ps.ns_rowss.as_ref().unwrap(); // [rows] scratch
-                                                               // r[i] = mean_j X[i,j]^2  (per-row mean-square of the orthogonal update)
+                    // r[i] = mean_j X[i,j]^2  (per-row mean-square of the orthogonal update)
                     compute::gpu_row_dot_reduce(&self.ctx, x_buf, x_buf, rowss, rows, cols);
                     compute::gpu_scale(&self.ctx, rowss, rows, 1.0 / cols as f32);
                     // v[i] = beta2*v[i] + (1-beta2)*r[i]

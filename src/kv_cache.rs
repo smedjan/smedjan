@@ -88,10 +88,8 @@ impl ModelKvCache {
     }
 
     pub fn reset(&mut self) {
-        for c in &mut self.caches {
-            if let Some(c) = c {
-                c.reset();
-            }
+        for c in self.caches.iter_mut().flatten() {
+            c.reset();
         }
     }
 }

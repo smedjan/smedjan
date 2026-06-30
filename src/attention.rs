@@ -1,5 +1,5 @@
 use crate::autograd::{self, Op, TapeEntry};
-use crate::gpu::{compute, MetalContext};
+use crate::gpu::{MetalContext, compute};
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -117,9 +117,9 @@ pub fn block_sparse_gather_attention(
     let q_bnq = q.reshape(vec![bh * nb, block, hd]);
     let scale = 1.0 / (hd as f32).sqrt();
     let scores = q_bnq.batched_matmul_trans_b(&k_sel_t).scale(scale); // [bh*nb, block, sel_w]
-                                                                      // In-place causal mask sets out-of-causal/sentinel keys to -inf BEFORE softmax → ~0 weight and
-                                                                      // ~0 gradient there. Safe under autograd: softmax caches its own output for backward, and the
-                                                                      // upstream scale/matmul backwards read their inputs (q_bnq, k_sel_t), not this masked buffer.
+    // In-place causal mask sets out-of-causal/sentinel keys to -inf BEFORE softmax → ~0 weight and
+    // ~0 gradient there. Safe under autograd: softmax caches its own output for backward, and the
+    // upstream scale/matmul backwards read their inputs (q_bnq, k_sel_t), not this masked buffer.
     compute::gpu_gather_causal_mask(
         &ctx,
         &scores.buffer,
@@ -639,11 +639,7 @@ impl MultiHeadAttention {
         // YaRN attention temperature: fold mscale into Q (MLA decode is softmax attention).
         let q = {
             let ms = self.yarn_attn_mscale();
-            if ms != 1.0 {
-                q.scale(ms)
-            } else {
-                q
-            }
+            if ms != 1.0 { q.scale(ms) } else { q }
         };
 
         // GQA expand K/V heads to match Q heads.
