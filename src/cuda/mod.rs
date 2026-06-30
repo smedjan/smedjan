@@ -198,7 +198,7 @@ impl MetalContext {
     /// page setup) with a same-stream memset of an already-mapped allocation in the steady state.
     pub fn alloc_buffer(&self, size_bytes: usize) -> Buf {
         let n_floats = size_bytes.div_ceil(4); // round up: byte-sized (int8) allocs must not under-provision
-                                               // Pop a recycled same-device, same-size buffer under the lock; release it before the GPU op.
+        // Pop a recycled same-device, same-size buffer under the lock; release it before the GPU op.
         let reused = if POOL_BYPASS.load(Ordering::Relaxed) == 0 {
             let key = (device_id(&self.device), n_floats);
             let mut pool = buffer_pool().lock().unwrap();
