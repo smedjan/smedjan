@@ -5,6 +5,7 @@ use crate::gpu::compute;
 use crate::loss;
 use crate::model::Transformer;
 use crate::optim::{AdamW, CosineWarmupScheduler};
+use crate::tensor::Tensor;
 use crate::tokenizer::{BOS_TOKEN, BpeTokenizer, EOS_TOKEN, PAD_TOKEN};
 use rand::seq::SliceRandom;
 use std::io::{Error, ErrorKind};
@@ -320,6 +321,14 @@ pub struct SftConfig {
     pub max_grad_norm: f32,
     pub log_interval: u32,
     pub checkpoint_interval: u32,
+    /// Self-distillation strength (0.0 = disabled). When > 0, each step runs a
+    /// second (teacher) forward pass with hints inserted at response positions,
+    /// and the loss becomes `CE + alpha * KL(teacher, student)`.
+    pub self_distill_alpha: f32,
+    /// Optional textual-feedback samples for localized credit assignment. When
+    /// non-empty, the teacher input is built from these samples (inserting the
+    /// hint at the target turn) instead of the generic response-position hint.
+    pub self_distill_samples: Vec<crate::self_distill::TextualFeedbackSample>,
 }
 
 impl SftConfig {
@@ -338,6 +347,8 @@ impl SftConfig {
             max_grad_norm: 1.0,
             log_interval: 10,
             checkpoint_interval: 500,
+            self_distill_alpha: 0.0,
+            self_distill_samples: Vec::new(),
         }
     }
 
@@ -457,6 +468,26 @@ fn apply_loss_mask(
     unmasked_count as f32 / total_positions as f32
 }
 
+/// Build a teacher input by replacing response positions with the correct target
+/// tokens. The teacher sees the same context as the student, but at every
+/// response position it also sees the *correct next token* — this creates a
+/// "what if the model had known the right answer" distribution for KL
+/// distillation. Positions where `loss_mask` is false (prompt tokens) are left
+/// unchanged.
+///
+/// This is the generic path used when `self_distill_samples` is empty. When
+/// samples are provided, `build_teacher_input_from_sample` is used instead for
+/// finer-grained per-turn control.
+fn build_teacher_input(inputs: &[u32], targets: &[u32], loss_mask: &[bool]) -> Vec<u32> {
+    assert_eq!(inputs.len(), targets.len());
+    assert_eq!(inputs.len(), loss_mask.len());
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, &tok)| if loss_mask[i] { targets[i] } else { tok })
+        .collect()
+}
+
 /// Run supervised fine-tuning on a pre-trained checkpoint.
 pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result<()> {
     config.validate()?;
@@ -523,7 +554,48 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
         // Get SFT batch with loss mask
         let (inputs, targets, loss_mask) = data_loader.next_batch();
 
-        // Forward pass (batched GPU dispatch)
+        // --- Self-distillation: teacher forward (detached, no grad) ---
+        // When self_distill_alpha > 0, run a second forward pass with hints
+        // inserted at response positions. The teacher logits form the target
+        // distribution for KL distillation, giving per-turn credit assignment.
+        let mut targets = targets;
+        let teacher_logits: Option<Tensor> = if config.self_distill_alpha > 0.0 {
+            let (teacher_inputs, sample_targets) = if config.self_distill_samples.is_empty() {
+                (build_teacher_input(&inputs, &targets, &loss_mask), None)
+            } else {
+                // Use one sample per step (rotated). The sample defines both the
+                // teacher input (hint inserted at the target turn) and the correct
+                // target tokens for the CE loss.
+                let sample =
+                    &config.self_distill_samples[step as usize % config.self_distill_samples.len()];
+                let teacher_input = crate::self_distill::build_teacher_input_from_sample(
+                    sample,
+                    config.batch_size * config.seq_len,
+                );
+                // Tile the sample's target tokens across the batch.
+                let total = config.batch_size * config.seq_len;
+                let tiled: Vec<u32> = (0..total)
+                    .map(|i| sample.target_token_ids[i % sample.target_token_ids.len()])
+                    .collect();
+                (teacher_input, Some(tiled))
+            };
+            if let Some(st) = sample_targets {
+                targets = st;
+            }
+            Some(autograd::no_grad(|| {
+                model.forward(
+                    &teacher_inputs,
+                    config.batch_size,
+                    config.seq_len,
+                    None,
+                    false,
+                )
+            }))
+        } else {
+            None
+        };
+
+        // --- Student forward (with grad) ---
         ctx.begin_batch();
         let logits = model.forward(
             &inputs,
@@ -533,8 +605,18 @@ pub fn sft_train(ctx: &Arc<MetalContext>, config: &SftConfig) -> std::io::Result
             false, // no gradient checkpointing for SFT (small datasets)
         );
 
-        // Cross-entropy loss on all positions (we mask gradients below)
-        let (loss_tensor, grad_logits) = loss::cross_entropy_loss(ctx, &logits, &targets);
+        // Loss: CE (+ alpha * KL if teacher is active)
+        let (loss_tensor, grad_logits) = match &teacher_logits {
+            Some(teacher) => crate::self_distill::textual_feedback_loss(
+                ctx,
+                &logits,
+                teacher,
+                &targets,
+                &loss_mask,
+                config.self_distill_alpha,
+            ),
+            None => loss::cross_entropy_loss(ctx, &logits, &targets),
+        };
         ctx.flush_batch();
 
         // Apply loss mask: zero out gradients for prompt positions, rescale

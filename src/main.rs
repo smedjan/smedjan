@@ -35,6 +35,7 @@ mod optim;
 pub mod quantize;
 mod rwkv;
 mod safetensors;
+mod self_distill;
 mod sft;
 mod spec_decode;
 mod ssm;
